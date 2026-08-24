@@ -874,7 +874,7 @@ async function egoDriverMain() {
     }
 
     async function inspectComposedPrompt() {
-      const candidates = await js(`(() => {
+      const candidates = await js(String.raw`(() => {
         const composer = document.querySelector('#prompt-textarea')
         if (!composer) {
           return []
