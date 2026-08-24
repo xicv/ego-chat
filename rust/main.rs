@@ -7,7 +7,7 @@ use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -459,12 +459,22 @@ fn write_runtime_tool_paths(runtime_dir: &Path, tools: &Toolchain) -> Result<(),
         )?;
     } else {
         let managed_codex_path = runtime_dir.join(".codex-path");
-        match fs::remove_file(&managed_codex_path) {
-            Ok(()) => {}
+        match fs::read_to_string(&managed_codex_path) {
+            Ok(value) => {
+                let existing = PathBuf::from(value.trim());
+                if !executable_file(&existing) {
+                    fs::remove_file(&managed_codex_path).map_err(|error| {
+                        format!(
+                            "could not remove stale {}: {error}",
+                            managed_codex_path.display()
+                        )
+                    })?;
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
-                    "could not remove stale {}: {error}",
+                    "could not read {}: {error}",
                     managed_codex_path.display()
                 ));
             }
@@ -620,7 +630,7 @@ fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result
     let executable = path_bytes(executable)?;
 
     if let Some(existing) = servers.get(MCP_SERVER_NAME)
-        && !zcode_server_value_matches(existing, &executable)
+        && !zcode_server_identity_matches(existing, &executable)
         && !force
     {
         return Err(format!(
@@ -629,7 +639,7 @@ fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result
     }
 
     if servers.get(MCP_SERVER_NAME).is_none()
-        || !zcode_server_value_matches(
+        || !zcode_server_identity_matches(
             servers.get(MCP_SERVER_NAME).expect("checked above"),
             &executable,
         )
@@ -651,16 +661,10 @@ fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result
     for codex_only_key in ["required", "startup_timeout_sec", "tool_timeout_sec"] {
         server.remove(codex_only_key);
     }
-    let existing_timeout = server
-        .get("timeoutMs")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_default();
-    if existing_timeout < MCP_TOOL_TIMEOUT_MILLISECONDS {
-        server.insert(
-            "timeoutMs".to_string(),
-            JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
-        );
-    }
+    server.insert(
+        "timeoutMs".to_string(),
+        JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
+    );
     let mut configured = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("could not serialize {}: {error}", config_path.display()))?;
     configured.push('\n');
@@ -681,7 +685,7 @@ fn json_object_entry<'a>(
         .ok_or_else(|| format!("{display_name} exists but is not a JSON object"))
 }
 
-fn zcode_server_value_matches(value: &JsonValue, executable: &str) -> bool {
+fn zcode_server_identity_matches(value: &JsonValue, executable: &str) -> bool {
     let Some(server) = value.as_object() else {
         return false;
     };
@@ -692,6 +696,11 @@ fn zcode_server_value_matches(value: &JsonValue, executable: &str) -> bool {
         .map(|values| values.len() == 1 && values[0].as_str() == Some("mcp"))
         .unwrap_or(false);
     command_matches && args_match
+}
+
+fn zcode_server_value_matches(value: &JsonValue, executable: &str) -> bool {
+    zcode_server_identity_matches(value, executable)
+        && value.get("timeoutMs").and_then(JsonValue::as_u64) == Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
 }
 
 fn doctor() -> Result<(), String> {
@@ -925,13 +934,30 @@ fn find_optional_program(name: &str, override_name: &str) -> Result<Option<PathB
 fn resolve_program(candidate: &OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(candidate);
     if path.components().count() > 1 {
-        return path.is_file().then_some(path);
+        return executable_file(&path).then_some(path);
     }
     env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
         .map(|directory| directory.join(&path))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| executable_file(candidate))
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn command_output(program: &Path, arguments: &[&OsStr]) -> Result<String, String> {
@@ -967,7 +993,7 @@ fn read_managed_path(path: &Path) -> Result<PathBuf, String> {
         )
     })?;
     let parsed = PathBuf::from(value.trim());
-    if !parsed.is_file() {
+    if !executable_file(&parsed) {
         return Err(format!(
             "managed tool path {} is unavailable; rerun ego-chat setup",
             parsed.display()
@@ -980,7 +1006,7 @@ fn read_optional_managed_path(path: &Path) -> Result<Option<PathBuf>, String> {
     match fs::read_to_string(path) {
         Ok(value) => {
             let parsed = PathBuf::from(value.trim());
-            if !parsed.is_file() {
+            if !executable_file(&parsed) {
                 return Err(format!(
                     "managed tool path {} is unavailable; rerun ego-chat setup or setup-zcode",
                     parsed.display()
@@ -1126,6 +1152,46 @@ mod tests {
     }
 
     #[test]
+    fn zcode_only_tool_paths_preserve_a_valid_managed_codex_outside_path() {
+        let directory = TestDirectory::new();
+        let runtime = directory.0.join("runtime");
+        let bin = directory.0.join("bin");
+        fs::create_dir_all(&bin).expect("create fake bin");
+        let codex = directory.0.join("private-codex");
+        let node = bin.join("node");
+        let npm = bin.join("npm");
+        let ego_browser = bin.join("ego-browser");
+        for path in [&codex, &node, &npm, &ego_browser] {
+            fs::write(path, "test executable placeholder").expect("write fake executable");
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(path).expect("read mode").permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(path, permissions).expect("set executable mode");
+            }
+        }
+        fs::create_dir_all(&runtime).expect("create runtime");
+        fs::write(
+            runtime.join(".codex-path"),
+            codex.to_str().expect("utf8 test path"),
+        )
+        .expect("seed managed Codex path");
+        let tools = Toolchain {
+            codex: None,
+            ego_browser,
+            node,
+            npm,
+        };
+
+        write_runtime_tool_paths(&runtime, &tools).expect("write managed tool paths");
+
+        assert_eq!(
+            read_optional_managed_path(&runtime.join(".codex-path")).expect("read preserved path"),
+            Some(codex)
+        );
+    }
+
+    #[test]
     fn codex_configuration_is_scoped_and_preserves_other_entries() {
         let directory = TestDirectory::new();
         let config = directory.0.join("config.toml");
@@ -1265,6 +1331,65 @@ mod tests {
         let server = &configured["mcp"]["servers"][MCP_SERVER_NAME];
         assert!(server.get("required").is_none());
         assert!(server.get("tool_timeout_sec").is_none());
+    }
+
+    #[test]
+    fn zcode_configuration_normalizes_every_invalid_timeout_form() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("ego-chat");
+        let invalid_timeouts = [
+            ("missing", None),
+            ("string", Some(JsonValue::String("1900000".to_string()))),
+            (
+                "fractional",
+                Some(JsonValue::Number(
+                    serde_json::Number::from_f64(1_900_000.5).expect("finite timeout"),
+                )),
+            ),
+            ("too-small", Some(JsonValue::from(30_000_u64))),
+            ("excessive", Some(JsonValue::from(3_800_000_u64))),
+        ];
+
+        for (label, invalid_timeout) in invalid_timeouts {
+            let config = directory.0.join(format!("config-{label}.json"));
+            let mut server = JsonMap::new();
+            server.insert(
+                "command".to_string(),
+                JsonValue::String(executable.to_str().expect("utf8 path").to_string()),
+            );
+            server.insert(
+                "args".to_string(),
+                JsonValue::Array(vec![JsonValue::String("mcp".to_string())]),
+            );
+            if let Some(timeout) = invalid_timeout {
+                server.insert("timeoutMs".to_string(), timeout);
+            }
+            let mut servers = JsonMap::new();
+            servers.insert(MCP_SERVER_NAME.to_string(), JsonValue::Object(server));
+            let mut mcp = JsonMap::new();
+            mcp.insert("servers".to_string(), JsonValue::Object(servers));
+            let mut root = JsonMap::new();
+            root.insert("mcp".to_string(), JsonValue::Object(mcp));
+            let document = JsonValue::Object(root);
+            fs::write(
+                &config,
+                serde_json::to_vec_pretty(&document).expect("serialize invalid config"),
+            )
+            .expect("seed invalid timeout");
+
+            assert!(!zcode_server_matches(&config, &executable).expect("inspect invalid config"));
+            configure_zcode(&config, &executable, false).expect("normalize owned timeout");
+            assert!(zcode_server_matches(&config, &executable).expect("inspect repaired config"));
+            let repaired = serde_json::from_str::<JsonValue>(
+                &fs::read_to_string(&config).expect("read repaired config"),
+            )
+            .expect("parse repaired config");
+            assert_eq!(
+                repaired["mcp"]["servers"][MCP_SERVER_NAME]["timeoutMs"].as_u64(),
+                Some(MCP_TOOL_TIMEOUT_MILLISECONDS),
+                "invalid timeout variant {label} was not normalized"
+            );
+        }
     }
 
     #[test]

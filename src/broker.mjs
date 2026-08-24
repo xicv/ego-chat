@@ -338,6 +338,38 @@ export class Broker {
             inputDigest: workflow.inputDigest,
             turnMarker,
           })
+      let recoveredModelPolicyObservation = null
+      let recoveredResponse = null
+      if (boundRecovery) {
+        if (
+          typeof verified.responseText !== "string"
+          || verified.responseText.length === 0
+          || !verified.responseText.trimEnd().endsWith(expectedTerminalMarker)
+        ) {
+          throw new EgoChatError(
+            "human_required",
+            "The attributable late response did not contain the exact workflow terminal marker.",
+            { reason: "recovered_response_invalid" },
+          )
+        }
+        const responseDigest = digest(verified.responseText)
+        if (verified.responseDigest && verified.responseDigest !== responseDigest) {
+          throw new EgoChatError(
+            "human_required",
+            "The attributable late response digest changed during reconciliation.",
+            { reason: "recovered_response_digest_mismatch" },
+          )
+        }
+        recoveredResponse = {
+          responseDigest,
+          responseText: verified.responseText,
+        }
+        if (persisted.modelPolicyObservation) {
+          recoveredModelPolicyObservation = this.#validateModelPolicyObservation(
+            persisted.modelPolicyObservation,
+          )
+        }
+      }
       const now = new Date().toISOString()
       const nextBinding = {
         ...binding,
@@ -356,7 +388,28 @@ export class Broker {
         verifiedAt: now,
       }
       await this.#store.persistBinding("binding.reconciled", nextBinding)
-      return publicBinding(nextBinding)
+      let recoveredModelPolicy = null
+      if (recoveredModelPolicyObservation) {
+        const modelPolicy = await this.#recordModelPolicyObservation(
+          recoveredModelPolicyObservation,
+          bindingKey,
+        )
+        recoveredModelPolicy = {
+          ...modelPolicy.lastObserved,
+          policyRevision: modelPolicy.revision,
+        }
+      }
+      return {
+        ...publicBinding(nextBinding),
+        ...(recoveredResponse
+          ? {
+              recovery: {
+                ...recoveredResponse,
+                modelPolicy: recoveredModelPolicy,
+              },
+            }
+          : {}),
+      }
     } finally {
       this.#activeBindings.delete(bindingKey)
     }
@@ -733,6 +786,18 @@ export class Broker {
       }
 
       const isHumanRequired = error instanceof EgoChatError && error.code === "human_required"
+      let reconciliation = current.reconciliation
+      const observedModelPolicy = error.details?.evidence?.modelPolicy
+      if (isHumanRequired && observedModelPolicy) {
+        try {
+          reconciliation = {
+            ...reconciliation,
+            modelPolicyObservation: this.#validateModelPolicyObservation(observedModelPolicy),
+          }
+        } catch (_error) {
+          // Invalid diagnostic evidence is deliberately not made durable.
+        }
+      }
       this.#activeBindings.delete(workflow.bindingKey)
       await this.#transition(current, isHumanRequired ? "workflow.human_required" : "workflow.failed", {
         ...(isHumanRequired
@@ -754,6 +819,7 @@ export class Broker {
               },
             }),
         private: undefined,
+        reconciliation,
         status: isHumanRequired ? "human_required" : "failed",
       })
     } finally {

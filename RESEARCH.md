@@ -7,7 +7,7 @@ Scope: research and design only; no product implementation or configuration chan
 
 The post-research implementation now includes the smallest bounded Codex-first convergence slice described later in this record. A single broker-owned workflow starts one dedicated Codex App Server thread, posts each candidate to one reserved canonical ChatGPT conversation through Ego, injects the strict ChatGPT review into the next Codex turn as untrusted context, and stops only at validated settlement or a bounded fail-closed condition.
 
-This closes the normal-process A/B/A continuation gap without claiming unsafe crash replay. MCP facade disconnects are recoverable because the daemon owns the workflow. A daemon restart, browser ambiguity, authentication interruption, invalid envelope, secret match, stagnation, missing authority, deadline, or cycle exhaustion requires reconciliation instead of automatically repeating a possibly accepted operation. ChatGPT-first initiation and a full content-addressed local context capsule remain later work.
+This closes the normal-process A/B/A continuation gap without claiming unsafe crash replay. MCP facade disconnects are recoverable because the daemon owns the workflow. For a browser turn that completed after capture, one evidence-only reconciliation may recover the exact prior-head-anchored user/assistant pair without sending again. A daemon restart, unattributable browser state, authentication interruption, invalid envelope, secret match, stagnation, missing authority, deadline, or cycle exhaustion still requires a fail-closed stop. ChatGPT-first initiation and a full content-addressed local context capsule remain later work.
 
 The portable wrapper now also targets ZCode's documented native user surfaces: `~/.zcode/cli/config.json` with `mcp.servers` for local STDIO MCP services, and `~/.zcode/skills/<name>/SKILL.md` for user skills. ZCode's current [MCP Services](https://zcode.z.ai/en/docs/mcp-services), [Skills](https://zcode.z.ai/en/docs/skill), and [Goal](https://zcode.z.ai/en/docs/goal) documentation supports an in-client loop in which the current ZCode task remains side A and invokes Ego Chat for each strict side-B review.
 
@@ -100,7 +100,7 @@ The current [Codex Chat README](https://github.com/xicv/codex-chat/blob/360c5080
 2. Treat compose, submit, and observe as separate operations.
 3. Add a unique visible turn marker to every outbound message.
 4. Bind the context digest, task-envelope digest, conversation identity, task-space ID, and target ID.
-5. If the process dies after a click may have happened, reconcile the marker and conversation read-only; never blindly click Send again.
+5. If capture stops after a click may have happened, reconcile the prior head, unique marker, adjacent roles, terminal marker, and stable tail read-only; never blindly click Send again. Because ChatGPT may normalize Markdown while rendering it, prove the exact prompt digest in the composer immediately before the click rather than requiring its later presentation text to be byte-identical.
 6. Keep “committed,” “pushed,” “reviewed,” “tested,” and “deployed” as separate claims.
 7. Treat the external collaborator's response as untrusted advice until Codex independently validates it.
 

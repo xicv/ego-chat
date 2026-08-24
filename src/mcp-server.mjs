@@ -51,6 +51,13 @@ const AGENT_REVIEW_INPUT_SCHEMA = {
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
 }
 
+const RECOVERABLE_AGENT_REVIEW_CODES = new Set([
+  "completion_timeout_after_confirmed_send",
+  "conversation_head_commit_mismatch",
+  "marker_count_changed",
+  "send_confirmation_ambiguous",
+])
+
 const MCP_INSTRUCTIONS = [
   "Use binding ego-chat-main unless the user explicitly names another binding.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
@@ -58,7 +65,7 @@ const MCP_INSTRUCTIONS = [
   "For broker-owned automatic Codex/ChatGPT convergence, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
-  "If a browser workflow returns human_required, surface the exact stop and never retry an ambiguous send.",
+  "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers; otherwise surface the exact human_required stop.",
 ].join(" ")
 
 function toolResult(value) {
@@ -305,7 +312,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding.",
+      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding.",
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
@@ -330,7 +337,37 @@ export function createMcpServer(config = loadConfig()) {
             { signal: extra.signal, timeoutMs: waitMs + 5_000 },
           ),
         )
-        if (completed.status !== "succeeded") {
+        let exchangeResult = completed.result
+        let recoveredLateResponse = false
+        if (
+          completed.status === "human_required"
+          && RECOVERABLE_AGENT_REVIEW_CODES.has(completed.humanRequired?.code)
+        ) {
+          const reconciled = await requestBroker(
+            config,
+            "conversation.reconcile",
+            {
+              bindingKey: input.bindingKey,
+              expectedTerminalMarker: prepared.terminalMarker,
+              turnMarker: prepared.turnMarker,
+              workflowId: workflow.id,
+            },
+            { timeoutMs: 65_000 },
+          )
+          if (
+            typeof reconciled.recovery?.responseText !== "string"
+            || typeof reconciled.recovery?.responseDigest !== "string"
+            || !reconciled.recovery.modelPolicy
+          ) {
+            throw new EgoChatError(
+              "human_required",
+              "The late ChatGPT review was attributable, but its exact response and pre-send maximum-model proof were not both recoverable.",
+              { reason: "review_recovery_proof_missing", workflowId: workflow.id },
+            )
+          }
+          exchangeResult = reconciled.recovery
+          recoveredLateResponse = true
+        } else if (completed.status !== "succeeded") {
           throw new EgoChatError(
             "human_required",
             "The ChatGPT browser review did not complete unambiguously.",
@@ -342,14 +379,15 @@ export function createMcpServer(config = loadConfig()) {
             },
           )
         }
-        const { review, settled } = completeAgentReview(prepared, completed.result.responseText)
+        const { review, settled } = completeAgentReview(prepared, exchangeResult.responseText)
         return toolResult({
           bindingKey: input.bindingKey,
           candidateDigest: prepared.candidateDigest,
           cycle: input.cycle,
           exchangeWorkflowId: workflow.id,
-          modelPolicy: completed.result.modelPolicy,
-          responseDigest: completed.result.digest,
+          modelPolicy: exchangeResult.modelPolicy,
+          recoveredLateResponse,
+          responseDigest: exchangeResult.responseDigest,
           review,
           settled,
           targetDigest: prepared.contract.targetDigest,

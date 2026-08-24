@@ -8,6 +8,7 @@ async function egoDriverMain() {
   const uid = typeof process.getuid === "function" ? process.getuid() : "user"
   const inputPath = `/tmp/egc-driver-${uid}/input.json`
   const input = JSON.parse(await fs.readFile(inputPath, "utf8"))
+  let observedModelPolicy = null
 
   function emit(value) {
     const encoded = Buffer.from(JSON.stringify(value), "utf8").toString("base64url")
@@ -44,7 +45,10 @@ async function egoDriverMain() {
 
   function humanRequired(reason, message, evidence) {
     emit({
-      evidence: evidence || {},
+      evidence: {
+        ...(evidence || {}),
+        ...(observedModelPolicy ? { modelPolicy: observedModelPolicy } : {}),
+      },
       humanRequired: true,
       message,
       ok: false,
@@ -697,28 +701,44 @@ async function egoDriverMain() {
     const committed = anchorIndex >= 0 ? entries.slice(anchorIndex + 1) : []
     const prompt = committed[0]
     const response = committed[1]
+    const anchorDigestMatches = !input.expectedPreviousContentDigest
+      || anchor?.contentDigest === input.expectedPreviousContentDigest
+    const anchorRoleMatches = !input.binding.headRole || anchor?.role === input.binding.headRole
+    const promptDigestMatches = prompt?.contentDigest === input.inputDigest
+    const promptMarkerCount = prompt?.text.split(input.turnMarker).length - 1
     const renderedMarkerCount = entries.reduce(
       (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
       0,
     )
     const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
+    const responseEndsWithTerminal = response?.text.trimEnd().endsWith(input.expectedTerminalMarker) ?? false
     const attributablePair = (
       anchorIndexes.length === 1
-      && (!input.expectedPreviousContentDigest || anchor?.contentDigest === input.expectedPreviousContentDigest)
+      && anchorDigestMatches
+      && anchorRoleMatches
       && committed.length === 2
       && prompt?.role === "user"
       && response?.role === "assistant"
-      && prompt?.contentDigest === input.inputDigest
-      && prompt?.text.split(input.turnMarker).length - 1 === 1
+      && Boolean(prompt?.messageId)
+      && Boolean(response?.messageId)
+      && prompt.messageId !== response.messageId
+      && promptMarkerCount === 1
       && renderedMarkerCount === 1
       && terminalCount === 1
-      && response?.text.trimEnd().endsWith(input.expectedTerminalMarker)
+      && responseEndsWithTerminal
     )
     if (!attributablePair) {
       humanRequired("bound_reconciliation_mismatch", "The browser does not contain exactly one stable late user/assistant pair attributable to that workflow.", {
         anchorCount: anchorIndexes.length,
+        anchorDigestMatches,
+        anchorRoleMatches,
         committedCount: committed.length,
+        promptDigestMatches,
+        promptMarkerCount: Number.isInteger(promptMarkerCount) ? promptMarkerCount : null,
+        promptRole: prompt?.role ?? null,
         renderedMarkerCount,
+        responseEndsWithTerminal,
+        responseRole: response?.role ?? null,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
         terminalCount: Number.isInteger(terminalCount) ? terminalCount : null,
@@ -728,6 +748,8 @@ async function egoDriverMain() {
 
     await wait(1)
     const stableEntries = await readConversationEntries()
+    const stablePrompt = stableEntries.find((entry) => entry.messageId === prompt.messageId)
+    const stablePromptMarkerCount = stablePrompt?.text.split(input.turnMarker).length - 1
     const stableHead = summarizeConversationHead(
       stableEntries,
       Number.isInteger(input.binding.messageCount) ? input.binding.messageCount + 2 : undefined,
@@ -736,7 +758,13 @@ async function egoDriverMain() {
       entries,
       Number.isInteger(input.binding.messageCount) ? input.binding.messageCount + 2 : undefined,
     )
-    if (stableHead.fingerprint !== firstHead.fingerprint || stableHead.lastMessageId !== response.messageId) {
+    if (
+      stableHead.fingerprint !== firstHead.fingerprint
+      || stableHead.lastMessageId !== response.messageId
+      || stableEntries.length !== entries.length
+      || stablePrompt?.role !== "user"
+      || stablePromptMarkerCount !== 1
+    ) {
       humanRequired("bound_reconciliation_unstable", "The late response head changed while reconciliation was being observed.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
@@ -820,6 +848,7 @@ async function egoDriverMain() {
     if (!modelPolicy) {
       return
     }
+    observedModelPolicy = modelPolicy
     const preComposeHead = await readConversationHead(input.binding.messageCount)
     if (preComposeHead.fingerprint !== beforeHead.fingerprint) {
       humanRequired("conversation_head_changed", "The bound conversation head changed while the ChatGPT model policy was being verified.", {
@@ -844,17 +873,36 @@ async function egoDriverMain() {
       return
     }
 
+    async function inspectComposedPrompt() {
+      const candidates = await js(`(() => {
+        const composer = document.querySelector('#prompt-textarea')
+        if (!composer) {
+          return []
+        }
+        const values = composer.matches('input, textarea')
+          ? [composer.value]
+          : [composer.innerText, composer.textContent]
+        return [...new Set(values.filter((value) => typeof value === 'string'))]
+      })()`)
+      const expectedDigest = sha256(input.prompt)
+      const matchingCandidates = candidates.filter((candidate) => sha256(candidate) === expectedDigest)
+      return {
+        candidateCount: candidates.length,
+        digestMatchCount: matchingCandidates.length,
+        markerCount: matchingCandidates[0]?.split(input.turnMarker).length - 1,
+      }
+    }
+
+    function composedPromptIsExact(inspection) {
+      return inspection.digestMatchCount === 1 && inspection.markerCount === 1
+    }
+
     await fillInput("#prompt-textarea", input.prompt)
-    const composedMarkerCount = await js(`(() => {
-      const composer = document.querySelector('#prompt-textarea')
-      const value = composer.matches('input, textarea')
-        ? composer.value
-        : composer.innerText || composer.textContent || ''
-      return String(value).split(${markerLiteral}).length - 1
-    })()`)
-    if (composedMarkerCount !== 1) {
-      humanRequired("compose_verification_failed", "The uniquely marked prompt was not composed exactly once.", {
-        markerCount: composedMarkerCount,
+    const composedPrompt = await inspectComposedPrompt()
+    if (!composedPromptIsExact(composedPrompt)) {
+      humanRequired("compose_verification_failed", "The exact uniquely marked prompt was not present in the ChatGPT composer.", {
+        ...composedPrompt,
+        phase: "after_fill",
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
@@ -888,6 +936,17 @@ async function egoDriverMain() {
     }
     if (!sendTarget.ok || !sendTarget.hit) {
       humanRequired("send_control_unavailable", "The ChatGPT send control is unavailable after composing the prompt.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    const preClickPrompt = await inspectComposedPrompt()
+    if (!composedPromptIsExact(preClickPrompt)) {
+      humanRequired("compose_verification_failed", "The exact uniquely marked prompt changed before the ChatGPT send click.", {
+        ...preClickPrompt,
+        phase: "before_click",
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
@@ -1050,6 +1109,15 @@ async function egoDriverMain() {
           : finishedEntries.slice(anchorIndex + 1)
         const anchor = anchorIndex === -1 ? null : finishedEntries[anchorIndex]
         const userMarkerCount = committed[0]?.text.split(input.turnMarker).length - 1
+        const renderedMarkerCount = finishedEntries.reduce(
+          (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
+          0,
+        )
+        const terminalCount = committed[1]?.text.split(input.expectedTerminalMarker).length - 1
+        const responseEndsWithTerminal = committed[1]?.text
+          .trimEnd()
+          .endsWith(input.expectedTerminalMarker) ?? false
+        const promptDigestMatches = committed[0]?.contentDigest === sha256(input.prompt)
         const attributablePair = (
           (beforeHead.lastMessageId === null || (
             anchorIndex >= 0
@@ -1059,8 +1127,13 @@ async function egoDriverMain() {
           && committed.length === 2
           && committed[0]?.role === "user"
           && committed[1]?.role === "assistant"
-          && committed[0]?.contentDigest === sha256(input.prompt)
+          && Boolean(committed[0]?.messageId)
+          && Boolean(committed[1]?.messageId)
+          && committed[0].messageId !== committed[1].messageId
           && userMarkerCount === 1
+          && renderedMarkerCount === 1
+          && terminalCount === 1
+          && responseEndsWithTerminal
         )
         const finishedHead = summarizeConversationHead(
           finishedEntries,
@@ -1070,9 +1143,16 @@ async function egoDriverMain() {
           humanRequired("conversation_head_commit_mismatch", "The completed turn did not produce exactly one attributable user/assistant pair.", {
             anchorFound: anchorIndex >= 0,
             committedCount: committed.length,
+            promptDigestMatches,
+            promptMarkerCount: Number.isInteger(userMarkerCount) ? userMarkerCount : null,
+            promptRole: committed[0]?.role ?? null,
             renderedMessageCount: finishedHead.renderedMessageCount,
+            renderedMarkerCount,
+            responseEndsWithTerminal,
+            responseRole: committed[1]?.role ?? null,
             targetId: selected.targetId,
             taskSpaceId: selected.task.id,
+            terminalCount: Number.isInteger(terminalCount) ? terminalCount : null,
           })
           return
         }

@@ -697,7 +697,10 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
       throw new EgoChatError(
         "human_required",
         "The click was not confirmed.",
-        { reason: "send_confirmation_ambiguous" },
+        {
+          evidence: { modelPolicy: modelPolicyObservation() },
+          reason: "send_confirmation_ambiguous",
+        },
       )
     },
     reconcileBound: async (input) => {
@@ -742,6 +745,7 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
   const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
   assert.equal(stopped.humanRequired.code, "send_confirmation_ambiguous")
   assert.equal(stopped.reconciliation.beforeHead.messageId, "old-assistant")
+  assert.equal(stopped.reconciliation.modelPolicyObservation.modelLabel, "GPT-5.6 Sol")
 
   const reconciled = await broker.reconcileConversation({
     bindingKey: "ego-chat-main",
@@ -752,6 +756,11 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
   assert.equal(reconciled.headMessageId, "late-assistant")
   assert.equal(reconciled.lastReconciledWorkflowId, stopped.id)
   assert.equal(reconciled.messageCount, 6)
+  assert.equal(reconciled.recovery.modelPolicy.effortLabel, "Pro")
+  assert.equal(reconciled.recovery.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(reconciled.recovery.modelPolicy.policyRevision, 1)
+  assert.match(reconciled.recovery.responseDigest, /^[a-f0-9]{64}$/)
+  assert.equal(reconciled.recovery.responseText, terminalMarker)
   assert.equal(reconciled.revision, 2)
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "human_required")
 })

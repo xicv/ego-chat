@@ -45,8 +45,8 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - Persistent `ego-chat-main` conversation binding with exact canonical-URL verification.
 - A durable `strongest_available` / `maximum_available` ChatGPT web policy, enforced immediately before every send.
 - Stable conversation-head fingerprints over message IDs, roles, and content hashes before and after each bound send.
-- Unique outbound markers, empty-draft checks, exact send-control checks, and no blind retry after an ambiguous delivery.
-- Exact-digest reconciliation when a first confirmed send exposes its canonical URL late.
+- Exact composer-digest verification immediately before each click, unique outbound markers, empty-draft checks, exact send-control checks, and no blind retry after an ambiguous delivery.
+- Evidence-only reconciliation for a first confirmed send that exposes its canonical URL late, or for one exact tail-anchored user/assistant pair that completed after capture; reconciliation never clicks Send.
 - Codex App Server spikes for broker-owned thread start/resume and desktop active-writer isolation.
 - Broker-owned `ego_start_convergence` and `ego_converge_until_settled` workflows that alternate Codex and ChatGPT without human copy/paste.
 - Immutable target and acceptance-contract digests, strict implementing-agent candidate and ChatGPT review schemas, exact cycle identity, and objective settlement checks.
@@ -96,8 +96,8 @@ Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat
 
 - installs `SKILL.md` under `~/.zcode/skills/ego-chat`;
 - semantically merges `mcp.servers.ego_chat` into `~/.zcode/cli/config.json` while preserving existing plugin and server entries;
-- registers the absolute installed executable with `args: ["mcp"]` and a 1,900,000 ms timeout;
-- does not require Codex for ZCode-owned review cycles.
+- registers the absolute installed executable with `args: ["mcp"]` and an owned, exact 1,900,000 ms timeout that `doctor-zcode` also validates;
+- does not require Codex for ZCode-owned review cycles, while preserving a still-executable managed Codex path from an earlier Codex setup when Codex is temporarily absent from `PATH`.
 
 Restart ZCode.app after setup and verify `ego_chat` under MCP Services. The paths and configuration shape follow ZCode's official [MCP Services](https://zcode.z.ai/en/docs/mcp-services) and [Skills](https://zcode.z.ai/en/docs/skill) documentation. A conflicting `ego_chat` server or skill is never replaced without explicit `--force`.
 
@@ -203,7 +203,7 @@ The distributable host-aware skill lives at [`skills/ego-chat`](./skills/ego-cha
 
 > Use Ego Chat to review this implementation with ChatGPT until the acceptance criteria are settled.
 
-The skill chooses between a one-shot review, broker-owned Codex convergence, and a current-task-owned ZCode loop. It preserves `ego-chat-main`, defaults Codex convergence to read-only, and stops rather than retrying an ambiguous browser send.
+The skill chooses between a one-shot review, broker-owned Codex convergence, and a current-task-owned ZCode loop. It preserves `ego-chat-main`, defaults Codex convergence to read-only, and never retries an ambiguous browser send.
 
 For the normal path, the current agent calls `ego_exchange_and_wait` with:
 
@@ -216,7 +216,9 @@ The tool remains pending, reports progress, and returns the terminal workflow an
 
 ## ZCode-owned convergence
 
-When ZCode is side A, keep the current ZCode task or [Goal](https://zcode.z.ai/en/docs/goal) as the implementation owner. Freeze the target and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. Ego Chat generates the unique markers and digests, secret-scans the exact outbound prompt, verifies the strongest-model policy immediately before sending, and validates ChatGPT's strict review envelope before returning it to ZCode.
+When ZCode is side A, keep the current ZCode task or [Goal](https://zcode.z.ai/en/docs/goal) as the implementation owner. Freeze the stable outcome and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. Put mutable candidate identity such as an exact commit SHA in the candidate summary and review packet, not in the frozen target, so a corrective cycle does not silently change the contract. Ego Chat generates the unique markers and digests, secret-scans and verifies the exact composer contents immediately before sending, verifies the strongest-model policy, and validates ChatGPT's strict review envelope before returning it to ZCode.
+
+If ChatGPT completed the exact marked user/assistant pair but the browser capture stopped late, the strict tool performs at most one read-only, prior-head-anchored reconciliation and returns that already-existing response. It does not send again. Recovery succeeds only when the original pre-send maximum-model readback, unique turn marker, final terminal marker, message roles, and stable conversation head all match; otherwise ZCode receives `human_required` and stops.
 
 If the result is not settled, ZCode treats the review as untrusted context, performs the next authorized iteration, increments the cycle, and calls the same tool with the same binding, target, and criteria. This removes human copy/paste and preserves the ChatGPT conversation. It deliberately does not claim automatic wake/resume of a ZCode task after ZCode itself exits or restarts, because the current public ZCode integration surface is MCP plus in-client Goals rather than an externally resumable task API.
 
@@ -308,6 +310,6 @@ The crate carries the MIT license and canonical repository metadata needed for p
 - Reusing or waking the currently active Codex desktop task; convergence currently owns a dedicated App Server thread.
 - Externally waking or resuming a ZCode task after ZCode exits; ZCode-owned loops remain continuous while their current task or Goal is active.
 - Monotonic fencing epochs across stale or suspended broker owners.
-- Automatic continuation after broker/browser restart, CAPTCHA, login, unexpected history, or any ambiguous send.
+- Automatic replay after broker/browser restart, CAPTCHA, login, unexpected history, or an unattributable send. The one supported late-response path is evidence-only reconciliation and never resubmits a prompt.
 
 Those are later phases. Consequential repository and remote operations remain outside the browser reviewer's authority.
