@@ -232,9 +232,20 @@ async function egoDriverMain() {
       const powerItems = [...menu.querySelectorAll('[role="menuitem"][aria-label="Power"]')]
         .filter(visible)
       const slider = powerItems[0]?.querySelector('[role="slider"]')
-      const minimum = Number(slider?.getAttribute('aria-valuemin'))
-      const maximum = Number(slider?.getAttribute('aria-valuemax'))
-      const current = Number(slider?.getAttribute('aria-valuenow'))
+      const strictInteger = (raw) => {
+        if (typeof raw !== 'string') {
+          return null
+        }
+        const normalized = raw.trim()
+        if (!normalized || !/^-?(?:0|[1-9]\d*)$/.test(normalized)) {
+          return null
+        }
+        const parsed = Number(normalized)
+        return Number.isSafeInteger(parsed) ? parsed : null
+      }
+      const minimum = strictInteger(slider?.getAttribute('aria-valuemin'))
+      const maximum = strictInteger(slider?.getAttribute('aria-valuemax'))
+      const current = strictInteger(slider?.getAttribute('aria-valuenow'))
       const rows = [...menu.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')]
         .filter(visible)
         .map((row) => String(row.innerText || row.textContent || '').trim().replace(/\s+/g, ' '))

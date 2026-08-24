@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import fs from "node:fs/promises"
 import test from "node:test"
 
 import { decodeDriverResult } from "../src/ego-adapter.mjs"
@@ -7,6 +8,138 @@ import { EGO_DRIVER_RESULT_PREFIX, EGO_DRIVER_SOURCE } from "../src/ego-driver-s
 
 function envelope(value) {
   return `${EGO_DRIVER_RESULT_PREFIX}${Buffer.from(JSON.stringify(value)).toString("base64url")}\n`
+}
+
+let driverCase = 0
+
+async function runMalformedModelPolicyCase(attributes) {
+  driverCase += 1
+  const driverUid = `ego-chat-test-${process.pid}-${driverCase}`
+  const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
+  const input = {
+    binding: {
+      startUrl: "https://chatgpt.com/",
+      state: "unbound",
+      targetId: "policy-tab",
+      taskSpaceId: 10,
+    },
+    expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_POLICY_TEST",
+    mode: "exchange",
+    modelPolicy: {
+      enforcement: "repair_then_verify",
+      key: "chatgpt-web-default",
+      modelSelection: "strongest_available",
+      thinkingEffort: "maximum_available",
+    },
+    prompt: "EGO_CHAT_POLICY_TEST_MARKER",
+    timeoutMs: 1_000,
+    turnMarker: "EGO_CHAT_POLICY_TEST_MARKER",
+  }
+  await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
+  await fs.writeFile(`${mailboxDirectory}/input.json`, JSON.stringify(input), { mode: 0o600 })
+
+  const harness = `
+process.getuid = () => ${JSON.stringify(driverUid)}
+const counters = { cdp: 0, fillInput: 0, pressKey: 0, typeText: 0 }
+const attributes = ${JSON.stringify(attributes)}
+const visible = { getClientRects: () => [{}] }
+const slider = {
+  getAttribute(name) {
+    return Object.hasOwn(attributes, name) ? attributes[name] : null
+  },
+}
+const powerItem = {
+  ...visible,
+  querySelector: (selector) => selector === '[role="slider"]' ? slider : null,
+}
+const row = (text) => ({ ...visible, innerText: text, textContent: text })
+const menu = {
+  ...visible,
+  querySelectorAll(selector) {
+    if (selector === '[role="menuitem"][aria-label="Power"]') return [powerItem]
+    if (selector === '[role="menuitem"][aria-haspopup="menu"]') {
+      return [row('Model GPT-5.6 Sol'), row('Effort Pro')]
+    }
+    return []
+  },
+}
+const pill = {
+  ...visible,
+  innerText: 'Pro',
+  textContent: 'Pro',
+  getAttribute(name) {
+    if (name === 'aria-controls') return 'policy-menu'
+    if (name === 'aria-expanded') return 'true'
+    return null
+  },
+}
+const pageDocument = {
+  getElementById: (id) => id === 'policy-menu' ? menu : null,
+  querySelectorAll: (selector) => selector === 'button.__composer-pill[aria-haspopup="menu"]' ? [pill] : [],
+}
+globalThis.cliLog = (value) => console.log(value)
+globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+globalThis.listTabs = async () => [{ active: true, targetId: 'policy-tab' }]
+globalThis.switchTab = async () => {}
+globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
+globalThis.pageInfo = async () => ({ url: 'https://chatgpt.com/' })
+globalThis.snapshotText = async () => ''
+globalThis.wait = async () => {}
+globalThis.click = async () => {}
+globalThis.fillInput = async () => { counters.fillInput += 1 }
+globalThis.typeText = async () => { counters.typeText += 1 }
+globalThis.pressKey = async () => { counters.pressKey += 1 }
+globalThis.cdp = async () => { counters.cdp += 1 }
+globalThis.js = async (source) => {
+  if (source.includes('hasLoginAction')) {
+    return { draft: '', hasComposer: true, hasLoginAction: false }
+  }
+  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+    return []
+  }
+  if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) {
+    return 0
+  }
+  if (source.includes('aria-valuemin')) {
+    return Function('document', 'return ' + source)(pageDocument)
+  }
+  if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
+    return { composerCount: 1, count: 1, expanded: 'false' }
+  }
+  if (source.includes('button.__composer-pill[aria-haspopup="menu"]')) {
+    return Function('document', 'return ' + source)(pageDocument)
+  }
+  if (source.trimStart().startsWith('Boolean(')) {
+    return false
+  }
+  throw new Error('Unexpected page script: ' + source.slice(0, 80))
+}
+await ${EGO_DRIVER_SOURCE.trim()}
+console.log('__EGO_CHAT_TEST_COUNTERS__' + JSON.stringify(counters))
+`
+
+  try {
+    const executed = spawnSync(process.execPath, ["--input-type=module"], {
+      encoding: "utf8",
+      input: harness,
+    })
+    assert.equal(executed.status, 0, executed.stderr)
+    let stopped
+    try {
+      decodeDriverResult(executed.stdout)
+    } catch (error) {
+      stopped = error
+    }
+    assert.equal(stopped?.code, "human_required")
+    assert.equal(stopped?.details?.reason, "model_policy_ui_unknown")
+    const countersLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_TEST_COUNTERS__"))
+    assert.ok(countersLine)
+    return JSON.parse(countersLine.slice("__EGO_CHAT_TEST_COUNTERS__".length))
+  } finally {
+    await fs.rm(mailboxDirectory, { force: true, recursive: true })
+  }
 }
 
 test("fixed Ego driver source is valid ESM", () => {
@@ -40,6 +173,26 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& committed\[0\]\?\.contentDigest === sha256\(input\.prompt\)/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& prompt\?\.contentDigest === input\.inputDigest/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /finishedHead\.messageCount !== beforeHead\.messageCount/)
+})
+
+test("malformed model-policy attributes stop before composition or send", async () => {
+  const valid = {
+    "aria-valuemax": "0",
+    "aria-valuemin": "0",
+    "aria-valuenow": "0",
+  }
+  const cases = [
+    { "aria-valuemax": "0", "aria-valuenow": "0" },
+    { ...valid, "aria-valuemax": "" },
+    { ...valid, "aria-valuenow": "   " },
+    { ...valid, "aria-valuemin": "zero" },
+    { ...valid, "aria-valuemax": "4.5" },
+  ]
+
+  for (const attributes of cases) {
+    const counters = await runMalformedModelPolicyCase(attributes)
+    assert.deepEqual(counters, { cdp: 0, fillInput: 0, pressKey: 0, typeText: 0 })
+  }
 })
 
 test("driver envelope returns structured data without log scraping", () => {
