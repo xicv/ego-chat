@@ -879,9 +879,14 @@ async function egoDriverMain() {
         if (!composer) {
           return []
         }
+        const blockChildren = [...composer.children]
+        const blockText = blockChildren.length > 0
+          && blockChildren.every((child) => child.tagName === 'P')
+          ? blockChildren.map((child) => String(child.textContent || '')).join('\n')
+          : null
         const values = composer.matches('input, textarea')
           ? [composer.value]
-          : [composer.innerText, composer.textContent]
+          : [composer.innerText, composer.textContent, blockText]
         return [...new Set(values.filter((value) => typeof value === 'string'))]
       })()`)
       const expectedDigest = sha256(input.prompt)

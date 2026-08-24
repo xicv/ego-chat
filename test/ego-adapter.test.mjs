@@ -22,6 +22,8 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.match(EGO_DRIVER_SOURCE, /dismiss ChatGPT policy menu/)
   assert.match(EGO_DRIVER_SOURCE, /draftMarkerCount/)
   assert.match(EGO_DRIVER_SOURCE, /digestMatchCount/)
+  assert.match(EGO_DRIVER_SOURCE, /blockChildren\.every\(\(child\) => child\.tagName === 'P'\)/)
+  assert.match(EGO_DRIVER_SOURCE, /map\(\(child\) => String\(child\.textContent \|\| ''\)\)\.join\('\\n'\)/)
   assert.match(EGO_DRIVER_SOURCE, /fingerprintVersion: "tail-v1"/)
   assert.match(EGO_DRIVER_SOURCE, /expectedPreviousMessageId/)
   assert.match(EGO_DRIVER_SOURCE, /Input\.dispatchMouseEvent/)
