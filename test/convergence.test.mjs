@@ -6,9 +6,12 @@ import {
   buildCodexPrompt,
   createContract,
   digestJson,
+  completeAgentReview,
   evaluateReview,
   parseChatGptReview,
+  prepareAgentReview,
   scanForSecrets,
+  validateAgentCandidate,
   validateCodexCandidate,
 } from "../src/convergence.mjs"
 
@@ -140,5 +143,65 @@ test("high-confidence secret signatures block the exact outbound packet", () => 
   assert.deepEqual(
     scanForSecrets(`${PRIVATE_KEY_TEST_HEADER}\nredacted`),
     ["private_key"],
+  )
+})
+
+test("a host-owned candidate receives the same identity-bound strict review", () => {
+  const target = "Settle a candidate while the current host remains side A."
+  const acceptanceCriteria = [
+    "The current host retains implementation ownership.",
+    "The review is bound to exact evidence.",
+  ]
+  const contract = createContract(target, acceptanceCriteria)
+  const candidate = validateAgentCandidate(candidateFor(contract), contract.criteria)
+  const prepared = prepareAgentReview({
+    acceptanceCriteria,
+    candidate,
+    cycle: 1,
+    markerToken: "HOSTOWNEDREVIEW1234",
+    target,
+  })
+
+  assert.match(prepared.prompt, /Implementing-agent candidate summary/)
+  assert.doesNotMatch(prepared.prompt, /Codex candidate summary/)
+  assert.equal(prepared.contract.targetDigest, contract.targetDigest)
+  const review = reviewFor(contract, prepared.candidateDigest)
+  const completed = completeAgentReview(
+    prepared,
+    `${JSON.stringify(review)}\n${prepared.terminalMarker}`,
+  )
+  assert.equal(completed.settled, true)
+  assert.deepEqual(completed.review, review)
+})
+
+test("a blocked or secret-bearing host candidate stops before browser submission", () => {
+  const target = "Stop unsafe review packets."
+  const acceptanceCriteria = ["No unresolved blocker or secret is sent."]
+  const contract = createContract(target, acceptanceCriteria)
+
+  assert.throws(
+    () => prepareAgentReview({
+      acceptanceCriteria,
+      candidate: candidateFor(contract, {
+        blockers: ["Missing authority."],
+        status: "blocked",
+      }),
+      cycle: 1,
+      markerToken: "BLOCKEDREVIEW1234",
+      target,
+    }),
+    (error) => error.details?.reason === "agent_candidate_blocked",
+  )
+  assert.throws(
+    () => prepareAgentReview({
+      acceptanceCriteria,
+      candidate: candidateFor(contract, {
+        reviewPacket: `Unsafe ${OPENAI_LIKE_TEST_TOKEN}`,
+      }),
+      cycle: 1,
+      markerToken: "SECRETREVIEW12345",
+      target,
+    }),
+    (error) => error.details?.reason === "review_packet_secret_detected",
   )
 })

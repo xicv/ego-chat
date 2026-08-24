@@ -11,12 +11,14 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 const MINIMUM_NODE_MAJOR: u64 = 24;
 const RUNTIME_MARKER: &str = ".ego-chat-runtime-version";
 const MCP_SERVER_NAME: &str = "ego_chat";
 const MCP_TOOL_TIMEOUT_SECONDS: i64 = 1_900;
+const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = 1_900_000;
 const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
 
 struct EmbeddedFile {
@@ -114,16 +116,23 @@ const SKILL_FILES: &[EmbeddedFile] = &[
     },
 ];
 
+const ZCODE_SKILL_FILES: &[EmbeddedFile] = &[EmbeddedFile {
+    path: "SKILL.md",
+    bytes: include_bytes!("../skills/ego-chat/SKILL.md"),
+}];
+
 #[derive(Clone, Debug)]
 struct InstallPaths {
     codex_config: PathBuf,
+    codex_skill_dir: PathBuf,
     runtime_dir: PathBuf,
-    skill_dir: PathBuf,
+    zcode_config: PathBuf,
+    zcode_skill_dir: PathBuf,
 }
 
 #[derive(Clone, Debug)]
 struct Toolchain {
-    codex: PathBuf,
+    codex: Option<PathBuf>,
     ego_browser: PathBuf,
     node: PathBuf,
     npm: PathBuf,
@@ -161,16 +170,40 @@ fn run() -> Result<u8, String> {
             setup(flags.force, !flags.skip_codex_config)?;
             Ok(0)
         }
+        "setup-zcode" => {
+            args.remove(0);
+            let force = parse_force_only(&args, "setup-zcode")?;
+            setup_zcode(force)?;
+            Ok(0)
+        }
         "install-skill" => {
             args.remove(0);
-            let force = parse_force_only(&args)?;
+            let force = parse_force_only(&args, "install-skill")?;
             let paths = InstallPaths::discover()?;
-            install_skill(&paths.skill_dir, force)?;
-            println!("Installed Codex skill at {}", paths.skill_dir.display());
+            install_skill(&paths.codex_skill_dir, SKILL_FILES, force)?;
+            println!(
+                "Installed Codex skill at {}",
+                paths.codex_skill_dir.display()
+            );
+            Ok(0)
+        }
+        "install-zcode-skill" => {
+            args.remove(0);
+            let force = parse_force_only(&args, "install-zcode-skill")?;
+            let paths = InstallPaths::discover()?;
+            install_skill(&paths.zcode_skill_dir, ZCODE_SKILL_FILES, force)?;
+            println!(
+                "Installed ZCode skill at {}",
+                paths.zcode_skill_dir.display()
+            );
             Ok(0)
         }
         "doctor" => {
             doctor()?;
+            Ok(0)
+        }
+        "doctor-zcode" => {
+            doctor_zcode()?;
             Ok(0)
         }
         "mcp" => {
@@ -200,11 +233,11 @@ fn parse_setup_flags(args: &[OsString]) -> Result<SetupFlags, String> {
     Ok(flags)
 }
 
-fn parse_force_only(args: &[OsString]) -> Result<bool, String> {
+fn parse_force_only(args: &[OsString], command: &str) -> Result<bool, String> {
     match args {
         [] => Ok(false),
         [value] if value == "--force" => Ok(true),
-        _ => Err("install-skill accepts only the optional --force flag".to_string()),
+        _ => Err(format!("{command} accepts only the optional --force flag")),
     }
 }
 
@@ -213,11 +246,14 @@ fn print_help() {
         "Ego Chat portable launcher\n\n\
 Usage:\n  \
   ego-chat setup [--force] [--skip-codex-config]\n  \
+  ego-chat setup-zcode [--force]\n  \
   ego-chat install-skill [--force]\n  \
+  ego-chat install-zcode-skill [--force]\n  \
   ego-chat doctor\n  \
+  ego-chat doctor-zcode\n  \
   ego-chat mcp\n  \
   ego-chat <broker-cli-command> [args...]\n\n\
-setup installs the embedded, versioned Node runtime and Codex skill, then registers this executable as the ego_chat MCP server.\n\
+setup configures Codex; setup-zcode configures ZCode. Both install the same embedded runtime and host skill, then register this executable as the ego_chat MCP server.\n\
 All other commands are forwarded to the qualified Ego Chat broker CLI."
     );
 }
@@ -230,6 +266,9 @@ impl InstallPaths {
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
+        let zcode_home = env::var_os("ZCODE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".zcode"));
         let install_root = env::var_os("EGO_CHAT_INSTALL_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -240,23 +279,29 @@ impl InstallPaths {
             });
         Ok(Self {
             codex_config: codex_home.join("config.toml"),
+            codex_skill_dir: codex_home.join("skills").join("ego-chat"),
             runtime_dir: install_root.join(env!("CARGO_PKG_VERSION")),
-            skill_dir: codex_home.join("skills").join("ego-chat"),
+            zcode_config: zcode_home.join("cli").join("config.json"),
+            zcode_skill_dir: zcode_home.join("skills").join("ego-chat"),
         })
     }
 }
 
 impl Toolchain {
-    fn discover() -> Result<Self, String> {
+    fn discover(require_codex: bool) -> Result<Self, String> {
         Ok(Self {
-            codex: find_program("codex", "EGO_CHAT_CODEX")?,
+            codex: if require_codex {
+                Some(find_program("codex", "EGO_CHAT_CODEX")?)
+            } else {
+                find_optional_program("codex", "EGO_CHAT_CODEX")?
+            },
             ego_browser: find_program("ego-browser", "EGO_CHAT_EGO_BROWSER")?,
             node: find_program("node", "EGO_CHAT_NODE")?,
             npm: find_program("npm", "EGO_CHAT_NPM")?,
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, require_codex: bool) -> Result<(), String> {
         let node_version = command_output(&self.node, &[OsStr::new("--version")])?;
         let major = parse_node_major(&node_version)
             .ok_or_else(|| format!("could not parse Node.js version {node_version:?}"))?;
@@ -266,14 +311,27 @@ impl Toolchain {
             ));
         }
         command_output(&self.npm, &[OsStr::new("--version")])?;
-        command_output(&self.codex, &[OsStr::new("--version")])?;
+        if require_codex {
+            let codex = self.codex.as_ref().ok_or_else(|| {
+                "Codex is required for Codex setup and broker-owned convergence".to_string()
+            })?;
+            command_output(codex, &[OsStr::new("--version")])?;
+        }
         command_output(&self.ego_browser, &[OsStr::new("--help")])?;
         Ok(())
     }
 
     fn prepend_path(&self, command: &mut Command) -> Result<(), String> {
         let mut directories = Vec::new();
-        for program in [&self.node, &self.npm, &self.codex, &self.ego_browser] {
+        for program in [
+            Some(&self.node),
+            Some(&self.npm),
+            self.codex.as_ref(),
+            Some(&self.ego_browser),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if let Some(parent) = program.parent()
                 && !directories.iter().any(|candidate| candidate == parent)
             {
@@ -295,10 +353,10 @@ fn setup(force: bool, configure: bool) -> Result<(), String> {
         return Err("the Ego Lite integration currently supports macOS only".to_string());
     }
     let paths = InstallPaths::discover()?;
-    let tools = Toolchain::discover()?;
-    tools.validate()?;
+    let tools = Toolchain::discover(true)?;
+    tools.validate(true)?;
     install_runtime(&paths.runtime_dir, &tools, force)?;
-    install_skill(&paths.skill_dir, force)?;
+    install_skill(&paths.codex_skill_dir, SKILL_FILES, force)?;
 
     if configure {
         let executable = env::current_exe()
@@ -307,12 +365,37 @@ fn setup(force: bool, configure: bool) -> Result<(), String> {
     }
 
     println!("Ego Chat runtime: {}", paths.runtime_dir.display());
-    println!("Codex skill: {}", paths.skill_dir.display());
+    println!("Codex skill: {}", paths.codex_skill_dir.display());
     if configure {
         println!("Codex MCP server: {MCP_SERVER_NAME}");
         println!("Restart Codex.app, then use /mcp to verify the connection.");
     } else {
         println!("Codex MCP configuration was skipped.");
+    }
+    Ok(())
+}
+
+fn setup_zcode(force: bool) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("the Ego Lite integration currently supports macOS only".to_string());
+    }
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover(false)?;
+    tools.validate(false)?;
+    install_runtime(&paths.runtime_dir, &tools, force)?;
+    install_skill(&paths.zcode_skill_dir, ZCODE_SKILL_FILES, force)?;
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+    configure_zcode(&paths.zcode_config, &executable, force)?;
+
+    println!("Ego Chat runtime: {}", paths.runtime_dir.display());
+    println!("ZCode skill: {}", paths.zcode_skill_dir.display());
+    println!("ZCode MCP server: {MCP_SERVER_NAME}");
+    println!("Restart ZCode.app, then verify ego_chat in MCP Services.");
+    if tools.codex.is_none() {
+        println!(
+            "Codex was not found; ZCode-owned reviews work, while broker-owned Codex convergence remains unavailable."
+        );
     }
     Ok(())
 }
@@ -326,9 +409,7 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
         .join("node_modules/@modelcontextprotocol/sdk/package.json")
         .is_file()
         && runtime_dir.join("node_modules/zod/package.json").is_file();
-    if version_matches && dependencies_present && !force {
-        return Ok(());
-    }
+    let embedded_files_match = managed_files_match(runtime_dir, RUNTIME_FILES);
     if runtime_dir.exists() && !version_matches && !force {
         return Err(format!(
             "{} contains an unmanaged or incomplete runtime; inspect it and rerun setup with --force to repair managed files",
@@ -336,27 +417,15 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
         ));
     }
 
+    write_runtime_tool_paths(runtime_dir, tools)?;
+    if version_matches && dependencies_present && embedded_files_match && !force {
+        return Ok(());
+    }
+
     for file in RUNTIME_FILES {
         let destination = safe_join(runtime_dir, file.path)?;
         write_atomic(&destination, file.bytes)?;
     }
-    write_atomic(
-        &runtime_dir.join(".node-path"),
-        path_bytes(&tools.node)?.as_bytes(),
-    )?;
-    write_atomic(
-        &runtime_dir.join(".npm-path"),
-        path_bytes(&tools.npm)?.as_bytes(),
-    )?;
-    write_atomic(
-        &runtime_dir.join(".codex-path"),
-        path_bytes(&tools.codex)?.as_bytes(),
-    )?;
-    write_atomic(
-        &runtime_dir.join(".ego-browser-path"),
-        path_bytes(&tools.ego_browser)?.as_bytes(),
-    )?;
-
     let mut npm = Command::new(&tools.npm);
     npm.args(["ci", "--omit=dev", "--ignore-scripts"])
         .current_dir(runtime_dir);
@@ -374,8 +443,46 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
     Ok(())
 }
 
-fn install_skill(skill_dir: &Path, force: bool) -> Result<(), String> {
-    let conflicts = SKILL_FILES.iter().any(|file| {
+fn write_runtime_tool_paths(runtime_dir: &Path, tools: &Toolchain) -> Result<(), String> {
+    write_atomic(
+        &runtime_dir.join(".node-path"),
+        path_bytes(&tools.node)?.as_bytes(),
+    )?;
+    write_atomic(
+        &runtime_dir.join(".npm-path"),
+        path_bytes(&tools.npm)?.as_bytes(),
+    )?;
+    if let Some(codex) = &tools.codex {
+        write_atomic(
+            &runtime_dir.join(".codex-path"),
+            path_bytes(codex)?.as_bytes(),
+        )?;
+    } else {
+        let managed_codex_path = runtime_dir.join(".codex-path");
+        match fs::remove_file(&managed_codex_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not remove stale {}: {error}",
+                    managed_codex_path.display()
+                ));
+            }
+        }
+    }
+    write_atomic(
+        &runtime_dir.join(".ego-browser-path"),
+        path_bytes(&tools.ego_browser)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn install_skill(
+    skill_dir: &Path,
+    embedded_files: &[EmbeddedFile],
+    force: bool,
+) -> Result<(), String> {
+    let conflicts = embedded_files.iter().any(|file| {
         let destination = skill_dir.join(file.path);
         destination.exists()
             && fs::read(&destination)
@@ -388,7 +495,7 @@ fn install_skill(skill_dir: &Path, force: bool) -> Result<(), String> {
             skill_dir.display()
         ));
     }
-    for file in SKILL_FILES {
+    for file in embedded_files {
         let destination = safe_join(skill_dir, file.path)?;
         write_atomic(&destination, file.bytes)?;
     }
@@ -493,12 +600,106 @@ fn server_matches(item: &Item, executable: &str) -> bool {
     command_matches && args_match
 }
 
+fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result<(), String> {
+    let original = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    let mut document = if original.trim().is_empty() {
+        JsonValue::Object(JsonMap::new())
+    } else {
+        serde_json::from_str::<JsonValue>(&original)
+            .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?
+    };
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", config_path.display()))?;
+    let mcp = json_object_entry(root, "mcp", "mcp")?;
+    let servers = json_object_entry(mcp, "servers", "mcp.servers")?;
+    let executable = path_bytes(executable)?;
+
+    if let Some(existing) = servers.get(MCP_SERVER_NAME)
+        && !zcode_server_value_matches(existing, &executable)
+        && !force
+    {
+        return Err(format!(
+            "ZCode already has a different {MCP_SERVER_NAME} MCP server; rerun with --force only after verifying that replacement is intended"
+        ));
+    }
+
+    if servers.get(MCP_SERVER_NAME).is_none()
+        || !zcode_server_value_matches(
+            servers.get(MCP_SERVER_NAME).expect("checked above"),
+            &executable,
+        )
+    {
+        servers.insert(
+            MCP_SERVER_NAME.to_string(),
+            JsonValue::Object(JsonMap::new()),
+        );
+    }
+    let server = servers
+        .get_mut(MCP_SERVER_NAME)
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| format!("mcp.servers.{MCP_SERVER_NAME} is not a JSON object"))?;
+    server.insert("command".to_string(), JsonValue::String(executable));
+    server.insert(
+        "args".to_string(),
+        JsonValue::Array(vec![JsonValue::String("mcp".to_string())]),
+    );
+    for codex_only_key in ["required", "startup_timeout_sec", "tool_timeout_sec"] {
+        server.remove(codex_only_key);
+    }
+    let existing_timeout = server
+        .get("timeoutMs")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if existing_timeout < MCP_TOOL_TIMEOUT_MILLISECONDS {
+        server.insert(
+            "timeoutMs".to_string(),
+            JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
+        );
+    }
+    let mut configured = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("could not serialize {}: {error}", config_path.display()))?;
+    configured.push('\n');
+    write_atomic(config_path, configured.as_bytes())?;
+    Ok(())
+}
+
+fn json_object_entry<'a>(
+    parent: &'a mut JsonMap<String, JsonValue>,
+    key: &str,
+    display_name: &str,
+) -> Result<&'a mut JsonMap<String, JsonValue>, String> {
+    let value = parent
+        .entry(key.to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{display_name} exists but is not a JSON object"))
+}
+
+fn zcode_server_value_matches(value: &JsonValue, executable: &str) -> bool {
+    let Some(server) = value.as_object() else {
+        return false;
+    };
+    let command_matches = server.get("command").and_then(JsonValue::as_str) == Some(executable);
+    let args_match = server
+        .get("args")
+        .and_then(JsonValue::as_array)
+        .map(|values| values.len() == 1 && values[0].as_str() == Some("mcp"))
+        .unwrap_or(false);
+    command_matches && args_match
+}
+
 fn doctor() -> Result<(), String> {
     let paths = InstallPaths::discover()?;
-    let tools = Toolchain::discover()?;
+    let tools = Toolchain::discover(true)?;
     let mut failures = Vec::new();
 
-    match tools.validate() {
+    match tools.validate(true) {
         Ok(()) => println!("[ok] Node.js, npm, Codex, and ego-browser are available"),
         Err(error) => {
             println!("[fail] {error}");
@@ -512,15 +713,15 @@ fn doctor() -> Result<(), String> {
         println!("[fail] {message}");
         failures.push(message);
     }
-    if skill_matches(&paths.skill_dir) {
+    if skill_matches(&paths.codex_skill_dir, SKILL_FILES) {
         println!(
             "[ok] Codex skill {} is installed",
-            paths.skill_dir.display()
+            paths.codex_skill_dir.display()
         );
     } else {
         let message = format!(
             "Codex skill {} is missing or differs",
-            paths.skill_dir.display()
+            paths.codex_skill_dir.display()
         );
         println!("[fail] {message}");
         failures.push(message);
@@ -546,6 +747,67 @@ fn doctor() -> Result<(), String> {
     }
 }
 
+fn doctor_zcode() -> Result<(), String> {
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover(false)?;
+    let mut failures = Vec::new();
+
+    match tools.validate(false) {
+        Ok(()) => println!("[ok] Node.js, npm, and ego-browser are available"),
+        Err(error) => {
+            println!("[fail] {error}");
+            failures.push(error);
+        }
+    }
+    if let Some(codex) = &tools.codex {
+        match command_output(codex, &[OsStr::new("--version")]) {
+            Ok(_) => println!("[ok] Codex is also available for broker-owned convergence"),
+            Err(error) => println!(
+                "[warn] Codex was detected but is not usable for optional broker-owned convergence: {error}"
+            ),
+        }
+    }
+    if runtime_ready(&paths.runtime_dir) {
+        println!("[ok] Runtime {} is installed", paths.runtime_dir.display());
+    } else {
+        let message = format!("Runtime {} is not ready", paths.runtime_dir.display());
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    if skill_matches(&paths.zcode_skill_dir, ZCODE_SKILL_FILES) {
+        println!(
+            "[ok] ZCode skill {} is installed",
+            paths.zcode_skill_dir.display()
+        );
+    } else {
+        let message = format!(
+            "ZCode skill {} is missing or differs",
+            paths.zcode_skill_dir.display()
+        );
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+    if zcode_server_matches(&paths.zcode_config, &executable)? {
+        println!("[ok] ZCode MCP server {MCP_SERVER_NAME} points to this executable");
+    } else {
+        let message = format!("ZCode MCP server {MCP_SERVER_NAME} is missing or points elsewhere");
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+
+    if failures.is_empty() {
+        println!("Ego Chat is ready. Restart ZCode.app after configuration changes.");
+        Ok(())
+    } else {
+        Err(format!(
+            "doctor-zcode found {} problem(s); run ego-chat setup-zcode",
+            failures.len()
+        ))
+    }
+}
+
 fn runtime_ready(runtime_dir: &Path) -> bool {
     fs::read_to_string(runtime_dir.join(RUNTIME_MARKER))
         .map(|value| value.trim() == env!("CARGO_PKG_VERSION"))
@@ -554,11 +816,16 @@ fn runtime_ready(runtime_dir: &Path) -> bool {
             .join("node_modules/@modelcontextprotocol/sdk/package.json")
             .is_file()
         && runtime_dir.join("node_modules/zod/package.json").is_file()
+        && managed_files_match(runtime_dir, RUNTIME_FILES)
 }
 
-fn skill_matches(skill_dir: &Path) -> bool {
-    SKILL_FILES.iter().all(|file| {
-        fs::read(skill_dir.join(file.path))
+fn skill_matches(skill_dir: &Path, embedded_files: &[EmbeddedFile]) -> bool {
+    managed_files_match(skill_dir, embedded_files)
+}
+
+fn managed_files_match(root: &Path, embedded_files: &[EmbeddedFile]) -> bool {
+    embedded_files.iter().all(|file| {
+        fs::read(root.join(file.path))
             .map(|existing| existing == file.bytes)
             .unwrap_or(false)
     })
@@ -583,6 +850,24 @@ fn codex_server_matches(config_path: &Path, executable: &Path) -> Result<bool, S
     Ok(server_matches(server, &path_bytes(executable)?))
 }
 
+fn zcode_server_matches(config_path: &Path, executable: &Path) -> Result<bool, String> {
+    let contents = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    let document = serde_json::from_str::<JsonValue>(&contents)
+        .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?;
+    let Some(server) = document
+        .get("mcp")
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+    else {
+        return Ok(false);
+    };
+    Ok(zcode_server_value_matches(server, &path_bytes(executable)?))
+}
+
 fn proxy_node(script: &str, arguments: &[OsString]) -> Result<u8, String> {
     let paths = InstallPaths::discover()?;
     if !runtime_ready(&paths.runtime_dir) {
@@ -590,7 +875,7 @@ fn proxy_node(script: &str, arguments: &[OsString]) -> Result<u8, String> {
     }
     let node = read_managed_path(&paths.runtime_dir.join(".node-path"))?;
     let tools = Toolchain {
-        codex: read_managed_path(&paths.runtime_dir.join(".codex-path"))?,
+        codex: read_optional_managed_path(&paths.runtime_dir.join(".codex-path"))?,
         ego_browser: read_managed_path(&paths.runtime_dir.join(".ego-browser-path"))?,
         node: node.clone(),
         npm: read_managed_path(&paths.runtime_dir.join(".npm-path"))?,
@@ -626,6 +911,15 @@ fn find_program(name: &str, override_name: &str) -> Result<PathBuf, String> {
             "{name} was not found on PATH; install it or set {override_name} to its absolute path"
         )
     })
+}
+
+fn find_optional_program(name: &str, override_name: &str) -> Result<Option<PathBuf>, String> {
+    if let Some(value) = env::var_os(override_name) {
+        return resolve_program(&value)
+            .map(Some)
+            .ok_or_else(|| format!("{override_name} does not identify an executable"));
+    }
+    Ok(resolve_program(OsStr::new(name)))
 }
 
 fn resolve_program(candidate: &OsStr) -> Option<PathBuf> {
@@ -680,6 +974,26 @@ fn read_managed_path(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(parsed)
+}
+
+fn read_optional_managed_path(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            let parsed = PathBuf::from(value.trim());
+            if !parsed.is_file() {
+                return Err(format!(
+                    "managed tool path {} is unavailable; rerun ego-chat setup or setup-zcode",
+                    parsed.display()
+                ));
+            }
+            Ok(Some(parsed))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not read {}: {error}; rerun ego-chat setup or setup-zcode",
+            path.display()
+        )),
+    }
 }
 
 fn path_bytes(path: &Path) -> Result<String, String> {
@@ -772,10 +1086,43 @@ mod tests {
         paths.sort_unstable();
         paths.dedup();
         assert_eq!(paths.len(), RUNTIME_FILES.len());
-        for file in RUNTIME_FILES.iter().chain(SKILL_FILES.iter()) {
+        for file in RUNTIME_FILES
+            .iter()
+            .chain(SKILL_FILES.iter())
+            .chain(ZCODE_SKILL_FILES.iter())
+        {
             assert!(safe_join(Path::new("/tmp/owned"), file.path).is_ok());
             assert!(!file.bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn zcode_only_tool_paths_remove_a_stale_managed_codex_path() {
+        let directory = TestDirectory::new();
+        let runtime = directory.0.join("runtime");
+        let bin = directory.0.join("bin");
+        fs::create_dir_all(&bin).expect("create fake bin");
+        let node = bin.join("node");
+        let npm = bin.join("npm");
+        let ego_browser = bin.join("ego-browser");
+        for path in [&node, &npm, &ego_browser] {
+            fs::write(path, "test executable placeholder").expect("write fake executable");
+        }
+        fs::create_dir_all(&runtime).expect("create runtime");
+        fs::write(runtime.join(".codex-path"), "/removed/codex").expect("seed stale path");
+        let tools = Toolchain {
+            codex: None,
+            ego_browser,
+            node,
+            npm,
+        };
+
+        write_runtime_tool_paths(&runtime, &tools).expect("write managed tool paths");
+
+        assert!(!runtime.join(".codex-path").exists());
+        assert!(runtime.join(".node-path").is_file());
+        assert!(runtime.join(".npm-path").is_file());
+        assert!(runtime.join(".ego-browser-path").is_file());
     }
 
     #[test]
@@ -845,13 +1192,89 @@ mod tests {
     }
 
     #[test]
+    fn zcode_configuration_is_scoped_and_preserves_other_entries() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.json");
+        fs::write(
+            &config,
+            r#"{
+  "plugins": {
+    "enabledPlugins": {
+      "existing": true
+    }
+  },
+  "mcp": {
+    "servers": {
+      "other": {
+        "command": "other"
+      }
+    }
+  }
+}
+"#,
+        )
+        .expect("seed config");
+        let executable = directory.0.join("bin/ego-chat");
+        configure_zcode(&config, &executable, false).expect("configure Ego Chat");
+        let value = fs::read_to_string(&config).expect("read config");
+        let document = serde_json::from_str::<JsonValue>(&value).expect("parse updated config");
+        assert_eq!(
+            document["plugins"]["enabledPlugins"]["existing"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["mcp"]["servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+        let server = &document["mcp"]["servers"][MCP_SERVER_NAME];
+        assert!(zcode_server_value_matches(
+            server,
+            executable.to_str().expect("utf8 path")
+        ));
+        assert_eq!(
+            server["timeoutMs"].as_u64(),
+            Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
+        );
+        assert!(value.find("\"plugins\"").unwrap() < value.find("\"mcp\"").unwrap());
+    }
+
+    #[test]
+    fn zcode_configuration_refuses_an_unowned_server_without_force() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.json");
+        fs::write(
+            &config,
+            r#"{"mcp":{"servers":{"ego_chat":{"command":"someone-else","args":["mcp"],"required":true,"tool_timeout_sec":1900}}}}"#,
+        )
+        .expect("seed config");
+        let executable = directory.0.join("ego-chat");
+        let error = configure_zcode(&config, &executable, false).expect_err("must reject conflict");
+        assert!(error.contains("different ego_chat"));
+        assert!(
+            fs::read_to_string(&config)
+                .expect("read config")
+                .contains("someone-else")
+        );
+
+        configure_zcode(&config, &executable, true).expect("replace with force");
+        assert!(zcode_server_matches(&config, &executable).expect("inspect ZCode config"));
+        let configured = serde_json::from_str::<JsonValue>(
+            &fs::read_to_string(&config).expect("read configured ZCode config"),
+        )
+        .expect("parse configured ZCode config");
+        let server = &configured["mcp"]["servers"][MCP_SERVER_NAME];
+        assert!(server.get("required").is_none());
+        assert!(server.get("tool_timeout_sec").is_none());
+    }
+
+    #[test]
     fn skill_installation_requires_force_for_different_managed_files() {
         let directory = TestDirectory::new();
         let skill = directory.0.join("ego-chat");
         fs::create_dir_all(&skill).expect("create skill");
         fs::write(skill.join("SKILL.md"), "custom skill").expect("write custom skill");
-        assert!(install_skill(&skill, false).is_err());
-        install_skill(&skill, true).expect("force managed skill files");
-        assert!(skill_matches(&skill));
+        assert!(install_skill(&skill, SKILL_FILES, false).is_err());
+        install_skill(&skill, SKILL_FILES, true).expect("force managed skill files");
+        assert!(skill_matches(&skill, SKILL_FILES));
     }
 }

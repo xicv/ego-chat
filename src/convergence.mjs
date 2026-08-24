@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { z } from "zod/v4"
 
+import { MAX_PROMPT_BYTES } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const CriterionResultSchema = z.object({
@@ -16,7 +17,7 @@ const FindingSchema = z.object({
   title: z.string().trim().min(1).max(500),
 }).strict()
 
-const CodexCandidateSchema = z.object({
+const AgentCandidateSchema = z.object({
   blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
   criteria: z.array(CriterionResultSchema).min(1).max(8),
   reviewPacket: z.string().trim().min(1).max(28_000),
@@ -118,13 +119,26 @@ function parseWithSchema(schema, value, source) {
 }
 
 export function validateCodexCandidate(value, criteria) {
-  const candidate = parseWithSchema(CodexCandidateSchema, value, "Codex")
+  const candidate = parseWithSchema(AgentCandidateSchema, value, "Codex")
   validateCriteriaCoverage(criteria, candidate.criteria, "Codex")
   if (candidate.status === "candidate" && candidate.blockers.length > 0) {
     throw new EgoChatError(
       "human_required",
       "Codex marked a candidate ready while also reporting unresolved blockers.",
       { reason: "codex_candidate_inconsistent" },
+    )
+  }
+  return candidate
+}
+
+export function validateAgentCandidate(value, criteria) {
+  const candidate = parseWithSchema(AgentCandidateSchema, value, "Implementing agent")
+  validateCriteriaCoverage(criteria, candidate.criteria, "Implementing agent")
+  if (candidate.status === "candidate" && candidate.blockers.length > 0) {
+    throw new EgoChatError(
+      "human_required",
+      "The implementing agent marked a candidate ready while also reporting unresolved blockers.",
+      { reason: "agent_candidate_inconsistent" },
     )
   }
   return candidate
@@ -244,17 +258,75 @@ export function buildChatGptPrompt({ candidate, candidateDigest, contract, cycle
     contract.target,
     "Acceptance contract:",
     criteria,
-    "Codex candidate summary:",
+    "Implementing-agent candidate summary:",
     candidate.summary,
-    "Codex per-criterion evidence:",
+    "Implementing-agent per-criterion evidence:",
     JSON.stringify(candidate.criteria),
-    "Codex review packet:",
+    "Implementing-agent review packet:",
     candidate.reviewPacket,
     "Return exactly one JSON object with these fields: targetDigest, candidateDigest, cycle, decision, summary, criteria, findings.",
     "decision must be settled, continue, or blocked. Settlement is permitted only when every criterion is pass and there are no blocking findings. Continue must contain at least one blocking finding or a fail/unknown criterion. Each finding needs id, severity (blocking or advisory), title, and action. Every finding id must start with B- and match B-[A-Z0-9_-]{1,40}. Report every acceptance criterion exactly once and in contract order using the supplied AC-N ids.",
     "After the JSON object, output the following terminal marker on its own final line. Do not use Markdown prose and do not repeat the outbound turn marker.",
     terminalMarker,
   ].join("\n\n")
+}
+
+export function prepareAgentReview({ acceptanceCriteria, candidate, cycle, markerToken, target }) {
+  const contract = createContract(target, acceptanceCriteria)
+  const validatedCandidate = validateAgentCandidate(candidate, contract.criteria)
+  if (validatedCandidate.status === "blocked") {
+    throw new EgoChatError(
+      "human_required",
+      "The implementing agent reported that the target requires missing authority or cannot proceed safely.",
+      { reason: "agent_candidate_blocked" },
+    )
+  }
+  const candidateDigest = digestJson(validatedCandidate)
+  const turnMarker = `EGO_CHAT_AGENT_REVIEW_${markerToken}_C${cycle}`
+  const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}`
+  const prompt = buildChatGptPrompt({
+    candidate: validatedCandidate,
+    candidateDigest,
+    contract,
+    cycle,
+    terminalMarker,
+    turnMarker,
+  })
+  const signatures = scanForSecrets(prompt)
+  if (signatures.length > 0) {
+    throw new EgoChatError(
+      "human_required",
+      "The exact outbound review prompt contains a high-confidence secret signature.",
+      { reason: "review_packet_secret_detected", signatures },
+    )
+  }
+  if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) {
+    throw new EgoChatError(
+      "invalid_input",
+      `The generated review prompt exceeds ${MAX_PROMPT_BYTES} bytes.`,
+      { reason: "review_prompt_too_large" },
+    )
+  }
+  return {
+    candidate: validatedCandidate,
+    candidateDigest,
+    contract,
+    cycle,
+    prompt,
+    terminalMarker,
+    turnMarker,
+  }
+}
+
+export function completeAgentReview(prepared, responseText) {
+  const review = parseChatGptReview(responseText, {
+    candidateDigest: prepared.candidateDigest,
+    criteria: prepared.contract.criteria,
+    cycle: prepared.cycle,
+    targetDigest: prepared.contract.targetDigest,
+    terminalMarker: prepared.terminalMarker,
+  })
+  return { review, ...evaluateReview(review) }
 }
 
 export function reviewSignature(review) {

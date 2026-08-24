@@ -1,5 +1,5 @@
 export const APP_NAME = "ego-chat"
-export const APP_VERSION = "0.0.0-gate0"
+export const APP_VERSION = "0.1.0"
 export const IPC_VERSION = 1
 
 export const DEFAULT_MODEL_POLICY = Object.freeze({

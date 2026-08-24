@@ -2,6 +2,7 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import readline from "node:readline"
 
+import { APP_VERSION } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 function digest(value) {
@@ -69,8 +70,8 @@ export class AppServerClient {
       },
       clientInfo: {
         name: "ego_chat",
-        title: "Ego Chat Gate 0",
-        version: "0.0.0-gate0",
+        title: "Ego Chat",
+        version: APP_VERSION,
       },
     })
     this.notify("initialized", {})
@@ -80,7 +81,7 @@ export class AppServerClient {
     cwd,
     developerInstructions = null,
     sandbox = "read-only",
-    serviceName = "ego_chat_gate0",
+    serviceName = "ego_chat",
   }) {
     const response = await this.request("thread/start", {
       approvalPolicy: "never",
@@ -330,7 +331,7 @@ export class AppServerClient {
 
     if (message.id !== undefined && typeof message.method === "string") {
       this.#write({
-        error: { code: -32601, message: "Ego Chat Gate 0 does not service App Server callbacks." },
+        error: { code: -32601, message: "Ego Chat does not service App Server callbacks." },
         id: message.id,
       })
       return

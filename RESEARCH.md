@@ -9,6 +9,10 @@ The post-research implementation now includes the smallest bounded Codex-first c
 
 This closes the normal-process A/B/A continuation gap without claiming unsafe crash replay. MCP facade disconnects are recoverable because the daemon owns the workflow. A daemon restart, browser ambiguity, authentication interruption, invalid envelope, secret match, stagnation, missing authority, deadline, or cycle exhaustion requires reconciliation instead of automatically repeating a possibly accepted operation. ChatGPT-first initiation and a full content-addressed local context capsule remain later work.
 
+The portable wrapper now also targets ZCode's documented native user surfaces: `~/.zcode/cli/config.json` with `mcp.servers` for local STDIO MCP services, and `~/.zcode/skills/<name>/SKILL.md` for user skills. ZCode's current [MCP Services](https://zcode.z.ai/en/docs/mcp-services), [Skills](https://zcode.z.ai/en/docs/skill), and [Goal](https://zcode.z.ai/en/docs/goal) documentation supports an in-client loop in which the current ZCode task remains side A and invokes Ego Chat for each strict side-B review.
+
+No documented external ZCode task start/resume API was found in those surfaces. Ego Chat therefore does not route ZCode work through the broker-owned Codex convergence runner or claim that it can wake ZCode after the app exits. The bounded ZCode loop remains active in the current task or Goal; each browser review is broker-owned and reattachable, while inter-cycle implementation state remains ZCode-owned. This is an explicit durability boundary, not an inferred equivalence with Codex App Server.
+
 ## Executive recommendation
 
 Build Ego Chat as a **local durable broker with two asymmetric adapters**:

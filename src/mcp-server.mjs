@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod/v4"
@@ -5,7 +7,8 @@ import { z } from "zod/v4"
 import { APP_NAME, APP_VERSION, MAX_WAIT_MS } from "./constants.mjs"
 import { loadConfig } from "./config.mjs"
 import { requestBroker } from "./ipc-client.mjs"
-import { asPublicError } from "./errors.mjs"
+import { completeAgentReview, prepareAgentReview } from "./convergence.mjs"
+import { EgoChatError, asPublicError } from "./errors.mjs"
 
 const EGO_EXCHANGE_INPUT_SCHEMA = {
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
@@ -27,10 +30,32 @@ const CONVERGENCE_INPUT_SCHEMA = {
   wallClockTimeoutMs: z.number().int().min(120_000).max(MAX_WAIT_MS).default(MAX_WAIT_MS),
 }
 
+const CRITERION_RESULT_SCHEMA = z.object({
+  evidence: z.string().trim().min(1).max(4_000),
+  id: z.string().regex(/^AC-[1-8]$/),
+  status: z.enum(["pass", "fail", "unknown"]),
+}).strict()
+
+const AGENT_REVIEW_INPUT_SCHEMA = {
+  acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
+  bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
+  candidate: z.object({
+    blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
+    criteria: z.array(CRITERION_RESULT_SCHEMA).min(1).max(8),
+    reviewPacket: z.string().trim().min(1).max(28_000),
+    status: z.enum(["candidate", "blocked"]),
+    summary: z.string().trim().min(1).max(4_000),
+  }).strict(),
+  cycle: z.number().int().min(1).max(6),
+  target: z.string().trim().min(1).max(8_000),
+  timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+}
+
 const MCP_INSTRUCTIONS = [
   "Use binding ego-chat-main unless the user explicitly names another binding.",
-  "For one ChatGPT review returned to the current Codex turn, use ego_exchange_and_wait.",
-  "For an automatic bounded Codex/ChatGPT loop, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
+  "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
+  "For a strict candidate review while the current ZCode or other agent remains the implementer, use ego_review_candidate_and_wait and continue in that same host task until settled.",
+  "For broker-owned automatic Codex/ChatGPT convergence, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "If a browser workflow returns human_required, surface the exact stop and never retry an ambiguous send.",
@@ -257,7 +282,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_exchange_and_wait",
     {
-      description: "Normal Codex-first handoff: send one uniquely marked prompt through a durable named ChatGPT binding, wait with progress notifications, and return the complete captured review into this same Codex turn.",
+      description: "Send one uniquely marked free-form prompt through a durable named ChatGPT binding, wait with progress notifications, and return the complete captured review into this same agent turn.",
       inputSchema: EGO_EXCHANGE_INPUT_SCHEMA,
     },
     async (input, extra) => {
@@ -271,6 +296,64 @@ export function createMcpServer(config = loadConfig()) {
           { signal: extra.signal, timeoutMs: waitMs + 5_000 },
         ))
         return toolResult(result)
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "ego_review_candidate_and_wait",
+    {
+      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding.",
+      inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
+    },
+    async (input, extra) => {
+      try {
+        const markerToken = randomUUID().replaceAll("-", "").toUpperCase()
+        const prepared = prepareAgentReview({ ...input, markerToken })
+        const workflow = await requestBroker(config, "ego.start_exchange", {
+          bindingKey: input.bindingKey,
+          expectedTerminalMarker: prepared.terminalMarker,
+          prompt: prepared.prompt,
+          timeoutMs: input.timeoutMs,
+          turnMarker: prepared.turnMarker,
+        })
+        const waitMs = Math.min(MAX_WAIT_MS, input.timeoutMs + 60_000)
+        const completed = await withProgress(
+          extra,
+          `Waiting for strict candidate review ${workflow.id}`,
+          () => requestBroker(
+            config,
+            "workflow.await",
+            { timeoutMs: waitMs, workflowId: workflow.id },
+            { signal: extra.signal, timeoutMs: waitMs + 5_000 },
+          ),
+        )
+        if (completed.status !== "succeeded") {
+          throw new EgoChatError(
+            "human_required",
+            "The ChatGPT browser review did not complete unambiguously.",
+            {
+              reason: completed.humanRequired?.code
+                ?? completed.error?.code
+                ?? "chatgpt_review_incomplete",
+              workflowId: workflow.id,
+            },
+          )
+        }
+        const { review, settled } = completeAgentReview(prepared, completed.result.responseText)
+        return toolResult({
+          bindingKey: input.bindingKey,
+          candidateDigest: prepared.candidateDigest,
+          cycle: input.cycle,
+          exchangeWorkflowId: workflow.id,
+          modelPolicy: completed.result.modelPolicy,
+          responseDigest: completed.result.digest,
+          review,
+          settled,
+          targetDigest: prepared.contract.targetDigest,
+        })
       } catch (error) {
         return toolError(error)
       }
@@ -376,7 +459,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "cancel_workflow",
     {
-      description: "Cancel a probe. Browser and convergence workflows become human_required because a Codex turn or visible delivery may be ambiguous.",
+      description: "Cancel a probe. Browser and convergence workflows become human_required because an agent turn or visible delivery may be ambiguous.",
       inputSchema: { workflowId: z.uuid() },
     },
     async (input) => {

@@ -1,6 +1,6 @@
 interface:
   display_name: "Ego Chat"
-  short_description: "Continuous Codex and ChatGPT review loops"
+  short_description: "Continuous agent and ChatGPT review loops"
   default_prompt: "Use $ego-chat to review this work with ChatGPT until the acceptance criteria are settled."
 dependencies:
   tools:

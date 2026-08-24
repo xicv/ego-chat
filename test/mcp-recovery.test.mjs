@@ -35,6 +35,7 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.match(firstClient.getInstructions(), /binding ego-chat-main/)
   assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
+  assert.ok(tools.tools.some((tool) => tool.name === "ego_review_candidate_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_ensure_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
