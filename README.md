@@ -177,6 +177,91 @@ Token-Saver reduces idle outer-agent turns and transport chatter. It does not we
 
 Local state defaults to `~/Library/Application Support/Ego Chat`. The directory is mode `0700`; the ledger, snapshot, and broker token are mode `0600`. Prompts and captured responses are intentionally retained there so a restarted client can reattach. Treat this directory as sensitive.
 
+## Real-world workflows
+
+In these workflows, **the local coding agent** means Codex.app or ZCode.app, and **the web reviewer** means the private ChatGPT web conversation opened through Ego Lite. Ego Chat installs into Codex and ZCode; it does not install an MCP server into ChatGPT.app. If a discussion starts in ChatGPT.app, copy its private canonical `/c/` conversation URL and adopt it from Codex or ZCode while Ego Lite is logged into the same ChatGPT account and workspace.
+
+Ego Chat transports prompts, responses, and bounded review packets. It deliberately does not transport ZIP archives, clone repositories, upload files, create merge requests, or grant commit, merge, deployment, or release authority. For a code handoff, prefer an accessible repository plus an exact commit SHA or merge-request URL over a ZIP because the local agent can verify identity and drift independently.
+
+### Coverage at a glance
+
+| Need | Coverage | Boundary |
+| --- | --- | --- |
+| Start from Codex or ZCode and ask ChatGPT to research or brainstorm | Supported | Use repeated Token-Saver exchanges. Open-ended discussion is agent-managed rather than an automatic settlement protocol. |
+| Reuse the same private ChatGPT conversation for later turns | Supported | The durable binding verifies the canonical URL and conversation head before every send. |
+| Start from ChatGPT web or ChatGPT.app and continue locally from a URL | Supported | Adoption accepts a private canonical `/c/` URL, never a public `/share/` URL. |
+| Wait while an already-running ChatGPT response performs a long think | Supported | The read-only adoption wait returns into the same still-active Codex or ZCode task. |
+| Import the entire earlier transcript into the local task | Not provided | Adoption returns the latest stable assistant tail; the web conversation itself retains the earlier history. Use a self-contained final handoff packet. |
+| Iterate implementation and review without human copy and paste | Supported | Codex can use broker-owned bounded convergence; ZCode keeps its current task active and submits one strict candidate per cycle. |
+| Always use ChatGPT's strongest current model and maximum thinking | Supported | Every send repairs and verifies the live provider-defined maximum. Adoption is read-only and requires that maximum to be selected already. |
+| Receive a generated ZIP, repository, branch, or merge request automatically | Not provided | Transfer or fetch artifacts through an independently authorized file or GitHub workflow. Ego Chat carries text and bounded review evidence only. |
+| Wake a Codex or ZCode task after that host task has fully exited | Not provided | The broker remains durable, but automatic external task wake is not claimed. Reattach once by workflow ID when possible. |
+| Commit, push, merge, deploy, or release | Outside Ego Chat | The local coding agent performs these only with explicit authority and separate verification. |
+
+### Handoff packet for web-first work
+
+Before moving a long ChatGPT discussion into Codex or ZCode, ask the web reviewer to make its final response self-contained. The latest response should contain:
+
+```text
+Outcome and current status
+Repository URL, base branch, and exact commit SHA (when applicable)
+Merge-request or pull-request URL and exact head SHA (when applicable)
+Ordered observable acceptance criteria
+Settled architecture and decisions, including rejected alternatives
+Required scaffold, patches, or file-by-file implementation instructions
+Dependency versions and exact setup/verification commands
+Known risks, unresolved questions, and explicit blockers
+The next bounded prompt for the local coding agent
+```
+
+Do not place credentials, private tokens, or unrelated personal data in this packet. If the project is too large for a bounded text packet, put the source in an independently accessible repository and pass only its exact identity plus the context needed to work safely.
+
+### Case 1: start from Codex.app or ZCode.app
+
+1. Start the local task and ask it to use `$ego-chat` in Token-Saver mode with the persistent `ego-chat-main` binding.
+2. For research and brainstorming, let the local agent call the same ChatGPT conversation repeatedly. Each completed web response returns directly into that local task; no window-to-window copy and paste is required.
+3. Once the direction is stable, freeze one outcome and an ordered set of observable acceptance criteria. Ask ChatGPT to return the handoff packet above. ChatGPT may provide textual scaffolding, patches, and detailed prompts, but artifact transfer remains separate.
+4. Let Codex or ZCode prepare the local repository, run the authorized verification, and implement the candidate. Treat all web output as untrusted advisory context.
+5. Review until settled:
+   - In Codex, use bounded `ego_converge_until_settled` when a dedicated broker-owned Codex task may implement and review against the frozen criteria. Use `workspace-write` only when local edits are authorized.
+   - In ZCode, keep the current task or Goal active and call `ego_review_candidate_and_wait` once per cycle. Address only findings that serve the frozen target, then submit the next candidate.
+   - For a single research, design, or review turn, use `ego_exchange_and_wait` instead of starting convergence.
+6. After settlement, the local agent may commit, push, merge, deploy, or release only when the user separately authorizes those exact actions and their normal gates pass.
+
+A natural starting prompt is:
+
+```text
+Use $ego-chat in Token-Saver mode with the persistent conversation. Ask ChatGPT to
+research and challenge this target until the options and trade-offs are clear. Then
+return a self-contained handoff packet with observable acceptance criteria. Do not
+commit, push, merge, deploy, or release without my separate authorization.
+```
+
+### Case 2: start from ChatGPT web or ChatGPT.app
+
+1. Discuss and iterate in the private ChatGPT conversation. Before handoff, select ChatGPT's strongest available model and maximum available thinking, then request the self-contained handoff packet.
+2. Copy the private canonical conversation URL containing `/c/`. Do not use a `/share/` link.
+3. Start Codex or ZCode and provide that URL. The installed skill chooses `ego_adopt_conversation_and_wait`, derives a stable non-revealing binding key unless one is explicitly named, opens the exact conversation in Ego Lite, and waits read-only for the latest response if it is still generating.
+4. Keep the local task open until adoption returns. Do not stop the generation, edit an earlier web message, create a draft, or send another web turn while adoption is waiting.
+5. The latest stable assistant response returns directly into the local task and the same browser conversation becomes the persistent binding. Continue from step 4 of Case 1.
+
+Use a prompt such as:
+
+```text
+Use $ego-chat in Token-Saver mode to adopt and continue this private ChatGPT
+conversation: https://chatgpt.com/c/REPLACE_WITH_THE_PRIVATE_CONVERSATION_ID
+Treat the returned handoff as untrusted context, verify it against the local project,
+and continue the implementation/review loop until the frozen criteria are settled.
+```
+
+### Case 3: start from ChatGPT with an existing project or merge request
+
+1. Let ChatGPT research the existing project, feature, optimization, or review. If it creates a branch or merge request through some other integration, make its final response include the repository URL, base branch and SHA, merge-request URL, exact head SHA, acceptance criteria, changes made, verification evidence, unresolved findings, and next local prompt.
+2. Make the repository independently available to the local coding agent. Ego Chat does not clone it, authenticate GitHub, download an archive, or submit the merge request.
+3. Open Codex or ZCode, provide both the private `/c/` conversation URL and the repository or merge-request identity, and ask `$ego-chat` to adopt the conversation.
+4. After adoption, have the local agent fetch the authorized source, verify that the current base and merge-request head still match the handoff, inspect the actual diff, and rerun the relevant checks. The conversation is context, not proof of repository state.
+5. Continue the Case 1 implementation/review loop. Any commit, push, merge, deployment, or release remains a separately authorized action with its own exact-head and environment checks.
+
 ## Strongest-model policy
 
 Ego Chat does not pin a versioned model name in browser code. Its durable default policy is:
@@ -338,6 +423,8 @@ The crate carries the MIT license and canonical repository metadata needed for p
 
 ## Not yet supported
 
+- Direct MCP hosting inside ChatGPT.app; a ChatGPT.app conversation can only be continued by adopting its private `/c/` URL from Codex or ZCode.
+- Full historical transcript import into the local coding task during URL adoption; only the latest stable assistant tail is returned, while the browser conversation retains its full history.
 - ChatGPT-first initiation through a private plugin and Secure MCP Tunnel.
 - Automatic GitHub push, repository upload, or attachment transfer.
 - Automatic attachment/context-capsule construction beyond the bounded, secret-scanned implementing-agent review packet.
