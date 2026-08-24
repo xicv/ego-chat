@@ -66,6 +66,7 @@ function reviewInput(label) {
     cycle: 1,
     target: `Settle controlled candidate ${label}.`,
     timeoutMs: 30_000,
+    waitMode: "token_saver",
   }
 }
 
@@ -93,11 +94,24 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.match(firstClient.getInstructions(), /binding ego-chat-main/)
   assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
+  assert.ok(tools.tools.some((tool) => tool.name === "ego_adopt_conversation_and_wait"))
+  assert.ok(tools.tools.some((tool) => tool.name === "ego_start_conversation_adoption"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_review_candidate_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_ensure_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
+  for (const toolName of [
+    "ego_adopt_conversation_and_wait",
+    "ego_exchange_and_wait",
+    "ego_review_candidate_and_wait",
+    "ego_converge_until_settled",
+    "await_workflow",
+  ]) {
+    const waitMode = tools.tools.find((tool) => tool.name === toolName)
+      ?.inputSchema?.properties?.waitMode
+    assert.deepEqual(waitMode?.enum, ["progress", "token_saver"])
+  }
   const modelPolicy = await firstClient.callTool({
     arguments: {},
     name: "ego_get_model_policy",
@@ -115,13 +129,146 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   const secondClient = await connectClient(env)
   t.after(() => secondClient.close())
   const completed = await secondClient.callTool({
-    arguments: { timeoutMs: 5_000, workflowId },
+    arguments: { timeoutMs: 5_000, waitMode: "token_saver", workflowId },
     name: "await_workflow",
   })
 
   assert.equal(completed.isError, undefined)
   assert.equal(completed.structuredContent.status, "succeeded")
   assert.equal(completed.structuredContent.result.text, "facade-recovery")
+  assert.equal(completed.structuredContent.waitMode, "token_saver")
+  assert.equal(completed.content[0].text.includes("\n"), false)
+})
+
+test("conversation adoption returns the stable ChatGPT tail into the same MCP turn", async (t) => {
+  const { config, env } = await createTestConfig()
+  const canonicalUrl = "https://chatgpt.com/c/mcp-adoption"
+  const derivedBindingKey = `adopt-${digest(canonicalUrl).slice(0, 24)}`
+  const responseText = "The existing ChatGPT long-think response is ready."
+  const responseDigest = digest(responseText)
+  let adoptionCalls = 0
+  let exchangeCalls = 0
+  let receivedTaskSpace
+  let receivedTimeoutMs
+  const egoAdapter = {
+    adopt: async (input) => {
+      adoptionCalls += 1
+      receivedTaskSpace = input.taskSpace
+      receivedTimeoutMs = input.timeoutMs
+      return {
+        adoptedWhileGenerating: true,
+        anchor: { contentDigest: "a".repeat(64), messageId: "mcp-adopt-user" },
+        canonicalUrl,
+        durationMs: 10_000,
+        head: {
+          fingerprint: "mcp-adopt-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: responseDigest,
+          lastMessageId: "mcp-adopt-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest,
+        responseText,
+        targetId: "mcp-adopt-tab",
+        taskSpaceId: 12,
+      }
+    },
+    exchange: async () => {
+      exchangeCalls += 1
+      throw new Error("adoption must not send")
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(config.dataDir) })
+  await broker.initialize()
+  const token = await loadOrCreateBrokerToken(config.dataDir)
+  const methods = new Map([
+    ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
+    ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
+  ])
+  const ipc = await startIpcServer({
+    dispatch: async (method, params, signal) => {
+      const handler = methods.get(method)
+      if (!handler) {
+        throw new EgoChatError("method_not_found", "Unexpected controlled adoption method.")
+      }
+      return handler(params, signal)
+    },
+    socketPath: config.socketPath,
+    token,
+  })
+  t.after(async () => {
+    broker.close()
+    await ipc.close()
+    await removeTestConfig(config)
+  })
+  const client = await connectClient(env)
+  t.after(() => client.close())
+
+  const adopted = await client.callTool({
+    arguments: {
+      canonicalUrl,
+    },
+    name: "ego_adopt_conversation_and_wait",
+  })
+  assert.equal(adopted.isError, undefined)
+  assert.equal(adopted.structuredContent.status, "succeeded")
+  assert.equal(adopted.structuredContent.result.bindingKey, derivedBindingKey)
+  assert.equal(adopted.structuredContent.result.responseText, responseText)
+  assert.equal(adopted.structuredContent.result.responseDigest, responseDigest)
+  assert.equal(adopted.structuredContent.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.structuredContent.waitMode, "token_saver")
+  assert.equal(adopted.content[0].text.includes("\n"), false)
+  assert.equal(adoptionCalls, 1)
+  assert.equal(exchangeCalls, 0)
+  assert.equal(receivedTaskSpace, "ego-chat-adoptions")
+  assert.equal(receivedTimeoutMs > 0 && receivedTimeoutMs <= 15 * 60 * 1_000, true)
+  assert.equal(broker.getConversationBinding({ bindingKey: derivedBindingKey }).state, "bound")
+})
+
+test("Token-Saver wait errors preserve the durable workflow recovery handle", async (t) => {
+  const { config, env } = await createTestConfig()
+  const workflowId = "a2397352-b40f-428a-87d6-379abb262573"
+  const token = await loadOrCreateBrokerToken(config.dataDir)
+  const ipc = await startIpcServer({
+    dispatch: async (method) => {
+      if (method === "ego.start_exchange") {
+        return { id: workflowId, kind: "ego_exchange", status: "running" }
+      }
+      if (method === "workflow.await") {
+        throw new EgoChatError("wait_timeout", "The controlled workflow is still running.")
+      }
+      throw new EgoChatError("method_not_found", "Unexpected Token-Saver recovery method.")
+    },
+    socketPath: config.socketPath,
+    token,
+  })
+  t.after(async () => {
+    await ipc.close()
+    await removeTestConfig(config)
+  })
+  const client = await connectClient(env)
+  t.after(() => client.close())
+
+  const turnMarker = "EGO_CHAT_TOKEN_SAVER_RECOVERY"
+  const result = await client.callTool({
+    arguments: {
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: "TOKEN_SAVER_RECOVERY_DONE",
+      prompt: `${turnMarker}\nreview`,
+      timeoutMs: 30_000,
+      turnMarker,
+      waitMode: "token_saver",
+    },
+    name: "ego_exchange_and_wait",
+  })
+  const error = JSON.parse(result.content[0].text)
+  assert.equal(result.isError, true)
+  assert.equal(error.code, "wait_timeout")
+  assert.equal(error.details.waitMode, "token_saver")
+  assert.equal(error.details.workflowId, workflowId)
 })
 
 test("strict candidate review crosses MCP, validates settlement, and reconciles without resending", async (t) => {
@@ -275,6 +422,8 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(settled.structuredContent.targetDigest, expectedDirect.contract.targetDigest)
   assert.equal(settled.structuredContent.review.candidateDigest, expectedDirect.candidateDigest)
   assert.equal(settled.structuredContent.review.targetDigest, expectedDirect.contract.targetDigest)
+  assert.equal(settled.structuredContent.waitMode, "token_saver")
+  assert.equal(settled.content[0].text.includes("\n"), false)
 
   const malformed = await client.callTool({
     arguments: reviewInput("malformed"),

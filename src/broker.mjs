@@ -17,6 +17,7 @@ import {
 } from "./convergence.mjs"
 import {
   AwaitWorkflowSchema,
+  ConversationAdoptionSchema,
   ConversationBindSchema,
   ConversationKeyInputSchema,
   ConversationReconcileSchema,
@@ -77,6 +78,8 @@ const CHATGPT_TRANSPORT_GRACE_MS = 70_000
 
 export class Broker {
   #activeBindings = new Set()
+  #activeConversationUrls = new Map()
+  #adoptionTaskSpaces = new Map()
   #appServerFactory
   #convergenceBindings = new Map()
   #convergenceChildren = new Map()
@@ -103,6 +106,46 @@ export class Broker {
 
       if (workflow.kind === "probe") {
         this.#scheduleProbe(workflow)
+      } else if (workflow.kind === "conversation_adoption") {
+        const request = workflow.private?.request
+        if (
+          !request
+          || typeof workflow.bindingKey !== "string"
+          || !Number.isFinite(Date.parse(workflow.deadlineAt))
+        ) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: "adoption_recovery_metadata_missing",
+              message: "The broker cannot safely resume this read-only adoption because its durable request is incomplete.",
+            },
+            status: "human_required",
+          })
+          continue
+        }
+        const taskSpaceOwner = this.#adoptionTaskSpaces.get(String(request.taskSpace))
+        const canonicalUrlDigest = digest(request.canonicalUrl)
+        const urlOwner = this.#activeConversationUrls.get(canonicalUrlDigest)
+        if (
+          workflow.canonicalUrlDigest !== canonicalUrlDigest
+          || this.#activeBindings.has(workflow.bindingKey)
+          || taskSpaceOwner
+          || urlOwner
+        ) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: "adoption_recovery_conflict",
+              message: "Another durable adoption already owns this binding or Ego task space after restart.",
+            },
+            status: "human_required",
+          })
+          continue
+        }
+        this.#activeBindings.add(workflow.bindingKey)
+        this.#activeConversationUrls.set(canonicalUrlDigest, workflow.id)
+        this.#adoptionTaskSpaces.set(String(request.taskSpace), workflow.id)
+        this.#runConversationAdoption(workflow.id).catch((error) => {
+          console.error("Conversation adoption runner failed:", error)
+        })
       } else if (workflow.kind === "convergence") {
         await this.#transition(workflow, "workflow.human_required", {
           humanRequired: {
@@ -193,8 +236,31 @@ export class Broker {
     if (this.#activeBindings.has(params.bindingKey)) {
       throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
     }
+    const canonicalUrlDigest = params.mode === "existing" ? digest(params.canonicalUrl) : null
+    if (params.mode === "existing") {
+      const existingConversation = this.#findBindingByCanonicalUrl(params.canonicalUrl)
+      if (existingConversation) {
+        throw new EgoChatError(
+          "conversation_already_bound",
+          "That canonical ChatGPT conversation already has a durable binding.",
+          { bindingKey: existingConversation.key },
+        )
+      }
+      const owner = this.#activeConversationUrls.get(canonicalUrlDigest)
+      if (owner) {
+        throw new EgoChatError(
+          "conversation_reserved",
+          "That canonical ChatGPT conversation already has an active binding or adoption operation.",
+          { operationId: owner },
+        )
+      }
+    }
 
     this.#activeBindings.add(params.bindingKey)
+    const urlOwner = canonicalUrlDigest ? `bind-${randomUUID()}` : null
+    if (canonicalUrlDigest) {
+      this.#activeConversationUrls.set(canonicalUrlDigest, urlOwner)
+    }
     try {
       const verified = await this.#egoAdapter.bind(params)
       const now = new Date().toISOString()
@@ -228,7 +294,77 @@ export class Broker {
       return publicBinding(binding)
     } finally {
       this.#activeBindings.delete(params.bindingKey)
+      if (canonicalUrlDigest && this.#activeConversationUrls.get(canonicalUrlDigest) === urlOwner) {
+        this.#activeConversationUrls.delete(canonicalUrlDigest)
+      }
     }
+  }
+
+  async startConversationAdoption(input) {
+    const params = parse(ConversationAdoptionSchema, input)
+    const bindingKey = params.bindingKey ?? `adopt-${digest(params.canonicalUrl).slice(0, 24)}`
+    const request = { ...params, bindingKey }
+    const canonicalUrlDigest = digest(params.canonicalUrl)
+    this.#assertTaskSpaceAvailable(params.taskSpace)
+    if (this.#store.getBinding(bindingKey)) {
+      throw new EgoChatError(
+        "binding_exists",
+        "That conversation binding already exists; inspect it instead of silently replacing it.",
+      )
+    }
+    if (this.#activeBindings.has(bindingKey)) {
+      throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
+    }
+    const existingConversation = this.#findBindingByCanonicalUrl(params.canonicalUrl)
+    if (existingConversation) {
+      throw new EgoChatError(
+        "conversation_already_bound",
+        "That canonical ChatGPT conversation already has a durable binding.",
+        { bindingKey: existingConversation.key },
+      )
+    }
+    const urlOwner = this.#activeConversationUrls.get(canonicalUrlDigest)
+    if (urlOwner) {
+      throw new EgoChatError(
+        "conversation_reserved",
+        "That canonical ChatGPT conversation already has an active binding or adoption operation.",
+        { operationId: urlOwner },
+      )
+    }
+
+    const startedAt = new Date()
+    const now = startedAt.toISOString()
+    const workflow = {
+      bindingKey,
+      canonicalUrlDigest,
+      createdAt: now,
+      deadlineAt: new Date(startedAt.getTime() + params.timeoutMs).toISOString(),
+      id: randomUUID(),
+      inputDigest: digest(JSON.stringify(request)),
+      kind: "conversation_adoption",
+      phase: "waiting",
+      private: {
+        request,
+      },
+      status: "running",
+      updatedAt: now,
+    }
+
+    this.#activeBindings.add(bindingKey)
+    this.#activeConversationUrls.set(canonicalUrlDigest, workflow.id)
+    this.#adoptionTaskSpaces.set(String(params.taskSpace), workflow.id)
+    try {
+      await this.#store.persist("workflow.started", workflow)
+    } catch (error) {
+      this.#activeBindings.delete(bindingKey)
+      this.#activeConversationUrls.delete(canonicalUrlDigest)
+      this.#adoptionTaskSpaces.delete(String(params.taskSpace))
+      throw error
+    }
+    this.#runConversationAdoption(workflow.id).catch((error) => {
+      console.error("Conversation adoption runner failed:", error)
+    })
+    return publicWorkflow(workflow)
   }
 
   getConversationBinding(input) {
@@ -609,6 +745,10 @@ export class Broker {
       const workflowWaiters = this.#waiters.get(workflowId) ?? new Set()
       workflowWaiters.add(waiter)
       this.#waiters.set(workflowId, workflowWaiters)
+      const latest = this.#store.getWorkflow(workflowId)
+      if (latest && isTerminal(latest)) {
+        waiter.resolve(publicWorkflow(latest))
+      }
     })
   }
 
@@ -677,6 +817,8 @@ export class Broker {
     this.#convergenceClients.clear()
     this.#convergenceChildren.clear()
     this.#convergenceBindings.clear()
+    this.#activeConversationUrls.clear()
+    this.#adoptionTaskSpaces.clear()
     this.#activeBindings.clear()
     for (const waiters of this.#waiters.values()) {
       for (const waiter of waiters) {
@@ -713,6 +855,172 @@ export class Broker {
       },
       status: "succeeded",
     })
+  }
+
+  async #runConversationAdoption(workflowId) {
+    const controller = new AbortController()
+    this.#controllers.set(workflowId, controller)
+
+    try {
+      let current = this.#store.getWorkflow(workflowId)
+      if (!current || current.kind !== "conversation_adoption" || current.status !== "running") {
+        return
+      }
+
+      if (current.phase === "waiting") {
+        if (this.#store.getBinding(current.bindingKey)) {
+          throw new EgoChatError(
+            "human_required",
+            "A conversation binding appeared before the read-only adoption could establish its capture.",
+            { reason: "adoption_binding_conflict" },
+          )
+        }
+        const remainingMs = Date.parse(current.deadlineAt) - Date.now()
+        if (remainingMs <= 0) {
+          throw new EgoChatError(
+            "human_required",
+            "The conversation adoption deadline elapsed before a stable response was captured.",
+            { reason: "adoption_deadline_reached" },
+          )
+        }
+        const capture = this.#validateAdoptionCapture(
+          await this.#egoAdapter.adopt({
+            ...current.private.request,
+            modelPolicy: this.#resolveModelPolicy(),
+            timeoutMs: Math.min(current.private.request.timeoutMs, remainingMs),
+          }, controller.signal),
+          current.private.request,
+        )
+        current = this.#store.getWorkflow(workflowId)
+        if (!current || current.status !== "running") {
+          return
+        }
+        await this.#transition(current, "adoption.response_captured", {
+          phase: "captured",
+          private: {
+            ...current.private,
+            capture,
+          },
+        })
+        current = this.#store.getWorkflow(workflowId)
+      }
+
+      if (!current || current.phase !== "captured" || !current.private?.capture) {
+        throw new EgoChatError(
+          "human_required",
+          "The durable conversation adoption has no attributable captured response.",
+          { reason: "adoption_capture_missing" },
+        )
+      }
+      const request = current.private.request
+      const capture = this.#validateAdoptionCapture(current.private.capture, request)
+      const now = new Date().toISOString()
+      const candidateBinding = {
+        adoptionWorkflowId: workflowId,
+        canonicalUrl: capture.canonicalUrl,
+        createdAt: now,
+        ...bindingHeadPatch(capture.head),
+        key: current.bindingKey,
+        messageCount: capture.head.messageCount,
+        mode: "existing",
+        modelPolicyKey: DEFAULT_MODEL_POLICY.key,
+        projectUrl: request.projectUrl ?? null,
+        revision: 1,
+        startUrl: capture.canonicalUrl,
+        state: "bound",
+        targetId: capture.targetId,
+        taskSpaceId: capture.taskSpaceId,
+        updatedAt: now,
+        verifiedAt: now,
+      }
+      const existingBinding = this.#store.getBinding(current.bindingKey)
+      if (existingBinding) {
+        const sameCapture = existingBinding.adoptionWorkflowId === workflowId
+          && existingBinding.canonicalUrl === candidateBinding.canonicalUrl
+          && existingBinding.headFingerprint === candidateBinding.headFingerprint
+          && existingBinding.headMessageId === candidateBinding.headMessageId
+        if (!sameCapture) {
+          throw new EgoChatError(
+            "human_required",
+            "A different binding owns the requested conversation name after adoption capture.",
+            { reason: "adoption_binding_conflict" },
+          )
+        }
+      } else {
+        await this.#store.persistBinding("binding.adopted", candidateBinding)
+      }
+
+      current = this.#store.getWorkflow(workflowId)
+      if (!current || current.status !== "running") {
+        return
+      }
+      await this.#transition(current, "workflow.succeeded", {
+        phase: "bound",
+        private: undefined,
+        result: {
+          adoptedWhileGenerating: capture.adoptedWhileGenerating,
+          anchor: capture.anchor,
+          bindingKey: current.bindingKey,
+          canonicalUrl: capture.canonicalUrl,
+          durationMs: capture.durationMs,
+          head: capture.head,
+          modelPolicy: capture.modelPolicy,
+          responseDigest: capture.responseDigest,
+          responseText: capture.responseText,
+          targetId: capture.targetId,
+          taskSpaceId: capture.taskSpaceId,
+        },
+        status: "succeeded",
+      })
+    } catch (error) {
+      const current = this.#store.getWorkflow(workflowId)
+      if (!current || isTerminal(current) || controller.signal.aborted) {
+        return
+      }
+      const isHumanRequired = error instanceof EgoChatError && error.code === "human_required"
+      await this.#transition(current, isHumanRequired ? "workflow.human_required" : "workflow.failed", {
+        ...(isHumanRequired
+          ? {
+              humanRequired: {
+                code: error.details?.reason ?? "adoption_intervention_required",
+                message: error.message,
+              },
+            }
+          : {
+              error: {
+                code: error instanceof EgoChatError ? error.code : "adoption_failed",
+                message: error instanceof EgoChatError
+                  ? error.message
+                  : "The read-only conversation adoption failed unexpectedly.",
+              },
+            }),
+        phase: "stopped",
+        private: undefined,
+        status: isHumanRequired ? "human_required" : "failed",
+      })
+    } finally {
+      this.#controllers.delete(workflowId)
+      const final = this.#store.getWorkflow(workflowId)
+      if (final) {
+        this.#activeBindings.delete(final.bindingKey)
+        if (this.#activeConversationUrls.get(final.canonicalUrlDigest) === workflowId) {
+          this.#activeConversationUrls.delete(final.canonicalUrlDigest)
+        }
+        const taskSpace = final.private?.request?.taskSpace
+        if (
+          taskSpace !== undefined
+          && this.#adoptionTaskSpaces.get(String(taskSpace)) === workflowId
+        ) {
+          this.#adoptionTaskSpaces.delete(String(taskSpace))
+        } else {
+          for (const [key, owner] of this.#adoptionTaskSpaces) {
+            if (owner === workflowId) {
+              this.#adoptionTaskSpaces.delete(key)
+            }
+          }
+        }
+      }
+    }
   }
 
   async #runEgoExchange(workflow) {
@@ -1161,6 +1469,55 @@ export class Broker {
     return Math.min(requestedMs, availableGenerationMs)
   }
 
+  #validateAdoptionCapture(capture, request) {
+    const responseText = capture?.responseText
+    const responseDigest = typeof responseText === "string" ? digest(responseText) : null
+    const valid = capture
+      && capture.canonicalUrl === request.canonicalUrl
+      && typeof capture.adoptedWhileGenerating === "boolean"
+      && capture.modelPolicy?.adjusted === false
+      && typeof capture.anchor?.messageId === "string"
+      && capture.anchor.messageId.length > 0
+      && /^[a-f0-9]{64}$/.test(capture.anchor?.contentDigest)
+      && typeof responseText === "string"
+      && responseText.trim().length > 0
+      && capture.responseDigest === responseDigest
+      && capture.head?.lastContentDigest === responseDigest
+      && capture.head?.fingerprintVersion === "tail-v1"
+      && capture.head?.lastRole === "assistant"
+      && typeof capture.head?.lastMessageId === "string"
+      && capture.head.lastMessageId.length > 0
+      && capture.head.lastMessageId !== capture.anchor.messageId
+      && typeof capture.head?.fingerprint === "string"
+      && capture.head.fingerprint.length > 0
+      && Number.isInteger(capture.head?.messageCount)
+      && capture.head.messageCount >= 2
+      && capture.head.renderedMessageCount === capture.head.messageCount
+      && typeof capture.targetId === "string"
+      && capture.targetId.length > 0
+      && (
+        (typeof capture.taskSpaceId === "string" && capture.taskSpaceId.length > 0)
+        || (Number.isInteger(capture.taskSpaceId) && capture.taskSpaceId > 0)
+      )
+      && Number.isFinite(capture.durationMs)
+      && capture.durationMs >= 0
+    if (!valid) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser returned an invalid or internally inconsistent conversation-adoption capture.",
+        { reason: "adoption_capture_invalid" },
+      )
+    }
+    return {
+      ...structuredClone(capture),
+      modelPolicy: this.#validateModelPolicyObservation(capture.modelPolicy),
+    }
+  }
+
+  #findBindingByCanonicalUrl(canonicalUrl) {
+    return this.#store.listBindings().find((binding) => binding.canonicalUrl === canonicalUrl)
+  }
+
   #assertBindingAvailable(bindingKey, convergenceId = undefined) {
     const owner = this.#convergenceBindings.get(bindingKey)
     if (owner && owner !== convergenceId) {
@@ -1170,9 +1527,38 @@ export class Broker {
         { workflowId: owner },
       )
     }
+    const binding = this.#store.getBinding(bindingKey)
+    const adoptionOwner = binding
+      ? this.#adoptionTaskSpaces.get(String(binding.taskSpaceId))
+      : undefined
+    if (adoptionOwner) {
+      throw new EgoChatError(
+        "task_space_reserved",
+        "That Ego task space is reserved by a read-only conversation adoption.",
+        { workflowId: adoptionOwner },
+      )
+    }
   }
 
   #assertTaskSpaceAvailable(taskSpace) {
+    const adoptionOwner = this.#adoptionTaskSpaces.get(String(taskSpace))
+    if (adoptionOwner) {
+      throw new EgoChatError(
+        "task_space_reserved",
+        "That Ego task space is reserved by a read-only conversation adoption.",
+        { workflowId: adoptionOwner },
+      )
+    }
+    for (const bindingKey of this.#activeBindings) {
+      const binding = this.#store.getBinding(bindingKey)
+      if (binding && String(binding.taskSpaceId) === String(taskSpace)) {
+        throw new EgoChatError(
+          "task_space_busy",
+          "That Ego task space already has an active bound-conversation browser operation.",
+          { bindingKey },
+        )
+      }
+    }
     for (const [bindingKey, workflowId] of this.#convergenceBindings) {
       const binding = this.#store.getBinding(bindingKey)
       if (binding && String(binding.taskSpaceId) === String(taskSpace)) {

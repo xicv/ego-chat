@@ -142,6 +142,140 @@ console.log('__EGO_CHAT_TEST_COUNTERS__' + JSON.stringify(counters))
   }
 }
 
+async function runAdoptionDriverCase({
+  interleave = false,
+  initiallyGenerating = true,
+  policyInitiallyMaximum = true,
+} = {}) {
+  driverCase += 1
+  const driverUid = `ego-chat-adopt-${process.pid}-${driverCase}`
+  const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
+  const canonicalUrl = "https://chatgpt.com/c/adoption-driver-test"
+  const input = {
+    bindingKey: "adoption-driver-test",
+    canonicalUrl,
+    mode: "adopt",
+    modelPolicy: {
+      enforcement: "repair_then_verify",
+      key: "chatgpt-web-default",
+      modelSelection: "strongest_available",
+      thinkingEffort: "maximum_available",
+    },
+    taskSpace: 10,
+    timeoutMs: 30_000,
+  }
+  await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
+  await fs.writeFile(`${mailboxDirectory}/input.json`, JSON.stringify(input), { mode: 0o600 })
+
+  const harness = `
+process.getuid = () => ${JSON.stringify(driverUid)}
+let generating = ${JSON.stringify(initiallyGenerating)}
+let waits = 0
+let policyMenuOpen = false
+let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
+const counters = { click: 0, fillInput: 0, pressKey: 0, sendClick: 0, typeText: 0 }
+const canonicalUrl = ${JSON.stringify(canonicalUrl)}
+const messages = () => {
+  const values = [
+    { messageId: 'adopt-user-1', role: 'user', text: 'Please perform a long review.' },
+    {
+      messageId: 'adopt-assistant-1',
+      role: 'assistant',
+      text: generating ? 'Partial review' : 'The stable long review is complete.',
+    },
+  ]
+  if (${JSON.stringify(interleave)} && !generating) {
+    values.push({ messageId: 'manual-user-2', role: 'user', text: 'Manual interleaving message.' })
+  }
+  return values
+}
+globalThis.cliLog = (value) => console.log(value)
+globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+globalThis.listTabs = async () => [{ active: true, targetId: 'adopt-tab' }]
+globalThis.switchTab = async () => {}
+globalThis.openOrReuseTab = async () => ({ active: true, targetId: 'adopt-tab' })
+globalThis.pageInfo = async () => ({ url: canonicalUrl })
+globalThis.snapshotText = async () => ''
+globalThis.wait = async () => {
+  waits += 1
+  generating = false
+}
+globalThis.click = async (target) => {
+  counters.click += 1
+  if (String(target).includes('send-button')) counters.sendClick += 1
+  if (String(target).includes('__composer-pill')) policyMenuOpen = true
+  if (target === '#prompt-textarea') policyMenuOpen = false
+}
+globalThis.fillInput = async () => { counters.fillInput += 1 }
+globalThis.typeText = async () => { counters.typeText += 1 }
+globalThis.pressKey = async () => {
+  counters.pressKey += 1
+  policyCurrent = 4
+}
+globalThis.cdp = async () => {}
+globalThis.js = async (source) => {
+  if (source.includes('hasLoginAction')) {
+    return { draft: '', hasComposer: true, hasLoginAction: false }
+  }
+  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+    return messages()
+  }
+  if (source.includes('aria-valuemin')) {
+    return {
+      current: policyCurrent,
+      effortLabel: 'Pro',
+      maximum: 4,
+      minimum: 0,
+      modelLabel: 'GPT-5.6 Sol',
+      ok: true,
+      pillLabel: 'Pro',
+    }
+  }
+  if (source.includes('powerItems[0].focus()')) {
+    return true
+  }
+  if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
+    return { composerCount: 1, count: 1, expanded: policyMenuOpen ? 'true' : 'false' }
+  }
+  if (source.includes("expanded: pills[0]?.getAttribute('aria-expanded') === 'true'")) {
+    return { count: 1, expanded: policyMenuOpen }
+  }
+  if (source.trimStart().startsWith('Boolean(')) {
+    return generating
+  }
+  throw new Error('Unexpected page script: ' + source.slice(0, 100))
+}
+await ${EGO_DRIVER_SOURCE.trim()}
+console.log('__EGO_CHAT_ADOPT_COUNTERS__' + JSON.stringify({ ...counters, waits }))
+`
+
+  try {
+    const executed = spawnSync(process.execPath, ["--input-type=module"], {
+      encoding: "utf8",
+      input: harness,
+    })
+    assert.equal(executed.status, 0, executed.stderr)
+    const countersLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_ADOPT_COUNTERS__"))
+    assert.ok(countersLine)
+    let result
+    let error
+    try {
+      result = decodeDriverResult(executed.stdout)
+    } catch (caught) {
+      error = caught
+    }
+    return {
+      counters: JSON.parse(countersLine.slice("__EGO_CHAT_ADOPT_COUNTERS__".length)),
+      error,
+      result,
+    }
+  } finally {
+    await fs.rm(mailboxDirectory, { force: true, recursive: true })
+  }
+}
+
 test("fixed Ego driver source is valid ESM", () => {
   const checked = spawnSync(process.execPath, ["--check", "--input-type=module"], {
     encoding: "utf8",
@@ -166,6 +300,9 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.match(EGO_DRIVER_SOURCE, /responseEndsWithTerminal/)
   assert.match(EGO_DRIVER_SOURCE, /userMarkerCount/)
   assert.match(EGO_DRIVER_SOURCE, /model_policy_mismatch/)
+  assert.match(EGO_DRIVER_SOURCE, /adoption_anchor_changed/)
+  assert.match(EGO_DRIVER_SOURCE, /adoption_tail_interleaved/)
+  assert.match(EGO_DRIVER_SOURCE, /adoptedWhileGenerating/)
   assert.match(EGO_DRIVER_SOURCE, /!dom\.hasComposer/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /'value' in composer/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /document\.body\.innerText\.split/)
@@ -215,4 +352,49 @@ test("driver envelope preserves human-required stop state", () => {
     })),
     (error) => error.code === "human_required" && error.details.reason === "authentication_required",
   )
+})
+
+test("conversation adoption waits for a stable assistant tail without composing or sending", async () => {
+  const adopted = await runAdoptionDriverCase()
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.adoptedWhileGenerating, true)
+  assert.equal(adopted.result.anchor.messageId, "adopt-user-1")
+  assert.equal(adopted.result.head.lastMessageId, "adopt-assistant-1")
+  assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.deepEqual(adopted.counters, {
+    click: 2,
+    fillInput: 0,
+    pressKey: 0,
+    sendClick: 0,
+    typeText: 0,
+    waits: 4,
+  })
+})
+
+test("conversation adoption fails closed when another message interleaves", async () => {
+  const adopted = await runAdoptionDriverCase({ interleave: true })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "adoption_tail_interleaved")
+  assert.deepEqual(adopted.counters, {
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    sendClick: 0,
+    typeText: 0,
+    waits: 1,
+  })
+})
+
+test("conversation adoption rejects a response when the live policy is below maximum", async () => {
+  const adopted = await runAdoptionDriverCase({ policyInitiallyMaximum: false })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(adopted.error?.details?.evidence?.powerLevel, 4)
+  assert.equal(adopted.error?.details?.evidence?.powerMax, 5)
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
 })

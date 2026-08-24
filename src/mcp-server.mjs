@@ -10,12 +10,40 @@ import { requestBroker } from "./ipc-client.mjs"
 import { completeAgentReview, prepareAgentReview } from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
 
+const WAIT_MODES = ["progress", "token_saver"]
+
+function waitModeSchema(defaultMode = "progress") {
+  return z.enum(WAIT_MODES).default(defaultMode)
+}
+
 const EGO_EXCHANGE_INPUT_SCHEMA = {
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: z.string().min(1).max(64 * 1024),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS),
   turnMarker: z.string().regex(/^EGO_CHAT_[A-Z0-9_-]{8,160}$/),
+}
+
+const CONVERSATION_ADOPTION_INPUT_SCHEMA = {
+  bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/).optional(),
+  canonicalUrl: z.string().url().refine((value) => {
+    try {
+      const parsed = new URL(value)
+      return parsed.protocol === "https:"
+        && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
+        && parsed.username === ""
+        && parsed.password === ""
+        && parsed.port === ""
+        && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(parsed.pathname)
+    } catch (_error) {
+      return false
+    }
+  }, "URL must identify a canonical HTTPS ChatGPT conversation"),
+  projectUrl: z.string().url().optional(),
+  targetId: z.string().min(1).max(200).optional(),
+  taskSpace: z.union([z.string().min(1).max(120), z.number().int().positive()])
+    .default("ego-chat-adoptions"),
+  timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS - 60_000).default(15 * 60 * 1_000),
 }
 
 const CONVERGENCE_INPUT_SCHEMA = {
@@ -49,6 +77,7 @@ const AGENT_REVIEW_INPUT_SCHEMA = {
   cycle: z.number().int().min(1).max(6),
   target: z.string().trim().min(1).max(8_000),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+  waitMode: waitModeSchema(),
 }
 
 const RECOVERABLE_AGENT_REVIEW_CODES = new Set([
@@ -60,18 +89,37 @@ const RECOVERABLE_AGENT_REVIEW_CODES = new Set([
 
 const MCP_INSTRUCTIONS = [
   "Use binding ego-chat-main unless the user explicitly names another binding.",
+  "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "For a strict candidate review while the current ZCode or other agent remains the implementer, use ego_review_candidate_and_wait and continue in that same host task until settled.",
   "For broker-owned automatic Codex/ChatGPT convergence, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
+  "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers; otherwise surface the exact human_required stop.",
 ].join(" ")
 
-function toolResult(value) {
+function toolResult(value, { compact = false } = {}) {
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: compact ? JSON.stringify(value) : JSON.stringify(value, null, 2) }],
     structuredContent: value,
+  }
+}
+
+function waitedToolResult(value, waitMode) {
+  return toolResult(
+    { ...value, waitMode },
+    { compact: waitMode === "token_saver" },
+  )
+}
+
+function attachWaitRecovery(error, workflow, waitMode) {
+  if (workflow && error instanceof EgoChatError) {
+    error.details = {
+      ...(error.details ?? {}),
+      waitMode,
+      workflowId: workflow.id,
+    }
   }
 }
 
@@ -106,6 +154,13 @@ async function withProgress(extra, description, operation) {
   }
 }
 
+async function withWaitMode(extra, description, waitMode, operation) {
+  if (waitMode === "token_saver") {
+    return operation()
+  }
+  return withProgress(extra, description, operation)
+}
+
 export function createMcpServer(config = loadConfig()) {
   const server = new McpServer(
     { name: APP_NAME, version: APP_VERSION },
@@ -137,21 +192,23 @@ export function createMcpServer(config = loadConfig()) {
       inputSchema: {
         delayMs: z.number().int().min(1).max(MAX_WAIT_MS),
         value: z.string().min(1).max(64 * 1024),
+        waitMode: waitModeSchema(),
       },
     },
     async (input, extra) => {
       try {
-        const workflow = await requestBroker(config, "workflow.start_probe", input)
-        const result = await withProgress(extra, `Waiting for workflow ${workflow.id}`, () => requestBroker(
+        const { waitMode, ...request } = input
+        const workflow = await requestBroker(config, "workflow.start_probe", request)
+        const result = await withWaitMode(extra, `Waiting for workflow ${workflow.id}`, waitMode, () => requestBroker(
           config,
           "workflow.await",
-          { timeoutMs: Math.min(MAX_WAIT_MS, input.delayMs + 60_000), workflowId: workflow.id },
+          { timeoutMs: Math.min(MAX_WAIT_MS, request.delayMs + 60_000), workflowId: workflow.id },
           {
             signal: extra.signal,
-            timeoutMs: Math.min(MAX_WAIT_MS, input.delayMs + 65_000),
+            timeoutMs: Math.min(MAX_WAIT_MS, request.delayMs + 65_000),
           },
         ))
-        return toolResult(result)
+        return waitedToolResult(result, waitMode)
       } catch (error) {
         return toolError(error)
       }
@@ -231,6 +288,55 @@ export function createMcpServer(config = loadConfig()) {
   )
 
   server.registerTool(
+    "ego_start_conversation_adoption",
+    {
+      description: "Start a durable read-only takeover of a supplied private ChatGPT /c/ conversation. It anchors the latest user turn, waits outside the coding model for exactly one stable assistant tail, never sends, derives a stable binding key when omitted, and returns a workflow ID immediately.",
+      inputSchema: CONVERSATION_ADOPTION_INPUT_SCHEMA,
+    },
+    async (input) => {
+      try {
+        return toolResult(await requestBroker(config, "conversation.start_adoption", input))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "ego_adopt_conversation_and_wait",
+    {
+      description: "Take over a supplied private ChatGPT /c/ conversation and return its latest stable assistant response into this same agent turn. The broker performs the long read-only wait and never sends to ChatGPT; Token-Saver is the default wait mode.",
+      inputSchema: {
+        ...CONVERSATION_ADOPTION_INPUT_SCHEMA,
+        waitMode: waitModeSchema("token_saver"),
+      },
+    },
+    async (input, extra) => {
+      let workflow
+      try {
+        const { waitMode, ...request } = input
+        workflow = await requestBroker(config, "conversation.start_adoption", request)
+        const waitMs = Math.min(MAX_WAIT_MS, request.timeoutMs + 60_000)
+        const result = await withWaitMode(
+          extra,
+          `Waiting for conversation adoption ${workflow.id}`,
+          waitMode,
+          () => requestBroker(
+            config,
+            "workflow.await",
+            { timeoutMs: waitMs, workflowId: workflow.id },
+            { signal: extra.signal, timeoutMs: waitMs + 5_000 },
+          ),
+        )
+        return waitedToolResult(result, waitMode)
+      } catch (error) {
+        attachWaitRecovery(error, workflow, input.waitMode)
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
     "ego_get_conversation",
     {
       description: "Read one durable named ChatGPT conversation binding without changing browser or broker state.",
@@ -289,21 +395,27 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_exchange_and_wait",
     {
-      description: "Send one uniquely marked free-form prompt through a durable named ChatGPT binding, wait with progress notifications, and return the complete captured review into this same agent turn.",
-      inputSchema: EGO_EXCHANGE_INPUT_SCHEMA,
+      description: "Send one uniquely marked free-form prompt through a durable named ChatGPT binding and return the complete captured review into this same agent turn. Set waitMode to token_saver for one silent durable wait without progress chatter.",
+      inputSchema: {
+        ...EGO_EXCHANGE_INPUT_SCHEMA,
+        waitMode: waitModeSchema(),
+      },
     },
     async (input, extra) => {
+      let workflow
       try {
-        const workflow = await requestBroker(config, "ego.start_exchange", input)
-        const waitMs = Math.min(MAX_WAIT_MS, input.timeoutMs + 60_000)
-        const result = await withProgress(extra, `Waiting for Ego exchange ${workflow.id}`, () => requestBroker(
+        const { waitMode, ...request } = input
+        workflow = await requestBroker(config, "ego.start_exchange", request)
+        const waitMs = Math.min(MAX_WAIT_MS, request.timeoutMs + 60_000)
+        const result = await withWaitMode(extra, `Waiting for Ego exchange ${workflow.id}`, waitMode, () => requestBroker(
           config,
           "workflow.await",
           { timeoutMs: waitMs, workflowId: workflow.id },
           { signal: extra.signal, timeoutMs: waitMs + 5_000 },
         ))
-        return toolResult(result)
+        return waitedToolResult(result, waitMode)
       } catch (error) {
+        attachWaitRecovery(error, workflow, input.waitMode)
         return toolError(error)
       }
     },
@@ -312,14 +424,16 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding.",
+      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
+      let workflow
       try {
+        const { waitMode } = input
         const markerToken = randomUUID().replaceAll("-", "").toUpperCase()
         const prepared = prepareAgentReview({ ...input, markerToken })
-        const workflow = await requestBroker(config, "ego.start_exchange", {
+        workflow = await requestBroker(config, "ego.start_exchange", {
           bindingKey: input.bindingKey,
           expectedTerminalMarker: prepared.terminalMarker,
           prompt: prepared.prompt,
@@ -327,9 +441,10 @@ export function createMcpServer(config = loadConfig()) {
           turnMarker: prepared.turnMarker,
         })
         const waitMs = Math.min(MAX_WAIT_MS, input.timeoutMs + 60_000)
-        const completed = await withProgress(
+        const completed = await withWaitMode(
           extra,
           `Waiting for strict candidate review ${workflow.id}`,
+          waitMode,
           () => requestBroker(
             config,
             "workflow.await",
@@ -380,7 +495,7 @@ export function createMcpServer(config = loadConfig()) {
           )
         }
         const { review, settled } = completeAgentReview(prepared, exchangeResult.responseText)
-        return toolResult({
+        return waitedToolResult({
           bindingKey: input.bindingKey,
           candidateDigest: prepared.candidateDigest,
           cycle: input.cycle,
@@ -391,8 +506,9 @@ export function createMcpServer(config = loadConfig()) {
           review,
           settled,
           targetDigest: prepared.contract.targetDigest,
-        })
+        }, waitMode)
       } catch (error) {
+        attachWaitRecovery(error, workflow, input.waitMode)
         return toolError(error)
       }
     },
@@ -431,16 +547,22 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_converge_until_settled",
     {
-      description: "Run the bounded Codex/ChatGPT loop and wait until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. Caller disconnect does not cancel broker ownership.",
-      inputSchema: CONVERGENCE_INPUT_SCHEMA,
+      description: "Run the bounded Codex/ChatGPT loop and wait until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
+      inputSchema: {
+        ...CONVERGENCE_INPUT_SCHEMA,
+        waitMode: waitModeSchema(),
+      },
     },
     async (input, extra) => {
+      let workflow
       try {
-        const workflow = await requestBroker(config, "convergence.start", input)
-        const waitMs = input.wallClockTimeoutMs ?? MAX_WAIT_MS
-        const result = await withProgress(
+        const { waitMode, ...request } = input
+        workflow = await requestBroker(config, "convergence.start", request)
+        const waitMs = request.wallClockTimeoutMs ?? MAX_WAIT_MS
+        const result = await withWaitMode(
           extra,
           `Waiting for convergence ${workflow.id}`,
+          waitMode,
           () => requestBroker(
             config,
             "workflow.await",
@@ -448,8 +570,9 @@ export function createMcpServer(config = loadConfig()) {
             { signal: extra.signal, timeoutMs: waitMs + 5_000 },
           ),
         )
-        return toolResult(result)
+        return waitedToolResult(result, waitMode)
       } catch (error) {
+        attachWaitRecovery(error, workflow, input.waitMode)
         return toolError(error)
       }
     },
@@ -461,18 +584,20 @@ export function createMcpServer(config = loadConfig()) {
       description: "Attach to a durable workflow and wait for a terminal result. Safe to call again after an MCP facade or client restart.",
       inputSchema: {
         timeoutMs: z.number().int().min(1).max(MAX_WAIT_MS),
+        waitMode: waitModeSchema(),
         workflowId: z.uuid(),
       },
     },
     async (input, extra) => {
       try {
-        const result = await withProgress(extra, `Waiting for workflow ${input.workflowId}`, () => requestBroker(
+        const { waitMode, ...request } = input
+        const result = await withWaitMode(extra, `Waiting for workflow ${request.workflowId}`, waitMode, () => requestBroker(
           config,
           "workflow.await",
-          input,
-          { signal: extra.signal, timeoutMs: Math.min(MAX_WAIT_MS + 5_000, input.timeoutMs + 5_000) },
+          request,
+          { signal: extra.signal, timeoutMs: Math.min(MAX_WAIT_MS + 5_000, request.timeoutMs + 5_000) },
         ))
-        return toolResult(result)
+        return waitedToolResult(result, waitMode)
       } catch (error) {
         return toolError(error)
       }
@@ -497,7 +622,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "cancel_workflow",
     {
-      description: "Cancel a probe. Browser and convergence workflows become human_required because an agent turn or visible delivery may be ambiguous.",
+      description: "Cancel a probe or non-sending conversation adoption cleanly. Message-sending browser and convergence workflows become human_required because visible delivery or an agent turn may be ambiguous.",
       inputSchema: { workflowId: z.uuid() },
     },
     async (input) => {

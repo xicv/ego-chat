@@ -14,7 +14,7 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | cancel <id> | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | cancel <id> | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
@@ -74,6 +74,12 @@ try {
     }
     const input = JSON.parse(await fs.readFile(args[0], "utf8"))
     print(await requestBroker(config, "conversation.bind", input, { timeoutMs: 65_000 }))
+  } else if (command === "adopt") {
+    if (!args[0]) {
+      failUsage("adopt requires a JSON input file")
+    }
+    const input = JSON.parse(await fs.readFile(args[0], "utf8"))
+    print(await requestBroker(config, "conversation.start_adoption", input))
   } else if (command === "conversation") {
     if (!args[0]) {
       failUsage("conversation requires a binding key")

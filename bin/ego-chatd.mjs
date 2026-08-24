@@ -25,6 +25,7 @@ await broker.initialize()
 const token = await loadOrCreateBrokerToken(config.dataDir)
 
 const methods = new Map([
+  ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
   ["conversation.bind", (params) => broker.bindConversation(params)],
   ["conversation.get", (params) => broker.getConversationBinding(params)],
   ["conversation.reconcile", (params) => broker.reconcileConversation(params)],

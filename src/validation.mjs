@@ -50,6 +50,9 @@ function isChatGptUrl(value) {
     const parsed = new URL(value)
     return parsed.protocol === "https:"
       && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
+      && parsed.username === ""
+      && parsed.password === ""
+      && parsed.port === ""
   } catch (_error) {
     return false
   }
@@ -88,6 +91,15 @@ export const ConversationBindSchema = z.discriminatedUnion("mode", [
     taskSpace: TaskSpaceSchema,
   }),
 ])
+
+export const ConversationAdoptionSchema = z.object({
+  bindingKey: BindingKeySchema.optional(),
+  canonicalUrl: CanonicalConversationUrlSchema,
+  projectUrl: ChatGptUrlSchema.optional(),
+  targetId: TargetIdSchema.optional(),
+  taskSpace: TaskSpaceSchema.default("ego-chat-adoptions"),
+  timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS - 60_000).default(15 * 60 * 1_000),
+})
 
 export const ConversationKeyInputSchema = z.object({
   bindingKey: BindingKeySchema,

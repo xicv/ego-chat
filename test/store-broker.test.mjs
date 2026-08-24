@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -10,6 +11,10 @@ import { EventStore } from "../src/store.mjs"
 
 const OPENAI_LIKE_TEST_TOKEN = `sk-proj-${"A".repeat(26)}123456`
 
+function digest(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex")
+}
+
 async function createDataDir() {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-store-test-"))
   await fs.chmod(dataDir, 0o700)
@@ -17,6 +22,9 @@ async function createDataDir() {
 }
 
 const unusedEgoAdapter = {
+  adopt: async () => {
+    throw new Error("not expected")
+  },
   bind: async () => {
     throw new Error("not expected")
   },
@@ -273,6 +281,344 @@ test("create-once binding is promoted and reused for every later exchange", asyn
   assert.equal(modelPolicy.thinkingEffort, "maximum_available")
   assert.equal(modelPolicy.revision, 2)
   assert.equal(modelPolicy.lastObserved.powerLevel, 5)
+})
+
+test("conversation adoption waits outside the caller, captures one stable tail, and creates the binding", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adopted-conversation"
+  const responseText = "The long review is complete."
+  const responseDigest = digest(responseText)
+  let releaseAdoption
+  let received
+  let adoptionCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    adopt: async (input) => {
+      adoptionCalls += 1
+      received = input
+      await new Promise((resolve) => {
+        releaseAdoption = resolve
+      })
+      return {
+        adoptedWhileGenerating: true,
+        anchor: {
+          contentDigest: "a".repeat(64),
+          messageId: "adopt-user-1",
+        },
+        canonicalUrl,
+        durationMs: 25_000,
+        head: {
+          fingerprint: "adopted-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: responseDigest,
+          lastMessageId: "adopt-assistant-1",
+          lastRole: "assistant",
+          messageCount: 4,
+          renderedMessageCount: 4,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest,
+        responseText,
+        targetId: "adopted-tab",
+        taskSpaceId: 10,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const started = await broker.startConversationAdoption({
+    bindingKey: "adopted-review",
+    canonicalUrl,
+    taskSpace: 10,
+    timeoutMs: 30_000,
+  })
+  assert.equal(started.kind, "conversation_adoption")
+  assert.equal(started.status, "running")
+  assert.equal(started.private, undefined)
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: "adopted-review" }),
+    (error) => error.code === "binding_not_found",
+  )
+  await assert.rejects(
+    broker.startConversationAdoption({
+      bindingKey: "duplicate-adoption",
+      canonicalUrl,
+      taskSpace: 11,
+      timeoutMs: 30_000,
+    }),
+    (error) => error.code === "conversation_reserved",
+  )
+
+  releaseAdoption()
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.adoptedWhileGenerating, true)
+  assert.equal(completed.result.responseText, "The long review is complete.")
+  assert.equal(completed.result.responseDigest, responseDigest)
+  assert.equal(received.canonicalUrl, canonicalUrl)
+  assert.equal(received.modelPolicy.modelSelection, "strongest_available")
+  assert.equal(received.modelPolicy.thinkingEffort, "maximum_available")
+  assert.equal(received.timeoutMs > 0 && received.timeoutMs <= 30_000, true)
+
+  const binding = broker.getConversationBinding({ bindingKey: "adopted-review" })
+  assert.equal(binding.adoptionWorkflowId, started.id)
+  assert.equal(binding.canonicalUrl, canonicalUrl)
+  assert.equal(binding.headFingerprint, "adopted-head")
+  assert.equal(binding.headMessageId, "adopt-assistant-1")
+  assert.equal(binding.messageCount, 4)
+  assert.equal(binding.mode, "existing")
+  assert.equal(binding.state, "bound")
+  await assert.rejects(
+    broker.startConversationAdoption({
+      canonicalUrl,
+      taskSpace: 11,
+      timeoutMs: 30_000,
+    }),
+    (error) => (
+      error.code === "conversation_already_bound"
+      && error.details?.bindingKey === "adopted-review"
+    ),
+  )
+  assert.equal(adoptionCalls, 1)
+})
+
+test("a read-only conversation adoption resumes safely after a broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/restarted-adoption"
+  const responseText = "Recovered without resending."
+  const responseDigest = digest(responseText)
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const workflow = {
+    bindingKey: "restarted-review",
+    canonicalUrlDigest: digest(canonicalUrl),
+    createdAt: "2026-08-24T00:00:00.000Z",
+    deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+    id: "5f695a20-20e6-4724-aa23-b99e2c7dbb93",
+    kind: "conversation_adoption",
+    phase: "waiting",
+    private: {
+      request: {
+        bindingKey: "restarted-review",
+        canonicalUrl,
+        taskSpace: 11,
+        timeoutMs: 30_000,
+      },
+    },
+    status: "running",
+    updatedAt: "2026-08-24T00:00:00.000Z",
+  }
+  await store.persist("workflow.started", workflow)
+
+  let adoptionCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    adopt: async () => {
+      adoptionCalls += 1
+      return {
+        adoptedWhileGenerating: false,
+        anchor: { contentDigest: "d".repeat(64), messageId: "restart-user" },
+        canonicalUrl,
+        durationMs: 1_000,
+        head: {
+          fingerprint: "restart-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: responseDigest,
+          lastMessageId: "restart-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest,
+        responseText,
+        targetId: "restart-tab",
+        taskSpaceId: 11,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: workflow.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.responseText, "Recovered without resending.")
+  assert.equal(adoptionCalls, 1)
+  assert.equal(broker.getConversationBinding({ bindingKey: "restarted-review" }).state, "bound")
+})
+
+test("a captured adoption finalizes its binding after restart without reopening the browser", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/captured-adoption"
+  const responseText = "The response was durably captured before restart."
+  const responseDigest = digest(responseText)
+  const capture = {
+    adoptedWhileGenerating: true,
+    anchor: { contentDigest: "f".repeat(64), messageId: "captured-user" },
+    canonicalUrl,
+    durationMs: 20_000,
+    head: {
+      fingerprint: "captured-head",
+      fingerprintVersion: "tail-v1",
+      lastContentDigest: responseDigest,
+      lastMessageId: "captured-assistant",
+      lastRole: "assistant",
+      messageCount: 6,
+      renderedMessageCount: 6,
+    },
+    modelPolicy: modelPolicyObservation(),
+    responseDigest,
+    responseText,
+    targetId: "captured-tab",
+    taskSpaceId: 13,
+  }
+  const workflow = {
+    bindingKey: "captured-review",
+    canonicalUrlDigest: digest(canonicalUrl),
+    createdAt: "2026-08-24T00:00:00.000Z",
+    deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+    id: "94101294-a21f-4664-8aca-dbe673aad8f7",
+    kind: "conversation_adoption",
+    phase: "captured",
+    private: {
+      capture,
+      request: {
+        bindingKey: "captured-review",
+        canonicalUrl,
+        taskSpace: 13,
+        timeoutMs: 30_000,
+      },
+    },
+    status: "running",
+    updatedAt: "2026-08-24T00:00:00.000Z",
+  }
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("adoption.response_captured", workflow)
+  let adoptionCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => {
+        adoptionCalls += 1
+        throw new Error("captured adoption must not reopen the browser")
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: workflow.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.responseDigest, responseDigest)
+  assert.equal(adoptionCalls, 0)
+  assert.equal(broker.getConversationBinding({ bindingKey: "captured-review" }).adoptionWorkflowId, workflow.id)
+})
+
+test("conversation adoption rejects non-private canonical URLs before opening the browser", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  let adoptionCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => {
+        adoptionCalls += 1
+        throw new Error("invalid URL must not reach the browser")
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  for (const canonicalUrl of [
+    "https://chatgpt.com/share/not-the-private-conversation",
+    "https://user:password@chatgpt.com/c/credential-bearing",
+    "https://chatgpt.com:8443/c/nonstandard-port",
+  ]) {
+    await assert.rejects(
+      broker.startConversationAdoption({
+        bindingKey: "invalid-review",
+        canonicalUrl,
+        taskSpace: 14,
+        timeoutMs: 30_000,
+      }),
+      (error) => error.code === "invalid_input",
+    )
+  }
+  assert.equal(adoptionCalls, 0)
+})
+
+test("conversation adoption does not enter a task space with an active bound operation", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  let releaseExchange
+  let adoptionCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    adopt: async () => {
+      adoptionCalls += 1
+      throw new Error("busy task space must not reach adoption")
+    },
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: {
+        fingerprint: "busy-initial-head",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "busy-tab",
+      taskSpaceId: 15,
+    }),
+    exchange: async () => {
+      await new Promise((resolve) => {
+        releaseExchange = resolve
+      })
+      throw new EgoChatError("human_required", "Test exchange stopped.", {
+        reason: "test_exchange_stopped",
+      })
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  await broker.bindConversation({
+    bindingKey: "busy-review",
+    canonicalUrl: "https://chatgpt.com/c/busy-review",
+    mode: "existing",
+    taskSpace: 15,
+  })
+  const turnMarker = "EGO_CHAT_BUSY_SPACE_1234"
+  const exchange = await broker.startEgoExchange({
+    bindingKey: "busy-review",
+    expectedTerminalMarker: "BUSY_SPACE_DONE",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+
+  await assert.rejects(
+    broker.startConversationAdoption({
+      canonicalUrl: "https://chatgpt.com/c/new-adoption",
+      taskSpace: 15,
+      timeoutMs: 30_000,
+    }),
+    (error) => error.code === "task_space_busy",
+  )
+  assert.equal(adoptionCalls, 0)
+
+  releaseExchange()
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: exchange.id })
+  assert.equal(stopped.status, "human_required")
 })
 
 test("maximum policy automatically records a future strongest model without a code change", async (t) => {

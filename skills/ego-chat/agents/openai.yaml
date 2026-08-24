@@ -1,7 +1,7 @@
 interface:
   display_name: "Ego Chat"
-  short_description: "Continuous agent and ChatGPT review loops"
-  default_prompt: "Use $ego-chat to review this work with ChatGPT until the acceptance criteria are settled."
+  short_description: "Token-saving ChatGPT handoffs and review loops"
+  default_prompt: "Use $ego-chat in Token-Saver mode to review this work with ChatGPT until the acceptance criteria are settled."
 dependencies:
   tools:
     - type: "mcp"

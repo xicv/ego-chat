@@ -36,6 +36,9 @@ async function egoDriverMain() {
     const parsed = new URL(value)
     return parsed.protocol === "https:"
       && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
+      && parsed.username === ""
+      && parsed.password === ""
+      && parsed.port === ""
   }
 
   function isCanonicalConversationUrl(value) {
@@ -448,6 +451,83 @@ async function egoDriverMain() {
     }
   }
 
+  async function verifyExistingMaximumModelPolicy(selected) {
+    const policy = input.modelPolicy
+    if (
+      !policy
+      || policy.key !== "chatgpt-web-default"
+      || policy.modelSelection !== "strongest_available"
+      || policy.thinkingEffort !== "maximum_available"
+      || policy.enforcement !== "repair_then_verify"
+    ) {
+      humanRequired("model_policy_unsupported", "The broker supplied an unsupported ChatGPT model policy.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return null
+    }
+
+    const trigger = await js(String.raw`(() => {
+      const pills = [...document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+        .filter((element) => element.getClientRects().length > 0)
+      return {
+        count: pills.length,
+        expanded: pills[0]?.getAttribute('aria-expanded') === 'true',
+      }
+    })()`)
+    if (trigger.count !== 1) {
+      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not be identified unambiguously.", {
+        pillCount: trigger.count,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return null
+    }
+    if (!trigger.expanded) {
+      await click('button.__composer-pill[aria-haspopup="menu"]', { label: "inspect ChatGPT policy menu" })
+      await wait(1)
+    }
+
+    const observed = await waitForModelPolicyMenu()
+    const labelsValid = observed.ok
+      && observed.modelLabel.length <= 120
+      && observed.effortLabel.length <= 120
+      && observed.pillLabel.length <= 120
+      && !/[\u0000-\u001F\u007F]/.test(`${observed.modelLabel}${observed.effortLabel}${observed.pillLabel}`)
+    const closed = await closeModelPolicyMenu()
+    if (!labelsValid || !closed) {
+      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power policy could not be read safely during adoption.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return null
+    }
+
+    const powerLevel = observed.current - observed.minimum + 1
+    const powerMax = observed.maximum - observed.minimum + 1
+    if (observed.current !== observed.maximum) {
+      humanRequired("adoption_live_model_not_maximum", "The existing response cannot be adopted because the conversation's live policy is not currently at ChatGPT's maximum setting.", {
+        effortLabel: observed.effortLabel,
+        modelLabel: observed.modelLabel,
+        powerLevel,
+        powerMax,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return null
+    }
+
+    return {
+      adjusted: false,
+      effortLabel: observed.effortLabel,
+      key: policy.key,
+      modelLabel: observed.modelLabel,
+      pillLabel: observed.pillLabel,
+      powerLevel,
+      powerMax,
+    }
+  }
+
   async function selectConversation(binding) {
     if (binding.state === "unbound") {
       const selected = await selectExactTarget(binding.taskSpaceId, binding.targetId)
@@ -602,6 +682,207 @@ async function egoDriverMain() {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       },
+    })
+  }
+
+  async function adopt() {
+    const selected = await selectConversation({
+      canonicalUrl: input.canonicalUrl,
+      startUrl: input.canonicalUrl,
+      state: "bound",
+      targetId: input.targetId || null,
+      taskSpaceId: input.taskSpace,
+    })
+    if (!selected) {
+      return
+    }
+
+    const startedAt = Date.now()
+    const canonicalUrl = normalizeUrl(input.canonicalUrl)
+    const initialEntries = await readConversationEntries()
+    let anchorIndex = -1
+    for (let index = initialEntries.length - 1; index >= 0; index -= 1) {
+      if (initialEntries[index].role === "user") {
+        anchorIndex = index
+        break
+      }
+    }
+    const anchor = initialEntries[anchorIndex]
+    if (!anchor || !anchor.messageId) {
+      humanRequired("adoption_anchor_missing", "The conversation has no uniquely identifiable latest user turn to adopt.", {
+        renderedMessageCount: initialEntries.length,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    const initialPrefixFingerprint = legacyConversationFingerprint(initialEntries.slice(0, anchorIndex + 1))
+    const initialTail = initialEntries.slice(anchorIndex + 1)
+    if (initialTail.length > 1 || (initialTail[0] && initialTail[0].role !== "assistant")) {
+      humanRequired("adoption_tail_interleaved", "The latest user turn is not followed by at most one assistant response.", {
+        committedCount: initialTail.length,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    const adoptedWhileGenerating = await js(String.raw`Boolean(
+      document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+    )`)
+    if (!adoptedWhileGenerating && initialTail.length !== 1) {
+      humanRequired("adoption_response_missing", "The latest user turn has no assistant response to adopt.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    let stableDigest = null
+    let stableHeadFingerprint = null
+    let stableCount = 0
+    while (Date.now() - startedAt < input.timeoutMs) {
+      const info = await pageInfo()
+      if (normalizeUrl(info.url) !== canonicalUrl) {
+        humanRequired("adoption_url_changed", "The ChatGPT conversation URL changed while adoption was waiting.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+
+      const generationRunning = await js(String.raw`Boolean(
+        document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+      )`)
+      const entries = await readConversationEntries()
+      const anchorIndexes = entries
+        .map((entry, index) => entry.messageId === anchor.messageId ? index : -1)
+        .filter((index) => index >= 0)
+      const currentAnchorIndex = anchorIndexes[0] ?? -1
+      const currentAnchor = currentAnchorIndex >= 0 ? entries[currentAnchorIndex] : null
+      const prefixFingerprint = currentAnchorIndex >= 0
+        ? legacyConversationFingerprint(entries.slice(0, currentAnchorIndex + 1))
+        : null
+      if (
+        anchorIndexes.length !== 1
+        || currentAnchor?.role !== "user"
+        || currentAnchor?.contentDigest !== anchor.contentDigest
+        || prefixFingerprint !== initialPrefixFingerprint
+      ) {
+        humanRequired("adoption_anchor_changed", "The adopted user turn or its preceding conversation changed while waiting.", {
+          anchorCount: anchorIndexes.length,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+
+      const committed = entries.slice(currentAnchorIndex + 1)
+      if (committed.length > 1 || (committed[0] && committed[0].role !== "assistant")) {
+        humanRequired("adoption_tail_interleaved", "Another message interleaved with the adopted user/assistant tail.", {
+          committedCount: committed.length,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+
+      const response = committed[0]
+      const head = summarizeConversationHead(entries)
+      const terminal = !generationRunning
+        && Boolean(response?.messageId)
+        && response?.role === "assistant"
+        && response.text.trim().length > 0
+        && head.lastMessageId === response.messageId
+      if (
+        terminal
+        && response.contentDigest === stableDigest
+        && head.fingerprint === stableHeadFingerprint
+      ) {
+        stableCount += 1
+      } else if (terminal) {
+        stableDigest = response.contentDigest
+        stableHeadFingerprint = head.fingerprint
+        stableCount = 1
+      } else {
+        stableDigest = null
+        stableHeadFingerprint = null
+        stableCount = 0
+      }
+
+      if (stableCount >= 2) {
+        const modelPolicy = await verifyExistingMaximumModelPolicy(selected)
+        if (!modelPolicy) {
+          return
+        }
+        observedModelPolicy = modelPolicy
+        const finalInspection = await inspectPage()
+        if (!assertReady(finalInspection, selected)) {
+          return
+        }
+        if (normalizeUrl(finalInspection.info.url) !== canonicalUrl) {
+          humanRequired("adoption_url_changed", "The ChatGPT conversation URL changed before adoption completed.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
+        const finalGenerationRunning = await js(String.raw`Boolean(
+          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+        )`)
+        const finalEntries = await readConversationEntries()
+        const finalAnchorIndexes = finalEntries
+          .map((entry, index) => entry.messageId === anchor.messageId ? index : -1)
+          .filter((index) => index >= 0)
+        const finalAnchorIndex = finalAnchorIndexes[0] ?? -1
+        const finalPrefixFingerprint = finalAnchorIndex >= 0
+          ? legacyConversationFingerprint(finalEntries.slice(0, finalAnchorIndex + 1))
+          : null
+        const finalCommitted = finalAnchorIndex >= 0 ? finalEntries.slice(finalAnchorIndex + 1) : []
+        const finalResponse = finalCommitted[0]
+        const finalHead = summarizeConversationHead(finalEntries)
+        const finalCaptureMatches = !finalGenerationRunning
+          && finalAnchorIndexes.length === 1
+          && finalPrefixFingerprint === initialPrefixFingerprint
+          && finalCommitted.length === 1
+          && finalResponse?.role === "assistant"
+          && finalResponse?.messageId === response.messageId
+          && finalResponse?.contentDigest === response.contentDigest
+          && finalHead.fingerprint === head.fingerprint
+        if (!finalCaptureMatches) {
+          humanRequired("adoption_capture_unstable", "The adopted response changed during the final capture check.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
+        emit({
+          ok: true,
+          result: {
+            adoptedWhileGenerating,
+            anchor: {
+              contentDigest: anchor.contentDigest,
+              messageId: anchor.messageId,
+            },
+            canonicalUrl,
+            durationMs: Date.now() - startedAt,
+            head: finalHead,
+            modelPolicy,
+            responseDigest: finalResponse.contentDigest,
+            responseText: finalResponse.text,
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          },
+        })
+        return
+      }
+      await wait(generationRunning ? 5 : 1)
+    }
+
+    humanRequired("adoption_timeout", "The adopted ChatGPT response did not become stable before the deadline.", {
+      targetId: selected.targetId,
+      taskSpaceId: selected.task.id,
     })
   }
 
@@ -1201,6 +1482,8 @@ async function egoDriverMain() {
   try {
     if (input.mode === "preflight") {
       await preflight()
+    } else if (input.mode === "adopt") {
+      await adopt()
     } else if (input.mode === "bind") {
       await bind()
     } else if (input.mode === "exchange") {

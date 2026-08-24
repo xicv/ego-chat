@@ -79,6 +79,10 @@ export class EgoAdapter {
     return this.#run({ ...bindingInput, bindingMode, mode: "bind" }, 60_000, signal)
   }
 
+  async adopt(params, signal = undefined) {
+    return this.#run({ ...params, mode: "adopt" }, params.timeoutMs + 60_000, signal)
+  }
+
   async exchange(params, signal = undefined) {
     return this.#run({ mode: "exchange", ...params }, params.timeoutMs + 60_000, signal)
   }

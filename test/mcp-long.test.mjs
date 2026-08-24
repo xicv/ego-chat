@@ -14,7 +14,7 @@ import {
 
 const runLongTest = process.env.EGO_CHAT_RUN_LONG_TESTS === "1"
 
-test("MCP call stays active beyond the SDK default timeout when explicitly configured", {
+test("progress and Token-Saver MCP calls both stay active beyond the SDK default timeout", {
   skip: !runLongTest,
   timeout: 90_000,
 }, async (t) => {
@@ -34,21 +34,39 @@ test("MCP call stays active beyond the SDK default timeout when explicitly confi
   t.after(() => client.close())
 
   let progressEvents = 0
+  let tokenSaverProgressEvents = 0
   const startedAt = Date.now()
-  const result = await client.callTool({
-    arguments: { delayMs: 65_000, value: "long-mcp-call" },
-    name: "gate0_probe_and_wait",
-  }, CallToolResultSchema, {
-    maxTotalTimeout: 80_000,
-    onprogress: () => {
-      progressEvents += 1
-    },
-    resetTimeoutOnProgress: true,
-    timeout: 70_000,
-  })
+  const [progressResult, tokenSaverResult] = await Promise.all([
+    client.callTool({
+      arguments: { delayMs: 65_000, value: "long-progress-call", waitMode: "progress" },
+      name: "gate0_probe_and_wait",
+    }, CallToolResultSchema, {
+      maxTotalTimeout: 80_000,
+      onprogress: () => {
+        progressEvents += 1
+      },
+      resetTimeoutOnProgress: true,
+      timeout: 70_000,
+    }),
+    client.callTool({
+      arguments: { delayMs: 65_000, value: "long-token-saver-call", waitMode: "token_saver" },
+      name: "gate0_probe_and_wait",
+    }, CallToolResultSchema, {
+      maxTotalTimeout: 80_000,
+      onprogress: () => {
+        tokenSaverProgressEvents += 1
+      },
+      resetTimeoutOnProgress: true,
+      timeout: 70_000,
+    }),
+  ])
   const elapsedMs = Date.now() - startedAt
 
-  assert.equal(result.structuredContent.status, "succeeded")
+  assert.equal(progressResult.structuredContent.status, "succeeded")
+  assert.equal(progressResult.structuredContent.waitMode, "progress")
+  assert.equal(tokenSaverResult.structuredContent.status, "succeeded")
+  assert.equal(tokenSaverResult.structuredContent.waitMode, "token_saver")
   assert.ok(elapsedMs >= 65_000, `expected at least 65000ms, observed ${elapsedMs}ms`)
   assert.ok(progressEvents >= 2, `expected at least two progress events, observed ${progressEvents}`)
+  assert.equal(tokenSaverProgressEvents, 0)
 })
