@@ -1,0 +1,10 @@
+interface:
+  display_name: "Ego Chat"
+  short_description: "Continuous Codex and ChatGPT review loops"
+  default_prompt: "Use $ego-chat to review this work with ChatGPT until the acceptance criteria are settled."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "ego_chat"
+      description: "Local Ego Chat MCP server installed by ego-chat setup"
+      transport: "stdio"

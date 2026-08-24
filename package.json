@@ -1,0 +1,31 @@
+{
+  "name": "ego-chat",
+  "version": "0.0.0-gate0",
+  "private": true,
+  "description": "Gate 0 integration spike for durable Codex and ChatGPT handoffs through Ego Browser",
+  "type": "module",
+  "bin": {
+    "ego-chat": "./bin/ego-chat.mjs",
+    "ego-chatd": "./bin/ego-chatd.mjs",
+    "ego-chat-mcp": "./bin/ego-chat-mcp.mjs"
+  },
+  "scripts": {
+    "audit": "npm audit --audit-level=high",
+    "gate0:app-server": "node ./scripts/app-server-gate.mjs",
+    "gate0:codex-mcp": "node ./scripts/codex-mcp-gate.mjs",
+    "gate0:ego": "node ./scripts/ego-gate.mjs",
+    "lint": "eslint bin src scripts test eslint.config.mjs",
+    "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "test:long": "EGO_CHAT_RUN_LONG_TESTS=1 node --test --test-reporter=spec test/mcp-long.test.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "eslint": "10.9.0"
+  }
+}

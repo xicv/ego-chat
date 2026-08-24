@@ -1,0 +1,857 @@
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use toml_edit::{Array, DocumentMut, Item, Table, value};
+
+const MINIMUM_NODE_MAJOR: u64 = 24;
+const RUNTIME_MARKER: &str = ".ego-chat-runtime-version";
+const MCP_SERVER_NAME: &str = "ego_chat";
+const MCP_TOOL_TIMEOUT_SECONDS: i64 = 1_900;
+const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
+
+struct EmbeddedFile {
+    path: &'static str,
+    bytes: &'static [u8],
+}
+
+const RUNTIME_FILES: &[EmbeddedFile] = &[
+    EmbeddedFile {
+        path: "package.json",
+        bytes: include_bytes!("../package.json"),
+    },
+    EmbeddedFile {
+        path: "package-lock.json",
+        bytes: include_bytes!("../package-lock.json"),
+    },
+    EmbeddedFile {
+        path: "bin/ego-chat-mcp.mjs",
+        bytes: include_bytes!("../bin/ego-chat-mcp.mjs"),
+    },
+    EmbeddedFile {
+        path: "bin/ego-chat.mjs",
+        bytes: include_bytes!("../bin/ego-chat.mjs"),
+    },
+    EmbeddedFile {
+        path: "bin/ego-chatd.mjs",
+        bytes: include_bytes!("../bin/ego-chatd.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/app-server-client.mjs",
+        bytes: include_bytes!("../src/app-server-client.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/auth-token.mjs",
+        bytes: include_bytes!("../src/auth-token.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/broker.mjs",
+        bytes: include_bytes!("../src/broker.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/config.mjs",
+        bytes: include_bytes!("../src/config.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/constants.mjs",
+        bytes: include_bytes!("../src/constants.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/convergence.mjs",
+        bytes: include_bytes!("../src/convergence.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/ego-adapter.mjs",
+        bytes: include_bytes!("../src/ego-adapter.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/ego-driver-source.mjs",
+        bytes: include_bytes!("../src/ego-driver-source.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/errors.mjs",
+        bytes: include_bytes!("../src/errors.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/ipc-client.mjs",
+        bytes: include_bytes!("../src/ipc-client.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/ipc-server.mjs",
+        bytes: include_bytes!("../src/ipc-server.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/mcp-server.mjs",
+        bytes: include_bytes!("../src/mcp-server.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/store.mjs",
+        bytes: include_bytes!("../src/store.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/validation.mjs",
+        bytes: include_bytes!("../src/validation.mjs"),
+    },
+];
+
+const SKILL_FILES: &[EmbeddedFile] = &[
+    EmbeddedFile {
+        path: "SKILL.md",
+        bytes: include_bytes!("../skills/ego-chat/SKILL.md"),
+    },
+    EmbeddedFile {
+        path: "agents/openai.yaml",
+        bytes: include_bytes!("../skills/ego-chat/agents/openai.yaml"),
+    },
+];
+
+#[derive(Clone, Debug)]
+struct InstallPaths {
+    codex_config: PathBuf,
+    runtime_dir: PathBuf,
+    skill_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct Toolchain {
+    codex: PathBuf,
+    ego_browser: PathBuf,
+    node: PathBuf,
+    npm: PathBuf,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(code),
+        Err(message) => {
+            eprintln!("ego-chat: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<u8, String> {
+    let mut args = env::args_os().skip(1).collect::<Vec<_>>();
+    let command = args
+        .first()
+        .and_then(|value| value.to_str())
+        .unwrap_or("help");
+
+    match command {
+        "help" | "--help" | "-h" => {
+            print_help();
+            Ok(0)
+        }
+        "version" | "--version" | "-V" => {
+            println!("ego-chat {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
+        "setup" => {
+            args.remove(0);
+            let flags = parse_setup_flags(&args)?;
+            setup(flags.force, !flags.skip_codex_config)?;
+            Ok(0)
+        }
+        "install-skill" => {
+            args.remove(0);
+            let force = parse_force_only(&args)?;
+            let paths = InstallPaths::discover()?;
+            install_skill(&paths.skill_dir, force)?;
+            println!("Installed Codex skill at {}", paths.skill_dir.display());
+            Ok(0)
+        }
+        "doctor" => {
+            doctor()?;
+            Ok(0)
+        }
+        "mcp" => {
+            args.remove(0);
+            proxy_node("bin/ego-chat-mcp.mjs", &args)
+        }
+        _ => proxy_node("bin/ego-chat.mjs", &args),
+    }
+}
+
+#[derive(Default)]
+struct SetupFlags {
+    force: bool,
+    skip_codex_config: bool,
+}
+
+fn parse_setup_flags(args: &[OsString]) -> Result<SetupFlags, String> {
+    let mut flags = SetupFlags::default();
+    for arg in args {
+        match arg.to_str() {
+            Some("--force") => flags.force = true,
+            Some("--skip-codex-config") => flags.skip_codex_config = true,
+            Some(value) => return Err(format!("unknown setup option {value:?}")),
+            None => return Err("setup options must be valid UTF-8".to_string()),
+        }
+    }
+    Ok(flags)
+}
+
+fn parse_force_only(args: &[OsString]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [value] if value == "--force" => Ok(true),
+        _ => Err("install-skill accepts only the optional --force flag".to_string()),
+    }
+}
+
+fn print_help() {
+    println!(
+        "Ego Chat portable launcher\n\n\
+Usage:\n  \
+  ego-chat setup [--force] [--skip-codex-config]\n  \
+  ego-chat install-skill [--force]\n  \
+  ego-chat doctor\n  \
+  ego-chat mcp\n  \
+  ego-chat <broker-cli-command> [args...]\n\n\
+setup installs the embedded, versioned Node runtime and Codex skill, then registers this executable as the ego_chat MCP server.\n\
+All other commands are forwarded to the qualified Ego Chat broker CLI."
+    );
+}
+
+impl InstallPaths {
+    fn discover() -> Result<Self, String> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_string())?;
+        let codex_home = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
+        let install_root = env::var_os("EGO_CHAT_INSTALL_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Ego Chat")
+                    .join("runtime")
+            });
+        Ok(Self {
+            codex_config: codex_home.join("config.toml"),
+            runtime_dir: install_root.join(env!("CARGO_PKG_VERSION")),
+            skill_dir: codex_home.join("skills").join("ego-chat"),
+        })
+    }
+}
+
+impl Toolchain {
+    fn discover() -> Result<Self, String> {
+        Ok(Self {
+            codex: find_program("codex", "EGO_CHAT_CODEX")?,
+            ego_browser: find_program("ego-browser", "EGO_CHAT_EGO_BROWSER")?,
+            node: find_program("node", "EGO_CHAT_NODE")?,
+            npm: find_program("npm", "EGO_CHAT_NPM")?,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let node_version = command_output(&self.node, &[OsStr::new("--version")])?;
+        let major = parse_node_major(&node_version)
+            .ok_or_else(|| format!("could not parse Node.js version {node_version:?}"))?;
+        if major < MINIMUM_NODE_MAJOR {
+            return Err(format!(
+                "Node.js {MINIMUM_NODE_MAJOR} or newer is required; found {node_version}"
+            ));
+        }
+        command_output(&self.npm, &[OsStr::new("--version")])?;
+        command_output(&self.codex, &[OsStr::new("--version")])?;
+        command_output(&self.ego_browser, &[OsStr::new("--help")])?;
+        Ok(())
+    }
+
+    fn prepend_path(&self, command: &mut Command) -> Result<(), String> {
+        let mut directories = Vec::new();
+        for program in [&self.node, &self.npm, &self.codex, &self.ego_browser] {
+            if let Some(parent) = program.parent()
+                && !directories.iter().any(|candidate| candidate == parent)
+            {
+                directories.push(parent.to_path_buf());
+            }
+        }
+        if let Some(existing) = env::var_os("PATH") {
+            directories.extend(env::split_paths(&existing));
+        }
+        let joined = env::join_paths(directories)
+            .map_err(|error| format!("could not construct child PATH: {error}"))?;
+        command.env("PATH", joined);
+        Ok(())
+    }
+}
+
+fn setup(force: bool, configure: bool) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("the Ego Lite integration currently supports macOS only".to_string());
+    }
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover()?;
+    tools.validate()?;
+    install_runtime(&paths.runtime_dir, &tools, force)?;
+    install_skill(&paths.skill_dir, force)?;
+
+    if configure {
+        let executable = env::current_exe()
+            .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+        configure_codex(&paths.codex_config, &executable, force)?;
+    }
+
+    println!("Ego Chat runtime: {}", paths.runtime_dir.display());
+    println!("Codex skill: {}", paths.skill_dir.display());
+    if configure {
+        println!("Codex MCP server: {MCP_SERVER_NAME}");
+        println!("Restart Codex.app, then use /mcp to verify the connection.");
+    } else {
+        println!("Codex MCP configuration was skipped.");
+    }
+    Ok(())
+}
+
+fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result<(), String> {
+    let marker = runtime_dir.join(RUNTIME_MARKER);
+    let version_matches = fs::read_to_string(&marker)
+        .map(|value| value.trim() == env!("CARGO_PKG_VERSION"))
+        .unwrap_or(false);
+    let dependencies_present = runtime_dir
+        .join("node_modules/@modelcontextprotocol/sdk/package.json")
+        .is_file()
+        && runtime_dir.join("node_modules/zod/package.json").is_file();
+    if version_matches && dependencies_present && !force {
+        return Ok(());
+    }
+    if runtime_dir.exists() && !version_matches && !force {
+        return Err(format!(
+            "{} contains an unmanaged or incomplete runtime; inspect it and rerun setup with --force to repair managed files",
+            runtime_dir.display()
+        ));
+    }
+
+    for file in RUNTIME_FILES {
+        let destination = safe_join(runtime_dir, file.path)?;
+        write_atomic(&destination, file.bytes)?;
+    }
+    write_atomic(
+        &runtime_dir.join(".node-path"),
+        path_bytes(&tools.node)?.as_bytes(),
+    )?;
+    write_atomic(
+        &runtime_dir.join(".npm-path"),
+        path_bytes(&tools.npm)?.as_bytes(),
+    )?;
+    write_atomic(
+        &runtime_dir.join(".codex-path"),
+        path_bytes(&tools.codex)?.as_bytes(),
+    )?;
+    write_atomic(
+        &runtime_dir.join(".ego-browser-path"),
+        path_bytes(&tools.ego_browser)?.as_bytes(),
+    )?;
+
+    let mut npm = Command::new(&tools.npm);
+    npm.args(["ci", "--omit=dev", "--ignore-scripts"])
+        .current_dir(runtime_dir);
+    tools.prepend_path(&mut npm)?;
+    let status = npm
+        .status()
+        .map_err(|error| format!("could not run npm ci: {error}"))?;
+    if !status.success() {
+        return Err(format!("npm ci failed with status {status}"));
+    }
+    write_atomic(
+        &marker,
+        format!("{}\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn install_skill(skill_dir: &Path, force: bool) -> Result<(), String> {
+    let conflicts = SKILL_FILES.iter().any(|file| {
+        let destination = skill_dir.join(file.path);
+        destination.exists()
+            && fs::read(&destination)
+                .map(|existing| existing != file.bytes)
+                .unwrap_or(true)
+    });
+    if conflicts && !force {
+        return Err(format!(
+            "{} contains a different Ego Chat skill; rerun with --force only if it is safe to replace the managed files",
+            skill_dir.display()
+        ));
+    }
+    for file in SKILL_FILES {
+        let destination = safe_join(skill_dir, file.path)?;
+        write_atomic(&destination, file.bytes)?;
+    }
+    Ok(())
+}
+
+fn configure_codex(config_path: &Path, executable: &Path, force: bool) -> Result<(), String> {
+    let original = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?;
+    if document.get("mcp_servers").is_none() {
+        document["mcp_servers"] = Item::Table(Table::new());
+    }
+    let servers = document["mcp_servers"]
+        .as_table_mut()
+        .ok_or_else(|| "mcp_servers exists but is not a TOML table".to_string())?;
+    let executable = path_bytes(executable)?;
+
+    if let Some(existing) = servers.get(MCP_SERVER_NAME)
+        && !server_matches(existing, &executable)
+        && !force
+    {
+        return Err(format!(
+            "Codex already has a different {MCP_SERVER_NAME} MCP server; rerun with --force only after verifying that replacement is intended"
+        ));
+    }
+
+    if servers.get(MCP_SERVER_NAME).is_none()
+        || !server_matches(
+            servers.get(MCP_SERVER_NAME).expect("checked above"),
+            &executable,
+        )
+    {
+        servers[MCP_SERVER_NAME] = Item::Table(Table::new());
+    }
+    let table = servers[MCP_SERVER_NAME]
+        .as_table_mut()
+        .ok_or_else(|| format!("mcp_servers.{MCP_SERVER_NAME} is not a TOML table"))?;
+    let mut arguments = Array::new();
+    arguments.push("mcp");
+    table["command"] = value(executable);
+    table["args"] = value(arguments);
+    table["required"] = value(true);
+    table["startup_timeout_sec"] = value(30);
+    let existing_timeout = table
+        .get("tool_timeout_sec")
+        .and_then(Item::as_integer)
+        .unwrap_or_default();
+    if existing_timeout < MCP_TOOL_TIMEOUT_SECONDS {
+        table["tool_timeout_sec"] = value(MCP_TOOL_TIMEOUT_SECONDS);
+    }
+    let configured = keep_server_after_coco_marker(document.to_string());
+    write_atomic(config_path, configured.as_bytes())?;
+    Ok(())
+}
+
+fn keep_server_after_coco_marker(config: String) -> String {
+    let server_header = format!("[mcp_servers.{MCP_SERVER_NAME}]");
+    let mut lines = config.split_inclusive('\n').collect::<Vec<_>>();
+    let Some(server_index) = lines
+        .iter()
+        .position(|line| line.trim_end() == server_header)
+    else {
+        return config;
+    };
+    let Some(marker_index) = lines
+        .iter()
+        .position(|line| line.trim_end() == COCO_MCP_END_MARKER)
+    else {
+        return config;
+    };
+    if marker_index < server_index {
+        return config;
+    }
+
+    let marker = lines.remove(marker_index);
+    let server_index = lines
+        .iter()
+        .position(|line| line.trim_end() == server_header)
+        .expect("server header was not removed");
+    lines.insert(server_index, marker);
+    lines.concat()
+}
+
+fn server_matches(item: &Item, executable: &str) -> bool {
+    let Some(table) = item.as_table() else {
+        return false;
+    };
+    let command_matches = table.get("command").and_then(Item::as_str) == Some(executable);
+    let args_match = table
+        .get("args")
+        .and_then(Item::as_array)
+        .map(|values| {
+            values.len() == 1 && values.get(0).and_then(|value| value.as_str()) == Some("mcp")
+        })
+        .unwrap_or(false);
+    command_matches && args_match
+}
+
+fn doctor() -> Result<(), String> {
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover()?;
+    let mut failures = Vec::new();
+
+    match tools.validate() {
+        Ok(()) => println!("[ok] Node.js, npm, Codex, and ego-browser are available"),
+        Err(error) => {
+            println!("[fail] {error}");
+            failures.push(error);
+        }
+    }
+    if runtime_ready(&paths.runtime_dir) {
+        println!("[ok] Runtime {} is installed", paths.runtime_dir.display());
+    } else {
+        let message = format!("Runtime {} is not ready", paths.runtime_dir.display());
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    if skill_matches(&paths.skill_dir) {
+        println!(
+            "[ok] Codex skill {} is installed",
+            paths.skill_dir.display()
+        );
+    } else {
+        let message = format!(
+            "Codex skill {} is missing or differs",
+            paths.skill_dir.display()
+        );
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+    if codex_server_matches(&paths.codex_config, &executable)? {
+        println!("[ok] Codex MCP server {MCP_SERVER_NAME} points to this executable");
+    } else {
+        let message = format!("Codex MCP server {MCP_SERVER_NAME} is missing or points elsewhere");
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+
+    if failures.is_empty() {
+        println!("Ego Chat is ready. Restart Codex.app after configuration changes.");
+        Ok(())
+    } else {
+        Err(format!(
+            "doctor found {} problem(s); run ego-chat setup",
+            failures.len()
+        ))
+    }
+}
+
+fn runtime_ready(runtime_dir: &Path) -> bool {
+    fs::read_to_string(runtime_dir.join(RUNTIME_MARKER))
+        .map(|value| value.trim() == env!("CARGO_PKG_VERSION"))
+        .unwrap_or(false)
+        && runtime_dir
+            .join("node_modules/@modelcontextprotocol/sdk/package.json")
+            .is_file()
+        && runtime_dir.join("node_modules/zod/package.json").is_file()
+}
+
+fn skill_matches(skill_dir: &Path) -> bool {
+    SKILL_FILES.iter().all(|file| {
+        fs::read(skill_dir.join(file.path))
+            .map(|existing| existing == file.bytes)
+            .unwrap_or(false)
+    })
+}
+
+fn codex_server_matches(config_path: &Path, executable: &Path) -> Result<bool, String> {
+    let contents = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    let document = contents
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?;
+    let Some(server) = document
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+    else {
+        return Ok(false);
+    };
+    Ok(server_matches(server, &path_bytes(executable)?))
+}
+
+fn proxy_node(script: &str, arguments: &[OsString]) -> Result<u8, String> {
+    let paths = InstallPaths::discover()?;
+    if !runtime_ready(&paths.runtime_dir) {
+        return Err("the embedded runtime is not installed; run ego-chat setup first".to_string());
+    }
+    let node = read_managed_path(&paths.runtime_dir.join(".node-path"))?;
+    let tools = Toolchain {
+        codex: read_managed_path(&paths.runtime_dir.join(".codex-path"))?,
+        ego_browser: read_managed_path(&paths.runtime_dir.join(".ego-browser-path"))?,
+        node: node.clone(),
+        npm: read_managed_path(&paths.runtime_dir.join(".npm-path"))?,
+    };
+    let script_path = safe_join(&paths.runtime_dir, script)?;
+    let mut command = Command::new(node);
+    command.arg(script_path).args(arguments);
+    tools.prepend_path(&mut command)?;
+
+    #[cfg(unix)]
+    {
+        let error = command.exec();
+        Err(format!(
+            "could not launch the embedded Node runtime: {error}"
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .map_err(|error| format!("could not launch the embedded Node runtime: {error}"))?;
+        Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+    }
+}
+
+fn find_program(name: &str, override_name: &str) -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os(override_name) {
+        return resolve_program(&value)
+            .ok_or_else(|| format!("{override_name} does not identify an executable"));
+    }
+    resolve_program(OsStr::new(name)).ok_or_else(|| {
+        format!(
+            "{name} was not found on PATH; install it or set {override_name} to its absolute path"
+        )
+    })
+}
+
+fn resolve_program(candidate: &OsStr) -> Option<PathBuf> {
+    let path = PathBuf::from(candidate);
+    if path.components().count() > 1 {
+        return path.is_file().then_some(path);
+    }
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(&path))
+        .find(|candidate| candidate.is_file())
+}
+
+fn command_output(program: &Path, arguments: &[&OsStr]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not run {}: {error}", program.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} exited with {}",
+            program.display(),
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_node_major(version: &str) -> Option<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn read_managed_path(path: &Path) -> Result<PathBuf, String> {
+    let value = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; rerun ego-chat setup",
+            path.display()
+        )
+    })?;
+    let parsed = PathBuf::from(value.trim());
+    if !parsed.is_file() {
+        return Err(format!(
+            "managed tool path {} is unavailable; rerun ego-chat setup",
+            parsed.display()
+        ));
+    }
+    Ok(parsed)
+}
+
+fn path_bytes(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("path {} is not valid UTF-8", path.display()))
+}
+
+fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let candidate = root.join(relative);
+    if Path::new(relative).is_absolute()
+        || Path::new(relative)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("embedded path {relative:?} is unsafe"));
+    }
+    Ok(candidate)
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| format!("{} has an invalid file name", path.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{}-{nonce}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
+    file.write_all(contents)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("could not replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                env::temp_dir().join(format!("ego-chat-rust-test-{}-{id}", std::process::id()));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove owned test directory");
+        }
+    }
+
+    #[test]
+    fn node_major_parser_accepts_node_output() {
+        assert_eq!(parse_node_major("v24.19.0"), Some(24));
+        assert_eq!(parse_node_major("23.1.0"), Some(23));
+        assert_eq!(parse_node_major("unknown"), None);
+    }
+
+    #[test]
+    fn embedded_paths_are_relative_and_unique() {
+        let mut paths = RUNTIME_FILES
+            .iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), RUNTIME_FILES.len());
+        for file in RUNTIME_FILES.iter().chain(SKILL_FILES.iter()) {
+            assert!(safe_join(Path::new("/tmp/owned"), file.path).is_ok());
+            assert!(!file.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_configuration_is_scoped_and_preserves_other_entries() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.toml");
+        fs::write(
+            &config,
+            "# keep this comment\nmodel = \"gpt-test\"\n\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .expect("seed config");
+        let executable = directory.0.join("bin/ego-chat");
+        configure_codex(&config, &executable, false).expect("configure Ego Chat");
+        let value = fs::read_to_string(&config).expect("read config");
+        assert!(value.contains("# keep this comment"));
+        assert!(value.contains("[mcp_servers.other]"));
+        let document = value.parse::<DocumentMut>().expect("parse updated config");
+        let server = &document["mcp_servers"][MCP_SERVER_NAME];
+        assert!(server_matches(
+            server,
+            executable.to_str().expect("utf8 path")
+        ));
+        assert_eq!(server["required"].as_bool(), Some(true));
+        assert_eq!(
+            server["tool_timeout_sec"].as_integer(),
+            Some(MCP_TOOL_TIMEOUT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn codex_configuration_refuses_an_unowned_server_without_force() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.toml");
+        fs::write(
+            &config,
+            "[mcp_servers.ego_chat]\ncommand = \"someone-else\"\nargs = [\"mcp\"]\n",
+        )
+        .expect("seed config");
+        let executable = directory.0.join("ego-chat");
+        let error = configure_codex(&config, &executable, false).expect_err("must reject conflict");
+        assert!(error.contains("different ego_chat"));
+        assert!(
+            fs::read_to_string(&config)
+                .expect("read config")
+                .contains("someone-else")
+        );
+    }
+
+    #[test]
+    fn codex_configuration_keeps_ego_chat_outside_coco_managed_section() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.toml");
+        fs::write(
+            &config,
+            "[mcp_servers.computer-use]\ncommand = \"computer-use\"\n# --- end coco MCP server ---\n",
+        )
+        .expect("seed config");
+        let executable = directory.0.join("ego-chat");
+        configure_codex(&config, &executable, false).expect("configure Ego Chat");
+        let value = fs::read_to_string(&config).expect("read config");
+        let marker_index = value.find(COCO_MCP_END_MARKER).expect("managed marker");
+        let server_index = value
+            .find("[mcp_servers.ego_chat]")
+            .expect("Ego Chat server");
+        assert!(marker_index < server_index);
+        assert!(value.contains("[mcp_servers.computer-use]"));
+    }
+
+    #[test]
+    fn skill_installation_requires_force_for_different_managed_files() {
+        let directory = TestDirectory::new();
+        let skill = directory.0.join("ego-chat");
+        fs::create_dir_all(&skill).expect("create skill");
+        fs::write(skill.join("SKILL.md"), "custom skill").expect("write custom skill");
+        assert!(install_skill(&skill, false).is_err());
+        install_skill(&skill, true).expect("force managed skill files");
+        assert!(skill_matches(&skill));
+    }
+}
