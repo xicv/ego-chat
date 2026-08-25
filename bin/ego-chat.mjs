@@ -14,13 +14,15 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | cancel <id> | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | broker-status | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
 try {
   if (command === "ping") {
     print(await requestBroker(config, "ping"))
+  } else if (command === "broker-status") {
+    print(await requestBroker(config, "broker.status"))
   } else if (command === "probe") {
     const delayMs = Number(args[0])
     const value = args[1]
@@ -44,11 +46,31 @@ try {
       { timeoutMs, workflowId: args[0] },
       { timeoutMs: timeoutMs + 5_000 },
     ))
+  } else if (command === "read-result") {
+    const offset = args[2] === undefined ? 0 : Number(args[2])
+    const maxBytes = args[3] === undefined ? 64 * 1024 : Number(args[3])
+    if (!args[0] || !/^[a-f0-9]{64}$/.test(args[1] ?? "") || !Number.isInteger(offset) || !Number.isInteger(maxBytes)) {
+      failUsage("read-result requires a workflow ID, SHA-256 digest, and optional integer offset/max-bytes")
+    }
+    print(await requestBroker(config, "result.read", {
+      expectedDigest: args[1],
+      maxBytes,
+      offset,
+      workflowId: args[0],
+    }))
   } else if (command === "cancel") {
     if (!args[0]) {
       failUsage("cancel requires a workflow ID")
     }
     print(await requestBroker(config, "workflow.cancel", { workflowId: args[0] }))
+  } else if (command === "abandon") {
+    if (!args[0] || args[1] !== "--acknowledge-potential-delivery" || args.length !== 2) {
+      failUsage("abandon requires one workflow ID and --acknowledge-potential-delivery")
+    }
+    print(await requestBroker(config, "workflow.abandon", {
+      acknowledgePotentialDelivery: true,
+      workflowId: args[0],
+    }))
   } else if (command === "preflight") {
     if (!args[0]) {
       failUsage("preflight requires a task-space name or numeric ID")

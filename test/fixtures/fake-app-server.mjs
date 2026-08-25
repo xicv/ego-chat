@@ -2,8 +2,13 @@ import readline from "node:readline"
 
 const lines = readline.createInterface({ input: process.stdin })
 const threadId = "019d0000-0000-7000-8000-000000000001"
+const duplicateTurnReads = process.argv.includes("--duplicate-turn-reads")
+const exitAfterTurnStart = process.argv.includes("--exit-after-turn-start")
+const multipleFinalMessages = process.argv.includes("--multiple-final-messages")
+const phaseUnknownMessages = process.argv.includes("--phase-unknown-messages")
 let turnNumber = 1
 let activeReadsRemaining = 0
+const completedTurns = []
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`)
@@ -27,7 +32,18 @@ lines.on("line", (line) => {
   } else if (message.method === "thread/read") {
     const status = activeReadsRemaining > 0 ? { activeFlags: [], type: "active" } : { type: "idle" }
     activeReadsRemaining = Math.max(0, activeReadsRemaining - 1)
-    send({ id: message.id, result: { thread: { id: message.params.threadId, status } } })
+    send({
+      id: message.id,
+      result: {
+        thread: {
+          id: message.params.threadId,
+          status,
+          ...(message.params.includeTurns
+            ? { turns: duplicateTurnReads ? [...completedTurns, ...completedTurns] : completedTurns }
+            : {}),
+        },
+      },
+    })
   } else if (message.method === "thread/unsubscribe") {
     send({ id: message.id, result: {} })
   } else if (message.method === "turn/start") {
@@ -44,11 +60,37 @@ lines.on("line", (line) => {
     const turn = {
       durationMs: 1,
       id: `019d0000-0000-7000-8000-${String(turnNumber).padStart(12, "0")}`,
-      items: [{ id: `message-${turnNumber}`, text: responseText, type: "agentMessage" }],
+      items: [
+        {
+          id: `commentary-${turnNumber}`,
+          phase: phaseUnknownMessages ? null : "commentary",
+          text: "The fake App Server is preparing the terminal response.",
+          type: "agentMessage",
+        },
+        ...(multipleFinalMessages
+          ? [{
+              id: `superseded-final-${turnNumber}`,
+              phase: "final_answer",
+              text: "This superseded final item is not the terminal structured envelope.",
+              type: "agentMessage",
+            }]
+          : []),
+        {
+          id: `message-${turnNumber}`,
+          phase: phaseUnknownMessages ? null : "final_answer",
+          text: responseText,
+          type: "agentMessage",
+        },
+      ],
       status: "completed",
     }
+    completedTurns.push(turn)
     activeReadsRemaining = 1
     send({ id: message.id, result: { turn: { ...turn, items: [], status: "inProgress" } } })
+    if (exitAfterTurnStart) {
+      setTimeout(() => process.exit(70), 10)
+      return
+    }
     send({ method: "turn/completed", params: { threadId, turn } })
   }
 })

@@ -6,25 +6,62 @@ import { EventStore } from "../src/store.mjs"
 import { EgoAdapter } from "../src/ego-adapter.mjs"
 import { loadConfig } from "../src/config.mjs"
 import { loadOrCreateBrokerToken } from "../src/auth-token.mjs"
-import { startIpcServer } from "../src/ipc-server.mjs"
+import { probeExistingBroker, startIpcServers } from "../src/ipc-server.mjs"
 import { EgoChatError } from "../src/errors.mjs"
+import { acquireBrokerLease } from "../src/broker-lease.mjs"
+import { RUNTIME_IDENTITY } from "../src/constants.mjs"
 
 const config = loadConfig()
+const lease = await acquireBrokerLease({
+  dataDir: config.dataDir,
+  runtimeIdentity: RUNTIME_IDENTITY,
+  socketPath: config.socketPath,
+})
+const token = await loadOrCreateBrokerToken(config.dataDir)
+for (const legacySocketPath of config.legacySocketPaths) {
+  if (await probeExistingBroker(legacySocketPath, token)) {
+    await lease.release()
+    throw new EgoChatError(
+      "legacy_broker_active",
+      "A legacy Ego Chat broker still owns this data directory. Restart Codex and ZCode before starting the canonical broker generation.",
+      { socketPath: legacySocketPath },
+    )
+  }
+}
 const store = new EventStore(config.dataDir)
+const brokerLease = {
+  brokerId: lease.identity.brokerId,
+  epoch: lease.identity.epoch,
+  ownerPath: lease.ownerPath,
+  pid: lease.identity.pid,
+  registerChild: lease.registerChild,
+  unregisterChild: lease.unregisterChild,
+}
 const egoAdapter = new EgoAdapter({
+  brokerLease,
   command: config.egoBrowserCommand,
   dataDir: config.dataDir,
 })
 const broker = new Broker({
   appServerFactory: () => new AppServerClient(),
+  brokerIdentity: lease.identity,
+  brokerLease,
   egoAdapter,
   store,
 })
 
-await broker.initialize()
-const token = await loadOrCreateBrokerToken(config.dataDir)
+try {
+  await egoAdapter.initialize()
+  await broker.initialize()
+} catch (error) {
+  broker.close()
+  await egoAdapter.drain()
+  await lease.release()
+  throw error
+}
 
 const methods = new Map([
+  ["broker.status", () => broker.getStatus()],
   ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
   ["conversation.bind", (params) => broker.bindConversation(params)],
   ["conversation.get", (params) => broker.getConversationBinding(params)],
@@ -36,7 +73,9 @@ const methods = new Map([
   ["model_policy.get", () => broker.getModelPolicy()],
   ["ego.start_exchange", (params) => broker.startEgoExchange(params)],
   ["ping", () => broker.ping()],
+  ["result.read", (params) => broker.readResult(params)],
   ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
+  ["workflow.abandon", (params) => broker.abandonWorkflow(params)],
   ["workflow.cancel", (params) => broker.cancelWorkflow(params)],
   ["workflow.get", (params) => broker.getWorkflow(params)],
   ["workflow.start_probe", (params) => broker.startProbe(params)],
@@ -44,7 +83,8 @@ const methods = new Map([
 
 let ipc
 try {
-  ipc = await startIpcServer({
+  const compatibilitySocketPaths = config.reserveLegacySockets ? config.legacySocketPaths : []
+  ipc = await startIpcServers({
   dispatch: async (method, params, signal) => {
     const handler = methods.get(method)
     if (!handler) {
@@ -52,13 +92,27 @@ try {
     }
     return handler(params, signal)
   },
-  socketPath: config.socketPath,
+  socketPaths: [...compatibilitySocketPaths, config.socketPath],
+  stickySocketPaths: compatibilitySocketPaths,
   token,
   })
 } catch (error) {
-  if (error instanceof EgoChatError && error.code === "already_running") {
-    broker.close()
+  broker.close()
+  await egoAdapter.drain()
+  await lease.release()
+  if (
+    error instanceof EgoChatError
+    && error.code === "already_running"
+    && error.details?.socketPath === config.socketPath
+  ) {
     process.exit(0)
+  }
+  if (error instanceof EgoChatError && error.code === "already_running") {
+    throw new EgoChatError(
+      "legacy_broker_active",
+      "A legacy Ego Chat broker claimed a compatibility socket while the canonical broker was starting. Restart Codex and ZCode before retrying.",
+      { socketPath: error.details?.socketPath },
+    )
   }
   throw error
 }
@@ -71,6 +125,8 @@ async function shutdown() {
   shuttingDown = true
   broker.close()
   await ipc.close()
+  await egoAdapter.drain()
+  await lease.release()
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

@@ -1,10 +1,14 @@
-import { randomUUID } from "node:crypto"
-
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod/v4"
 
-import { APP_NAME, APP_VERSION, MAX_WAIT_MS } from "./constants.mjs"
+import {
+  APP_NAME,
+  APP_VERSION,
+  DEFAULT_CHATGPT_GENERATION_MS,
+  MAX_RESULT_BYTES,
+  MAX_WAIT_MS,
+} from "./constants.mjs"
 import { loadConfig } from "./config.mjs"
 import { requestBroker } from "./ipc-client.mjs"
 import { completeAgentReview, prepareAgentReview } from "./convergence.mjs"
@@ -75,12 +79,15 @@ const AGENT_REVIEW_INPUT_SCHEMA = {
     summary: z.string().trim().min(1).max(4_000),
   }).strict(),
   cycle: z.number().int().min(1).max(6),
+  operationId: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{7,119}$/).optional(),
   target: z.string().trim().min(1).max(8_000),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   waitMode: waitModeSchema(),
 }
 
 const RECOVERABLE_AGENT_REVIEW_CODES = new Set([
+  "broker_restarted_during_browser_operation",
+  "browser_operation_interrupted_before_send_confirmation",
   "completion_timeout_after_confirmed_send",
   "conversation_head_commit_mismatch",
   "marker_count_changed",
@@ -92,11 +99,13 @@ const MCP_INSTRUCTIONS = [
   "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "For a strict candidate review while the current ZCode or other agent remains the implementer, use ego_review_candidate_and_wait and continue in that same host task until settled.",
+  "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
   "For broker-owned automatic Codex/ChatGPT convergence, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
   "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers; otherwise surface the exact human_required stop.",
+  "Never abandon a stopped recovery unless the user explicitly authorizes that exact workflow and acknowledges that visible ChatGPT delivery or a Codex turn may remain ambiguous; abandonment preserves any at-most-once operation tombstone.",
 ].join(" ")
 
 function toolResult(value, { compact = false } = {}) {
@@ -107,10 +116,61 @@ function toolResult(value, { compact = false } = {}) {
 }
 
 function waitedToolResult(value, waitMode) {
-  return toolResult(
-    { ...value, waitMode },
-    { compact: waitMode === "token_saver" },
+  const structured = { ...value, waitMode }
+  if (waitMode !== "token_saver") {
+    return toolResult(structured)
+  }
+  const result = structured.result ?? {}
+  const modelPolicy = structured.modelPolicy ?? result.modelPolicy
+  const summary = {
+    ...(structured.bindingKey ? { bindingKey: structured.bindingKey } : {}),
+    ...(structured.exchangeWorkflowId ? { exchangeWorkflowId: structured.exchangeWorkflowId } : {}),
+    ...(modelPolicy
+      ? {
+          modelPolicy: {
+            effortLabel: modelPolicy.effortLabel,
+            modelLabel: modelPolicy.modelLabel,
+            powerLevel: modelPolicy.powerLevel,
+            powerMax: modelPolicy.powerMax,
+          },
+        }
+      : {}),
+    ...(result.responseRef ? { responseRef: result.responseRef } : {}),
+    ...(structured.settled !== undefined ? { settled: structured.settled } : {}),
+    ...(structured.status ? { status: structured.status } : {}),
+    waitMode,
+    ...(structured.id ? { workflowId: structured.id } : {}),
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify(summary) }],
+    structuredContent: structured,
+  }
+}
+
+function exchangeWaitMs(requestedTimeoutMs) {
+  return Math.min(
+    MAX_WAIT_MS,
+    Math.max(requestedTimeoutMs, DEFAULT_CHATGPT_GENERATION_MS) + 60_000,
   )
+}
+
+async function resolveResponseText(config, workflowId, result) {
+  if (typeof result?.responseText === "string") {
+    return result.responseText
+  }
+  if (!result?.responseRef) {
+    throw new EgoChatError("result_not_found", "The completed ChatGPT workflow has no readable response body.")
+  }
+  const captured = await requestBroker(config, "result.read", {
+    expectedDigest: result.responseRef.digest,
+    maxBytes: MAX_RESULT_BYTES,
+    offset: 0,
+    workflowId,
+  })
+  if (!captured.complete) {
+    throw new EgoChatError("result_too_large", "The ChatGPT review exceeded the supported strict-review size.")
+  }
+  return captured.text
 }
 
 function attachWaitRecovery(error, workflow, waitMode) {
@@ -165,6 +225,21 @@ export function createMcpServer(config = loadConfig()) {
   const server = new McpServer(
     { name: APP_NAME, version: APP_VERSION },
     { instructions: MCP_INSTRUCTIONS },
+  )
+
+  server.registerTool(
+    "ego_status",
+    {
+      description: "Read authoritative broker generation, runtime compatibility, active workflow, and bounded-store diagnostics without opening the browser.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return toolResult(await requestBroker(config, "broker.status"))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
   )
 
   server.registerTool(
@@ -356,7 +431,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_reconcile_conversation",
     {
-      description: "Reconcile an attributable late browser send without sending again. Supports create-once promotion and a bound workflow's exact tail-anchored user/assistant pair; never resurrects the stopped workflow.",
+      description: "Reconcile an attributable late browser send without sending again. Supports create-once promotion and a bound workflow's exact tail-anchored user/assistant pair; durably stores the recovered response and completes that exact workflow.",
       inputSchema: {
         bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
         expectedPreviousContentDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -406,7 +481,7 @@ export function createMcpServer(config = loadConfig()) {
       try {
         const { waitMode, ...request } = input
         workflow = await requestBroker(config, "ego.start_exchange", request)
-        const waitMs = Math.min(MAX_WAIT_MS, request.timeoutMs + 60_000)
+        const waitMs = exchangeWaitMs(request.timeoutMs)
         const result = await withWaitMode(extra, `Waiting for Ego exchange ${workflow.id}`, waitMode, () => requestBroker(
           config,
           "workflow.await",
@@ -424,15 +499,14 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
+      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
       let workflow
       try {
         const { waitMode } = input
-        const markerToken = randomUUID().replaceAll("-", "").toUpperCase()
-        const prepared = prepareAgentReview({ ...input, markerToken })
+        const prepared = prepareAgentReview(input)
         workflow = await requestBroker(config, "ego.start_exchange", {
           bindingKey: input.bindingKey,
           expectedTerminalMarker: prepared.terminalMarker,
@@ -440,7 +514,7 @@ export function createMcpServer(config = loadConfig()) {
           timeoutMs: input.timeoutMs,
           turnMarker: prepared.turnMarker,
         })
-        const waitMs = Math.min(MAX_WAIT_MS, input.timeoutMs + 60_000)
+        const waitMs = exchangeWaitMs(input.timeoutMs)
         const completed = await withWaitMode(
           extra,
           `Waiting for strict candidate review ${workflow.id}`,
@@ -469,6 +543,13 @@ export function createMcpServer(config = loadConfig()) {
             },
             { timeoutMs: 65_000 },
           )
+          if (reconciled.recovery?.deliveryState === "absent") {
+            throw new EgoChatError(
+              "human_required",
+              "The interrupted ChatGPT review was proven not delivered. A new uniquely marked review may now be started without duplicate-send ambiguity.",
+              { reason: "review_delivery_absent", workflowId: workflow.id },
+            )
+          }
           if (
             typeof reconciled.recovery?.responseText !== "string"
             || typeof reconciled.recovery?.responseDigest !== "string"
@@ -494,13 +575,15 @@ export function createMcpServer(config = loadConfig()) {
             },
           )
         }
-        const { review, settled } = completeAgentReview(prepared, exchangeResult.responseText)
+        const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
+        const { review, settled } = completeAgentReview(prepared, responseText)
         return waitedToolResult({
           bindingKey: input.bindingKey,
           candidateDigest: prepared.candidateDigest,
           cycle: input.cycle,
           exchangeWorkflowId: workflow.id,
           modelPolicy: exchangeResult.modelPolicy,
+          operationId: prepared.operationId,
           recoveredLateResponse,
           responseDigest: exchangeResult.responseDigest,
           review,
@@ -509,6 +592,31 @@ export function createMcpServer(config = loadConfig()) {
         }, waitMode)
       } catch (error) {
         attachWaitRecovery(error, workflow, input.waitMode)
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "ego_read_result",
+    {
+      description: "Read a digest-bound byte range from a private large ChatGPT result. Use the workflow and response reference returned by a prior Ego Chat call.",
+      inputSchema: {
+        expectedDigest: z.string().regex(/^[a-f0-9]{64}$/),
+        maxBytes: z.number().int().min(4).max(MAX_RESULT_BYTES).default(64 * 1024),
+        offset: z.number().int().min(0).max(MAX_RESULT_BYTES).default(0),
+        workflowId: z.uuid(),
+      },
+    },
+    async (input) => {
+      try {
+        const result = await requestBroker(config, "result.read", input)
+        const { text, ...metadata } = result
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: metadata,
+        }
+      } catch (error) {
         return toolError(error)
       }
     },
@@ -628,6 +736,24 @@ export function createMcpServer(config = loadConfig()) {
     async (input) => {
       try {
         return toolResult(await requestBroker(config, "workflow.cancel", input))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "abandon_workflow_recovery",
+    {
+      description: "Explicitly abandon one stopped adoption, browser, or convergence recovery and release its protected capacity. This never permits the same durable operation identity to run again and requires acknowledging that visible ChatGPT delivery or a Codex turn may remain ambiguous.",
+      inputSchema: {
+        acknowledgePotentialDelivery: z.literal(true),
+        workflowId: z.uuid(),
+      },
+    },
+    async (input) => {
+      try {
+        return toolResult(await requestBroker(config, "workflow.abandon", input))
       } catch (error) {
         return toolError(error)
       }

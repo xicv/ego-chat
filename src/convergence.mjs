@@ -271,7 +271,15 @@ export function buildChatGptPrompt({ candidate, candidateDigest, contract, cycle
   ].join("\n\n")
 }
 
-export function prepareAgentReview({ acceptanceCriteria, candidate, cycle, markerToken, target }) {
+export function prepareAgentReview({
+  acceptanceCriteria,
+  bindingKey = undefined,
+  candidate,
+  cycle,
+  markerToken = undefined,
+  operationId = undefined,
+  target,
+}) {
   const contract = createContract(target, acceptanceCriteria)
   const validatedCandidate = validateAgentCandidate(candidate, contract.criteria)
   if (validatedCandidate.status === "blocked") {
@@ -282,13 +290,24 @@ export function prepareAgentReview({ acceptanceCriteria, candidate, cycle, marke
     )
   }
   const candidateDigest = digestJson(validatedCandidate)
-  const turnMarker = `EGO_CHAT_AGENT_REVIEW_${markerToken}_C${cycle}`
-  const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}`
+  const resolvedOperationId = operationId ?? `review-${digestJson({
+    bindingKey: bindingKey ?? null,
+    candidateDigest,
+    cycle,
+    targetDigest: contract.targetDigest,
+  }).slice(0, 48)}`
+  const resolvedMarkerToken = markerToken ?? digestJson({
+    bindingKey: bindingKey ?? null,
+    operationId: resolvedOperationId,
+  }).slice(0, 32).toUpperCase()
+  const turnMarker = `EGO_CHAT_AGENT_REVIEW_${resolvedMarkerToken}_C${cycle}`
+  const terminalMarker = `EGO_CHAT_REVIEW_DONE_${resolvedMarkerToken}`
   const prompt = buildChatGptPrompt({
     candidate: validatedCandidate,
     candidateDigest,
     contract,
     cycle,
+    operationId: resolvedOperationId,
     terminalMarker,
     turnMarker,
   })
@@ -312,6 +331,7 @@ export function prepareAgentReview({ acceptanceCriteria, candidate, cycle, marke
     candidateDigest,
     contract,
     cycle,
+    operationId: resolvedOperationId,
     prompt,
     terminalMarker,
     turnMarker,

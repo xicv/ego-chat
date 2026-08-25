@@ -101,6 +101,12 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
+  const abandonmentTool = tools.tools.find((tool) => tool.name === "abandon_workflow_recovery")
+  assert.ok(abandonmentTool)
+  assert.equal(
+    abandonmentTool.inputSchema.properties.acknowledgePotentialDelivery.const,
+    true,
+  )
   for (const toolName of [
     "ego_adopt_conversation_and_wait",
     "ego_exchange_and_wait",
@@ -294,6 +300,26 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     }),
     exchange: async (input) => {
       exchanges += 1
+      if (input.turnMarker === "EGO_CHAT_MCP_LARGE_RESULT_20260825") {
+        const responseText = `${"😀large-token-saver-result ".repeat(900)}${input.expectedTerminalMarker}`
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "controlled-large-result-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "controlled-large-result-assistant",
+            lastRole: "assistant",
+            messageCount: input.binding.messageCount + 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "controlled-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      }
       const responseText = strictReviewResponse(input)
       responseDigests.set(exchanges, digest(responseText))
       if (exchanges === 3) {
@@ -315,6 +341,19 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           {
             evidence: { modelPolicy: modelPolicyObservation() },
             reason: "send_confirmation_ambiguous",
+          },
+        )
+      }
+      if (exchanges === 5) {
+        pendingRecovery = { kind: "absent" }
+        throw new EgoChatError(
+          "ego_driver_error",
+          "The fixed Ego Browser driver failed.",
+          {
+            diagnosticDigest: "f".repeat(64),
+            draftCleared: true,
+            driverStage: "composing_prompt",
+            evidence: { modelPolicy: modelPolicyObservation() },
           },
         )
       }
@@ -352,6 +391,24 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           { reason: "bound_reconciliation_mismatch" },
         )
       }
+      if (pendingRecovery.kind === "absent") {
+        pendingRecovery = null
+        return {
+          canonicalUrl,
+          deliveryState: "absent",
+          head: {
+            fingerprint: input.binding.headFingerprint,
+            fingerprintVersion: input.binding.headFingerprintVersion,
+            lastContentDigest: input.binding.headContentDigest,
+            lastMessageId: input.binding.headMessageId,
+            lastRole: input.binding.headRole,
+            messageCount: input.binding.messageCount,
+          },
+          targetId: "controlled-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      }
       const responseText = pendingRecovery.responseText
       pendingRecovery = null
       return {
@@ -368,6 +425,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
         responseText,
         targetId: "controlled-tab",
         taskSpaceId: 10,
+        turnMarker: input.turnMarker,
       }
     },
   }
@@ -383,6 +441,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   const methods = new Map([
     ["conversation.reconcile", (params) => broker.reconcileConversation(params)],
     ["ego.start_exchange", (params) => broker.startEgoExchange(params)],
+    ["result.read", (params) => broker.readResult(params)],
     ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
   ])
   const ipc = await startIpcServer({
@@ -422,8 +481,19 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(settled.structuredContent.targetDigest, expectedDirect.contract.targetDigest)
   assert.equal(settled.structuredContent.review.candidateDigest, expectedDirect.candidateDigest)
   assert.equal(settled.structuredContent.review.targetDigest, expectedDirect.contract.targetDigest)
+  assert.equal(settled.structuredContent.operationId, expectedDirect.operationId)
+  assert.match(settled.structuredContent.operationId, /^review-[a-f0-9]{48}$/)
   assert.equal(settled.structuredContent.waitMode, "token_saver")
   assert.equal(settled.content[0].text.includes("\n"), false)
+
+  const replayed = await client.callTool({
+    arguments: directInput,
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(replayed.isError, undefined)
+  assert.equal(replayed.structuredContent.exchangeWorkflowId, settled.structuredContent.exchangeWorkflowId)
+  assert.equal(replayed.structuredContent.operationId, settled.structuredContent.operationId)
+  assert.equal(exchanges, 1)
 
   const malformed = await client.callTool({
     arguments: reviewInput("malformed"),
@@ -448,6 +518,73 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(ambiguous.isError, true)
   assert.equal(JSON.parse(ambiguous.content[0].text).details.reason, "bound_reconciliation_mismatch")
-  assert.equal(exchanges, 4)
-  assert.equal(reconciliations, 2)
+
+  const absent = await client.callTool({
+    arguments: reviewInput("delivery-absent"),
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(absent.isError, true)
+  assert.equal(JSON.parse(absent.content[0].text).details.reason, "review_delivery_absent")
+  assert.equal(exchanges, 5)
+  assert.equal(reconciliations, 3)
+
+  const explicitOperationId = "review-conflict-operation-20260825"
+  const firstConflict = await client.callTool({
+    arguments: { ...reviewInput("conflict-base"), operationId: explicitOperationId },
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(firstConflict.isError, undefined)
+  assert.equal(firstConflict.structuredContent.operationId, explicitOperationId)
+  const conflictingRetry = await client.callTool({
+    arguments: { ...reviewInput("conflict-changed"), operationId: explicitOperationId },
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(conflictingRetry.isError, true)
+  assert.equal(JSON.parse(conflictingRetry.content[0].text).code, "operation_key_conflict")
+  assert.equal(exchanges, 6)
+
+  const largeTurnMarker = "EGO_CHAT_MCP_LARGE_RESULT_20260825"
+  const largeResult = await client.callTool({
+    arguments: {
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: "EGO_CHAT_MCP_LARGE_RESULT_DONE",
+      prompt: `${largeTurnMarker}\nReturn the large controlled response.`,
+      timeoutMs: 30_000,
+      turnMarker: largeTurnMarker,
+      waitMode: "token_saver",
+    },
+    name: "ego_exchange_and_wait",
+  })
+  assert.equal(largeResult.isError, undefined)
+  assert.equal(largeResult.structuredContent.result.responseText, undefined)
+  assert.match(largeResult.structuredContent.result.responseRef.digest, /^[a-f0-9]{64}$/)
+  assert.ok(largeResult.structuredContent.result.responseExcerpt.length < 5_000)
+  assert.ok(Buffer.byteLength(largeResult.content[0].text, "utf8") < 1_024)
+  assert.equal(largeResult.content[0].text.includes("large-token-saver-result"), false)
+  const largeWorkflowId = largeResult.structuredContent.id
+  const largeDigest = largeResult.structuredContent.result.responseRef.digest
+  const read = await client.callTool({
+    arguments: {
+      expectedDigest: largeDigest,
+      maxBytes: 256 * 1024,
+      offset: 0,
+      workflowId: largeWorkflowId,
+    },
+    name: "ego_read_result",
+  })
+  assert.equal(read.isError, undefined)
+  assert.equal(read.structuredContent.complete, true)
+  assert.match(read.content[0].text, /EGO_CHAT_MCP_LARGE_RESULT_DONE$/)
+  const crossWorkflowRead = await client.callTool({
+    arguments: {
+      expectedDigest: largeDigest,
+      maxBytes: 64 * 1024,
+      offset: 0,
+      workflowId: settled.structuredContent.exchangeWorkflowId,
+    },
+    name: "ego_read_result",
+  })
+  assert.equal(crossWorkflowRead.isError, true)
+  assert.equal(JSON.parse(crossWorkflowRead.content[0].text).code, "result_digest_mismatch")
+  assert.equal(exchanges, 7)
 })

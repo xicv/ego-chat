@@ -28,6 +28,18 @@ export const WorkflowIdInputSchema = z.object({
   workflowId: WorkflowIdSchema,
 })
 
+export const AbandonWorkflowSchema = z.object({
+  acknowledgePotentialDelivery: z.literal(true),
+  workflowId: WorkflowIdSchema,
+})
+
+export const ResultReadSchema = z.object({
+  expectedDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  maxBytes: z.number().int().min(4).max(256 * 1024).default(64 * 1024),
+  offset: z.number().int().min(0).max(256 * 1024).default(0),
+  workflowId: WorkflowIdSchema,
+})
+
 export const EgoPreflightSchema = z.object({
   taskSpace: TaskSpaceSchema,
 })
