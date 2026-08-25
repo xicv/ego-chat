@@ -236,12 +236,26 @@ export function buildCodexPrompt({ contract, cycle, sandbox, priorReview }) {
     criteria,
     prior,
     `Execution sandbox: ${sandbox}. Work only inside the supplied cwd.`,
+    "This is repository work, not a protocol-only handshake. You MUST inspect the supplied cwd with local tools and run proportionate validation before deciding candidate or blocked.",
+    "The output-schema instruction controls only the final answer format; it does not prohibit analysis or tool calls.",
     "Do not call Ego Chat or contact ChatGPT yourself; the broker owns side B.",
     "Do not commit, push, create a PR, deploy, release, access production, or expand permissions.",
     "If the target requires any forbidden action or missing authority, return status blocked and explain it.",
     "For a candidate, blockers must be empty. Report every criterion exactly once and in contract order.",
     "The reviewPacket must be self-contained and contain the minimal relevant diff/content plus exact validation evidence that ChatGPT needs. Do not include secrets, credentials, private keys, environment files, databases, browser data, or unrelated files.",
     "Return only the JSON object constrained by the provided output schema.",
+  ].join("\n\n")
+}
+
+export function buildCodexInspectionCorrectionPrompt({ contract, cycle }) {
+  return [
+    "Your preceding convergence turn made no observable workspace tool call, so the broker cannot treat its candidate or blocked status as evidence-backed.",
+    `Remain on cycle ${cycle} and immutable target digest ${contract.targetDigest}.`,
+    "The JSON-only requirement applies only to the final answer format. It does not prohibit analysis, local tool calls, or validation.",
+    "Now inspect the supplied cwd with local tools and run proportionate validation within the original sandbox and authority boundaries.",
+    "Do not merely repeat the prior blocked envelope. Decide candidate or blocked only after that inspection; if a genuine authority blocker remains, cite concrete inspected evidence.",
+    "All original prohibitions remain in force, including no ChatGPT or Ego Chat calls, commits, pushes, pull requests, deployments, releases, production access, or permission expansion.",
+    "Then return a fresh JSON object constrained by the provided output schema.",
   ].join("\n\n")
 }
 

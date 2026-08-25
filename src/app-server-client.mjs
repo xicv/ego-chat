@@ -5,6 +5,15 @@ import readline from "node:readline"
 import { APP_VERSION } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
+const WORKSPACE_ACTIVITY_ITEM_TYPES = new Set([
+  "collabAgentToolCall",
+  "commandExecution",
+  "dynamicToolCall",
+  "fileChange",
+  "imageView",
+  "mcpToolCall",
+])
+
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }
@@ -49,6 +58,17 @@ function structuredTurnResult(turn) {
     responseDigest: digest(responseText),
     turnId: turn.id,
     value,
+    workspaceActivity: summarizeWorkspaceActivity(turn),
+  }
+}
+
+function summarizeWorkspaceActivity(turn) {
+  const types = turn.items
+    .filter((item) => WORKSPACE_ACTIVITY_ITEM_TYPES.has(item.type))
+    .map((item) => item.type)
+  return {
+    count: types.length,
+    types: [...new Set(types)].sort(),
   }
 }
 

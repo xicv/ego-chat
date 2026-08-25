@@ -62,6 +62,13 @@ lines.on("line", (line) => {
       id: `019d0000-0000-7000-8000-${String(turnNumber).padStart(12, "0")}`,
       items: [
         {
+          aggregatedOutput: "test/fixtures/fake-app-server.mjs\n",
+          command: "rg --files",
+          id: `command-${turnNumber}`,
+          status: "completed",
+          type: "commandExecution",
+        },
+        {
           id: `commentary-${turnNumber}`,
           phase: phaseUnknownMessages ? null : "commentary",
           text: "The fake App Server is preparing the terminal response.",

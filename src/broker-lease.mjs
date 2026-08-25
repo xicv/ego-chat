@@ -271,6 +271,22 @@ export async function acquireBrokerLease({
 
     return {
       identity,
+      inspect: async () => {
+        await ownerTail
+        const owner = await readOwner(lockPath)
+        if (
+          !owner
+          || owner.brokerId !== brokerId
+          || owner.epoch !== identity.epoch
+          || owner.pid !== process.pid
+        ) {
+          throw new EgoChatError(
+            "broker_lease_lost",
+            "The broker lease changed before its child ledger could be inspected.",
+          )
+        }
+        return structuredClone(owner)
+      },
       lockPath,
       ownerPath: lockPath,
       registerChild: async (pid, { processGroup = false } = {}) => {

@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   buildChatGptPrompt,
+  buildCodexInspectionCorrectionPrompt,
   buildCodexPrompt,
   createContract,
   digestJson,
@@ -132,6 +133,25 @@ test("continuation must be actionable and browser feedback stays explicitly untr
     terminalMarker: "EGO_CHAT_REVIEW_DONE_SCHEMA123",
     turnMarker: "EGO_CHAT_CONVERGENCE_SCHEMA123_C1",
   }), /finding id must start with B-/)
+})
+
+test("Codex convergence prompts require workspace inspection before final-only JSON", () => {
+  const contract = createContract("Review and improve the checked-out project.", [
+    "The project was inspected with local tools.",
+  ])
+  const initial = buildCodexPrompt({
+    contract,
+    cycle: 1,
+    priorReview: null,
+    sandbox: "workspace-write",
+  })
+  const correction = buildCodexInspectionCorrectionPrompt({ contract, cycle: 1 })
+
+  assert.match(initial, /MUST inspect the supplied cwd with local tools/)
+  assert.match(initial, /only the final answer format/i)
+  assert.match(correction, /made no observable workspace tool call/i)
+  assert.match(correction, new RegExp(contract.targetDigest))
+  assert.match(correction, /do not merely repeat the prior blocked envelope/i)
 })
 
 test("high-confidence secret signatures block the exact outbound packet", () => {

@@ -96,6 +96,8 @@ ego-chat doctor-zcode
 
 - materializes the embedded runtime under `~/Library/Application Support/Ego Chat/runtime/<version>`;
 - runs `npm ci --omit=dev --ignore-scripts` inside that managed runtime;
+- redirects only verified older managed daemon launchers to the new runtime, so a still-open older host facade cannot resurrect an obsolete broker;
+- hands off an authenticated stale broker only after closing new mutation admission and proving it is idle with no prompt mailbox entry or browser child; current brokers drain atomically, while the one-time legacy path quarantines every authenticated socket before two final identity/idle/lease checks and restores those sockets on any active or ambiguous evidence;
 - installs the bundled `ego-chat` skill under `~/.codex/skills/ego-chat`;
 - registers the installed executable as the `ego_chat` STDIO MCP server with a 21,900-second tool timeout.
 
@@ -140,7 +142,9 @@ Inspect the authoritative broker generation, runtime-contract digest, active wor
 node ./bin/ego-chat.mjs broker-status
 ```
 
-After upgrading the runtime, restart Codex.app and ZCode.app. A stale facade may read status and existing workflow results, but new mutations fail with `restart_required`; Ego Chat never starts a second broker against the same data directory to hide that mismatch.
+`ego-chat doctor` and `ego-chat doctor-zcode` also compare any live authoritative broker with the installed runtime. During setup, a protocol-aware stale broker atomically rejects new mutations, waits for already admitted mutation handlers, and rechecks durable workflows, active bindings, and the driver mailbox before gracefully releasing its lease. A legacy v0.2.1 broker has no drain method, so setup temporarily removes its authenticated socket names from ordinary clients, waits for in-flight requests, repeats the idle proof through the quarantined socket, and either stops it or restores every socket without signalling. This makes concurrent Codex/ZCode use fail closed instead of racing shutdown.
+
+After upgrading, restart every open supported host, including both Codex.app and ZCode.app when both are running. A stale facade may read status and existing workflow results, but new mutations fail with `restart_required`; its verified managed daemon launcher points to the current runtime, so it cannot recreate an obsolete broker while waiting to be restarted. Ego Chat never starts a second broker against the same data directory to hide a mismatch.
 
 ## Persistent conversation
 
@@ -156,11 +160,11 @@ Verify its canonical URL and current conversation head without sending:
 node ./bin/ego-chat.mjs verify ego-chat-main
 ```
 
-Create-once and existing-URL bindings are accepted through `ego_bind_conversation` or the CLI's `bind <input-json-file>` command. A binding key is immutable: an existing key is never silently replaced. A ChatGPT Project can organize the conversation, but the canonical conversation URL and head fingerprint remain the authoritative identity. Continuous convergence requires a canonical bound conversation and reserves it for the whole workflow, so no manual or second automated send can interleave with the A/B loop.
+Create-once and existing-URL bindings are accepted through `ego_bind_conversation` or the CLI's `bind <input-json-file>` command. A binding key is immutable: an existing key is never silently replaced. A ChatGPT Project can organize the conversation, but the canonical conversation URL and head fingerprint remain the authoritative identity. Separate workflows may run concurrently only when they use different canonical conversations and different Ego task spaces. The same conversation or task space is rejected before browser work with a reservation error. Continuous convergence reserves its canonical conversation for the whole workflow, so no manual or second automated send can interleave with the A/B loop.
 
 ### Adopt a conversation from ChatGPT.app
 
-Supply the private canonical conversation URL containing `/c/`, not a public `/share/` link. Ego Lite must already be logged into the same ChatGPT account and workspace. From Codex or ZCode, `ego_adopt_conversation_and_wait` opens that exact URL, anchors its latest user turn, and waits for exactly one stable assistant tail. If ChatGPT is still performing a long think, the broker owns that read-only wait while the MCP call remains quiet; the captured response returns once into the same host turn. Adoption never clicks Send or changes the model selection. It accepts the existing response only when the live policy is already at `strongest_available` plus `maximum_available`; a lower setting stops fail-closed without repairing it. This is a live composer-policy readback, not historical per-message model provenance, so the captured response remains untrusted context. Every later send independently enforces and reads back that maximum policy immediately before composition.
+Supply the private canonical conversation URL containing `/c/`, not a public `/share/` link. Ego Lite must already be logged into the same ChatGPT account and workspace. From Codex or ZCode, `ego_adopt_conversation_and_wait` opens that exact URL, observes the same latest user-message ID and rendered prefix twice before locking the anchor, then waits for exactly one stable assistant tail. This bounded initial stabilization tolerates ChatGPT's normal DOM hydration; any change after the anchor is locked still stops fail-closed. If ChatGPT is still performing a long think, the broker owns that read-only wait while the MCP call remains quiet; the captured response returns once into the same host turn. Adoption never clicks Send or changes the model selection. It accepts the existing response only when the live policy is already at `strongest_available` plus `maximum_available`; a lower setting stops fail-closed without repairing it. This is a live composer-policy readback, not historical per-message model provenance, so the captured response remains untrusted context. Every later send independently enforces and reads back that maximum policy immediately before composition.
 
 `bindingKey` is optional for adoption. When omitted, the broker derives a stable `adopt-...` key from the URL digest, so pasting a URL does not replace `ego-chat-main` or expose the conversation ID in the binding name. An explicitly supplied key remains immutable. `taskSpace` also defaults to the dedicated `ego-chat-adoptions` space, so the URL is the only required input.
 
@@ -397,7 +401,7 @@ node ./bin/ego-chat.mjs converge ./convergence.json
 node ./bin/ego-chat.mjs await <workflow-id> 1800000
 ```
 
-Codex can instead call `ego_start_convergence` and later `await_workflow`, or call `ego_converge_until_settled` with either progress notifications or `waitMode: token_saver`. Closing the MCP facade only detaches that waiter; the daemon keeps alternating the dedicated Codex thread and the same ChatGPT conversation. If the Codex App Server transport exits before a ChatGPT review starts, the broker can reconnect at most twice across the workflow, resume the exact thread, and inspect the exact interrupted turn. It reuses a completed structured candidate, retries only a turn proven `interrupted` or `failed`, and stops if identity or status is ambiguous. This recovery cannot duplicate a ChatGPT send because no browser child workflow exists yet.
+Codex can instead call `ego_start_convergence` and later `await_workflow`, or call `ego_converge_until_settled` with either progress notifications or `waitMode: token_saver`. Closing the MCP facade only detaches that waiter; the daemon keeps alternating the dedicated Codex thread and the same ChatGPT conversation. The broker requires observable workspace-capable App Server activity before it accepts a Codex envelope for external review. If Codex mistakes final JSON formatting for a ban on local tools, the broker issues at most one corrective turn in the same task before any ChatGPT send; a second zero-tool envelope stops as `codex_workspace_not_inspected`. If the Codex App Server transport exits before a ChatGPT review starts, the broker can reconnect at most twice across the workflow, resume the exact thread, and inspect the exact interrupted turn. It reuses a completed structured candidate, retries only a turn proven `interrupted` or `failed`, and stops if identity or status is ambiguous. This recovery cannot duplicate a ChatGPT send because no browser child workflow exists yet.
 
 Each cycle is bound as follows:
 

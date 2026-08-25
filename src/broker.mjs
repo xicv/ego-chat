@@ -11,6 +11,7 @@ import {
 import {
   CODEX_CANDIDATE_OUTPUT_SCHEMA,
   buildChatGptPrompt,
+  buildCodexInspectionCorrectionPrompt,
   buildCodexPrompt,
   createContract,
   digestJson,
@@ -1832,7 +1833,7 @@ export class Broker {
           private: current.private,
         })
 
-        const codexTurnInput = {
+        let codexTurnInput = {
           ...(priorReview
             ? {
                 additionalContext: {
@@ -1849,60 +1850,89 @@ export class Broker {
         }
         let codexResult
         let cycleRecoveryCount = 0
-        while (!codexResult) {
-          current = this.#requireRunningConvergence(workflowId, controller.signal)
-          const codexTimeoutMs = this.#boundedConvergenceTimeout(
-            current,
-            request.codexTurnTimeoutMs,
-            1,
-          )
-          try {
-            codexResult = await client.runStructuredTurn({
-              ...codexTurnInput,
-              timeoutMs: codexTimeoutMs,
-            })
-          } catch (error) {
+        let inspectionRetryCount = 0
+        while (true) {
+          while (!codexResult) {
             current = this.#requireRunningConvergence(workflowId, controller.signal)
-            const recoveryCount = current.appServerRecoveryCount ?? 0
-            const turnId = error?.details?.turnId
-            const canRecover = error instanceof EgoChatError
-              && error.code === "app_server_exited"
-              && typeof turnId === "string"
-              && turnId.length > 0
-              && recoveryCount < MAX_APP_SERVER_RECOVERIES
-            if (!canRecover) {
-              throw error
-            }
+            const codexTimeoutMs = this.#boundedConvergenceTimeout(
+              current,
+              request.codexTurnTimeoutMs,
+              1,
+            )
+            try {
+              codexResult = await client.runStructuredTurn({
+                ...codexTurnInput,
+                timeoutMs: codexTimeoutMs,
+              })
+            } catch (error) {
+              current = this.#requireRunningConvergence(workflowId, controller.signal)
+              const recoveryCount = current.appServerRecoveryCount ?? 0
+              const turnId = error?.details?.turnId
+              const canRecover = error instanceof EgoChatError
+                && error.code === "app_server_exited"
+                && typeof turnId === "string"
+                && turnId.length > 0
+                && recoveryCount < MAX_APP_SERVER_RECOVERIES
+              if (!canRecover) {
+                throw error
+              }
 
-            cycleRecoveryCount += 1
-            await this.#transition(current, "convergence.codex_app_server_recovery_started", {
-              appServerRecoveryCount: recoveryCount + 1,
-              lastAppServerExit: appServerDiagnostic(error),
-              phase: "codex_recovering",
-              private: current.private,
-            })
-            await client.close().catch(() => {})
-            client = this.#createAppServerClient()
-            this.#convergenceClients.set(workflowId, client)
-            await client.connect()
-            await client.resumeThread(threadId, {
-              cwd: request.cwd,
-              developerInstructions: CONVERGENCE_DEVELOPER_INSTRUCTIONS,
-              sandbox: request.codexSandbox,
-            })
-            current = this.#requireRunningConvergence(workflowId, controller.signal)
-            const recoveryTimeoutMs = this.#boundedConvergenceTimeout(current, 30_000, 1)
-            const recovered = await client.recoverStructuredTurn(threadId, turnId, recoveryTimeoutMs)
-            current = this.#requireRunningConvergence(workflowId, controller.signal)
-            await this.#transition(current, "convergence.codex_app_server_recovered", {
-              appServerRecoveryDisposition: recovered.disposition,
-              phase: "codex_running",
-              private: current.private,
-            })
-            if (recovered.disposition === "completed") {
-              codexResult = recovered.result
+              cycleRecoveryCount += 1
+              await this.#transition(current, "convergence.codex_app_server_recovery_started", {
+                appServerRecoveryCount: recoveryCount + 1,
+                lastAppServerExit: appServerDiagnostic(error),
+                phase: "codex_recovering",
+                private: current.private,
+              })
+              await client.close().catch(() => {})
+              client = this.#createAppServerClient()
+              this.#convergenceClients.set(workflowId, client)
+              await client.connect()
+              await client.resumeThread(threadId, {
+                cwd: request.cwd,
+                developerInstructions: CONVERGENCE_DEVELOPER_INSTRUCTIONS,
+                sandbox: request.codexSandbox,
+              })
+              current = this.#requireRunningConvergence(workflowId, controller.signal)
+              const recoveryTimeoutMs = this.#boundedConvergenceTimeout(current, 30_000, 1)
+              const recovered = await client.recoverStructuredTurn(threadId, turnId, recoveryTimeoutMs)
+              current = this.#requireRunningConvergence(workflowId, controller.signal)
+              await this.#transition(current, "convergence.codex_app_server_recovered", {
+                appServerRecoveryDisposition: recovered.disposition,
+                phase: "codex_running",
+                private: current.private,
+              })
+              if (recovered.disposition === "completed") {
+                codexResult = recovered.result
+              }
             }
           }
+
+          if ((codexResult.workspaceActivity?.count ?? 0) > 0) {
+            break
+          }
+          if (inspectionRetryCount >= 1) {
+            throw new EgoChatError(
+              "human_required",
+              "Codex returned two structured convergence envelopes without observable workspace inspection.",
+              { reason: "codex_workspace_not_inspected" },
+            )
+          }
+
+          inspectionRetryCount += 1
+          current = this.#requireRunningConvergence(workflowId, controller.signal)
+          await this.#transition(current, "convergence.codex_workspace_inspection_retry_started", {
+            codexInspectionRetryCount: (current.codexInspectionRetryCount ?? 0) + 1,
+            cycle,
+            phase: "codex_running",
+            private: current.private,
+          })
+          codexTurnInput = {
+            outputSchema: CODEX_CANDIDATE_OUTPUT_SCHEMA,
+            prompt: buildCodexInspectionCorrectionPrompt({ contract, cycle }),
+            threadId,
+          }
+          codexResult = undefined
         }
         const candidate = validateCodexCandidate(codexResult.value, contract.criteria)
         const candidateDigest = digestJson(candidate)
@@ -1912,8 +1942,10 @@ export class Broker {
           codex: {
             appServerRecoveryCount: cycleRecoveryCount,
             durationMs: codexResult.durationMs,
+            inspectionRetryCount,
             responseDigest: codexResult.responseDigest,
             turnId: codexResult.turnId,
+            workspaceActivity: codexResult.workspaceActivity,
           },
           cycle,
         }

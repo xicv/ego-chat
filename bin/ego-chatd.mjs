@@ -10,6 +10,7 @@ import { probeExistingBroker, startIpcServers } from "../src/ipc-server.mjs"
 import { EgoChatError } from "../src/errors.mjs"
 import { acquireBrokerLease } from "../src/broker-lease.mjs"
 import { RUNTIME_IDENTITY } from "../src/constants.mjs"
+import { createUpgradeAwareDispatch } from "../src/upgrade-dispatch.mjs"
 
 const config = loadConfig()
 const lease = await acquireBrokerLease({
@@ -82,9 +83,12 @@ const methods = new Map([
 ])
 
 let ipc
-try {
-  const compatibilitySocketPaths = config.reserveLegacySockets ? config.legacySocketPaths : []
-  ipc = await startIpcServers({
+let resolveIpcReady
+const ipcReady = new Promise((resolve) => {
+  resolveIpcReady = resolve
+})
+let upgradeShutdownScheduled = false
+const dispatch = createUpgradeAwareDispatch({
   dispatch: async (method, params, signal) => {
     const handler = methods.get(method)
     if (!handler) {
@@ -92,10 +96,47 @@ try {
     }
     return handler(params, signal)
   },
-  socketPaths: [...compatibilitySocketPaths, config.socketPath],
-  stickySocketPaths: compatibilitySocketPaths,
-  token,
+  getStatus: () => broker.getStatus(),
+  onUpgradeAccepted: async () => {
+    await ipcReady
+    const owner = await lease.inspect()
+    if (
+      !Array.isArray(owner.browserPids)
+      || !Array.isArray(owner.browserProcessGroups)
+    ) {
+      throw new EgoChatError(
+        "unsafe_broker_lease",
+        "The authoritative broker lease has no trustworthy browser-child ledger.",
+      )
+    }
+    if (owner.browserPids.length > 0 || owner.browserProcessGroups.length > 0) {
+      throw new EgoChatError(
+        "upgrade_blocked_browser_child",
+        "The authoritative broker still owns a click-capable browser child; retry setup after it exits.",
+      )
+    }
+    if (upgradeShutdownScheduled) return
+    upgradeShutdownScheduled = true
+    globalThis.setImmediate(() => {
+      shutdown()
+        .then(() => process.exit(0))
+        .catch((error) => {
+          console.error("Failed to stop broker after upgrade drain:", error)
+          process.exit(1)
+        })
+    })
+  },
+  runtimeIdentity: RUNTIME_IDENTITY,
+})
+try {
+  const compatibilitySocketPaths = config.reserveLegacySockets ? config.legacySocketPaths : []
+  ipc = await startIpcServers({
+    dispatch,
+    socketPaths: [...compatibilitySocketPaths, config.socketPath],
+    stickySocketPaths: compatibilitySocketPaths,
+    token,
   })
+  resolveIpcReady()
 } catch (error) {
   broker.close()
   await egoAdapter.drain()

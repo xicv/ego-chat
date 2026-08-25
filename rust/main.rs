@@ -100,8 +100,16 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/mcp-server.mjs"),
     },
     EmbeddedFile {
+        path: "src/runtime-handoff.mjs",
+        bytes: include_bytes!("../src/runtime-handoff.mjs"),
+    },
+    EmbeddedFile {
         path: "src/store.mjs",
         bytes: include_bytes!("../src/store.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/upgrade-dispatch.mjs",
+        bytes: include_bytes!("../src/upgrade-dispatch.mjs"),
     },
     EmbeddedFile {
         path: "src/validation.mjs",
@@ -361,6 +369,8 @@ fn setup(force: bool, configure: bool) -> Result<(), String> {
     let tools = Toolchain::discover(true)?;
     tools.validate(true)?;
     install_runtime(&paths.runtime_dir, &tools, force)?;
+    let redirected_launchers = redirect_stale_broker_launchers(&paths.runtime_dir)?;
+    let handoff_status = handoff_installed_broker(&paths.runtime_dir, &tools)?;
     install_skill(&paths.codex_skill_dir, SKILL_FILES, force)?;
 
     if configure {
@@ -370,10 +380,20 @@ fn setup(force: bool, configure: bool) -> Result<(), String> {
     }
 
     println!("Ego Chat runtime: {}", paths.runtime_dir.display());
+    if handoff_status == "stopped" {
+        println!("Stopped the idle stale Ego Chat broker before activating this runtime.");
+    }
+    if redirected_launchers > 0 {
+        println!(
+            "Redirected {redirected_launchers} older managed broker launcher(s) to this runtime."
+        );
+    }
     println!("Codex skill: {}", paths.codex_skill_dir.display());
     if configure {
         println!("Codex MCP server: {MCP_SERVER_NAME}");
-        println!("Restart Codex.app, then use /mcp to verify the connection.");
+        println!(
+            "Restart Codex.app and any other open Ego Chat host, then use /mcp to verify the connection."
+        );
     } else {
         println!("Codex MCP configuration was skipped.");
     }
@@ -388,21 +408,194 @@ fn setup_zcode(force: bool) -> Result<(), String> {
     let tools = Toolchain::discover(false)?;
     tools.validate(false)?;
     install_runtime(&paths.runtime_dir, &tools, force)?;
+    let redirected_launchers = redirect_stale_broker_launchers(&paths.runtime_dir)?;
+    let handoff_status = handoff_installed_broker(&paths.runtime_dir, &tools)?;
     install_skill(&paths.zcode_skill_dir, ZCODE_SKILL_FILES, force)?;
     let executable = env::current_exe()
         .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
     configure_zcode(&paths.zcode_config, &executable, force)?;
 
     println!("Ego Chat runtime: {}", paths.runtime_dir.display());
+    if handoff_status == "stopped" {
+        println!("Stopped the idle stale Ego Chat broker before activating this runtime.");
+    }
+    if redirected_launchers > 0 {
+        println!(
+            "Redirected {redirected_launchers} older managed broker launcher(s) to this runtime."
+        );
+    }
     println!("ZCode skill: {}", paths.zcode_skill_dir.display());
     println!("ZCode MCP server: {MCP_SERVER_NAME}");
-    println!("Restart ZCode.app, then verify ego_chat in MCP Services.");
+    println!(
+        "Restart ZCode.app and any other open Ego Chat host, then verify ego_chat in MCP Services."
+    );
     if tools.codex.is_none() {
         println!(
             "Codex was not found; ZCode-owned reviews work, while broker-owned Codex convergence remains unavailable."
         );
     }
     Ok(())
+}
+
+fn handoff_installed_broker(runtime_dir: &Path, tools: &Toolchain) -> Result<String, String> {
+    let cli = runtime_dir.join("bin/ego-chat.mjs");
+    if !cli.is_file() {
+        return Err(format!(
+            "the installed broker CLI {} is missing",
+            cli.display()
+        ));
+    }
+    let mut command = Command::new(&tools.node);
+    command.arg(&cli).arg("broker-handoff");
+    tools.prepend_path(&mut command)?;
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run broker runtime handoff: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let parsed = serde_json::from_str::<JsonValue>(stderr.trim()).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("broker_handoff_failed");
+        let message = parsed
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("The installed runtime could not safely hand off the authoritative broker.");
+        return Err(format!("{code}: {message}"));
+    }
+    let response = serde_json::from_slice::<JsonValue>(&output.stdout)
+        .map_err(|_| "the installed broker handoff returned invalid JSON".to_string())?;
+    let status = response
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "the installed broker handoff omitted its status".to_string())?;
+    if !matches!(status, "current" | "not_running" | "stopped") {
+        return Err(format!(
+            "the installed broker handoff returned unknown status {status:?}"
+        ));
+    }
+    Ok(status.to_string())
+}
+
+fn inspect_installed_broker_runtime(
+    runtime_dir: &Path,
+    tools: &Toolchain,
+) -> Result<String, String> {
+    let cli = runtime_dir.join("bin/ego-chat.mjs");
+    if !cli.is_file() {
+        return Err(format!(
+            "the installed broker CLI {} is missing",
+            cli.display()
+        ));
+    }
+    let mut command = Command::new(&tools.node);
+    command.arg(&cli).arg("broker-runtime-status");
+    tools.prepend_path(&mut command)?;
+    let output = command
+        .output()
+        .map_err(|error| format!("could not inspect the live broker runtime: {error}"))?;
+    if !output.status.success() {
+        return Err("the installed runtime could not inspect the authoritative broker".to_string());
+    }
+    let response = serde_json::from_slice::<JsonValue>(&output.stdout)
+        .map_err(|_| "the installed broker runtime check returned invalid JSON".to_string())?;
+    let status = response
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "the installed broker runtime check omitted its status".to_string())?;
+    if !matches!(status, "current" | "not_running" | "stale") {
+        return Err(format!(
+            "the installed broker runtime check returned unknown status {status:?}"
+        ));
+    }
+    Ok(status.to_string())
+}
+
+fn redirect_stale_broker_launchers(current_runtime: &Path) -> Result<usize, String> {
+    let install_root = current_runtime.parent().ok_or_else(|| {
+        format!(
+            "the managed runtime {} has no installation root",
+            current_runtime.display()
+        )
+    })?;
+    let current_daemon = current_runtime.join("bin/ego-chatd.mjs");
+    if !current_daemon.is_file() {
+        return Err(format!(
+            "the current managed broker daemon {} is missing",
+            current_daemon.display()
+        ));
+    }
+    let daemon_path = serde_json::to_string(&path_bytes(&current_daemon)?)
+        .map_err(|error| format!("could not encode the current broker daemon path: {error}"))?;
+    let launcher = format!(
+        "#!/usr/bin/env node\n\
+import {{ pathToFileURL }} from \"node:url\"\n\
+await import(pathToFileURL({daemon_path}).href)\n"
+    );
+    let mut redirected = 0;
+    let entries = fs::read_dir(install_root)
+        .map_err(|error| format!("could not inspect {}: {error}", install_root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect an entry under {}: {error}",
+                install_root.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let runtime = entry.path();
+        if runtime == current_runtime {
+            continue;
+        }
+        let version = match fs::read_to_string(runtime.join(RUNTIME_MARKER)) {
+            Ok(value) => value.trim().to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not read the managed marker under {}: {error}",
+                    runtime.display()
+                ));
+            }
+        };
+        if version.is_empty()
+            || version == env!("CARGO_PKG_VERSION")
+            || runtime.file_name().and_then(OsStr::to_str) != Some(version.as_str())
+        {
+            continue;
+        }
+        let daemon = runtime.join("bin/ego-chatd.mjs");
+        let metadata = match fs::symlink_metadata(&daemon) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("could not inspect {}: {error}", daemon.display()));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "refusing to replace non-regular managed broker launcher {}",
+                daemon.display()
+            ));
+        }
+        if fs::read(&daemon)
+            .map(|value| value == launcher.as_bytes())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        write_atomic(&daemon, launcher.as_bytes())?;
+        redirected += 1;
+    }
+    Ok(redirected)
 }
 
 fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result<(), String> {
@@ -720,12 +913,32 @@ fn doctor() -> Result<(), String> {
             failures.push(error);
         }
     }
-    if runtime_ready(&paths.runtime_dir) {
+    let runtime_installed = runtime_ready(&paths.runtime_dir);
+    if runtime_installed {
         println!("[ok] Runtime {} is installed", paths.runtime_dir.display());
     } else {
         let message = format!("Runtime {} is not ready", paths.runtime_dir.display());
         println!("[fail] {message}");
         failures.push(message);
+    }
+    if runtime_installed {
+        match inspect_installed_broker_runtime(&paths.runtime_dir, &tools) {
+            Ok(status) if status == "current" => {
+                println!("[ok] The authoritative broker matches the installed runtime")
+            }
+            Ok(status) if status == "not_running" => {
+                println!("[ok] No authoritative Ego Chat broker is currently running")
+            }
+            Ok(_) => {
+                let message = "A stale authoritative broker is still running; run ego-chat setup after its active work stops".to_string();
+                println!("[fail] {message}");
+                failures.push(message);
+            }
+            Err(error) => {
+                println!("[fail] {error}");
+                failures.push(error);
+            }
+        }
     }
     if skill_matches(&paths.codex_skill_dir, SKILL_FILES) {
         println!(
@@ -781,12 +994,32 @@ fn doctor_zcode() -> Result<(), String> {
             ),
         }
     }
-    if runtime_ready(&paths.runtime_dir) {
+    let runtime_installed = runtime_ready(&paths.runtime_dir);
+    if runtime_installed {
         println!("[ok] Runtime {} is installed", paths.runtime_dir.display());
     } else {
         let message = format!("Runtime {} is not ready", paths.runtime_dir.display());
         println!("[fail] {message}");
         failures.push(message);
+    }
+    if runtime_installed {
+        match inspect_installed_broker_runtime(&paths.runtime_dir, &tools) {
+            Ok(status) if status == "current" => {
+                println!("[ok] The authoritative broker matches the installed runtime")
+            }
+            Ok(status) if status == "not_running" => {
+                println!("[ok] No authoritative Ego Chat broker is currently running")
+            }
+            Ok(_) => {
+                let message = "A stale authoritative broker is still running; run ego-chat setup-zcode after its active work stops".to_string();
+                println!("[fail] {message}");
+                failures.push(message);
+            }
+            Err(error) => {
+                println!("[fail] {error}");
+                failures.push(error);
+            }
+        }
     }
     if skill_matches(&paths.zcode_skill_dir, ZCODE_SKILL_FILES) {
         println!(
@@ -1125,6 +1358,135 @@ mod tests {
             assert!(safe_join(Path::new("/tmp/owned"), file.path).is_ok());
             assert!(!file.bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn setup_runtime_handoff_invokes_the_installed_broker_cli() {
+        let directory = TestDirectory::new();
+        let runtime = directory.0.join("runtime");
+        let runtime_bin = runtime.join("bin");
+        let tool_bin = directory.0.join("tools");
+        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        fs::create_dir_all(&tool_bin).expect("create tool bin");
+        fs::write(runtime_bin.join("ego-chat.mjs"), "// managed runtime CLI\n")
+            .expect("write runtime CLI");
+        let invocation = directory.0.join("node-invocation.txt");
+        let node = tool_bin.join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"status\":\"not_running\"}}\\n'\n",
+                invocation.display()
+            ),
+        )
+        .expect("write fake node");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&node).expect("read node mode").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&node, permissions).expect("make node executable");
+        }
+        let tools = Toolchain {
+            codex: None,
+            ego_browser: tool_bin.join("ego-browser"),
+            node,
+            npm: tool_bin.join("npm"),
+        };
+
+        assert_eq!(
+            handoff_installed_broker(&runtime, &tools).expect("handoff idle broker"),
+            "not_running"
+        );
+        let arguments = fs::read_to_string(invocation).expect("read node invocation");
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            [
+                runtime_bin.join("ego-chat.mjs").to_str().unwrap(),
+                "broker-handoff"
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_runtime_check_detects_a_live_stale_broker_without_handoff() {
+        let directory = TestDirectory::new();
+        let runtime = directory.0.join("runtime");
+        let runtime_bin = runtime.join("bin");
+        let tool_bin = directory.0.join("tools");
+        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        fs::create_dir_all(&tool_bin).expect("create tool bin");
+        fs::write(runtime_bin.join("ego-chat.mjs"), "// managed runtime CLI\n")
+            .expect("write runtime CLI");
+        let invocation = directory.0.join("node-doctor-invocation.txt");
+        let node = tool_bin.join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"runtime\":{{\"appVersion\":\"0.2.0\"}},\"status\":\"stale\"}}\\n'\n",
+                invocation.display()
+            ),
+        )
+        .expect("write fake node");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&node).expect("read node mode").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&node, permissions).expect("make node executable");
+        }
+        let tools = Toolchain {
+            codex: None,
+            ego_browser: tool_bin.join("ego-browser"),
+            node,
+            npm: tool_bin.join("npm"),
+        };
+
+        assert_eq!(
+            inspect_installed_broker_runtime(&runtime, &tools).expect("inspect live broker"),
+            "stale"
+        );
+        let arguments = fs::read_to_string(invocation).expect("read node invocation");
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            [
+                runtime_bin.join("ego-chat.mjs").to_str().unwrap(),
+                "broker-runtime-status"
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_redirects_only_verified_stale_managed_broker_launchers() {
+        let directory = TestDirectory::new();
+        let install_root = directory.0.join("runtime");
+        let current = install_root.join(env!("CARGO_PKG_VERSION"));
+        let stale = install_root.join("0.1.0");
+        let unmanaged = install_root.join("personal-runtime");
+        for runtime in [&current, &stale, &unmanaged] {
+            fs::create_dir_all(runtime.join("bin")).expect("create runtime bin");
+            fs::write(runtime.join("bin/ego-chatd.mjs"), "// original daemon\n")
+                .expect("write daemon");
+        }
+        fs::write(
+            current.join(RUNTIME_MARKER),
+            format!("{}\n", env!("CARGO_PKG_VERSION")),
+        )
+        .expect("write current marker");
+        fs::write(stale.join(RUNTIME_MARKER), "0.1.0\n").expect("write stale marker");
+        fs::write(unmanaged.join(RUNTIME_MARKER), "different-name\n")
+            .expect("write unmanaged marker");
+
+        assert_eq!(
+            redirect_stale_broker_launchers(&current).expect("redirect stale launchers"),
+            1
+        );
+        let redirected =
+            fs::read_to_string(stale.join("bin/ego-chatd.mjs")).expect("read redirected daemon");
+        assert!(redirected.contains("pathToFileURL"));
+        assert!(redirected.contains(current.join("bin/ego-chatd.mjs").to_str().unwrap()));
+        assert_eq!(
+            fs::read_to_string(unmanaged.join("bin/ego-chatd.mjs")).expect("read unmanaged daemon"),
+            "// original daemon\n"
+        );
     }
 
     #[test]
