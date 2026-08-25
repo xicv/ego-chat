@@ -4,6 +4,7 @@ import fs from "node:fs/promises"
 
 import { loadConfig } from "../src/config.mjs"
 import { requestBroker } from "../src/ipc-client.mjs"
+import { handoffBrokerRuntime, inspectBrokerRuntime } from "../src/runtime-handoff.mjs"
 
 const config = loadConfig()
 const [command, ...args] = process.argv.slice(2)
@@ -14,7 +15,7 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | broker-status | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
@@ -23,6 +24,16 @@ try {
     print(await requestBroker(config, "ping"))
   } else if (command === "broker-status") {
     print(await requestBroker(config, "broker.status"))
+  } else if (command === "broker-runtime-status") {
+    if (args.length > 0) {
+      failUsage("broker-runtime-status does not accept arguments")
+    }
+    print(await inspectBrokerRuntime(config))
+  } else if (command === "broker-handoff") {
+    if (args.length > 0) {
+      failUsage("broker-handoff does not accept arguments")
+    }
+    print(await handoffBrokerRuntime(config))
   } else if (command === "probe") {
     const delayMs = Number(args[0])
     const value = args[1]

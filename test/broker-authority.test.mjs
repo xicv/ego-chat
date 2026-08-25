@@ -140,6 +140,7 @@ test("a live click-capable browser child prevents generation takeover", async (t
   await lease.registerChild(process.pid)
   const owner = JSON.parse(await fs.readFile(lease.ownerPath, "utf8"))
   assert.deepEqual(owner.browserPids, [process.pid])
+  assert.deepEqual((await lease.inspect()).browserPids, [process.pid])
   await fs.writeFile(lease.ownerPath, `${JSON.stringify({
     ...owner,
     pid: Number.MAX_SAFE_INTEGER,

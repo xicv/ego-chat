@@ -19,7 +19,14 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function requestOnce(config, method, params, timeoutMs, signal = undefined) {
+async function requestOnce(
+  config,
+  method,
+  params,
+  timeoutMs,
+  signal = undefined,
+  runtime = RUNTIME_IDENTITY,
+) {
   const token = await readBrokerToken(config.dataDir)
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(config.socketPath)
@@ -54,7 +61,7 @@ async function requestOnce(config, method, params, timeoutMs, signal = undefined
         id: randomUUID(),
         method,
         params,
-        runtime: RUNTIME_IDENTITY,
+        runtime,
         token,
         version: IPC_VERSION,
       })}\n`)
@@ -92,6 +99,17 @@ async function requestOnce(config, method, params, timeoutMs, signal = undefined
       }
     })
   })
+}
+
+export async function requestBrokerUpgrade(config, broker, targetRuntime = RUNTIME_IDENTITY) {
+  return requestOnce(
+    config,
+    "broker.prepare_upgrade",
+    { expectedBroker: broker, targetRuntime },
+    5_000,
+    undefined,
+    broker.runtimeIdentity,
+  )
 }
 
 function startDaemon(config) {

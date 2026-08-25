@@ -318,8 +318,10 @@ console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
 
 async function runAdoptionDriverCase({
   fallbackTaskSpaceOwnership = null,
+  hydrateAnchorPrefix = false,
   interleave = false,
   initiallyGenerating = true,
+  mutateAnchorAfterLock = false,
   pageStates = ["authenticated"],
   pageUrl = null,
   pageUrls = null,
@@ -383,6 +385,7 @@ let pageInspection = 0
 let pageInfoRead = 0
 let pageUrlOverride = null
 let openedRecoveredTab = false
+let messageReads = 0
 const pageStates = ${JSON.stringify(pageStates)}
 const taskSpaceRequests = []
 const counters = { click: 0, fillInput: 0, pressKey: 0, sendClick: 0, typeText: 0 }
@@ -390,8 +393,17 @@ const canonicalUrl = ${JSON.stringify(canonicalUrl)}
 const pageUrl = ${JSON.stringify(pageUrl)}
 const pageUrls = ${JSON.stringify(pageUrls)}
 const messages = () => {
+  messageReads += 1
   const values = [
-    { messageId: 'adopt-user-1', role: 'user', text: 'Please perform a long review.' },
+    {
+      messageId: 'adopt-user-1',
+      role: 'user',
+      text: ${JSON.stringify(hydrateAnchorPrefix)} && messageReads === 1
+        ? 'Please perform a long review.'
+        : ${JSON.stringify(mutateAnchorAfterLock)} && messageReads >= 3
+          ? 'The user turn changed after the adoption anchor was locked.'
+          : 'Please perform a long review with the fully hydrated prompt.',
+    },
     {
       messageId: 'adopt-assistant-1',
       role: 'assistant',
@@ -1316,6 +1328,28 @@ test("conversation adoption tolerates transient ChatGPT hydration without asking
   const adopted = await runAdoptionDriverCase({ pageStates: ["unknown", "authenticated"] })
   assert.equal(adopted.error, undefined)
   assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption stabilizes one hydrated anchor prefix before locking it", async () => {
+  const adopted = await runAdoptionDriverCase({ hydrateAnchorPrefix: true })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.anchor.messageId, "adopt-user-1")
+  assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption still fails closed when the anchor changes after locking", async () => {
+  const adopted = await runAdoptionDriverCase({ mutateAnchorAfterLock: true })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "adoption_anchor_changed")
   assert.equal(adopted.counters.sendClick, 0)
   assert.equal(adopted.counters.fillInput, 0)
   assert.equal(adopted.counters.pressKey, 0)

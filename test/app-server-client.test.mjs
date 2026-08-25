@@ -37,6 +37,10 @@ test("App Server client preserves identities and waits for idle between exact tu
   assert.deepEqual(recovered.result.value, structured.value)
   assert.equal(structured.value.criteria[0].id, "AC-1")
   assert.equal(structured.value.status, "candidate")
+  assert.deepEqual(structured.workspaceActivity, {
+    count: 1,
+    types: ["commandExecution"],
+  })
   assert.notEqual(structured.turnId, turn.turnId)
 })
 

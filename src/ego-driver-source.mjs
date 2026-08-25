@@ -1030,21 +1030,10 @@ async function egoDriverMain(inputPathOverride = undefined) {
         break
       }
     }
-    const anchor = initialEntries[anchorIndex]
-    if (!anchor || !anchor.messageId) {
+    const initialAnchor = initialEntries[anchorIndex]
+    if (!initialAnchor || !initialAnchor.messageId) {
       humanRequired("adoption_anchor_missing", "The conversation has no uniquely identifiable latest user turn to adopt.", {
         renderedMessageCount: initialEntries.length,
-        targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      })
-      return
-    }
-
-    const initialPrefixFingerprint = legacyConversationFingerprint(initialEntries.slice(0, anchorIndex + 1))
-    const initialTail = initialEntries.slice(anchorIndex + 1)
-    if (initialTail.length > 1 || (initialTail[0] && initialTail[0].role !== "assistant")) {
-      humanRequired("adoption_tail_interleaved", "The latest user turn is not followed by at most one assistant response.", {
-        committedCount: initialTail.length,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
@@ -1054,6 +1043,62 @@ async function egoDriverMain(inputPathOverride = undefined) {
     const adoptedWhileGenerating = await js(String.raw`Boolean(
       document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
     )`)
+    let anchor = initialAnchor
+    let initialPrefixFingerprint = legacyConversationFingerprint(initialEntries.slice(0, anchorIndex + 1))
+    let stableAnchorIndex = anchorIndex
+    let stableEntries = initialEntries
+    let stableAnchorCount = 1
+    while (stableAnchorCount < 2 && Date.now() - startedAt < input.timeoutMs) {
+      await wait(1)
+      if (Date.now() - startedAt >= input.timeoutMs) {
+        break
+      }
+      const entries = await readConversationEntries()
+      const anchorIndexes = entries
+        .map((entry, index) => entry.messageId === initialAnchor.messageId ? index : -1)
+        .filter((index) => index >= 0)
+      const currentAnchorIndex = anchorIndexes[0] ?? -1
+      const currentAnchor = currentAnchorIndex >= 0 ? entries[currentAnchorIndex] : null
+      if (anchorIndexes.length !== 1 || currentAnchor?.role !== "user") {
+        humanRequired("adoption_anchor_changed", "The adopted user turn changed while its initial browser rendering was stabilizing.", {
+          anchorCount: anchorIndexes.length,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      const prefixFingerprint = legacyConversationFingerprint(entries.slice(0, currentAnchorIndex + 1))
+      if (
+        currentAnchor.contentDigest === anchor.contentDigest
+        && prefixFingerprint === initialPrefixFingerprint
+      ) {
+        stableAnchorCount += 1
+      } else {
+        anchor = currentAnchor
+        initialPrefixFingerprint = prefixFingerprint
+        stableAnchorCount = 1
+      }
+      stableAnchorIndex = currentAnchorIndex
+      stableEntries = entries
+    }
+    if (stableAnchorCount < 2) {
+      humanRequired("adoption_anchor_unstable", "The adopted user turn did not reach a stable initial browser rendering before the deadline.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    const initialTail = stableEntries.slice(stableAnchorIndex + 1)
+    if (initialTail.length > 1 || (initialTail[0] && initialTail[0].role !== "assistant")) {
+      humanRequired("adoption_tail_interleaved", "The latest user turn is not followed by at most one assistant response.", {
+        committedCount: initialTail.length,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
     if (!adoptedWhileGenerating && initialTail.length !== 1) {
       humanRequired("adoption_response_missing", "The latest user turn has no assistant response to adopt.", {
         targetId: selected.targetId,

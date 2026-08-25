@@ -87,6 +87,7 @@ class FakeConvergenceAppServer {
     this.additionalContexts = []
     this.candidateFactory = candidateFactory
     this.closed = false
+    this.prompts = []
     this.turns = 0
   }
 
@@ -107,11 +108,16 @@ class FakeConvergenceAppServer {
   async runStructuredTurn(input) {
     this.turns += 1
     this.additionalContexts.push(input.additionalContext ?? null)
+    this.prompts.push(input.prompt)
     return {
       durationMs: 10,
       responseDigest: String(this.turns).repeat(64),
       turnId: `codex-turn-${this.turns}`,
       value: this.candidateFactory(this.turns),
+      workspaceActivity: {
+        count: 1,
+        types: ["commandExecution"],
+      },
     }
   }
 
@@ -1620,6 +1626,117 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(broker.getModelPolicy().revision, 2)
 })
 
+test("convergence corrects one schema-only Codex turn before sending to ChatGPT", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  appServer.runStructuredTurn = async (input) => {
+    appServer.turns += 1
+    appServer.prompts.push(input.prompt)
+    return {
+      durationMs: 10,
+      responseDigest: String(appServer.turns).repeat(64),
+      turnId: `codex-turn-${appServer.turns}`,
+      value: appServer.turns === 1
+        ? {
+            ...convergenceCandidate(1),
+            blockers: ["The final JSON instruction was mistaken for a ban on tools."],
+            status: "blocked",
+          }
+        : convergenceCandidate(1),
+      workspaceActivity: appServer.turns === 1
+        ? { count: 0, types: [] }
+        : { count: 1, types: ["commandExecution"] },
+    }
+  }
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The corrected turn inspected the workspace.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The corrected candidate is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-inspection-correction-test",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The workspace is inspected before review."],
+    bindingKey: "ego-chat-main",
+    codexSandbox: "workspace-write",
+    cwd: process.cwd(),
+    target: "Inspect the project and produce an evidence-backed candidate.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.codexInspectionRetryCount, 1)
+  assert.equal(appServer.turns, 2)
+  assert.match(appServer.prompts[0], /MUST inspect the supplied cwd with local tools/)
+  assert.match(appServer.prompts[1], /made no observable workspace tool call/i)
+  assert.equal(ego.exchanges, 1)
+})
+
+test("convergence stops before ChatGPT after two Codex turns without workspace activity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  appServer.runStructuredTurn = async (input) => {
+    appServer.turns += 1
+    appServer.prompts.push(input.prompt)
+    return {
+      durationMs: 10,
+      responseDigest: String(appServer.turns).repeat(64),
+      turnId: `codex-turn-${appServer.turns}`,
+      value: convergenceCandidate(1),
+      workspaceActivity: { count: 0, types: [] },
+    }
+  }
+  const ego = createConvergenceEgoAdapter(() => {
+    throw new Error("an uninspected candidate must not reach ChatGPT")
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-inspection-required-test",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The workspace is inspected before review."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Require workspace evidence before external review.",
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "codex_workspace_not_inspected")
+  assert.equal(stopped.codexInspectionRetryCount, 1)
+  assert.equal(appServer.turns, 2)
+  assert.equal(ego.exchanges, 0)
+})
+
 test("convergence resumes the exact Codex thread after one pre-review App Server exit", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -1864,6 +1981,7 @@ test("an active convergence lease blocks interleaved sends to its conversation",
         blockers: ["Test stop after lease qualification."],
         status: "blocked",
       },
+      workspaceActivity: { count: 1, types: ["commandExecution"] },
     }
   }
   const broker = new Broker({
