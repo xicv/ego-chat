@@ -1,14 +1,64 @@
 export const EGO_DRIVER_RESULT_PREFIX = "__EGO_CHAT_DRIVER_RESULT__"
 
-async function egoDriverMain() {
+async function egoDriverMain(inputPathOverride = undefined) {
+  const fsConstants = (await import("node:fs")).constants
   const fs = await import("node:fs/promises")
   const crypto = await import("node:crypto")
+  const path = await import("node:path")
 
   const resultPrefix = "__EGO_CHAT_DRIVER_RESULT__"
   const uid = typeof process.getuid === "function" ? process.getuid() : "user"
-  const inputPath = `/tmp/egc-driver-${uid}/input.json`
-  const input = JSON.parse(await fs.readFile(inputPath, "utf8"))
+  const mailboxDirectory = `/tmp/egc-driver-${uid}`
+  const inputPath = inputPathOverride ?? `${mailboxDirectory}/input.json`
+  const inputNameMatch = /^input-([1-9][0-9]{0,9})-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.json$/
+    .exec(path.basename(inputPath))
+  if (
+    inputPathOverride !== undefined
+    && (
+      path.dirname(inputPath) !== mailboxDirectory
+      || !inputNameMatch
+    )
+  ) {
+    throw new Error("The Ego driver input path is outside its private mailbox.")
+  }
+  let inputText
+  if (inputPathOverride === undefined) {
+    inputText = await fs.readFile(inputPath, "utf8")
+  } else {
+    const handle = await fs.open(
+      inputPath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    )
+    try {
+      const stat = await handle.stat()
+      if (
+        !stat.isFile()
+        || stat.nlink !== 1
+        || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+        || (stat.mode & 0o777) !== 0o600
+        || stat.size > 256 * 1024
+      ) {
+        throw new Error("The Ego driver input is not a private bounded regular file.")
+      }
+      const linkedStat = await fs.lstat(inputPath)
+      if (
+        linkedStat.isSymbolicLink()
+        || linkedStat.dev !== stat.dev
+        || linkedStat.ino !== stat.ino
+      ) {
+        throw new Error("The Ego driver input pathname changed after its private open.")
+      }
+      await fs.unlink(inputPath)
+      inputText = await handle.readFile("utf8")
+    } finally {
+      await handle.close()
+    }
+  }
+  const input = JSON.parse(inputText)
+  let driverStage = "initializing"
   let observedModelPolicy = null
+  let sendClickStarted = false
+  let unsentDraftMayExist = false
 
   function emit(value) {
     const encoded = Buffer.from(JSON.stringify(value), "utf8").toString("base64url")
@@ -59,6 +109,53 @@ async function egoDriverMain() {
     })
   }
 
+  async function assertBrokerAuthority(phase) {
+    if (
+      !input.brokerLease
+      || typeof input.brokerLease.ownerPath !== "string"
+      || typeof input.brokerLease.brokerId !== "string"
+      || !Number.isSafeInteger(input.brokerLease.epoch)
+      || !Number.isSafeInteger(input.brokerLease.pid)
+      || input.brokerLease.pid < 1
+    ) {
+      humanRequired("broker_fence_missing", "The browser operation has no authoritative broker generation proof.", { phase })
+      return false
+    }
+
+    let owner
+    try {
+      owner = JSON.parse(await fs.readFile(input.brokerLease.ownerPath, "utf8"))
+    } catch (_error) {
+      humanRequired("broker_fence_lost", "The authoritative broker lease disappeared during the browser operation.", { phase })
+      return false
+    }
+    if (
+      owner.brokerId !== input.brokerLease.brokerId
+      || owner.epoch !== input.brokerLease.epoch
+      || owner.pid !== input.brokerLease.pid
+    ) {
+      humanRequired("broker_fence_lost", "A newer broker generation fenced this browser operation.", {
+        observedBrokerId: owner.brokerId ?? null,
+        observedEpoch: owner.epoch ?? null,
+        phase,
+      })
+      return false
+    }
+    try {
+      process.kill(owner.pid, 0)
+    } catch (error) {
+      if (error?.code !== "EPERM") {
+        humanRequired("broker_fence_lost", "The authoritative broker process exited during the browser operation.", {
+          observedBrokerId: owner.brokerId,
+          observedEpoch: owner.epoch,
+          phase,
+        })
+        return false
+      }
+    }
+    return true
+  }
+
   async function inspectPage() {
     const info = await pageInfo()
     if (info?.dialog) {
@@ -76,12 +173,15 @@ async function egoDriverMain() {
     const normalized = snapshot.toLowerCase()
     const dom = await js(String.raw`(() => {
       const composer = document.querySelector('#prompt-textarea, textarea[placeholder], [contenteditable="true"]')
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
       const draft = composer
         ? (composer.matches('input, textarea')
             ? composer.value
             : composer.innerText || composer.textContent || '')
         : ''
       return {
+        composerCount: composers.length,
+        composerSemanticId: composers.length === 1 && composers[0].id === 'prompt-textarea',
         hasComposer: Boolean(composer),
         draft: String(draft || ''),
         hasLoginAction: [...document.querySelectorAll('a, button')].some((element) => {
@@ -93,7 +193,8 @@ async function egoDriverMain() {
         }),
       }
     })()`)
-    const hasCaptcha = !dom.hasComposer && (
+    const composerCount = Number.isInteger(dom.composerCount) ? dom.composerCount : (dom.hasComposer ? 1 : 0)
+    const hasCaptcha = composerCount === 0 && (
       normalized.includes("captcha")
         || normalized.includes("verify you are human")
         || normalized.includes("checking your browser")
@@ -101,16 +202,122 @@ async function egoDriverMain() {
     const accountState = hasCaptcha
       ? "blocked"
       : (dom.hasComposer
+          && composerCount === 1
           ? "authenticated"
           : (dom.hasLoginAction ? "unauthenticated" : "unknown"))
 
     return {
       accountState,
       blockedReason: hasCaptcha ? "verification_challenge" : null,
-      hasComposer: dom.hasComposer,
+      composerCount,
+      composerSemanticId: dom.composerSemanticId ?? composerCount === 1,
+      hasComposer: composerCount === 1,
       info,
       snapshotDigest: sha256(snapshot),
       unexpectedDraft: dom.draft.trim().length > 0,
+    }
+  }
+
+  async function clearUnsentComposerDraft() {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await js(String.raw`(() => {
+          const composer = document.querySelector('#prompt-textarea')
+          if (!composer) {
+            return false
+          }
+          composer.replaceChildren()
+          composer.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            inputType: 'deleteContentBackward',
+          }))
+          return true
+        })()`)
+        await wait(1)
+        const empty = await js(String.raw`(() => {
+          const composer = document.querySelector('#prompt-textarea')
+          if (!composer) {
+            return false
+          }
+          const draft = composer.matches('input, textarea')
+            ? composer.value
+            : composer.innerText || composer.textContent || ''
+          return String(draft).trim().length === 0
+        })()`)
+        if (empty) {
+          unsentDraftMayExist = false
+          return true
+        }
+      } catch (_error) {
+        // A timed-out renderer mutation can still complete; the next bounded pass verifies it.
+      }
+      await wait(1)
+    }
+    return false
+  }
+
+  function compositionChunks(value, maximumLength = 4_000) {
+    const chunks = []
+    let offset = 0
+    while (offset < value.length) {
+      let end = Math.min(value.length, offset + maximumLength)
+      const endsWithHighSurrogate = /[\uD800-\uDBFF]/.test(value[end - 1] ?? "")
+      const nextIsLowSurrogate = /[\uDC00-\uDFFF]/.test(value[end] ?? "")
+      if (end < value.length && endsWithHighSurrogate && nextIsLowSurrogate) {
+        end -= 1
+      }
+      chunks.push(value.slice(offset, end))
+      offset = end
+    }
+    return chunks
+  }
+
+  async function composePrompt(value) {
+    const ready = await js(String.raw`(() => {
+      const composer = document.querySelector('#prompt-textarea')
+      if (!composer) {
+        return false
+      }
+      const draft = composer.matches('input, textarea')
+        ? composer.value
+        : composer.innerText || composer.textContent || ''
+      if (String(draft).trim().length > 0) {
+        return false
+      }
+      composer.focus()
+      return document.activeElement === composer
+    })()`)
+    if (!ready) {
+      throw new Error("The verified ChatGPT composer was not empty and focusable.")
+    }
+
+    unsentDraftMayExist = true
+    const chunks = compositionChunks(value)
+    for (let index = 0; index < chunks.length; index += 1) {
+      driverStage = "inserting_prompt_chunk"
+      // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
+      await cdp("Input.insertText", { text: chunks[index] })
+      if (index === chunks.length - 1) {
+        continue
+      }
+      driverStage = "anchoring_prompt_chunk"
+      const cursorAtEnd = await js(String.raw`(() => {
+        const composer = document.querySelector('#prompt-textarea')
+        if (!composer) {
+          return false
+        }
+        const selection = window.getSelection()
+        const range = document.createRange()
+        range.selectNodeContents(composer)
+        range.collapse(false)
+        selection.removeAllRanges()
+        selection.addRange(range)
+        composer.focus()
+        return document.activeElement === composer
+      })()`)
+      if (!cursorAtEnd) {
+        throw new Error("The ChatGPT composer cursor could not be anchored after a text chunk.")
+      }
     }
   }
 
@@ -604,6 +811,15 @@ async function egoDriverMain() {
       ok: true,
       result: {
         accountState: inspection.accountState,
+        browserContract: {
+          composerCount: inspection.composerCount,
+          composerSemanticId: inspection.composerSemanticId,
+          revision: 2,
+          safe: inspection.accountState === "authenticated"
+            && inspection.composerCount === 1
+            && inspection.composerSemanticId
+            && !inspection.unexpectedDraft,
+        },
         blockedReason: inspection.blockedReason,
         hasComposer: inspection.hasComposer,
         snapshotDigest: inspection.snapshotDigest,
@@ -671,6 +887,9 @@ async function egoDriverMain() {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
+      return
+    }
+    if (!await assertBrokerAuthority("before_head_commit")) {
       return
     }
     emit({
@@ -857,6 +1076,9 @@ async function egoDriverMain() {
           })
           return
         }
+        if (!await assertBrokerAuthority("before_head_commit")) {
+          return
+        }
         emit({
           ok: true,
           result: {
@@ -887,6 +1109,10 @@ async function egoDriverMain() {
   }
 
   async function reconcile() {
+    if (input.browserContractRevision !== 6) {
+      humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
+      return
+    }
     const selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
     if (!selected) {
       return
@@ -902,21 +1128,10 @@ async function egoDriverMain() {
       })
       return
     }
-    const userTextCandidates = await js(String.raw`[...document.querySelectorAll('[data-message-author-role="user"]')]
-      .map((message) => [...new Set([
-        message.querySelector('[data-testid="collapsible-user-message-content"]')?.textContent,
-        message.querySelector('.whitespace-pre-wrap')?.textContent,
-        message.innerText,
-      ].filter((text) => typeof text === 'string'))])`)
-    const matchingTurns = userTextCandidates.filter(
-      (candidates) => candidates.some((text) => sha256(text) === input.inputDigest),
-    ).length
-    if (userTextCandidates.length !== 1 || matchingTurns !== 1) {
-      humanRequired("reconciliation_prompt_mismatch", "The canonical conversation does not contain exactly one user turn matching the confirmed send digest.", {
-        matchingTurns,
+    if (!input.expectedTerminalMarker || !input.turnMarker) {
+      humanRequired("reconciliation_metadata_missing", "Create-once reconciliation requires the exact workflow markers.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
-        userTurnCount: userTextCandidates.length,
       })
       return
     }
@@ -930,27 +1145,81 @@ async function egoDriverMain() {
       })
       return
     }
-    const head = await readConversationHead()
-    if (head.messageCount !== 2 || head.lastRole !== "assistant") {
-      humanRequired("reconciliation_head_incomplete", "The reconciled first turn does not have one stable user/assistant pair.", {
-        messageCount: head.messageCount,
+    const entries = await readConversationEntries()
+    const prompt = entries[0]
+    const response = entries[1]
+    const promptMarkerCount = prompt?.text.split(input.turnMarker).length - 1
+    const renderedMarkerCount = entries.reduce(
+      (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
+      0,
+    )
+    const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
+    const attributablePair = (
+      entries.length === 2
+      && prompt?.role === "user"
+      && response?.role === "assistant"
+      && Boolean(prompt?.messageId)
+      && Boolean(response?.messageId)
+      && prompt.messageId !== response.messageId
+      && prompt.contentDigest === input.inputDigest
+      && promptMarkerCount === 1
+      && renderedMarkerCount === 1
+      && terminalCount === 1
+      && response.text.trimEnd().endsWith(input.expectedTerminalMarker)
+    )
+    if (!attributablePair) {
+      humanRequired("reconciliation_prompt_mismatch", "The canonical conversation does not contain exactly one stable user/assistant pair attributable to the confirmed send.", {
+        messageCount: entries.length,
+        promptDigestMatches: prompt?.contentDigest === input.inputDigest,
+        promptMarkerCount: Number.isInteger(promptMarkerCount) ? promptMarkerCount : null,
+        renderedMarkerCount,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+        terminalCount: Number.isInteger(terminalCount) ? terminalCount : null,
+      })
+      return
+    }
+    const head = summarizeConversationHead(entries, 2)
+    await wait(1)
+    const stableEntries = await readConversationEntries()
+    const stableHead = summarizeConversationHead(stableEntries, 2)
+    const stablePrompt = stableEntries.find((entry) => entry.messageId === prompt.messageId)
+    const stableResponse = stableEntries.find((entry) => entry.messageId === response.messageId)
+    if (
+      stableEntries.length !== entries.length
+      || stableHead.fingerprint !== head.fingerprint
+      || stableHead.lastMessageId !== response.messageId
+      || stablePrompt?.contentDigest !== prompt.contentDigest
+      || stableResponse?.contentDigest !== response.contentDigest
+    ) {
+      humanRequired("reconciliation_head_incomplete", "The reconciled first turn changed while its response was being observed.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
+      return
+    }
+    if (!await assertBrokerAuthority("before_head_commit")) {
       return
     }
     emit({
       ok: true,
       result: {
         canonicalUrl: normalizeUrl(inspection.info.url),
-        head,
+        head: stableHead,
+        responseDigest: stableResponse.contentDigest,
+        responseText: stableResponse.text,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        turnMarker: input.turnMarker,
       },
     })
   }
 
   async function reconcileBound() {
+    if (input.browserContractRevision !== 6) {
+      humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
+      return
+    }
     const selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
     if (!selected) {
       return
@@ -959,24 +1228,48 @@ async function egoDriverMain() {
     if (!assertReady(inspection, selected)) {
       return
     }
-    if (normalizeUrl(inspection.info.url) !== normalizeUrl(input.binding.canonicalUrl)) {
+    const expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
+    if (!expectedCanonicalUrl || normalizeUrl(inspection.info.url) !== normalizeUrl(expectedCanonicalUrl)) {
       humanRequired("reconciliation_url_mismatch", "The late send is not in the bound canonical conversation.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return
     }
-    if (!input.expectedPreviousMessageId || !input.expectedTerminalMarker || !input.turnMarker) {
+    if (
+      (input.binding.state === "bound" && !input.expectedPreviousMessageId)
+      || !input.expectedTerminalMarker
+      || !input.turnMarker
+    ) {
       humanRequired("reconciliation_metadata_missing", "Bound late-send reconciliation requires the prior head and exact workflow markers.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return
     }
-    const generationRunning = await js(String.raw`Boolean(
+    let generationRunning = await js(String.raw`Boolean(
       document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
     )`)
-    if (generationRunning) {
+    if (input.mode === "capture_exchange") {
+      const captureDeadline = Date.now() + input.timeoutMs
+      while (generationRunning && Date.now() < captureDeadline) {
+        if (!await assertBrokerAuthority("capturing_confirmed_send")) {
+          return
+        }
+        await wait(5)
+        generationRunning = await js(String.raw`Boolean(
+          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+        )`)
+      }
+      if (generationRunning) {
+        humanRequired("completion_timeout_after_confirmed_send", "The confirmed prompt is still generating after the broker-owned generation deadline.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+          turnMarker: input.turnMarker,
+        })
+        return
+      }
+    } else if (generationRunning) {
       humanRequired("conversation_generation_in_progress", "The late accepted send is still generating a response.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
@@ -985,12 +1278,14 @@ async function egoDriverMain() {
     }
 
     const entries = await readConversationEntries()
-    const anchorIndexes = entries
-      .map((entry, index) => entry.messageId === input.expectedPreviousMessageId ? index : -1)
-      .filter((index) => index >= 0)
+    const anchorIndexes = input.expectedPreviousMessageId
+      ? entries
+          .map((entry, index) => entry.messageId === input.expectedPreviousMessageId ? index : -1)
+          .filter((index) => index >= 0)
+      : []
     const anchorIndex = anchorIndexes[0] ?? -1
     const anchor = anchorIndex >= 0 ? entries[anchorIndex] : null
-    const committed = anchorIndex >= 0 ? entries.slice(anchorIndex + 1) : []
+    const committed = anchorIndex >= 0 ? entries.slice(anchorIndex + 1) : entries
     const prompt = committed[0]
     const response = committed[1]
     const anchorDigestMatches = !input.expectedPreviousContentDigest
@@ -1004,8 +1299,63 @@ async function egoDriverMain() {
     )
     const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
     const responseEndsWithTerminal = response?.text.trimEnd().endsWith(input.expectedTerminalMarker) ?? false
+    const deliveryAbsentCandidate = (
+      input.allowDeliveryAbsent === true
+      && anchorIndexes.length === 1
+      && anchorDigestMatches
+      && anchorRoleMatches
+      && committed.length === 0
+      && renderedMarkerCount === 0
+    )
+    if (deliveryAbsentCandidate) {
+      await wait(2)
+      const stableEntries = await readConversationEntries()
+      const stableAnchorIndexes = stableEntries
+        .map((entry, index) => entry.messageId === input.expectedPreviousMessageId ? index : -1)
+        .filter((index) => index >= 0)
+      const stableAnchorIndex = stableAnchorIndexes[0] ?? -1
+      const stableAnchor = stableAnchorIndex >= 0 ? stableEntries[stableAnchorIndex] : null
+      const stableCommitted = stableAnchorIndex >= 0 ? stableEntries.slice(stableAnchorIndex + 1) : stableEntries
+      const stableMarkerCount = stableEntries.reduce(
+        (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
+        0,
+      )
+      const firstHead = summarizeConversationHead(entries, input.binding.messageCount)
+      const stableHead = summarizeConversationHead(stableEntries, input.binding.messageCount)
+      const deliveryAbsentStable = (
+        stableAnchorIndexes.length === 1
+        && stableAnchor?.contentDigest === input.expectedPreviousContentDigest
+        && stableAnchor?.role === input.binding.headRole
+        && stableCommitted.length === 0
+        && stableMarkerCount === 0
+        && stableEntries.length === entries.length
+        && stableHead.fingerprint === firstHead.fingerprint
+      )
+      if (!deliveryAbsentStable) {
+        humanRequired("bound_reconciliation_unstable", "The conversation changed while prompt-delivery absence was being verified.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (!await assertBrokerAuthority("before_absent_delivery_reconciliation")) {
+        return
+      }
+      emit({
+        ok: true,
+        result: {
+          canonicalUrl: normalizeUrl(inspection.info.url),
+          deliveryState: "absent",
+          head: stableHead,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+          turnMarker: input.turnMarker,
+        },
+      })
+      return
+    }
     const attributablePair = (
-      anchorIndexes.length === 1
+      (input.expectedPreviousMessageId ? anchorIndexes.length === 1 : anchorIndexes.length === 0)
       && anchorDigestMatches
       && anchorRoleMatches
       && committed.length === 2
@@ -1063,6 +1413,9 @@ async function egoDriverMain() {
       })
       return
     }
+    if (!await assertBrokerAuthority("before_head_commit")) {
+      return
+    }
     emit({
       ok: true,
       result: {
@@ -1078,10 +1431,17 @@ async function egoDriverMain() {
   }
 
   async function exchange() {
+    driverStage = "checking_browser_contract"
+    if (input.browserContractRevision !== 6) {
+      humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
+      return
+    }
+    driverStage = "selecting_conversation"
     const selected = await selectConversation(input.binding)
     if (!selected) {
       return
     }
+    driverStage = "checking_generation_state"
     const generationRunning = await js(String.raw`Boolean(
       document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
     )`)
@@ -1092,6 +1452,7 @@ async function egoDriverMain() {
       })
       return
     }
+    driverStage = "reading_before_head"
     const beforeEntries = await readConversationEntries()
     const beforeHead = summarizeConversationHead(beforeEntries, input.binding.messageCount)
     if (input.binding.state === "unbound" && beforeHead.messageCount !== 0) {
@@ -1136,11 +1497,17 @@ async function egoDriverMain() {
       return
     }
 
+    if (!await assertBrokerAuthority("before_policy_verification")) {
+      return
+    }
+
+    driverStage = "verifying_model_policy"
     const modelPolicy = await ensureMaximumModelPolicy(selected)
     if (!modelPolicy) {
       return
     }
     observedModelPolicy = modelPolicy
+    driverStage = "verifying_precompose_head"
     const preComposeHead = await readConversationHead(input.binding.messageCount)
     if (preComposeHead.fingerprint !== beforeHead.fingerprint) {
       humanRequired("conversation_head_changed", "The bound conversation head changed while the ChatGPT model policy was being verified.", {
@@ -1150,18 +1517,33 @@ async function egoDriverMain() {
       })
       return
     }
+    if (!await assertBrokerAuthority("before_composition")) {
+      return
+    }
 
+    driverStage = "inspecting_composer"
     const sendControl = await js(String.raw`(() => {
       const composers = [...document.querySelectorAll('#prompt-textarea')]
       const sendButtons = [...document.querySelectorAll('button[data-testid="send-button"]')]
+      const composer = composers[0]
+      const draft = composer
+        ? (composer.matches('input, textarea')
+            ? composer.value
+            : composer.innerText || composer.textContent || '')
+        : ''
       return {
         composerCount: composers.length,
+        draftEmpty: String(draft).trim().length === 0,
         enabledSendCount: sendButtons.filter((button) => !button.disabled).length,
         sendCount: sendButtons.length,
       }
     })()`)
     if (sendControl.composerCount !== 1) {
       humanRequired("unknown_chatgpt_ui", "The ChatGPT composer could not be identified unambiguously.", sendControl)
+      return
+    }
+    if (!sendControl.draftEmpty) {
+      humanRequired("unexpected_chatgpt_draft", "The ChatGPT composer contains an unexpected draft.", sendControl)
       return
     }
 
@@ -1181,11 +1563,14 @@ async function egoDriverMain() {
           : [composer.innerText, composer.textContent, blockText]
         return [...new Set(values.filter((value) => typeof value === 'string'))]
       })()`)
-      const expectedDigest = sha256(input.prompt)
-      const matchingCandidates = candidates.filter((candidate) => sha256(candidate) === expectedDigest)
+      const canonicalComposerText = (value) => value.replaceAll("\u00a0", " ")
+      const expectedDigest = sha256(canonicalComposerText(input.prompt))
+      const canonicalCandidates = [...new Set(candidates.map(canonicalComposerText))]
+      const matchingCandidates = canonicalCandidates.filter((candidate) => sha256(candidate) === expectedDigest)
       return {
-        candidateCount: candidates.length,
+        candidateCount: canonicalCandidates.length,
         digestMatchCount: matchingCandidates.length,
+        editorSpaceCanonicalized: candidates.some((candidate) => candidate.includes("\u00a0")),
         markerCount: matchingCandidates[0]?.split(input.turnMarker).length - 1,
       }
     }
@@ -1194,21 +1579,8 @@ async function egoDriverMain() {
       return inspection.digestMatchCount === 1 && inspection.markerCount === 1
     }
 
-    await fillInput("#prompt-textarea", input.prompt)
-    const composedPrompt = await inspectComposedPrompt()
-    if (!composedPromptIsExact(composedPrompt)) {
-      humanRequired("compose_verification_failed", "The exact uniquely marked prompt was not present in the ChatGPT composer.", {
-        ...composedPrompt,
-        phase: "after_fill",
-        targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      })
-      return
-    }
-
-    let sendTarget = null
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      sendTarget = await js(String.raw`(() => {
+    async function inspectSendTarget() {
+      return js(String.raw`(() => {
         const buttons = [...document.querySelectorAll('button[data-testid="send-button"]')]
         if (buttons.length !== 1 || buttons[0].disabled || buttons[0].getClientRects().length === 0) {
           return { ok: false }
@@ -1226,30 +1598,94 @@ async function egoDriverMain() {
           y,
         }
       })()`)
+    }
+
+    driverStage = "composing_prompt"
+    await composePrompt(input.prompt)
+    driverStage = "verifying_composed_prompt"
+    const composedPrompt = await inspectComposedPrompt()
+    if (!composedPromptIsExact(composedPrompt)) {
+      const draftCleared = await clearUnsentComposerDraft()
+      humanRequired("compose_verification_failed", "The exact uniquely marked prompt was not present in the ChatGPT composer.", {
+        ...composedPrompt,
+        draftCleared,
+        phase: "after_fill",
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    driverStage = "locating_send_control"
+    let sendTarget = null
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      sendTarget = await inspectSendTarget()
       if (sendTarget.ok && sendTarget.hit) {
         break
       }
       await wait(1)
     }
     if (!sendTarget.ok || !sendTarget.hit) {
+      const draftCleared = await clearUnsentComposerDraft()
       humanRequired("send_control_unavailable", "The ChatGPT send control is unavailable after composing the prompt.", {
+        draftCleared,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return
     }
 
+    driverStage = "checking_presend_policy_fence"
+    if (!await assertBrokerAuthority("before_presend_policy_verification")) {
+      await clearUnsentComposerDraft()
+      return
+    }
+    driverStage = "verifying_presend_model_policy"
+    const preSendModelPolicy = await verifyExistingMaximumModelPolicy(selected)
+    if (!preSendModelPolicy) {
+      await clearUnsentComposerDraft()
+      return
+    }
+    observedModelPolicy = preSendModelPolicy
+
+    driverStage = "verifying_preclick_prompt"
     const preClickPrompt = await inspectComposedPrompt()
     if (!composedPromptIsExact(preClickPrompt)) {
+      const draftCleared = await clearUnsentComposerDraft()
       humanRequired("compose_verification_failed", "The exact uniquely marked prompt changed before the ChatGPT send click.", {
         ...preClickPrompt,
+        draftCleared,
         phase: "before_click",
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return
     }
+    driverStage = "checking_preclick_fence"
+    if (!await assertBrokerAuthority("before_send_click")) {
+      await clearUnsentComposerDraft()
+      return
+    }
 
+    driverStage = "rechecking_send_control"
+    sendTarget = await inspectSendTarget()
+    if (!sendTarget.ok || !sendTarget.hit) {
+      const draftCleared = await clearUnsentComposerDraft()
+      humanRequired("send_control_changed", "The exact ChatGPT send control changed immediately before dispatch.", {
+        draftCleared,
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+    driverStage = "checking_send_dispatch_fence"
+    if (!await assertBrokerAuthority("immediately_before_send_click")) {
+      await clearUnsentComposerDraft()
+      return
+    }
+
+    driverStage = "dispatching_send_click"
+    sendClickStarted = true
     const sentAt = Date.now()
     // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
     await cdp("Input.dispatchMouseEvent", {
@@ -1267,6 +1703,7 @@ async function egoDriverMain() {
       x: sendTarget.x,
       y: sendTarget.y,
     })
+    driverStage = "confirming_send"
     let sendConfirmation = null
     const sendConfirmationDeadline = Date.now() + 30_000
     while (Date.now() < sendConfirmationDeadline) {
@@ -1316,6 +1753,7 @@ async function egoDriverMain() {
       })
       return
     }
+    driverStage = "resolving_canonical_conversation"
     let postSendInfo = await pageInfo()
     const canonicalDeadline = Math.min(sentAt + input.timeoutMs, Date.now() + 30_000)
     while (!isCanonicalConversationUrl(postSendInfo.url) && Date.now() < canonicalDeadline) {
@@ -1338,6 +1776,41 @@ async function egoDriverMain() {
       return
     }
 
+    if (input.exchangeStage === "send_only") {
+      driverStage = "verifying_sent_identity"
+      const sentEntries = await readConversationEntries()
+      const renderedMarkerCount = sentEntries.reduce(
+        (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
+        0,
+      )
+      const markedUsers = sentEntries.filter((entry) => (
+        entry.role === "user" && entry.text.split(input.turnMarker).length - 1 === 1
+      ))
+      if (renderedMarkerCount !== 1 || markedUsers.length !== 1 || !markedUsers[0].messageId) {
+        humanRequired("send_confirmation_ambiguous", "The prompt was clicked, but its durable user-message identity is ambiguous.", {
+          renderedMarkerCount,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+          userMarkerCount: markedUsers.length,
+        })
+        return
+      }
+      emit({
+        ok: true,
+        result: {
+          canonicalUrl,
+          modelPolicy,
+          promptMessageId: markedUsers[0].messageId,
+          sentAt: new Date(sentAt).toISOString(),
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+          turnMarker: input.turnMarker,
+        },
+      })
+      return
+    }
+
+    driverStage = "capturing_response"
     let stableText = null
     let stableCount = 0
     while (Date.now() - sentAt < input.timeoutMs) {
@@ -1389,6 +1862,9 @@ async function egoDriverMain() {
       }
 
       if (stableCount >= 2) {
+        if (!await assertBrokerAuthority("before_head_commit")) {
+          return
+        }
         const finishedInfo = await pageInfo()
         if (normalizeUrl(finishedInfo.url) !== canonicalUrl) {
           humanRequired("canonical_conversation_changed", "The bound conversation URL changed before capture completed.", {
@@ -1480,6 +1956,7 @@ async function egoDriverMain() {
   }
 
   try {
+    driverStage = `dispatching_${input.mode}`
     if (input.mode === "preflight") {
       await preflight()
     } else if (input.mode === "adopt") {
@@ -1503,13 +1980,16 @@ async function egoDriverMain() {
         })
         return
       }
+      if (!await assertBrokerAuthority("before_policy_verification")) {
+        return
+      }
       const modelPolicy = await ensureMaximumModelPolicy(selected)
       if (modelPolicy) {
         emit({ ok: true, result: modelPolicy })
       }
     } else if (input.mode === "reconcile") {
       await reconcile()
-    } else if (input.mode === "reconcile_bound") {
+    } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "verify") {
       const selected = await selectConversation(input.binding)
@@ -1554,16 +2034,26 @@ async function egoDriverMain() {
     if (controlRequired) {
       humanRequired("browser_control_unavailable", "The Ego task space is under user control or inactive.", {})
     } else {
+      const draftCleared = input.mode === "exchange" && !sendClickStarted && unsentDraftMayExist
+        ? await clearUnsentComposerDraft()
+        : null
       emit({
         error: {
           code: "ego_driver_error",
           diagnosticDigest: sha256(message),
+          ...(typeof draftCleared === "boolean" ? { draftCleared } : {}),
+          ...(observedModelPolicy ? { modelPolicy: observedModelPolicy } : {}),
           message: "The fixed Ego Browser driver failed.",
+          stage: driverStage,
         },
         ok: false,
       })
     }
   }
+}
+
+export function egoDriverSourceForInput(inputPath) {
+  return `(${egoDriverMain.toString()})(${JSON.stringify(inputPath)})\n`
 }
 
 export const EGO_DRIVER_SOURCE = `(${egoDriverMain.toString()})()\n`

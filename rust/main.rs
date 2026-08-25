@@ -17,8 +17,8 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const MINIMUM_NODE_MAJOR: u64 = 24;
 const RUNTIME_MARKER: &str = ".ego-chat-runtime-version";
 const MCP_SERVER_NAME: &str = "ego_chat";
-const MCP_TOOL_TIMEOUT_SECONDS: i64 = 1_900;
-const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = 1_900_000;
+const MCP_TOOL_TIMEOUT_SECONDS: i64 = 21_900;
+const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = 21_900_000;
 const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
 
 struct EmbeddedFile {
@@ -54,6 +54,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
         path: "src/auth-token.mjs",
         bytes: include_bytes!("../src/auth-token.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/broker-lease.mjs",
+        bytes: include_bytes!("../src/broker-lease.mjs"),
     },
     EmbeddedFile {
         path: "src/broker.mjs",
@@ -251,6 +255,7 @@ Usage:\n  \
   ego-chat install-zcode-skill [--force]\n  \
   ego-chat doctor\n  \
   ego-chat doctor-zcode\n  \
+  ego-chat broker-status\n  \
   ego-chat mcp\n  \
   ego-chat <broker-cli-command> [args...]\n\n\
 setup configures Codex; setup-zcode configures ZCode. Both install the same embedded runtime and host skill, then register this executable as the ego_chat MCP server.\n\

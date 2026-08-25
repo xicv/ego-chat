@@ -23,6 +23,45 @@ function classifyRemoteError(message) {
   return "unclassified"
 }
 
+function agentResponseText(turn) {
+  const messages = turn.items.filter((item) => item.type === "agentMessage")
+  const finalMessages = messages.filter((item) => item.phase === "final_answer")
+  const compatibilityMessages = messages.filter((item) => item.phase !== "commentary")
+  const selected = finalMessages.length > 0
+    ? finalMessages.slice(-1)
+    : compatibilityMessages.slice(-1)
+  return selected.map((item) => item.text).join("\n").trim()
+}
+
+function structuredTurnResult(turn) {
+  const responseText = agentResponseText(turn)
+  let value
+  try {
+    value = JSON.parse(responseText)
+  } catch (_error) {
+    throw new EgoChatError("invalid_codex_envelope", "Codex did not return the required structured result.", {
+      responseDigest: digest(responseText),
+      turnId: turn.id,
+    })
+  }
+  return {
+    durationMs: turn.durationMs ?? null,
+    responseDigest: digest(responseText),
+    turnId: turn.id,
+    value,
+  }
+}
+
+function withTurnIdentity(error, turnId) {
+  if (!(error instanceof EgoChatError)) {
+    return error
+  }
+  return new EgoChatError(error.code, error.message, {
+    ...(error.details ?? {}),
+    turnId,
+  })
+}
+
 export class AppServerClient {
   #args
   #command
@@ -43,6 +82,8 @@ export class AppServerClient {
       throw new EgoChatError("app_server_state", "The App Server client is already connected.")
     }
 
+    this.#notifications = []
+    this.#stderr = ""
     this.#process = spawn(this.#command, this.#args, {
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -97,16 +138,57 @@ export class AppServerClient {
     return response.thread
   }
 
-  async resumeThread(threadId) {
+  async resumeThread(threadId, {
+    cwd = undefined,
+    developerInstructions = undefined,
+    sandbox = "read-only",
+  } = {}) {
     const response = await this.request("thread/resume", {
       approvalPolicy: "never",
-      sandbox: "read-only",
+      ...(cwd ? { cwd } : {}),
+      ...(developerInstructions ? { developerInstructions } : {}),
+      ...(sandbox ? { sandbox } : {}),
       threadId,
     })
     if (response?.thread?.id !== threadId) {
       throw new EgoChatError("thread_identity_mismatch", "App Server resumed a different thread than requested.")
     }
     return response.thread
+  }
+
+  async recoverStructuredTurn(threadId, turnId, timeoutMs = 30_000) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const thread = await this.readThread(threadId, true, Math.max(1, deadline - Date.now()))
+      const matchingTurns = thread.turns?.filter((candidate) => candidate.id === turnId) ?? []
+      if (matchingTurns.length > 1) {
+        throw new EgoChatError("app_server_recovery_ambiguous", "The resumed App Server thread contained duplicate interrupted-turn identities.", {
+          turnId,
+        })
+      }
+      const turn = matchingTurns[0]
+      if (turn?.status === "completed") {
+        return { disposition: "completed", result: structuredTurnResult(turn) }
+      }
+      if (turn?.status === "failed" || turn?.status === "interrupted") {
+        return { disposition: "retry", status: turn.status }
+      }
+      if (thread.status?.type === "notLoaded" || thread.status?.type === "systemError") {
+        throw new EgoChatError("app_server_recovery_ambiguous", "The resumed App Server thread is not readable.", {
+          status: thread.status.type,
+          turnId,
+        })
+      }
+      if (!turn && thread.status?.type === "idle") {
+        throw new EgoChatError("app_server_recovery_ambiguous", "The resumed App Server thread did not contain the exact interrupted turn.", {
+          turnId,
+        })
+      }
+      await delay(Math.min(50, Math.max(1, deadline - Date.now())))
+    }
+    throw new EgoChatError("app_server_recovery_timeout", "The exact App Server turn did not become recoverable before the deadline.", {
+      turnId,
+    })
   }
 
   async readThread(threadId, includeTurns = false, timeoutMs = 30_000) {
@@ -145,11 +227,7 @@ export class AppServerClient {
       })
     }
 
-    const responseText = completed.turn.items
-      .filter((item) => item.type === "agentMessage")
-      .map((item) => item.text)
-      .join("\n")
-      .trim()
+    const responseText = agentResponseText(completed.turn)
     if (responseText !== marker) {
       throw new EgoChatError("marker_mismatch", "The App Server probe response did not match the expected marker.", {
         actualDigest: digest(responseText),
@@ -173,11 +251,16 @@ export class AppServerClient {
       outputSchema,
       threadId,
     }, timeoutMs)
-    const completed = await this.waitForNotification(
-      "turn/completed",
-      (params) => params?.threadId === threadId && params?.turn?.id === response?.turn?.id,
-      Math.max(1, deadline - Date.now()),
-    )
+    let completed
+    try {
+      completed = await this.waitForNotification(
+        "turn/completed",
+        (params) => params?.threadId === threadId && params?.turn?.id === response?.turn?.id,
+        Math.max(1, deadline - Date.now()),
+      )
+    } catch (error) {
+      throw withTurnIdentity(error, response?.turn?.id)
+    }
     if (response?.turn?.id !== completed?.turn?.id) {
       throw new EgoChatError("turn_identity_mismatch", "The completed App Server turn does not match the started turn.")
     }
@@ -187,25 +270,7 @@ export class AppServerClient {
       })
     }
 
-    const responseText = completed.turn.items
-      .filter((item) => item.type === "agentMessage")
-      .map((item) => item.text)
-      .join("\n")
-      .trim()
-    let value
-    try {
-      value = JSON.parse(responseText)
-    } catch (_error) {
-      throw new EgoChatError("invalid_codex_envelope", "Codex did not return the required structured result.", {
-        responseDigest: digest(responseText),
-      })
-    }
-    return {
-      durationMs: completed.turn.durationMs ?? null,
-      responseDigest: digest(responseText),
-      turnId: completed.turn.id,
-      value,
-    }
+    return structuredTurnResult(completed.turn)
   }
 
   request(method, params, timeoutMs = 30_000) {

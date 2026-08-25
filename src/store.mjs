@@ -1,21 +1,51 @@
 import { constants as fsConstants } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 
+import { MAX_RESULT_BYTES } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
+
+const DEFAULT_MAX_BINDINGS = 256
+const DEFAULT_MAX_MODEL_POLICIES = 8
+const DEFAULT_MAX_OPERATIONS = 10_000
+const DEFAULT_MAX_RECOVERY_WORKFLOWS = 256
+const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024
+const RESULT_RECOVERY_KINDS = new Set(["conversation_adoption", "ego_exchange"])
 
 const EMPTY_STATE = Object.freeze({
   bindings: {},
   modelPolicies: {},
   nextSeq: 1,
-  schemaVersion: 3,
+  operations: {},
+  schemaVersion: 4,
   workflows: {},
 })
 
 function clone(value) {
   return structuredClone(value)
+}
+
+function digestJson(value) {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex")
+}
+
+function isUtf8ContinuationByte(value) {
+  return (value & 0b1100_0000) === 0b1000_0000
+}
+
+function hasProtectedRecoveryState(workflow) {
+  return workflow.status === "human_required"
+    || workflow.status === "running"
+    || (workflow.status === "failed" && RESULT_RECOVERY_KINDS.has(workflow.kind))
+}
+
+function needsResultReservation(workflow) {
+  return hasProtectedRecoveryState(workflow)
+    && RESULT_RECOVERY_KINDS.has(workflow.kind)
+    && !workflow.result?.responseRef
+    && typeof workflow.result?.responseText !== "string"
 }
 
 async function assertPrivateDirectory(directory) {
@@ -66,6 +96,109 @@ async function writeAtomicJson(filePath, value) {
   }
 }
 
+async function writeAtomicText(filePath, value) {
+  const directory = path.dirname(filePath)
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`
+  const handle = await fs.open(
+    temporaryPath,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+    0o600,
+  )
+  try {
+    await handle.writeFile(value, "utf8")
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  await fs.rename(temporaryPath, filePath)
+  const directoryHandle = await fs.open(directory, fsConstants.O_RDONLY)
+  try {
+    await directoryHandle.sync()
+  } finally {
+    await directoryHandle.close()
+  }
+}
+
+function validateCheckpoint(value) {
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || !Number.isSafeInteger(value.nextSeq)
+    || value.nextSeq < 1
+    || !value.workflows
+    || !value.bindings
+    || !value.modelPolicies
+    || ![3, 4].includes(value.schemaVersion)
+  ) {
+    throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
+  }
+}
+
+function migrateState(value) {
+  validateCheckpoint(value)
+  const state = clone(value)
+  state.operations ??= {}
+
+  for (const workflow of Object.values(state.workflows)) {
+    if (
+      workflow.kind === "ego_exchange"
+      && typeof workflow.operationKey !== "string"
+      && typeof workflow.bindingKey === "string"
+      && typeof workflow.reconciliation?.turnMarker === "string"
+    ) {
+      workflow.operationKey = `exchange:${workflow.bindingKey}:${workflow.reconciliation.turnMarker}`
+    }
+    if (typeof workflow.operationKey !== "string" || typeof workflow.inputDigest !== "string") {
+      continue
+    }
+    const existing = state.operations[workflow.operationKey]
+    if (
+      existing
+      && (
+        existing.inputDigest !== workflow.inputDigest
+        || existing.workflowId !== workflow.id
+      )
+    ) {
+      throw new EgoChatError(
+        "corrupt_operation_ledger",
+        "The durable operation ledger contains conflicting at-most-once identities.",
+      )
+    }
+    state.operations[workflow.operationKey] = existing ?? {
+      createdAt: workflow.createdAt,
+      inputDigest: workflow.inputDigest,
+      key: workflow.operationKey,
+      workflowId: workflow.id,
+    }
+  }
+
+  state.schemaVersion = 4
+  return state
+}
+
+async function listFiles(directory) {
+  let entries
+  try {
+    entries = await fs.readdir(directory, { withFileTypes: true })
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return []
+    }
+    throw error
+  }
+  const files = []
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name)
+    if (entry.isDirectory()) {
+      files.push(...await listFiles(entryPath))
+    } else if (entry.isFile()) {
+      files.push(entryPath)
+    }
+  }
+  return files
+}
+
 function applyEvent(state, event) {
   if (
     !event
@@ -82,6 +215,9 @@ function applyEvent(state, event) {
 
   if (event.workflow && typeof event.workflow.id === "string") {
     state.workflows[event.workflow.id] = event.workflow
+    if (event.operation && typeof event.operation.key === "string") {
+      state.operations[event.operation.key] = event.operation
+    }
   } else if (event.binding && typeof event.binding.key === "string") {
     state.bindings[event.binding.key] = event.binding
   } else if (event.modelPolicy && typeof event.modelPolicy.key === "string") {
@@ -93,15 +229,46 @@ function applyEvent(state, event) {
 }
 
 export class EventStore {
+  #blobDirectory
+  #blobBytes = 0
+  #checkpointManifestPath
+  #checkpointPath
   #dataDir
+  #eventBytes = 0
+  #eventsSinceCheckpoint = 0
   #eventsPath
+  #maxBlobBytes
+  #maxBindings
+  #maxEventBytes
+  #maxEvents
+  #maxModelPolicies
+  #maxOperations
+  #maxRecoveryWorkflows
+  #maxResultBytes
+  #maxStateBytes
+  #maxTerminalWorkflows
+  #rawRetentionMs
   #state = clone(EMPTY_STATE)
   #statePath
   #tail = Promise.resolve()
 
-  constructor(dataDir) {
+  constructor(dataDir, options = {}) {
     this.#dataDir = dataDir
+    this.#blobDirectory = path.join(dataDir, "blobs", "sha256")
+    this.#checkpointPath = path.join(dataDir, "checkpoint.json")
+    this.#checkpointManifestPath = path.join(dataDir, "checkpoint.manifest.json")
     this.#eventsPath = path.join(dataDir, "events.jsonl")
+    this.#maxBlobBytes = options.maxBlobBytes ?? 256 * 1024 * 1024
+    this.#maxBindings = options.maxBindings ?? DEFAULT_MAX_BINDINGS
+    this.#maxEventBytes = options.maxEventBytes ?? 8 * 1024 * 1024
+    this.#maxEvents = options.maxEvents ?? 5_000
+    this.#maxModelPolicies = options.maxModelPolicies ?? DEFAULT_MAX_MODEL_POLICIES
+    this.#maxOperations = options.maxOperations ?? DEFAULT_MAX_OPERATIONS
+    this.#maxRecoveryWorkflows = options.maxRecoveryWorkflows ?? DEFAULT_MAX_RECOVERY_WORKFLOWS
+    this.#maxResultBytes = options.maxResultBytes ?? MAX_RESULT_BYTES
+    this.#maxStateBytes = options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES
+    this.#maxTerminalWorkflows = options.maxTerminalWorkflows ?? 500
+    this.#rawRetentionMs = options.rawRetentionMs ?? 30 * 24 * 60 * 60 * 1_000
     this.#statePath = path.join(dataDir, "state.json")
   }
 
@@ -109,9 +276,73 @@ export class EventStore {
     return this.#dataDir
   }
 
+  getMetrics() {
+    const capacity = this.#recoveryCapacity()
+    return {
+      bindingCount: Object.keys(this.#state.bindings).length,
+      blobBytes: this.#blobBytes,
+      checkpointNextSeq: this.#state.nextSeq,
+      eventBytes: this.#eventBytes,
+      eventsSinceCheckpoint: this.#eventsSinceCheckpoint,
+      modelPolicyCount: Object.keys(this.#state.modelPolicies).length,
+      nextSeq: this.#state.nextSeq,
+      operationCount: Object.keys(this.#state.operations).length,
+      operationLimit: this.#maxOperations,
+      operationSlotsRemaining: Math.max(
+        0,
+        this.#maxOperations - Object.keys(this.#state.operations).length,
+      ),
+      protectedBlobBytes: capacity.protectedBlobBytes,
+      recoveryWorkflowCount: capacity.recoveryWorkflowCount,
+      recoveryWorkflowLimit: this.#maxRecoveryWorkflows,
+      reservedBlobBytes: capacity.reservedBlobBytes,
+      stateBytes: Buffer.byteLength(JSON.stringify(this.#state), "utf8"),
+      stateByteLimit: this.#maxStateBytes,
+      workflowCount: Object.keys(this.#state.workflows).length,
+    }
+  }
+
   async initialize() {
     await ensurePrivateDirectory(this.#dataDir)
     this.#state = clone(EMPTY_STATE)
+    this.#blobBytes = 0
+    this.#eventBytes = 0
+    this.#eventsSinceCheckpoint = 0
+
+    try {
+      const [checkpointText, manifestText] = await Promise.all([
+        fs.readFile(this.#checkpointPath, "utf8"),
+        fs.readFile(this.#checkpointManifestPath, "utf8"),
+      ])
+      const checkpoint = JSON.parse(checkpointText)
+      const manifest = JSON.parse(manifestText)
+      validateCheckpoint(checkpoint)
+      if (
+        manifest?.digest !== digestJson(checkpoint)
+        || manifest?.nextSeq !== checkpoint.nextSeq
+      ) {
+        throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint digest does not match its manifest.")
+      }
+      this.#state = migrateState(checkpoint)
+    } catch (error) {
+      const checkpointMissing = error.code === "ENOENT"
+      const checkpointError = error instanceof SyntaxError
+        ? new EgoChatError("corrupt_checkpoint", "The durable state checkpoint contains invalid JSON.")
+        : error
+      if (
+        !checkpointMissing
+        && (!(checkpointError instanceof EgoChatError) || checkpointError.code !== "corrupt_checkpoint")
+      ) {
+        throw checkpointError
+      }
+      try {
+        this.#state = migrateState(JSON.parse(await fs.readFile(this.#statePath, "utf8")))
+      } catch (_recoveryError) {
+        if (!checkpointMissing) {
+          throw checkpointError
+        }
+      }
+    }
 
     let ledger
     try {
@@ -131,7 +362,12 @@ export class EventStore {
       }
 
       try {
-        applyEvent(this.#state, JSON.parse(line))
+        const event = JSON.parse(line)
+        if (event.seq < this.#state.nextSeq) {
+          continue
+        }
+        applyEvent(this.#state, event)
+        this.#eventsSinceCheckpoint += 1
       } catch (error) {
         if (error instanceof SyntaxError) {
           throw new EgoChatError("corrupt_event_log", `The event ledger has invalid JSON on line ${index + 1}.`)
@@ -139,6 +375,27 @@ export class EventStore {
         throw error
       }
     }
+
+    this.#state = migrateState(this.#state)
+
+    this.#eventBytes = Buffer.byteLength(ledger, "utf8")
+    for (const filePath of await listFiles(this.#blobDirectory)) {
+      this.#blobBytes += (await fs.stat(filePath)).size
+    }
+
+    if (
+      this.#blobBytes > this.#maxBlobBytes
+      || Buffer.byteLength(JSON.stringify(this.#state), "utf8") > this.#maxStateBytes
+    ) {
+      await this.#compact()
+    }
+    if (this.#blobBytes > this.#maxBlobBytes) {
+      throw new EgoChatError(
+        "protected_storage_capacity_exhausted",
+        "Protected recovery results already exceed the configured hard blob limit; data was preserved and new work is blocked.",
+      )
+    }
+    this.#assertStateCapacity(this.#state)
 
     await writeAtomicJson(this.#statePath, this.#state)
   }
@@ -150,6 +407,19 @@ export class EventStore {
   getWorkflow(workflowId) {
     const workflow = this.#state.workflows[workflowId]
     return workflow ? clone(workflow) : undefined
+  }
+
+  getWorkflowByOperationKey(operationKey) {
+    const operation = this.#state.operations[operationKey]
+    const workflow = operation
+      ? this.#state.workflows[operation.workflowId]
+      : Object.values(this.#state.workflows).find((candidate) => candidate.operationKey === operationKey)
+    return workflow ? clone(workflow) : undefined
+  }
+
+  getOperation(operationKey) {
+    const operation = this.#state.operations[operationKey]
+    return operation ? clone(operation) : undefined
   }
 
   listBindings() {
@@ -170,8 +440,143 @@ export class EventStore {
     return modelPolicy ? clone(modelPolicy) : undefined
   }
 
+  async putBlob(text, { mediaType = "text/plain; charset=utf-8" } = {}) {
+    const operation = this.#tail.then(() => this.#putBlob(text, mediaType))
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async #putBlob(text, mediaType) {
+    const bytes = Buffer.from(text, "utf8")
+    if (bytes.length > this.#maxResultBytes) {
+      throw new EgoChatError(
+        "result_too_large",
+        "The result body exceeds the reserved per-operation storage capacity.",
+        { limitBytes: this.#maxResultBytes, sizeBytes: bytes.length },
+      )
+    }
+    const digest = createHash("sha256").update(bytes).digest("hex")
+    const directory = path.join(this.#blobDirectory, digest.slice(0, 2))
+    const filePath = path.join(directory, digest)
+    await ensurePrivateDirectory(directory)
+    try {
+      const existing = await fs.readFile(filePath)
+      if (!existing.equals(bytes)) {
+        throw new EgoChatError("blob_digest_collision", "A stored result blob does not match its content digest.")
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error
+      }
+      if (this.#blobBytes + bytes.length > this.#maxBlobBytes) {
+        await this.#compact()
+      }
+      if (this.#blobBytes + bytes.length > this.#maxBlobBytes) {
+        throw new EgoChatError(
+          "protected_storage_capacity_exhausted",
+          "The hard result-storage limit is reserved by protected recovery evidence.",
+          {
+            blobBytes: this.#blobBytes,
+            limitBytes: this.#maxBlobBytes,
+            requestedBytes: bytes.length,
+          },
+        )
+      }
+      await writeAtomicText(filePath, text)
+      this.#blobBytes += bytes.length
+    }
+    return {
+      digest,
+      mediaType,
+      sizeBytes: bytes.length,
+      uri: `ego-chat-result:${digest}`,
+    }
+  }
+
+  async readBlob(reference, { maxBytes, offset }) {
+    const digest = reference?.digest
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new EgoChatError("invalid_result_ref", "The result reference digest is invalid.")
+    }
+    const filePath = path.join(this.#blobDirectory, digest.slice(0, 2), digest)
+    let bytes
+    try {
+      bytes = await fs.readFile(filePath)
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        throw new EgoChatError("result_not_found", "The referenced Ego Chat result is no longer available.")
+      }
+      throw error
+    }
+    const observed = createHash("sha256").update(bytes).digest("hex")
+    if (observed !== digest) {
+      throw new EgoChatError("corrupt_result_blob", "The referenced Ego Chat result failed its digest check.")
+    }
+    if (
+      offset > bytes.length
+      || (offset < bytes.length && isUtf8ContinuationByte(bytes[offset]))
+    ) {
+      throw new EgoChatError(
+        "invalid_result_range",
+        "The requested result offset is not a valid UTF-8 boundary.",
+      )
+    }
+    let end = Math.min(bytes.length, offset + maxBytes)
+    while (end > offset && end < bytes.length && isUtf8ContinuationByte(bytes[end])) {
+      end -= 1
+    }
+    if (end === offset && offset < bytes.length) {
+      throw new EgoChatError(
+        "invalid_result_range",
+        "The requested result range is too small to contain the next UTF-8 character.",
+      )
+    }
+    return {
+      complete: end === bytes.length,
+      digest,
+      nextOffset: end === bytes.length ? null : end,
+      offset,
+      sizeBytes: bytes.length,
+      text: bytes.subarray(offset, end).toString("utf8"),
+    }
+  }
+
   async persist(type, workflow, expectedWorkflow = undefined) {
     return this.#persistEntity(type, "workflow", workflow, expectedWorkflow)
+  }
+
+  async persistStarted(type, workflow) {
+    const operation = this.#tail.then(async () => {
+      const existingOperation = this.#state.operations[workflow.operationKey]
+      const existing = existingOperation
+        ? this.#state.workflows[existingOperation.workflowId]
+        : undefined
+      if (existingOperation) {
+        if (existingOperation.inputDigest !== workflow.inputDigest) {
+          throw new EgoChatError(
+            "operation_key_conflict",
+            "That durable operation key is already bound to different input.",
+            { existingWorkflowId: existingOperation.workflowId, operationKey: workflow.operationKey },
+          )
+        }
+        if (!existing) {
+          throw new EgoChatError(
+            "operation_already_completed",
+            "That durable operation was retained after its detailed workflow metadata expired; it will not be sent again.",
+            { existingWorkflowId: existingOperation.workflowId, operationKey: workflow.operationKey },
+          )
+        }
+        return { created: false, workflow: clone(existing) }
+      }
+
+      this.#assertNewWorkflowCapacity(workflow, { operation: true })
+
+      await this.#appendStarted(type, workflow)
+      return { created: true, workflow: clone(workflow) }
+    })
+
+    this.#tail = operation.catch(() => {})
+    return operation
   }
 
   async persistBinding(type, binding) {
@@ -193,27 +598,287 @@ export class EventStore {
           )
         }
       }
-      const event = {
-        at: new Date().toISOString(),
-        [entityName]: clone(entity),
-        schemaVersion: 1,
-        seq: this.#state.nextSeq,
-        type,
+      if (entityName === "workflow" && !this.#state.workflows[entity.id]) {
+        this.#assertNewWorkflowCapacity(entity)
       }
-      const handle = await fs.open(this.#eventsPath, "a", 0o600)
-      try {
-        await handle.writeFile(`${JSON.stringify(event)}\n`, "utf8")
-        await handle.sync()
-      } finally {
-        await handle.close()
+      if (
+        entityName === "binding"
+        && !this.#state.bindings[entity.key]
+        && Object.keys(this.#state.bindings).length >= this.#maxBindings
+      ) {
+        throw new EgoChatError(
+          "binding_capacity_exhausted",
+          "The durable binding limit has been reached; no browser work was started.",
+          { limit: this.#maxBindings },
+        )
       }
-
-      applyEvent(this.#state, event)
-      await writeAtomicJson(this.#statePath, this.#state)
+      if (
+        entityName === "modelPolicy"
+        && !this.#state.modelPolicies[entity.key]
+        && Object.keys(this.#state.modelPolicies).length >= this.#maxModelPolicies
+      ) {
+        throw new EgoChatError(
+          "model_policy_capacity_exhausted",
+          "The durable model-policy limit has been reached.",
+          { limit: this.#maxModelPolicies },
+        )
+      }
+      await this.#appendEntity(type, entityName, entity)
       return clone(entity)
     })
 
     this.#tail = operation.catch(() => {})
     return operation
+  }
+
+  async #appendEntity(type, entityName, entity) {
+    const event = {
+      at: new Date().toISOString(),
+      [entityName]: clone(entity),
+      schemaVersion: 1,
+      seq: this.#state.nextSeq,
+      type,
+    }
+    await this.#appendEvent(event)
+  }
+
+  async #appendEvent(event) {
+    const serializedEvent = `${JSON.stringify(event)}\n`
+    if (Buffer.byteLength(serializedEvent, "utf8") > this.#maxEventBytes) {
+      throw new EgoChatError(
+        "state_capacity_exhausted",
+        "One durable event exceeds the hard event-ledger byte limit.",
+        { limitBytes: this.#maxEventBytes },
+      )
+    }
+    if (this.#eventBytes + Buffer.byteLength(serializedEvent, "utf8") > this.#maxEventBytes) {
+      await this.#compact()
+    }
+    let prospectiveState = clone(this.#state)
+    applyEvent(prospectiveState, event)
+    if (Buffer.byteLength(JSON.stringify(prospectiveState), "utf8") > this.#maxStateBytes) {
+      await this.#compact()
+      prospectiveState = clone(this.#state)
+      applyEvent(prospectiveState, event)
+    }
+    this.#assertStateCapacity(prospectiveState)
+    const handle = await fs.open(this.#eventsPath, "a", 0o600)
+    try {
+      await handle.writeFile(serializedEvent, "utf8")
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+
+    applyEvent(this.#state, event)
+    this.#eventBytes += Buffer.byteLength(serializedEvent, "utf8")
+    this.#eventsSinceCheckpoint += 1
+    if (
+      this.#blobBytes > this.#maxBlobBytes
+      || this.#eventBytes >= this.#maxEventBytes
+      || this.#eventsSinceCheckpoint >= this.#maxEvents
+    ) {
+      await this.#compact()
+    }
+  }
+
+  async #appendStarted(type, workflow) {
+    const event = {
+      at: new Date().toISOString(),
+      operation: {
+        createdAt: workflow.createdAt,
+        inputDigest: workflow.inputDigest,
+        key: workflow.operationKey,
+        workflowId: workflow.id,
+      },
+      schemaVersion: 1,
+      seq: this.#state.nextSeq,
+      type,
+      workflow: clone(workflow),
+    }
+    await this.#appendEvent(event)
+  }
+
+  #assertNewWorkflowCapacity(workflow, { operation = false } = {}) {
+    if (operation && Object.keys(this.#state.operations).length >= this.#maxOperations) {
+      throw new EgoChatError(
+        "operation_capacity_exhausted",
+        "The bounded at-most-once identity ledger is full. Existing identities remain protected, and no browser work was started.",
+        { limit: this.#maxOperations },
+      )
+    }
+
+    const protectedStatus = hasProtectedRecoveryState(workflow)
+    const capacity = this.#recoveryCapacity()
+    if (protectedStatus && capacity.recoveryWorkflowCount >= this.#maxRecoveryWorkflows) {
+      throw new EgoChatError(
+        "recovery_workflow_capacity_exhausted",
+        "The bounded recovery-workflow limit is full. Existing evidence remains protected, and no browser work was started.",
+        { limit: this.#maxRecoveryWorkflows },
+      )
+    }
+
+    let additionalProtectedBytes = 0
+    let additionalReservedBytes = 0
+    const reference = workflow.result?.responseRef
+    if (protectedStatus && reference && !capacity.protectedDigests.has(reference.digest)) {
+      additionalProtectedBytes = reference.sizeBytes
+    } else if (needsResultReservation(workflow)) {
+      additionalReservedBytes = this.#maxResultBytes
+    }
+    const requiredBytes = capacity.protectedBlobBytes
+      + capacity.reservedBlobBytes
+      + additionalProtectedBytes
+      + additionalReservedBytes
+    if (requiredBytes > this.#maxBlobBytes) {
+      throw new EgoChatError(
+        "protected_storage_capacity_exhausted",
+        "Worst-case protected result capacity is unavailable. No policy mutation, composition, or browser send was started.",
+        {
+          limitBytes: this.#maxBlobBytes,
+          protectedBlobBytes: capacity.protectedBlobBytes,
+          requiredBytes,
+          reservedBlobBytes: capacity.reservedBlobBytes,
+        },
+      )
+    }
+  }
+
+  #assertStateCapacity(state) {
+    const stateBytes = Buffer.byteLength(JSON.stringify(state), "utf8")
+    if (stateBytes > this.#maxStateBytes) {
+      throw new EgoChatError(
+        "state_capacity_exhausted",
+        "The durable state checkpoint reached its hard byte limit. Existing state was preserved.",
+        { limitBytes: this.#maxStateBytes, stateBytes },
+      )
+    }
+  }
+
+  #recoveryCapacity() {
+    const protectedDigests = new Map()
+    let recoveryWorkflowCount = 0
+    let reservedBlobBytes = 0
+    for (const workflow of Object.values(this.#state.workflows)) {
+      if (!hasProtectedRecoveryState(workflow)) {
+        continue
+      }
+      recoveryWorkflowCount += 1
+      const reference = workflow.result?.responseRef
+      if (reference) {
+        protectedDigests.set(reference.digest, reference.sizeBytes)
+      } else if (needsResultReservation(workflow)) {
+        reservedBlobBytes += this.#maxResultBytes
+      }
+    }
+    return {
+      protectedBlobBytes: [...protectedDigests.values()].reduce((total, size) => total + size, 0),
+      protectedDigests,
+      recoveryWorkflowCount,
+      reservedBlobBytes,
+    }
+  }
+
+  async #compact() {
+    const { retainedDigests } = this.#applyRetention()
+    await writeAtomicJson(this.#statePath, this.#state)
+    await writeAtomicJson(this.#checkpointPath, this.#state)
+    await writeAtomicJson(this.#checkpointManifestPath, {
+      createdAt: new Date().toISOString(),
+      digest: digestJson(this.#state),
+      nextSeq: this.#state.nextSeq,
+    })
+    await writeAtomicText(this.#eventsPath, "")
+    this.#eventBytes = 0
+    this.#eventsSinceCheckpoint = 0
+    let retainedBytes = 0
+    for (const filePath of await listFiles(this.#blobDirectory)) {
+      const blobDigest = path.basename(filePath)
+      if (retainedDigests.has(blobDigest)) {
+        retainedBytes += (await fs.stat(filePath)).size
+      } else {
+        await fs.unlink(filePath)
+      }
+    }
+    this.#blobBytes = retainedBytes
+  }
+
+  #applyRetention() {
+    const workflows = Object.values(this.#state.workflows)
+    const terminal = workflows
+      .filter((workflow) => (
+        ["cancelled", "failed", "succeeded"].includes(workflow.status)
+        && !hasProtectedRecoveryState(workflow)
+      ))
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    for (const workflow of terminal.slice(this.#maxTerminalWorkflows)) {
+      delete this.#state.workflows[workflow.id]
+    }
+
+    const now = Date.now()
+    const candidates = Object.values(this.#state.workflows)
+      .filter((workflow) => workflow.result?.responseRef)
+      .sort((left, right) => Date.parse(left.updatedAt) - Date.parse(right.updatedAt))
+    const pinnedDigests = new Set()
+    const retainedDigests = new Map()
+    for (const workflow of candidates) {
+      if (hasProtectedRecoveryState(workflow)) {
+        const reference = workflow.result.responseRef
+        pinnedDigests.add(reference.digest)
+        retainedDigests.set(reference.digest, reference.sizeBytes)
+      }
+    }
+    for (const workflow of candidates) {
+      if (hasProtectedRecoveryState(workflow)) {
+        continue
+      }
+      const reference = workflow.result.responseRef
+      const ageMs = now - Date.parse(workflow.updatedAt)
+      if (ageMs <= this.#rawRetentionMs) {
+        retainedDigests.set(reference.digest, reference.sizeBytes)
+      } else {
+        this.#expireWorkflowResult(workflow)
+      }
+    }
+
+    let retainedBytes = [...retainedDigests.values()].reduce((total, size) => total + size, 0)
+    for (const workflow of candidates) {
+      if (retainedBytes <= this.#maxBlobBytes) {
+        break
+      }
+      const reference = workflow.result?.responseRef
+      if (
+        !reference
+        || pinnedDigests.has(reference.digest)
+        || !retainedDigests.has(reference.digest)
+      ) {
+        continue
+      }
+      retainedBytes -= retainedDigests.get(reference.digest)
+      retainedDigests.delete(reference.digest)
+      for (const shared of candidates) {
+        if (
+          !hasProtectedRecoveryState(shared)
+          && shared.result?.responseRef?.digest === reference.digest
+        ) {
+          this.#expireWorkflowResult(shared)
+        }
+      }
+    }
+    return { retainedDigests }
+  }
+
+  #expireWorkflowResult(workflow) {
+    const result = workflow.result
+    const excerpt = typeof result.responseExcerpt === "string"
+      ? result.responseExcerpt
+      : (typeof result.responseText === "string" ? result.responseText.slice(0, 4 * 1024) : undefined)
+    workflow.result = {
+      ...result,
+      ...(excerpt ? { responseExcerpt: excerpt } : {}),
+      responseExpired: true,
+    }
+    delete workflow.result.responseRef
+    delete workflow.result.responseText
   }
 }

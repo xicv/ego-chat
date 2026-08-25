@@ -36,19 +36,26 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 
 ## Implemented capabilities
 
-- Durable JSONL workflow and binding ledger with atomic state snapshots.
-- Private local state directory, files, token, and Unix socket.
+- Checkpointed JSONL workflow and binding ledger that avoids rewriting the full state on every transition and compacts after 5,000 events or 8 MiB.
+- Content-addressed private result blobs, 30-day raw-body retention, a 256 MiB default blob quota, and retained metadata for the latest 500 ordinary terminal workflows. Running, `human_required`, and still-reconcilable failed browser workflows retain their bodies or a full-size result reservation.
+- One canonical broker identity per real data-directory path, a stable socket independent of `TMPDIR`, an exclusive broker lease, and a monotonic fencing epoch. The canonical broker also reserves known v0.1 socket aliases so a late stale Codex or ZCode facade cannot launch a second daemon.
+- Private local state directory, files, token, runtime directory, and Unix socket.
+- A private 4 MiB / 16-file driver mailbox with a 256 KiB per-input ceiling, five-minute inactive crash retention, strict lstat ownership/mode/link checks, live-child preservation, and child-owned unlink immediately after a successful read and before browser interaction.
 - Authenticated IPC and an independently restartable stdio MCP facade.
+- A runtime-contract digest that allows stale facades to inspect status but returns `restart_required` before they mutate durable state.
 - Read-only adoption of a supplied private ChatGPT conversation URL, including a broker-owned wait for an already-running response and same-turn return to the invoking coding agent.
 - Explicit Token-Saver waits that keep one durable MCP call open, suppress periodic progress notifications, minify the returned text envelope, and direct the bundled skill not to poll from extra model turns.
 - One normal `ego_exchange_and_wait` MCP call that returns a long ChatGPT review into the same agent turn.
 - One strict `ego_review_candidate_and_wait` call for a current-host-owned candidate, with exact target/candidate/cycle binding and objective settlement validation.
-- Detached `ego_start_exchange`, `await_workflow`, `workflow_status`, and `cancel_workflow` operations for recovery.
+- Detached `ego_start_exchange`, `await_workflow`, `workflow_status`, and `cancel_workflow` operations for recovery, plus an explicit acknowledged recovery-abandonment tool that preserves the at-most-once operation tombstone.
+- A staged browser lifecycle that durably records `send_confirmed`, performs response capture read-only, and resumes that capture after a facade or broker restart without resending.
+- A two-hour default broker-owned ChatGPT generation budget, a six-hour transport ceiling, and separate caller attachment from browser-workflow ownership.
+- Compact Token-Saver text summaries plus digest-bound `ego_read_result` ranges for responses larger than 16 KiB.
 - Persistent `ego-chat-main` conversation binding with exact canonical-URL verification.
 - A durable `strongest_available` / `maximum_available` ChatGPT web policy, enforced immediately before every send.
 - Stable conversation-head fingerprints over message IDs, roles, and content hashes before and after each bound send.
 - Exact composer-digest verification immediately before each click, unique outbound markers, empty-draft checks, exact send-control checks, and no blind retry after an ambiguous delivery.
-- Evidence-only reconciliation for a first confirmed send that exposes its canonical URL late, or for one exact tail-anchored user/assistant pair that completed after capture; reconciliation never clicks Send.
+- Evidence-only reconciliation for a first confirmed send that exposes its canonical URL late, or for one exact tail-anchored user/assistant pair that completed after capture; reconciliation never clicks Send, stores the response by digest, and completes the original workflow for exact retry.
 - Codex App Server spikes for broker-owned thread start/resume and desktop active-writer isolation.
 - Broker-owned `ego_start_convergence` and `ego_converge_until_settled` workflows that alternate Codex and ChatGPT without human copy/paste.
 - Immutable target and acceptance-contract digests, strict implementing-agent candidate and ChatGPT review schemas, exact cycle identity, and objective settlement checks.
@@ -90,7 +97,7 @@ ego-chat doctor-zcode
 - materializes the embedded runtime under `~/Library/Application Support/Ego Chat/runtime/<version>`;
 - runs `npm ci --omit=dev --ignore-scripts` inside that managed runtime;
 - installs the bundled `ego-chat` skill under `~/.codex/skills/ego-chat`;
-- registers the installed executable as the `ego_chat` STDIO MCP server with a 1,900-second tool timeout.
+- registers the installed executable as the `ego_chat` STDIO MCP server with a 21,900-second tool timeout.
 
 Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat setup --skip-codex-config` when configuration is managed separately. Setup refuses to replace a different skill or MCP entry unless `--force` is explicit.
 
@@ -98,7 +105,7 @@ Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat
 
 - installs `SKILL.md` under `~/.zcode/skills/ego-chat`;
 - semantically merges `mcp.servers.ego_chat` into `~/.zcode/cli/config.json` while preserving existing plugin and server entries;
-- registers the absolute installed executable with `args: ["mcp"]` and an owned, exact 1,900,000 ms timeout that `doctor-zcode` also validates;
+- registers the absolute installed executable with `args: ["mcp"]` and an owned, exact 21,900,000 ms timeout that `doctor-zcode` also validates;
 - does not require Codex for ZCode-owned review cycles, while preserving a still-executable managed Codex path from an earlier Codex setup when Codex is temporarily absent from `PATH`.
 
 Restart ZCode.app after setup and verify `ego_chat` under MCP Services. The paths and configuration shape follow ZCode's official [MCP Services](https://zcode.z.ai/en/docs/mcp-services) and [Skills](https://zcode.z.ai/en/docs/skill) documentation. A conflicting `ego_chat` server or skill is never replaced without explicit `--force`.
@@ -126,6 +133,14 @@ The CLI and MCP facade autostart the broker. Check it with:
 ```sh
 node ./bin/ego-chat.mjs ping
 ```
+
+Inspect the authoritative broker generation, runtime-contract digest, active workflows, and bounded-store counters without opening ChatGPT:
+
+```sh
+node ./bin/ego-chat.mjs broker-status
+```
+
+After upgrading the runtime, restart Codex.app and ZCode.app. A stale facade may read status and existing workflow results, but new mutations fail with `restart_required`; Ego Chat never starts a second broker against the same data directory to hide that mismatch.
 
 ## Persistent conversation
 
@@ -171,11 +186,21 @@ The direct MCP path is preferable when the current Codex or ZCode task should co
 
 ### Token-Saver mode
 
-Set `waitMode` to `token_saver` on a direct wait tool when Codex or ZCode should stay idle while ChatGPT thinks. Ego Chat keeps exactly one MCP call attached to the durable broker workflow, emits no periodic progress notifications, and returns a minified text envelope marked with `waitMode: token_saver` when the workflow finishes. Do not poll `workflow_status` or repeatedly call `await_workflow`. If a still-connected host receives a wait error, Ego Chat includes the durable workflow ID so it can reattach once; a fully exited host task still has no external wake guarantee. Conversation adoption defaults to Token-Saver. The raw exchange, strict-review, convergence, and recovery-wait tools retain `progress` as their compatibility default, while the bundled `$ego-chat` skill selects Token-Saver for long waits unless visible progress was explicitly requested.
+Set `waitMode` to `token_saver` on a direct wait tool when Codex or ZCode should stay idle while ChatGPT thinks. Ego Chat keeps exactly one MCP call attached to the durable broker workflow, emits no periodic progress notifications, and returns one small summary marked with `waitMode: token_saver` when the workflow finishes. Do not poll `workflow_status` or repeatedly call `await_workflow`. A caller disconnect detaches only that waiter: after the prompt is confirmed once, the broker continues read-only capture for up to two hours by default and can resume that capture after its own restart. If a still-connected host receives a wait error, Ego Chat includes the durable workflow ID so it can reattach once; a fully exited host task still has no external wake guarantee. Conversation adoption defaults to Token-Saver. The raw exchange, strict-review, convergence, and recovery-wait tools retain `progress` as their compatibility default, while the bundled `$ego-chat` skill selects Token-Saver for long waits unless visible progress was explicitly requested.
 
 Token-Saver reduces idle outer-agent turns and transport chatter. It does not weaken the strongest-model policy, shorten ChatGPT's reasoning, reduce the implementation turns genuinely needed for convergence, or provide an external wake after the host task has exited.
 
-Local state defaults to `~/Library/Application Support/Ego Chat`. The directory is mode `0700`; the ledger, snapshot, and broker token are mode `0600`. Prompts and captured responses are intentionally retained there so a restarted client can reattach. Treat this directory as sensitive.
+Local state defaults to `~/Library/Application Support/Ego Chat`. The directory is mode `0700`; ledgers, checkpoints, blobs, and the broker token are private. Large responses return an `ego-chat-result:<sha256>` reference; use `ego_read_result` with the originating workflow ID and expected digest when the full body is needed. Raw bodies expire after 30 days or earlier under the 256 MiB blob limit, while bounded excerpts and identity metadata remain.
+
+Storage admission is fail-closed and happens before policy mutation, composition, or Send. Running, `human_required`, and still-reconcilable failed browser workflows keep their captured bodies protected; a bodyless workflow reserves the full 256 KiB per-result maximum across compaction and restart until exact reconciliation stores its response, delivery absence is proven, or the user explicitly abandons that recovery. The durable state checkpoint is limited to 64 MiB, the active event ledger to 8 MiB, unresolved recovery workflows to 256, bindings to 256, and exact lifetime operation identities to 10,000. The two checkpoint/state copies, event ledger, and blob tree therefore have a bounded persistent-data envelope of about 392 MiB plus small control files.
+
+Prompt-bearing fixed-driver handoff files live in a separate private mailbox capped at 4 MiB, 16 files, and 256 KiB per input, giving the complete bounded local envelope about 396 MiB plus small control files. A browser child is durably registered before its PID-derived input file is created. The child opens that exact regular file with no-follow semantics, validates owner/mode/link count and size, reads it, then unlinks the pathname before the first browser interaction. Startup and every admission lstat only recognized owned inputs, preserve an exact file for a still-live registered process group, and remove inactive crash leftovers after five minutes; legacy UUID-only inputs follow the same short retention rule. A symlink, foreign owner, non-`0600` mode, hard link, oversize input, ambiguous duplicate PID, unknown entry, or exhausted byte/file quota fails closed before a browser process starts. `broker-status` reports mailbox limits, current files/bytes, reservations, and retention without exposing prompt contents or paths.
+
+At an identity, recovery, or mailbox-capacity limit, existing exact retries and evidence remain readable, while a genuinely new operation stops before browser work instead of deleting proof or reopening an old identity. Treat the state directory and driver mailbox as sensitive.
+
+`abandon_workflow_recovery` is a deliberate last-resort capacity release, not a retry mechanism. It requires `acknowledgePotentialDelivery: true`, is valid only for one stopped adoption, browser, or convergence recovery, and never removes any durable operation identity or permits it to run again. Use it only after the user explicitly chooses to stop recovering that exact workflow and understands that a remote ChatGPT turn or Codex turn may still exist; inspect the bound conversation and task evidence before authorizing later work that could duplicate it.
+
+The equivalent direct CLI form is `ego-chat abandon <workflow-id> --acknowledge-potential-delivery`. Omitting the exact acknowledgement flag stops with usage error and does not mutate the workflow.
 
 ## Real-world workflows
 
@@ -190,7 +215,7 @@ Ego Chat transports prompts, responses, and bounded review packets. It deliberat
 | Start from Codex or ZCode and ask ChatGPT to research or brainstorm | Supported | Use repeated Token-Saver exchanges. Open-ended discussion is agent-managed rather than an automatic settlement protocol. |
 | Reuse the same private ChatGPT conversation for later turns | Supported | The durable binding verifies the canonical URL and conversation head before every send. |
 | Start from ChatGPT web or ChatGPT.app and continue locally from a URL | Supported | Adoption accepts a private canonical `/c/` URL, never a public `/share/` URL. |
-| Wait while an already-running ChatGPT response performs a long think | Supported | The read-only adoption wait returns into the same still-active Codex or ZCode task. |
+| Wait while an already-running ChatGPT response performs a long think | Supported | Adoption waits read-only. For Ego Chat sends, `send_confirmed` is durable and capture continues independently of the caller's original wait. |
 | Import the entire earlier transcript into the local task | Not provided | Adoption returns the latest stable assistant tail; the web conversation itself retains the earlier history. Use a self-contained final handoff packet. |
 | Iterate implementation and review without human copy and paste | Supported | Codex can use broker-owned bounded convergence; ZCode keeps its current task active and submits one strict candidate per cycle. |
 | Always use ChatGPT's strongest current model and maximum thinking | Supported | Every send repairs and verifies the live provider-defined maximum. Adoption is read-only and requires that maximum to be selected already. |
@@ -270,9 +295,9 @@ Ego Chat does not pin a versioned model name in browser code. Its durable defaul
 - thinking effort: `maximum_available`;
 - enforcement: `repair_then_verify`.
 
-Immediately before composition, the fixed driver opens ChatGPT's provider-defined power control, moves it to its numeric maximum using the advertised keyboard interaction, and reads the maximum back. It also records the resolved Model and Effort rows for audit. The currently observed resolution is `GPT-5.6 Sol`, effort `Pro`, at power `5/5`; those labels are an observation, not a permanent configuration value.
+Before composition, the fixed driver opens ChatGPT's provider-defined power control, moves it to its numeric maximum using the advertised keyboard interaction, and reads the maximum back. After composing, it opens the control again read-only and requires another maximum readback immediately before Send. It then re-verifies the exact prompt, re-hit-tests the sole visible enabled Send control, and checks the authoritative broker process once more before dispatch. It records the resolved Model and Effort rows for audit. The currently observed resolution is `GPT-5.6 Sol`, effort `Pro`, at power `5/5`; those labels are an observation, not a permanent configuration value.
 
-If ChatGPT later maps its maximum position to a stronger model or renames the maximum effort, the next successful verification records the new labels automatically and marks `selectionChanged`. No source edit or hardcoded model-name replacement is needed. If the maximum control, numeric state, or resolved rows cannot be identified unambiguously, Ego Chat stops before typing and reports `human_required`; it never silently downgrades.
+If ChatGPT later maps its maximum position to a stronger model or renames the maximum effort, the next successful verification records the new labels automatically and marks `selectionChanged`. No source edit or hardcoded model-name replacement is needed. If the maximum control, numeric state, resolved rows, exact prompt, or Send control cannot be identified unambiguously, Ego Chat stops before Send, clears an unsent draft when possible, and reports `human_required`; it never silently downgrades.
 
 Read the last durable observation without opening the browser:
 
@@ -286,7 +311,7 @@ Repair to the provider's current maximum and verify the exact bound chat without
 node ./bin/ego-chat.mjs ensure-model-policy ego-chat-main
 ```
 
-The equivalent MCP tools are `ego_get_model_policy` and `ego_ensure_model_policy`. Every normal handoff and every ChatGPT review cycle performs the same ensure-and-readback check again immediately before composition.
+The equivalent MCP tools are `ego_get_model_policy` and `ego_ensure_model_policy`. Every normal handoff and every ChatGPT review cycle performs the repair-and-readback before composition plus a fresh read-only maximum check immediately before Send.
 
 ## Codex and ZCode MCP configuration
 
@@ -297,7 +322,7 @@ The Cargo wrapper configures this automatically. For development directly from t
 command = "node"
 args = ["/absolute/path/to/ego-chat/bin/ego-chat-mcp.mjs"]
 required = true
-tool_timeout_sec = 1900
+tool_timeout_sec = 21900
 ```
 
 For development directly from this checkout, ZCode's equivalent native user configuration is:
@@ -309,7 +334,7 @@ For development directly from this checkout, ZCode's equivalent native user conf
       "ego_chat": {
         "command": "node",
         "args": ["/absolute/path/to/ego-chat/bin/ego-chat-mcp.mjs"],
-        "timeoutMs": 1900000
+        "timeoutMs": 21900000
       }
     }
   }
@@ -331,13 +356,13 @@ For the normal path, the current agent calls `ego_exchange_and_wait` with:
 - a distinct expected terminal marker that ChatGPT is instructed to emit exactly;
 - a bounded timeout.
 
-The tool remains pending and returns the terminal workflow and captured response. Its default `progress` mode emits keepalive notifications; `waitMode: token_saver` stays silent. If the facade remains connected long enough to return a wait error, that error includes the workflow ID for one `await_workflow` reattachment; a detached start tool is the reliable choice when caller exit is expected.
+The tool remains pending and returns the terminal workflow and captured response. Its default `progress` mode emits keepalive notifications; `waitMode: token_saver` stays silent. The browser send and response capture are separate: once `send_confirmed` is durable, capture can be restarted safely because it never composes or clicks. If the facade remains connected long enough to return a wait error, that error includes the workflow ID for one `await_workflow` reattachment; a detached start tool is the reliable choice when caller exit is expected.
 
 ## ZCode-owned convergence
 
-When ZCode is side A, keep the current ZCode task or [Goal](https://zcode.z.ai/en/docs/goal) as the implementation owner. Freeze the stable outcome and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. Put mutable candidate identity such as an exact commit SHA in the candidate summary and review packet, not in the frozen target, so a corrective cycle does not silently change the contract. Ego Chat generates the unique markers and digests, secret-scans and verifies the exact composer contents immediately before sending, verifies the strongest-model policy, and validates ChatGPT's strict review envelope before returning it to ZCode.
+When ZCode is side A, keep the current ZCode task or [Goal](https://zcode.z.ai/en/docs/goal) as the implementation owner. Freeze the stable outcome and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. Put mutable candidate identity such as an exact commit SHA in the candidate summary and review packet, not in the frozen target, so a corrective cycle does not silently change the contract. Give each exact candidate call one stable, non-secret `operationId` and retain it until the result is recovered. Reissuing byte-identical arguments with that same ID rediscovers the original workflow after a lost tool result; reusing it with changed input fails closed. Ego Chat derives stable unique markers from that identity, secret-scans and verifies the exact composer contents immediately before sending, verifies the strongest-model policy, and validates ChatGPT's strict review envelope before returning it to ZCode.
 
-If ChatGPT completed the exact marked user/assistant pair but the browser capture stopped late, the strict tool performs at most one read-only, prior-head-anchored reconciliation and returns that already-existing response. It does not send again. Recovery succeeds only when the original pre-send maximum-model readback, unique turn marker, final terminal marker, message roles, and stable conversation head all match; otherwise ZCode receives `human_required` and stops.
+If ChatGPT completed the exact marked user/assistant pair but the browser capture stopped late, the strict tool performs at most one read-only, prior-head-anchored reconciliation and returns that already-existing response. It does not send again. The broker stores the response in its digest-bound blob store, commits the exact binding and model proof idempotently, and completes the original workflow, so a lost result can be recovered through the same operation identity after restart. Recovery succeeds only when the original pre-send maximum-model readback, unique turn marker, final terminal marker, message roles, and stable conversation head all match; otherwise ZCode receives `human_required` and stops.
 
 If the result is not settled, ZCode treats the review as untrusted context, performs the next authorized iteration, increments the cycle, and calls the same tool with the same binding, target, and criteria. This removes human copy/paste and preserves the ChatGPT conversation. It deliberately does not claim automatic wake/resume of a ZCode task after ZCode itself exits or restarts, because the current public ZCode integration surface is MCP plus in-client Goals rather than an externally resumable task API.
 
@@ -372,7 +397,7 @@ node ./bin/ego-chat.mjs converge ./convergence.json
 node ./bin/ego-chat.mjs await <workflow-id> 1800000
 ```
 
-Codex can instead call `ego_start_convergence` and later `await_workflow`, or call `ego_converge_until_settled` with either progress notifications or `waitMode: token_saver`. Closing the MCP facade only detaches that waiter; the daemon keeps alternating the dedicated Codex thread and the same ChatGPT conversation.
+Codex can instead call `ego_start_convergence` and later `await_workflow`, or call `ego_converge_until_settled` with either progress notifications or `waitMode: token_saver`. Closing the MCP facade only detaches that waiter; the daemon keeps alternating the dedicated Codex thread and the same ChatGPT conversation. If the Codex App Server transport exits before a ChatGPT review starts, the broker can reconnect at most twice across the workflow, resume the exact thread, and inspect the exact interrupted turn. It reuses a completed structured candidate, retries only a turn proven `interrupted` or `failed`, and stops if identity or status is ambiguous. This recovery cannot duplicate a ChatGPT send because no browser child workflow exists yet.
 
 Each cycle is bound as follows:
 
@@ -381,7 +406,7 @@ Each cycle is bound as follows:
 3. ChatGPT returns one strict review bound to the target digest, candidate digest, and cycle number.
 4. `settled` is accepted only when every criterion is `pass` and no blocking finding remains. Otherwise the review enters the same Codex thread as untrusted context for the next cycle.
 
-The broker stops rather than loops indefinitely when either side reports a blocker, an identity or schema is invalid, a secret signature is detected, the same candidate/review state repeats, the cycle/deadline budget expires, browser delivery is ambiguous, or the broker restarts during an in-flight convergence operation. This is deliberate: automatic crash replay across a possibly accepted browser send could duplicate a message.
+The broker stops rather than loops indefinitely when either side reports a blocker, an identity or schema is invalid, a secret signature is detected, the same candidate/review state repeats, a storage/identity admission limit is reached, the cycle/deadline or App Server recovery budget expires, browser delivery is ambiguous, or the broker restarts during an in-flight convergence operation. This is deliberate: automatic crash replay across a possibly accepted browser send could duplicate a message. App Server exit diagnostics retain only bounded identity, exit, signal, status, and digest fields; raw stderr is not placed in workflow state.
 
 Current qualification status: the deterministic path, interruption behavior, long-lived MCP transport, and a fresh live two-cycle ChatGPT run all pass. The recorded run used one Codex App Server thread and the existing persistent ChatGPT Project conversation, returned the first review as untrusted context without human relay, and settled every criterion on cycle 2. See [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for exact identities, digests, and remaining fail-closed boundaries.
 
@@ -430,7 +455,7 @@ The crate carries the MIT license and canonical repository metadata needed for p
 - Automatic attachment/context-capsule construction beyond the bounded, secret-scanned implementing-agent review packet.
 - Externally waking a Codex desktop task after its MCP adoption waiter has exited; adoption continues the same task while `ego_adopt_conversation_and_wait` remains open, while convergence owns a dedicated App Server thread.
 - Externally waking or resuming a ZCode task after ZCode exits; ZCode-owned loops remain continuous while their current task or Goal is active.
-- Monotonic fencing epochs across stale or suspended broker owners.
-- Automatic replay after broker/browser restart, CAPTCHA, login, unexpected history, or an unattributable send. The one supported late-response path is evidence-only reconciliation and never resubmits a prompt.
+- Automatic replay of a browser operation that stopped before `send_confirmed`, or after an unattributable click. Those cases remain `human_required` because replay could duplicate a message. A durably confirmed send resumes read-only capture automatically.
+- Automatic bypass of CAPTCHA, login, changed history, an unknown ChatGPT capability contract, or a stale runtime. These remain explicit fail-closed stops.
 
 Those are later phases. Consequential repository and remote operations remain outside the browser reviewer's authority.

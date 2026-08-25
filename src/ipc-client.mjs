@@ -4,7 +4,12 @@ import { fileURLToPath } from "node:url"
 import { randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 
-import { IPC_VERSION, MAX_IPC_LINE_BYTES } from "./constants.mjs"
+import {
+  IPC_VERSION,
+  MAX_IPC_LINE_BYTES,
+  READ_ONLY_IPC_METHODS,
+  RUNTIME_IDENTITY,
+} from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 import { readBrokerToken } from "./auth-token.mjs"
 
@@ -49,6 +54,7 @@ async function requestOnce(config, method, params, timeoutMs, signal = undefined
         id: randomUUID(),
         method,
         params,
+        runtime: RUNTIME_IDENTITY,
         token,
         version: IPC_VERSION,
       })}\n`)
@@ -106,13 +112,63 @@ function isConnectionFailure(error) {
   return ["ECONNREFUSED", "ENOENT"].includes(error?.code)
 }
 
+function runtimeMatches(candidate) {
+  return JSON.stringify(candidate) === JSON.stringify(RUNTIME_IDENTITY)
+}
+
+async function assertCompatibleMutationTarget(config) {
+  const ping = await requestOnce(config, "ping", {}, 500)
+  if (!runtimeMatches(ping.runtimeIdentity)) {
+    throw new EgoChatError(
+      "restart_required",
+      "The configured socket belongs to a legacy or incompatible Ego Chat broker. Restart the host app before mutating durable state.",
+      {
+        brokerRuntime: ping.runtimeIdentity ?? null,
+        clientRuntime: RUNTIME_IDENTITY,
+        pid: ping.pid ?? null,
+        socketPath: config.socketPath,
+      },
+    )
+  }
+}
+
 export async function requestBroker(config, method, params = {}, options = {}) {
   const timeoutMs = options.timeoutMs ?? 10_000
   try {
+    if (
+      !READ_ONLY_IPC_METHODS.has(method)
+      && (config.legacySocketPaths ?? []).includes(config.socketPath)
+    ) {
+      await assertCompatibleMutationTarget(config)
+    }
     return await requestOnce(config, method, params, timeoutMs, options.signal)
   } catch (error) {
     if (options.autostart === false || (!isConnectionFailure(error) && error.code !== "ENOENT")) {
       throw error
+    }
+  }
+
+  for (const legacySocketPath of config.legacySocketPaths ?? []) {
+    try {
+      const legacy = { ...config, socketPath: legacySocketPath }
+      const ping = await requestOnce(legacy, "ping", {}, 500)
+      if (!ping.runtimeIdentity) {
+        if (!READ_ONLY_IPC_METHODS.has(method)) {
+          throw new EgoChatError(
+            "restart_required",
+            "A legacy Ego Chat broker is still active. Restart Codex and ZCode before starting another durable operation.",
+            { pid: ping.pid, socketPath: legacySocketPath },
+          )
+        }
+        return requestOnce(legacy, method, params, timeoutMs, options.signal)
+      }
+    } catch (error) {
+      if (error instanceof EgoChatError && error.code === "restart_required") {
+        throw error
+      }
+      if (!isConnectionFailure(error) && error.code !== "ENOENT" && error.code !== "ipc_timeout") {
+        throw error
+      }
     }
   }
 
