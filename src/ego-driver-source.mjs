@@ -397,12 +397,66 @@ async function egoDriverMain(inputPathOverride = undefined) {
     return { tab, targetId: tab.targetId, task }
   }
 
+  function taskSpaceMatches(taskSpace, identifier) {
+    if (typeof identifier === "number") {
+      return taskSpace.id === identifier
+    }
+    const requested = String(identifier)
+    if (taskSpace.name === requested || taskSpace.taskId === requested) {
+      return true
+    }
+    return /^\d+$/.test(requested) && String(taskSpace.id) === requested
+  }
+
+  function boundTaskSpaceName(binding) {
+    const identity = binding.key || binding.bindingKey || binding.canonicalUrl
+    return `ego-chat-bound-${sha256(String(identity)).slice(0, 16)}`
+  }
+
+  async function useBoundTaskSpace(binding) {
+    const taskSpaces = await globalThis.listTaskSpaces()
+    const requested = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, binding.taskSpaceId))
+    if (!binding.key) {
+      if (requested?.ownership && requested.ownership !== "agent") {
+        humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
+          taskSpaceId: requested.id,
+        })
+        return null
+      }
+      return useOrCreateTaskSpace(requested?.id ?? binding.taskSpaceId)
+    }
+    const fallbackName = boundTaskSpaceName(binding)
+    const fallback = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, fallbackName))
+    const controlled = [requested, fallback]
+      .find((taskSpace) => taskSpace?.ownership && taskSpace.ownership !== "agent")
+    if (controlled) {
+      humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
+        taskSpaceId: controlled.id,
+      })
+      return null
+    }
+    return useOrCreateTaskSpace(fallback?.id ?? fallbackName)
+  }
+
   function assertReady(inspection, selected) {
     if (!isChatGptOrigin(inspection.info.url)) {
       humanRequired("unexpected_origin", "The selected tab is no longer on ChatGPT.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
+      return false
+    }
+    if (inspection.accountState === "unknown") {
+      humanRequired(
+        "page_state_unresolved",
+        "ChatGPT page readiness could not be established.",
+        {
+          accountState: inspection.accountState,
+          composerCount: inspection.composerCount,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        },
+      )
       return false
     }
     if (inspection.accountState !== "authenticated") {
@@ -421,6 +475,39 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return false
     }
     return true
+  }
+
+  async function waitForReadyInspection() {
+    const configuredTimeoutMs = Number.isFinite(input.timeoutMs) ? input.timeoutMs : 10_000
+    const deadline = Date.now() + Math.max(0, Math.min(configuredTimeoutMs, 10_000))
+    let inspection = await inspectPage()
+    let consecutiveUnauthenticated = inspection.accountState === "unauthenticated" ? 1 : 0
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (
+        inspection.accountState === "authenticated"
+        || inspection.accountState === "blocked"
+        || consecutiveUnauthenticated >= 2
+      ) {
+        break
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        break
+      }
+      await wait(Math.min(1, remainingMs / 1_000))
+      inspection = await inspectPage()
+      consecutiveUnauthenticated = inspection.accountState === "unauthenticated"
+        ? consecutiveUnauthenticated + 1
+        : 0
+    }
+    if (
+      inspection.accountState === "authenticated"
+      || inspection.accountState === "blocked"
+      || consecutiveUnauthenticated >= 2
+    ) {
+      return inspection
+    }
+    return { ...inspection, accountState: "unknown" }
   }
 
   async function inspectModelPolicyMenu() {
@@ -741,7 +828,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       if (!selected) {
         return null
       }
-      const inspection = await inspectPage()
+      const inspection = await waitForReadyInspection()
       if (!assertReady(inspection, selected)) {
         return null
       }
@@ -762,7 +849,10 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return { ...selected, inspection }
     }
 
-    const task = await useOrCreateTaskSpace(binding.taskSpaceId)
+    const task = await useBoundTaskSpace(binding)
+    if (!task) {
+      return null
+    }
     const expectedUrl = normalizeUrl(binding.canonicalUrl)
     const tabs = await listTabs()
     const boundTab = tabs.find((candidate) => candidate.targetId === binding.targetId)
@@ -770,15 +860,27 @@ async function egoDriverMain(inputPathOverride = undefined) {
       await switchTab(boundTab.targetId)
       const currentInfo = await pageInfo()
       if (normalizeUrl(currentInfo.url) === expectedUrl) {
-        const inspection = await inspectPage()
+        const inspection = await waitForReadyInspection()
         const selected = { inspection, tab: boundTab, targetId: boundTab.targetId, task }
-        return assertReady(inspection, selected) ? selected : null
+        if (!assertReady(inspection, selected)) {
+          return null
+        }
+        if (normalizeUrl(inspection.info.url) !== expectedUrl) {
+          humanRequired("canonical_conversation_redirected", "ChatGPT did not remain on the bound canonical conversation URL.", {
+            targetId: selected.targetId,
+            taskSpaceId: task.id,
+          })
+          return null
+        }
+        return selected
       }
     }
 
     const opened = await openOrReuseTab(expectedUrl, { timeout: 30, wait: true })
     const refreshedTabs = await listTabs()
-    const activeTab = refreshedTabs.find((candidate) => candidate.active) || opened
+    const activeTab = refreshedTabs.find((candidate) => candidate.targetId === opened?.targetId)
+      || refreshedTabs.find((candidate) => candidate.active)
+      || opened
     if (!activeTab?.targetId) {
       humanRequired("bound_conversation_open_failed", "The canonical ChatGPT conversation could not be opened.", {
         taskSpaceId: task.id,
@@ -786,7 +888,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return null
     }
     await switchTab(activeTab.targetId)
-    const inspection = await inspectPage()
+    const inspection = await waitForReadyInspection()
     const selected = { inspection, tab: activeTab, targetId: activeTab.targetId, task }
     if (!assertReady(inspection, selected)) {
       return null
@@ -869,6 +971,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
 
     const selected = await selectConversation({
+      bindingKey: input.bindingKey,
       canonicalUrl: input.canonicalUrl,
       startUrl: input.canonicalUrl,
       state: "bound",
@@ -906,6 +1009,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function adopt() {
     const selected = await selectConversation({
+      bindingKey: input.bindingKey,
       canonicalUrl: input.canonicalUrl,
       startUrl: input.canonicalUrl,
       state: "bound",
@@ -1031,12 +1135,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       }
 
       if (stableCount >= 2) {
-        const modelPolicy = await verifyExistingMaximumModelPolicy(selected)
-        if (!modelPolicy) {
-          return
-        }
-        observedModelPolicy = modelPolicy
-        const finalInspection = await inspectPage()
+        const finalInspection = await waitForReadyInspection()
         if (!assertReady(finalInspection, selected)) {
           return
         }
@@ -1047,6 +1146,19 @@ async function egoDriverMain(inputPathOverride = undefined) {
           })
           return
         }
+        const modelPolicy = await verifyExistingMaximumModelPolicy(selected)
+        if (!modelPolicy) {
+          return
+        }
+        const postPolicyInfo = await pageInfo()
+        if (normalizeUrl(postPolicyInfo.url) !== canonicalUrl) {
+          humanRequired("adoption_url_changed", "The ChatGPT conversation URL changed before adoption completed.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
+        observedModelPolicy = modelPolicy
         const finalGenerationRunning = await js(String.raw`Boolean(
           document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
         )`)
@@ -1220,15 +1332,15 @@ async function egoDriverMain(inputPathOverride = undefined) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
-    const selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
+    const expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
+    const selected = await selectConversation({
+      ...input.binding,
+      canonicalUrl: expectedCanonicalUrl,
+    })
     if (!selected) {
       return
     }
-    const inspection = await inspectPage()
-    if (!assertReady(inspection, selected)) {
-      return
-    }
-    const expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
+    const inspection = selected.inspection
     if (!expectedCanonicalUrl || normalizeUrl(inspection.info.url) !== normalizeUrl(expectedCanonicalUrl)) {
       humanRequired("reconciliation_url_mismatch", "The late send is not in the bound canonical conversation.", {
         targetId: selected.targetId,
