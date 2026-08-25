@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -316,15 +317,34 @@ console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
 }
 
 async function runAdoptionDriverCase({
+  fallbackTaskSpaceOwnership = null,
   interleave = false,
   initiallyGenerating = true,
+  pageStates = ["authenticated"],
+  pageUrl = null,
+  pageUrls = null,
   policyInitiallyMaximum = true,
+  redirectAfterModelVerification = false,
+  taskSpaceAvailable = true,
+  taskSpaceOwnership = "agent",
+  targetId = null,
+  timeoutMs = 30_000,
+  unrelatedActiveAfterOpen = false,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-adopt-${process.pid}-${driverCase}`
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const canonicalUrl = "https://chatgpt.com/c/adoption-driver-test"
+  const fallbackName = `ego-chat-bound-${createHash("sha256").update("adoption-driver-test", "utf8").digest("hex").slice(0, 16)}`
+  const listedTaskSpaces = [
+    ...(taskSpaceAvailable
+      ? [{ id: 10, name: "adoption-driver-space", ownership: taskSpaceOwnership, taskId: "adoption-driver-space" }]
+      : []),
+    ...(fallbackTaskSpaceOwnership
+      ? [{ id: 12, name: fallbackName, ownership: fallbackTaskSpaceOwnership, taskId: fallbackName }]
+      : []),
+  ]
   const input = {
     bindingKey: "adoption-driver-test",
     brokerLease: {
@@ -341,8 +361,9 @@ async function runAdoptionDriverCase({
       modelSelection: "strongest_available",
       thinkingEffort: "maximum_available",
     },
+    targetId,
     taskSpace: 10,
-    timeoutMs: 30_000,
+    timeoutMs,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
   await fs.writeFile(ownerPath, JSON.stringify({
@@ -358,8 +379,16 @@ let generating = ${JSON.stringify(initiallyGenerating)}
 let waits = 0
 let policyMenuOpen = false
 let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
+let pageInspection = 0
+let pageInfoRead = 0
+let pageUrlOverride = null
+let openedRecoveredTab = false
+const pageStates = ${JSON.stringify(pageStates)}
+const taskSpaceRequests = []
 const counters = { click: 0, fillInput: 0, pressKey: 0, sendClick: 0, typeText: 0 }
 const canonicalUrl = ${JSON.stringify(canonicalUrl)}
+const pageUrl = ${JSON.stringify(pageUrl)}
+const pageUrls = ${JSON.stringify(pageUrls)}
 const messages = () => {
   const values = [
     { messageId: 'adopt-user-1', role: 'user', text: 'Please perform a long review.' },
@@ -375,12 +404,44 @@ const messages = () => {
   return values
 }
 globalThis.cliLog = (value) => console.log(value)
-globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
-globalThis.listTabs = async () => [{ active: true, targetId: 'adopt-tab' }]
+globalThis.listTaskSpaces = async () => ${JSON.stringify(listedTaskSpaces)}
+globalThis.useOrCreateTaskSpace = async (value) => {
+  taskSpaceRequests.push(value)
+  if (!${JSON.stringify(taskSpaceAvailable)} && value === 10) {
+    throw new Error('No task space matches numeric id 10')
+  }
+  return { id: value === 10 ? 10 : 11 }
+}
+globalThis.listTabs = async () => {
+  if (!${JSON.stringify(taskSpaceAvailable)}) {
+    return openedRecoveredTab ? [{ active: true, targetId: 'adopt-recovered-tab' }] : []
+  }
+  if (${JSON.stringify(unrelatedActiveAfterOpen)} && openedRecoveredTab) {
+    return [
+      { active: true, targetId: 'unrelated-active-tab' },
+      { active: false, targetId: 'adopt-recovered-tab' },
+    ]
+  }
+  return [{ active: true, targetId: 'adopt-tab' }]
+}
 globalThis.switchTab = async () => {}
-globalThis.openOrReuseTab = async () => ({ active: true, targetId: 'adopt-tab' })
-globalThis.pageInfo = async () => ({ url: canonicalUrl })
-globalThis.snapshotText = async () => ''
+globalThis.openOrReuseTab = async () => {
+  openedRecoveredTab = true
+  return {
+    active: true,
+    targetId: ${JSON.stringify(taskSpaceAvailable && !unrelatedActiveAfterOpen)} ? 'adopt-tab' : 'adopt-recovered-tab',
+  }
+}
+globalThis.pageInfo = async () => {
+  const sequencedUrl = pageUrls?.[Math.min(pageInfoRead, pageUrls.length - 1)]
+  pageInfoRead += 1
+  return { url: pageUrlOverride || sequencedUrl || pageUrl || canonicalUrl }
+}
+globalThis.snapshotText = async () => (
+  pageStates[Math.min(pageInspection, pageStates.length - 1)] === 'verification'
+    ? 'Verify you are human'
+    : ''
+)
 globalThis.wait = async () => {
   waits += 1
   generating = false
@@ -400,12 +461,50 @@ globalThis.pressKey = async () => {
 globalThis.cdp = async () => {}
 globalThis.js = async (source) => {
   if (source.includes('hasLoginAction')) {
-    return { draft: '', hasComposer: true, hasLoginAction: false }
+    const state = pageStates[Math.min(pageInspection, pageStates.length - 1)]
+    pageInspection += 1
+    if (state === 'unknown') {
+      return {
+        composerCount: 0,
+        composerSemanticId: false,
+        draft: '',
+        hasComposer: false,
+        hasLoginAction: false,
+      }
+    }
+    if (state === 'unauthenticated') {
+      return {
+        composerCount: 0,
+        composerSemanticId: false,
+        draft: '',
+        hasComposer: false,
+        hasLoginAction: true,
+      }
+    }
+    if (state === 'verification') {
+      return {
+        composerCount: 0,
+        composerSemanticId: false,
+        draft: '',
+        hasComposer: false,
+        hasLoginAction: false,
+      }
+    }
+    return {
+      composerCount: 1,
+      composerSemanticId: true,
+      draft: '',
+      hasComposer: true,
+      hasLoginAction: false,
+    }
   }
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
     return messages()
   }
   if (source.includes('aria-valuemin')) {
+    if (${JSON.stringify(redirectAfterModelVerification)}) {
+      pageUrlOverride = 'https://chatgpt.com/g/g-p-adoption-test/project'
+    }
     return {
       current: policyCurrent,
       effortLabel: 'Pro',
@@ -432,6 +531,7 @@ globalThis.js = async (source) => {
 }
 await ${EGO_DRIVER_SOURCE.trim()}
 console.log('__EGO_CHAT_ADOPT_COUNTERS__' + JSON.stringify({ ...counters, waits }))
+console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests))
 `
 
   try {
@@ -443,7 +543,11 @@ console.log('__EGO_CHAT_ADOPT_COUNTERS__' + JSON.stringify({ ...counters, waits 
     const countersLine = executed.stdout
       .split("\n")
       .find((line) => line.startsWith("__EGO_CHAT_ADOPT_COUNTERS__"))
+    const taskSpacesLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_ADOPT_TASK_SPACES__"))
     assert.ok(countersLine)
+    assert.ok(taskSpacesLine)
     let result
     let error
     try {
@@ -455,6 +559,144 @@ console.log('__EGO_CHAT_ADOPT_COUNTERS__' + JSON.stringify({ ...counters, waits 
       counters: JSON.parse(countersLine.slice("__EGO_CHAT_ADOPT_COUNTERS__".length)),
       error,
       result,
+      taskSpaceRequests: JSON.parse(taskSpacesLine.slice("__EGO_CHAT_ADOPT_TASK_SPACES__".length)),
+    }
+  } finally {
+    await fs.rm(mailboxDirectory, { force: true, recursive: true })
+  }
+}
+
+async function runTaskSpaceReconciliationCase({
+  fallbackTaskSpaceOwnership = null,
+  requestedTaskSpaceOwnership = null,
+} = {}) {
+  driverCase += 1
+  const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
+  const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
+  const ownerPath = `${mailboxDirectory}/owner.json`
+  const canonicalUrl = "https://chatgpt.com/c/reconcile-driver-test"
+  const fallbackName = `ego-chat-bound-${createHash("sha256").update("ego-chat-main", "utf8").digest("hex").slice(0, 16)}`
+  const listedTaskSpaces = [
+    ...(requestedTaskSpaceOwnership
+      ? [{ id: 10, name: "unrelated-agent-space", ownership: requestedTaskSpaceOwnership, taskId: "unrelated-agent-space" }]
+      : []),
+    ...(fallbackTaskSpaceOwnership
+      ? [{ id: 12, name: fallbackName, ownership: fallbackTaskSpaceOwnership, taskId: fallbackName }]
+      : []),
+  ]
+  const previousText = "Prior assistant response."
+  const previousDigest = createHash("sha256").update(previousText, "utf8").digest("hex")
+  const input = {
+    allowDeliveryAbsent: true,
+    binding: {
+      canonicalUrl,
+      headRole: "assistant",
+      key: "ego-chat-main",
+      messageCount: 2,
+      state: "bound",
+      targetId: "stale-bound-tab",
+      taskSpaceId: 10,
+    },
+    brokerLease: {
+      brokerId: "reconcile-test-broker",
+      epoch: 1,
+      ownerPath,
+      pid: process.pid,
+    },
+    browserContractRevision: 6,
+    canonicalUrl,
+    expectedPreviousContentDigest: previousDigest,
+    expectedPreviousMessageId: "previous-assistant",
+    expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    inputDigest: "0".repeat(64),
+    mode: "reconcile_bound",
+    timeoutMs: 1_000,
+    turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
+  }
+  await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
+  await fs.writeFile(ownerPath, JSON.stringify({
+    brokerId: "reconcile-test-broker",
+    epoch: 1,
+    pid: process.pid,
+  }), { mode: 0o600 })
+  await fs.writeFile(`${mailboxDirectory}/input.json`, JSON.stringify(input), { mode: 0o600 })
+
+  const harness = `
+process.getuid = () => ${JSON.stringify(driverUid)}
+let opened = false
+const taskSpaceRequests = []
+const counters = { click: 0, fillInput: 0, pressKey: 0, typeText: 0 }
+globalThis.cliLog = (value) => console.log(value)
+const fallbackName = ${JSON.stringify(fallbackName)}
+globalThis.listTaskSpaces = async () => ${JSON.stringify(listedTaskSpaces)}
+globalThis.useOrCreateTaskSpace = async (value) => {
+  taskSpaceRequests.push(value)
+  if (value === 10) return { id: 10 }
+  if (value === 12) return { id: 12 }
+  if (value === fallbackName) return { id: 11 }
+  throw new Error('Unexpected task space request: ' + value)
+}
+globalThis.listTabs = async () => opened ? [{ active: true, targetId: 'recovered-bound-tab' }] : []
+globalThis.switchTab = async () => {}
+globalThis.openOrReuseTab = async () => {
+  opened = true
+  return { active: true, targetId: 'recovered-bound-tab' }
+}
+globalThis.pageInfo = async () => ({ url: ${JSON.stringify(canonicalUrl)} })
+globalThis.snapshotText = async () => ''
+globalThis.wait = async () => {}
+globalThis.click = async () => { counters.click += 1 }
+globalThis.fillInput = async () => { counters.fillInput += 1 }
+globalThis.typeText = async () => { counters.typeText += 1 }
+globalThis.pressKey = async () => { counters.pressKey += 1 }
+globalThis.cdp = async () => {}
+globalThis.js = async (source) => {
+  if (source.includes('hasLoginAction')) {
+    return {
+      composerCount: 1,
+      composerSemanticId: true,
+      draft: '',
+      hasComposer: true,
+      hasLoginAction: false,
+    }
+  }
+  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+    return [{ messageId: 'previous-assistant', role: 'assistant', text: ${JSON.stringify(previousText)} }]
+  }
+  if (source.trimStart().startsWith('Boolean(')) return false
+  throw new Error('Unexpected page script: ' + source.slice(0, 100))
+}
+await ${EGO_DRIVER_SOURCE.trim()}
+console.log('__EGO_CHAT_RECONCILE_COUNTERS__' + JSON.stringify(counters))
+console.log('__EGO_CHAT_RECONCILE_TASK_SPACES__' + JSON.stringify(taskSpaceRequests))
+`
+
+  try {
+    const executed = spawnSync(process.execPath, ["--input-type=module"], {
+      encoding: "utf8",
+      input: harness,
+    })
+    assert.equal(executed.status, 0, executed.stderr)
+    const countersLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_RECONCILE_COUNTERS__"))
+    const taskSpacesLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_RECONCILE_TASK_SPACES__"))
+    assert.ok(countersLine)
+    assert.ok(taskSpacesLine)
+    let result
+    let error
+    try {
+      result = decodeDriverResult(executed.stdout)
+    } catch (caught) {
+      error = caught
+    }
+    return {
+      counters: JSON.parse(countersLine.slice("__EGO_CHAT_RECONCILE_COUNTERS__".length)),
+      error,
+      result,
+      taskSpaceRequests: JSON.parse(taskSpacesLine.slice("__EGO_CHAT_RECONCILE_TASK_SPACES__".length)),
     }
   } finally {
     await fs.rm(mailboxDirectory, { force: true, recursive: true })
@@ -1059,6 +1301,7 @@ test("conversation adoption waits for a stable assistant tail without composing 
   assert.equal(adopted.result.anchor.messageId, "adopt-user-1")
   assert.equal(adopted.result.head.lastMessageId, "adopt-assistant-1")
   assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.deepEqual(adopted.taskSpaceRequests, [10])
   assert.deepEqual(adopted.counters, {
     click: 2,
     fillInput: 0,
@@ -1067,6 +1310,209 @@ test("conversation adoption waits for a stable assistant tail without composing 
     typeText: 0,
     waits: 4,
   })
+})
+
+test("conversation adoption tolerates transient ChatGPT hydration without asking for authentication", async () => {
+  const adopted = await runAdoptionDriverCase({ pageStates: ["unknown", "authenticated"] })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption reports an unresolved page instead of a false authentication failure", async () => {
+  const adopted = await runAdoptionDriverCase({ pageStates: ["unknown"] })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "page_state_unresolved")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption still fails closed for an explicit authentication page", async () => {
+  const adopted = await runAdoptionDriverCase({ pageStates: ["unauthenticated"] })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "authentication_required")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption tolerates a transient logged-out shell during session restoration", async () => {
+  const adopted = await runAdoptionDriverCase({ pageStates: ["unauthenticated", "authenticated"] })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption does not infer authentication from one deadline-edge sample", async () => {
+  const adopted = await runAdoptionDriverCase({
+    pageStates: ["unauthenticated"],
+    timeoutMs: 0,
+  })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "page_state_unresolved")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption still fails closed for a verification challenge", async () => {
+  const adopted = await runAdoptionDriverCase({ pageStates: ["verification"] })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "verification_challenge")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption reports a settled project-page redirect after hydration", async () => {
+  const adopted = await runAdoptionDriverCase({
+    pageStates: ["unknown", "authenticated"],
+    pageUrl: "https://chatgpt.com/g/g-p-adoption-test/project",
+  })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "canonical_conversation_redirected")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption rechecks a reused tab URL after hydration", async () => {
+  const canonicalUrl = "https://chatgpt.com/c/adoption-driver-test"
+  const adopted = await runAdoptionDriverCase({
+    pageStates: ["unknown", "authenticated"],
+    pageUrls: [
+      canonicalUrl,
+      canonicalUrl,
+      "https://chatgpt.com/g/g-p-adoption-test/project",
+    ],
+    targetId: "adopt-tab",
+  })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "canonical_conversation_redirected")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption tolerates a transient composer remount before final capture", async () => {
+  const adopted = await runAdoptionDriverCase({
+    pageStates: ["authenticated", "unknown", "authenticated"],
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption rechecks the URL after maximum-model verification", async () => {
+  const adopted = await runAdoptionDriverCase({ redirectAfterModelVerification: true })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "adoption_url_changed")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption never routes around a user-controlled bound task space", async () => {
+  const adopted = await runAdoptionDriverCase({ taskSpaceOwnership: "user" })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "browser_control_unavailable")
+  assert.deepEqual(adopted.taskSpaceRequests, [])
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption stays in its explicit space when an unrelated fallback is user-controlled", async () => {
+  const adopted = await runAdoptionDriverCase({ fallbackTaskSpaceOwnership: "user" })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.taskSpaceId, 10)
+  assert.deepEqual(adopted.taskSpaceRequests, [10])
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption selects the exact tab returned by canonical navigation", async () => {
+  const adopted = await runAdoptionDriverCase({ unrelatedActiveAfterOpen: true })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.targetId, "adopt-recovered-tab")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("bound recovery reopens a canonical conversation after its task space disappears", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase()
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 11)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.equal(reconciled.taskSpaceRequests.length, 1)
+  assert.deepEqual(reconciled.counters, {
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    typeText: 0,
+  })
+})
+
+test("bound recovery ignores a recycled agent-owned numeric task space", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    requestedTaskSpaceOwnership: "agent",
+  })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 11)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.equal(reconciled.taskSpaceRequests.length, 1)
+})
+
+test("bound recovery stops instead of bypassing a user-controlled stale task space", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    requestedTaskSpaceOwnership: "user",
+  })
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("bound recovery stops instead of bypassing a user-controlled deterministic task space", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    fallbackTaskSpaceOwnership: "agentDelegatedToUser",
+  })
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
 })
 
 test("conversation adoption fails closed when another message interleaves", async () => {
