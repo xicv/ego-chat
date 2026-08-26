@@ -119,7 +119,7 @@ export function createUpgradeAwareDispatch({
       try {
         assertTargetRuntime(params?.targetRuntime, runtimeIdentity)
         await waitForAdmittedMutations()
-        const status = getStatus()
+        const status = await getStatus()
         assertBrokerIdentity(params?.expectedBroker, status?.broker)
         assertIdle(status)
         const result = {

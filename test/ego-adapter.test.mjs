@@ -871,6 +871,27 @@ test("driver mailbox startup scavenges stale inputs but preserves a live registe
   await assert.rejects(fs.access(activePath), { code: "ENOENT" })
 })
 
+test("driver mailbox metrics refresh after an external input is consumed", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-mailbox-refresh-test-"))
+  const mailboxDirectory = path.join(fixtureDirectory, "mailbox")
+  const inputPath = path.join(
+    mailboxDirectory,
+    "input-999997-77777777-7777-4777-8777-777777777777.json",
+  )
+  await fs.mkdir(mailboxDirectory, { mode: 0o700 })
+  await fs.writeFile(inputPath, "{}", { mode: 0o600 })
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+
+  const adapter = new EgoAdapter({
+    command: "/unused/ego-browser",
+    mailboxDirectory,
+  })
+  assert.equal((await adapter.initialize()).files, 1)
+  await fs.unlink(inputPath)
+  assert.equal(adapter.getMailboxMetrics().files, 1)
+  assert.equal((await adapter.refreshMailboxMetrics()).files, 0)
+})
+
 test("driver mailbox capacity rejects before browser startup and recovers after retention", async (t) => {
   const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-mailbox-quota-test-"))
   const mailboxDirectory = path.join(fixtureDirectory, "mailbox")

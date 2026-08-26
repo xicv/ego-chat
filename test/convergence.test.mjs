@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  CODEX_CANDIDATE_OUTPUT_SCHEMA,
   buildChatGptPrompt,
   buildCodexInspectionCorrectionPrompt,
   buildCodexPrompt,
@@ -15,6 +16,7 @@ import {
   validateAgentCandidate,
   validateCodexCandidate,
 } from "../src/convergence.mjs"
+import { MAX_PROMPT_BYTES } from "../src/constants.mjs"
 
 const OPENAI_LIKE_TEST_TOKEN = `sk-proj-${"A".repeat(26)}123456`
 const PRIVATE_KEY_TEST_HEADER = ["-----BEGIN", "PRIVATE KEY-----"].join(" ")
@@ -192,6 +194,64 @@ test("a host-owned candidate receives the same identity-bound strict review", ()
   )
   assert.equal(completed.settled, true)
   assert.deepEqual(completed.review, review)
+})
+
+test("review packet admission defers to the exact UTF-8 prompt byte budget", () => {
+  const target = "Review a large but transport-safe candidate packet."
+  const acceptanceCriteria = ["The review packet obeys the exact outbound byte budget."]
+  const contract = createContract(target, acceptanceCriteria)
+  const reviewPacket = "x".repeat(50_000)
+  const prepared = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract, { reviewPacket }),
+    cycle: 1,
+    markerToken: "LARGEREVIEWPACKET1234",
+    target,
+  })
+
+  assert.equal(
+    CODEX_CANDIDATE_OUTPUT_SCHEMA.properties.reviewPacket.maxLength,
+    MAX_PROMPT_BYTES,
+  )
+  assert.ok(Buffer.byteLength(prepared.prompt, "utf8") < MAX_PROMPT_BYTES)
+
+  const oversizedPacket = "界".repeat(22_000)
+  assert.throws(
+    () => prepareAgentReview({
+      acceptanceCriteria,
+      candidate: candidateFor(contract, { reviewPacket: oversizedPacket }),
+      cycle: 1,
+      markerToken: "MULTIBYTETESTPACKET1234",
+      target,
+    }),
+    (error) => {
+      assert.equal(error.code, "invalid_input")
+      assert.equal(error.details?.reason, "review_prompt_too_large")
+      assert.equal(error.details?.maxBytes, MAX_PROMPT_BYTES)
+      assert.equal(
+        error.details?.reviewPacketBytes,
+        Buffer.byteLength(oversizedPacket, "utf8"),
+      )
+      assert.ok(error.details?.actualBytes > error.details?.maxBytes)
+      assert.equal(
+        error.details?.overageBytes,
+        error.details?.actualBytes - error.details?.maxBytes,
+      )
+      assert.equal(
+        error.details?.promptOverheadBytes,
+        error.details?.actualBytes - error.details?.reviewPacketBytes,
+      )
+      return true
+    },
+  )
+
+  assert.throws(
+    () => validateAgentCandidate(
+      candidateFor(contract, { reviewPacket: "x".repeat(MAX_PROMPT_BYTES + 1) }),
+      contract.criteria,
+    ),
+    (error) => error.details?.reason === "convergence_protocol_invalid",
+  )
 })
 
 test("proven-absent review retries keep the root operation but use deterministic unique markers", () => {

@@ -5,11 +5,11 @@ import { EgoChatError } from "./errors.mjs"
 import {
   DEFAULT_CHATGPT_GENERATION_MS,
   DEFAULT_MODEL_POLICY,
-  MAX_PROMPT_BYTES,
   TERMINAL_STATUSES,
 } from "./constants.mjs"
 import {
   CODEX_CANDIDATE_OUTPUT_SCHEMA,
+  assertReviewPromptWithinBudget,
   buildChatGptPrompt,
   buildCodexInspectionCorrectionPrompt,
   buildCodexPrompt,
@@ -330,6 +330,13 @@ export class Broker {
       store: this.#store.getMetrics(),
       terminalWorkflowCount: workflows.filter(isTerminal).length,
     }
+  }
+
+  async getRefreshedStatus() {
+    if (typeof this.#egoAdapter.refreshMailboxMetrics === "function") {
+      await this.#egoAdapter.refreshMailboxMetrics()
+    }
+    return this.getStatus()
   }
 
   async startProbe(input) {
@@ -2109,13 +2116,11 @@ export class Broker {
           terminalMarker,
           turnMarker,
         })
-        if (Buffer.byteLength(reviewPrompt, "utf8") > MAX_PROMPT_BYTES) {
-          throw new EgoChatError(
-            "human_required",
-            "The exact ChatGPT review prompt exceeds the transport limit.",
-            { reason: "review_packet_too_large" },
-          )
-        }
+        assertReviewPromptWithinBudget(reviewPrompt, candidate.reviewPacket, {
+          code: "human_required",
+          message: "The exact ChatGPT review prompt exceeds the transport limit.",
+          reason: "review_packet_too_large",
+        })
         const secretSignatures = scanForSecrets(reviewPrompt)
         if (secretSignatures.length > 0) {
           throw new EgoChatError(
