@@ -86,6 +86,24 @@ function bindingHeadPatch(head) {
   }
 }
 
+function bindingHeadAnchor(binding) {
+  return {
+    contentDigest: binding.headContentDigest ?? null,
+    fingerprint: binding.headFingerprint ?? null,
+    fingerprintVersion: binding.headFingerprintVersion ?? null,
+    messageId: binding.headMessageId ?? null,
+    role: binding.headRole ?? null,
+  }
+}
+
+function headAnchorsMatch(left, right) {
+  return left.contentDigest === right.contentDigest
+    && left.fingerprint === right.fingerprint
+    && left.fingerprintVersion === right.fingerprintVersion
+    && left.messageId === right.messageId
+    && left.role === right.role
+}
+
 function isTerminal(workflow) {
   return TERMINAL_STATUSES.has(workflow.status)
 }
@@ -924,6 +942,16 @@ export class Broker {
     const binding = this.#store.getBinding(params.bindingKey)
     if (!binding) {
       throw new EgoChatError("binding_not_found", "Bind a ChatGPT conversation before starting an exchange.")
+    }
+    if (
+      params.expectedPreviousHead
+      && !headAnchorsMatch(bindingHeadAnchor(binding), params.expectedPreviousHead)
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The conversation binding changed after the preceding review attempt was proven not delivered.",
+        { reason: "review_retry_anchor_changed" },
+      )
     }
     this.#assertBindingAvailable(params.bindingKey, convergenceId)
     if (this.#activeBindings.has(params.bindingKey)) {

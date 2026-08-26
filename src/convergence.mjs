@@ -290,10 +290,14 @@ export function prepareAgentReview({
   bindingKey = undefined,
   candidate,
   cycle,
+  deliveryAttempt = 1,
   markerToken = undefined,
   operationId = undefined,
   target,
 }) {
+  if (!Number.isInteger(deliveryAttempt) || deliveryAttempt < 1) {
+    throw new EgoChatError("invalid_input", "The review delivery attempt must be a positive integer.")
+  }
   const contract = createContract(target, acceptanceCriteria)
   const validatedCandidate = validateAgentCandidate(candidate, contract.criteria)
   if (validatedCandidate.status === "blocked") {
@@ -310,10 +314,12 @@ export function prepareAgentReview({
     cycle,
     targetDigest: contract.targetDigest,
   }).slice(0, 48)}`
-  const resolvedMarkerToken = markerToken ?? digestJson({
+  const markerIdentity = {
     bindingKey: bindingKey ?? null,
     operationId: resolvedOperationId,
-  }).slice(0, 32).toUpperCase()
+    ...(deliveryAttempt > 1 ? { deliveryAttempt } : {}),
+  }
+  const resolvedMarkerToken = markerToken ?? digestJson(markerIdentity).slice(0, 32).toUpperCase()
   const turnMarker = `EGO_CHAT_AGENT_REVIEW_${resolvedMarkerToken}_C${cycle}`
   const terminalMarker = `EGO_CHAT_REVIEW_DONE_${resolvedMarkerToken}`
   const prompt = buildChatGptPrompt({
@@ -345,6 +351,7 @@ export function prepareAgentReview({
     candidateDigest,
     contract,
     cycle,
+    deliveryAttempt,
     operationId: resolvedOperationId,
     prompt,
     terminalMarker,

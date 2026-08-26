@@ -15,6 +15,7 @@ import { completeAgentReview, prepareAgentReview } from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
+const MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS = 3
 
 function waitModeSchema(defaultMode = "progress") {
   return z.enum(WAIT_MODES).default(defaultMode)
@@ -100,12 +101,13 @@ const MCP_INSTRUCTIONS = [
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
+  "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
   "Use ego_converge_until_settled only when the user explicitly wants a detached broker-owned Codex implementation loop; supply an immutable target, observable acceptance criteria, and the absolute working directory.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
   "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
-  "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers; otherwise surface the exact human_required stop.",
+  "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers, and may retry only a proven delivery absence; otherwise surface the exact human_required stop.",
   "Never abandon a stopped recovery unless the user explicitly authorizes that exact workflow and acknowledges that visible ChatGPT delivery or a Codex turn may remain ambiguous; abandonment preserves any at-most-once operation tombstone.",
 ].join(" ")
 
@@ -125,6 +127,9 @@ function waitedToolResult(value, waitMode) {
   const modelPolicy = structured.modelPolicy ?? result.modelPolicy
   const summary = {
     ...(structured.bindingKey ? { bindingKey: structured.bindingKey } : {}),
+    ...(Number.isInteger(structured.deliveryAttemptCount)
+      ? { deliveryAttemptCount: structured.deliveryAttemptCount }
+      : {}),
     ...(structured.exchangeWorkflowId ? { exchangeWorkflowId: structured.exchangeWorkflowId } : {}),
     ...(modelPolicy
       ? {
@@ -146,6 +151,31 @@ function waitedToolResult(value, waitMode) {
     content: [{ type: "text", text: JSON.stringify(summary) }],
     structuredContent: structured,
   }
+}
+
+function isDurablyProvenDeliveryAbsent(workflow) {
+  return workflow?.status === "cancelled"
+    && workflow.phase === "delivery_absent"
+    && workflow.result?.deliveryState === "absent"
+    && workflow.result.reconciled === true
+}
+
+function deliveryAbsenceAnchor(workflow) {
+  const beforeHead = workflow?.reconciliation?.beforeHead
+  const fields = ["contentDigest", "fingerprint", "fingerprintVersion", "messageId", "role"]
+  if (
+    !beforeHead
+    || fields.some((field) => !Object.hasOwn(beforeHead, field))
+    || fields.some((field) => beforeHead[field] !== null && typeof beforeHead[field] !== "string")
+    || (beforeHead.role !== null && !["assistant", "user"].includes(beforeHead.role))
+  ) {
+    throw new EgoChatError(
+      "human_required",
+      "The proven-absent review does not retain a complete prior conversation-head anchor.",
+      { reason: "review_delivery_absence_anchor_missing", workflowId: workflow?.id },
+    )
+  }
+  return Object.fromEntries(fields.map((field) => [field, beforeHead[field]]))
 }
 
 function exchangeWaitMs(requestedTimeoutMs) {
@@ -500,97 +530,134 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, performs at most one evidence-only recovery without resending when a completed browser turn was captured late, validates the strict review envelope, and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
+      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
       let workflow
       try {
         const { waitMode } = input
-        const prepared = prepareAgentReview(input)
-        workflow = await requestBroker(config, "ego.start_exchange", {
-          bindingKey: input.bindingKey,
-          expectedTerminalMarker: prepared.terminalMarker,
-          prompt: prepared.prompt,
-          timeoutMs: input.timeoutMs,
-          turnMarker: prepared.turnMarker,
-        })
+        const initialPrepared = prepareAgentReview(input)
+        const deliveryAbsentWorkflowIds = []
+        let retryAnchor
         const waitMs = exchangeWaitMs(input.timeoutMs)
-        const completed = await withWaitMode(
-          extra,
-          `Waiting for strict candidate review ${workflow.id}`,
-          waitMode,
-          () => requestBroker(
-            config,
-            "workflow.await",
-            { timeoutMs: waitMs, workflowId: workflow.id },
-            { signal: extra.signal, timeoutMs: waitMs + 5_000 },
-          ),
-        )
-        let exchangeResult = completed.result
-        let recoveredLateResponse = false
-        if (
-          completed.status === "human_required"
-          && RECOVERABLE_AGENT_REVIEW_CODES.has(completed.humanRequired?.code)
+        for (
+          let deliveryAttempt = 1;
+          deliveryAttempt <= MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS;
+          deliveryAttempt += 1
         ) {
-          const reconciled = await requestBroker(
-            config,
-            "conversation.reconcile",
-            {
-              bindingKey: input.bindingKey,
-              expectedTerminalMarker: prepared.terminalMarker,
-              turnMarker: prepared.turnMarker,
-              workflowId: workflow.id,
-            },
-            { timeoutMs: 65_000 },
-          )
-          if (reconciled.recovery?.deliveryState === "absent") {
+          if (extra.signal?.aborted) {
             throw new EgoChatError(
-              "human_required",
-              "The interrupted ChatGPT review was proven not delivered. A new uniquely marked review may now be started without duplicate-send ambiguity.",
-              { reason: "review_delivery_absent", workflowId: workflow.id },
+              "client_disconnected",
+              "The host disconnected before the next proven-absent review attempt could start.",
             )
+          }
+          const prepared = deliveryAttempt === 1
+            ? initialPrepared
+            : prepareAgentReview({
+                ...input,
+                deliveryAttempt,
+                operationId: initialPrepared.operationId,
+              })
+          workflow = await requestBroker(config, "ego.start_exchange", {
+            bindingKey: input.bindingKey,
+            ...(deliveryAttempt > 1 ? { expectedPreviousHead: retryAnchor } : {}),
+            expectedTerminalMarker: prepared.terminalMarker,
+            prompt: prepared.prompt,
+            timeoutMs: input.timeoutMs,
+            turnMarker: prepared.turnMarker,
+          })
+          const completed = await withWaitMode(
+            extra,
+            `Waiting for strict candidate review ${workflow.id} attempt ${deliveryAttempt}`,
+            waitMode,
+            () => requestBroker(
+              config,
+              "workflow.await",
+              { timeoutMs: waitMs, workflowId: workflow.id },
+              { signal: extra.signal, timeoutMs: waitMs + 5_000 },
+            ),
+          )
+          let exchangeResult = completed.result
+          let recoveredLateResponse = false
+          if (isDurablyProvenDeliveryAbsent(completed)) {
+            retryAnchor = deliveryAbsenceAnchor(completed)
+            deliveryAbsentWorkflowIds.push(workflow.id)
+            continue
           }
           if (
-            typeof reconciled.recovery?.responseText !== "string"
-            || typeof reconciled.recovery?.responseDigest !== "string"
-            || !reconciled.recovery.modelPolicy
+            completed.status === "human_required"
+            && RECOVERABLE_AGENT_REVIEW_CODES.has(completed.humanRequired?.code)
           ) {
+            const reconciled = await requestBroker(
+              config,
+              "conversation.reconcile",
+              {
+                bindingKey: input.bindingKey,
+                expectedTerminalMarker: prepared.terminalMarker,
+                turnMarker: prepared.turnMarker,
+                workflowId: workflow.id,
+              },
+              { timeoutMs: 65_000 },
+            )
+            if (reconciled.recovery?.deliveryState === "absent") {
+              retryAnchor = deliveryAbsenceAnchor(workflow)
+              deliveryAbsentWorkflowIds.push(workflow.id)
+              continue
+            }
+            if (
+              typeof reconciled.recovery?.responseText !== "string"
+              || typeof reconciled.recovery?.responseDigest !== "string"
+              || !reconciled.recovery.modelPolicy
+            ) {
+              throw new EgoChatError(
+                "human_required",
+                "The late ChatGPT review was attributable, but its exact response and pre-send maximum-model proof were not both recoverable.",
+                { reason: "review_recovery_proof_missing", workflowId: workflow.id },
+              )
+            }
+            exchangeResult = reconciled.recovery
+            recoveredLateResponse = true
+          } else if (completed.status !== "succeeded") {
             throw new EgoChatError(
               "human_required",
-              "The late ChatGPT review was attributable, but its exact response and pre-send maximum-model proof were not both recoverable.",
-              { reason: "review_recovery_proof_missing", workflowId: workflow.id },
+              "The ChatGPT browser review did not complete unambiguously.",
+              {
+                reason: completed.humanRequired?.code
+                  ?? completed.error?.code
+                  ?? "chatgpt_review_incomplete",
+                workflowId: workflow.id,
+              },
             )
           }
-          exchangeResult = reconciled.recovery
-          recoveredLateResponse = true
-        } else if (completed.status !== "succeeded") {
-          throw new EgoChatError(
-            "human_required",
-            "The ChatGPT browser review did not complete unambiguously.",
-            {
-              reason: completed.humanRequired?.code
-                ?? completed.error?.code
-                ?? "chatgpt_review_incomplete",
-              workflowId: workflow.id,
-            },
-          )
+          const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
+          const { review, settled } = completeAgentReview(prepared, responseText)
+          return waitedToolResult({
+            bindingKey: input.bindingKey,
+            candidateDigest: prepared.candidateDigest,
+            cycle: input.cycle,
+            deliveryAbsentWorkflowIds,
+            deliveryAttemptCount: deliveryAttempt,
+            exchangeWorkflowId: workflow.id,
+            modelPolicy: exchangeResult.modelPolicy,
+            operationId: prepared.operationId,
+            recoveredLateResponse,
+            responseDigest: exchangeResult.responseDigest,
+            review,
+            settled,
+            targetDigest: prepared.contract.targetDigest,
+          }, waitMode)
         }
-        const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
-        const { review, settled } = completeAgentReview(prepared, responseText)
-        return waitedToolResult({
-          bindingKey: input.bindingKey,
-          candidateDigest: prepared.candidateDigest,
-          cycle: input.cycle,
-          exchangeWorkflowId: workflow.id,
-          modelPolicy: exchangeResult.modelPolicy,
-          operationId: prepared.operationId,
-          recoveredLateResponse,
-          responseDigest: exchangeResult.responseDigest,
-          review,
-          settled,
-          targetDigest: prepared.contract.targetDigest,
-        }, waitMode)
+        throw new EgoChatError(
+          "human_required",
+          "ChatGPT review delivery was proven absent for every bounded automatic attempt.",
+          {
+            deliveryAbsentWorkflowIds,
+            deliveryAttemptCount: MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS,
+            reason: "review_delivery_retries_exhausted",
+            workflowId: workflow?.id,
+          },
+        )
       } catch (error) {
         attachWaitRecovery(error, workflow, input.waitMode)
         return toolError(error)

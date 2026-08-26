@@ -142,8 +142,17 @@ export const ConversationReconcileSchema = z.object({
   workflowId: WorkflowIdSchema,
 })
 
+const ConversationHeadAnchorSchema = z.object({
+  contentDigest: z.string().min(1).max(256).nullable(),
+  fingerprint: z.string().min(1).max(256).nullable(),
+  fingerprintVersion: z.string().min(1).max(64).nullable(),
+  messageId: TargetIdSchema.nullable(),
+  role: z.enum(["assistant", "user"]).nullable(),
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   bindingKey: BindingKeySchema,
+  expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: SafeTextSchema,
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS),
