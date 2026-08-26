@@ -2410,6 +2410,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
     lastRole: "assistant",
     messageCount: 8,
   }
+  let exchangeCalls = 0
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => ({
@@ -2419,6 +2420,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
       taskSpaceId: 10,
     }),
     exchange: async () => {
+      exchangeCalls += 1
       throw new EgoChatError(
         "ego_driver_error",
         "The fixed Ego Browser driver failed.",
@@ -2443,6 +2445,18 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
         turnMarker,
       }
     },
+    verify: async (input) => ({
+      canonicalUrl: input.binding.canonicalUrl,
+      head: {
+        ...beforeHead,
+        fingerprint: "interleaved-tail",
+        lastContentDigest: "e".repeat(64),
+        lastMessageId: "interleaved-assistant",
+        messageCount: 10,
+      },
+      targetId: "driver-interruption-tab",
+      taskSpaceId: 10,
+    }),
   }
   const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
   await broker.initialize()
@@ -2487,6 +2501,22 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
     broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
     bindingBefore,
   )
+
+  await broker.verifyConversation({ bindingKey: "ego-chat-main" })
+  await assert.rejects(
+    broker.startEgoExchange({
+      bindingKey: "ego-chat-main",
+      expectedPreviousHead: stopped.reconciliation.beforeHead,
+      expectedTerminalMarker: "EGO_CHAT_DRIVER_RETRY_DONE123",
+      prompt: "EGO_CHAT_DRIVER_RETRY123\nreview",
+      timeoutMs: 30_000,
+      turnMarker: "EGO_CHAT_DRIVER_RETRY123",
+    }),
+    (error) => error instanceof EgoChatError
+      && error.code === "human_required"
+      && error.details?.reason === "review_retry_anchor_changed",
+  )
+  assert.equal(exchangeCalls, 1)
 })
 
 test("probe completes through await and survives a broker restart", async (t) => {

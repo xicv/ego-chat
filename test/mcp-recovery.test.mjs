@@ -94,6 +94,7 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.match(firstClient.getInstructions(), /binding ego-chat-main/)
   assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
   assert.match(firstClient.getInstructions(), /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
+  assert.match(firstClient.getInstructions(), /retry internally with a deterministic fresh marker only after durable reconciliation proves/)
   assert.match(firstClient.getInstructions(), /post-settlement commit, push, merge, deploy, or release work outside the review target/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_adopt_conversation_and_wait"))
@@ -284,6 +285,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   const canonicalUrl = "https://chatgpt.com/c/controlled-mcp-review"
   const responseDigests = new Map()
   let exchanges = 0
+  const exchangeMarkers = []
   let pendingRecovery = null
   let reconciliations = 0
   const egoAdapter = {
@@ -302,6 +304,20 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     }),
     exchange: async (input) => {
       exchanges += 1
+      exchangeMarkers.push(input.turnMarker)
+      if (input.prompt.includes("always-absent")) {
+        pendingRecovery = { kind: "absent" }
+        throw new EgoChatError(
+          "ego_driver_error",
+          "The fixed Ego Browser driver failed before delivery.",
+          {
+            diagnosticDigest: "e".repeat(64),
+            draftCleared: true,
+            driverStage: "verifying_presend_model_policy",
+            evidence: { modelPolicy: modelPolicyObservation() },
+          },
+        )
+      }
       if (input.turnMarker === "EGO_CHAT_MCP_LARGE_RESULT_20260825") {
         const responseText = `${"😀large-token-saver-result ".repeat(900)}${input.expectedTerminalMarker}`
         return {
@@ -521,14 +537,30 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(ambiguous.isError, true)
   assert.equal(JSON.parse(ambiguous.content[0].text).details.reason, "bound_reconciliation_mismatch")
 
+  const absentInput = reviewInput("delivery-absent")
   const absent = await client.callTool({
-    arguments: reviewInput("delivery-absent"),
+    arguments: absentInput,
     name: "ego_review_candidate_and_wait",
   })
-  assert.equal(absent.isError, true)
-  assert.equal(JSON.parse(absent.content[0].text).details.reason, "review_delivery_absent")
-  assert.equal(exchanges, 5)
+  assert.equal(absent.isError, undefined)
+  assert.equal(absent.structuredContent.settled, true)
+  assert.equal(absent.structuredContent.deliveryAttemptCount, 2)
+  assert.equal(absent.structuredContent.deliveryAbsentWorkflowIds.length, 1)
+  assert.notEqual(exchangeMarkers[4], exchangeMarkers[5])
+  assert.equal(exchanges, 6)
   assert.equal(reconciliations, 3)
+
+  const replayedAbsent = await client.callTool({
+    arguments: absentInput,
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(replayedAbsent.isError, undefined)
+  assert.equal(replayedAbsent.structuredContent.exchangeWorkflowId, absent.structuredContent.exchangeWorkflowId)
+  assert.deepEqual(
+    replayedAbsent.structuredContent.deliveryAbsentWorkflowIds,
+    absent.structuredContent.deliveryAbsentWorkflowIds,
+  )
+  assert.equal(exchanges, 6)
 
   const explicitOperationId = "review-conflict-operation-20260825"
   const firstConflict = await client.callTool({
@@ -543,7 +575,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(conflictingRetry.isError, true)
   assert.equal(JSON.parse(conflictingRetry.content[0].text).code, "operation_key_conflict")
-  assert.equal(exchanges, 6)
+  assert.equal(exchanges, 7)
 
   const largeTurnMarker = "EGO_CHAT_MCP_LARGE_RESULT_20260825"
   const largeResult = await client.callTool({
@@ -588,5 +620,18 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(crossWorkflowRead.isError, true)
   assert.equal(JSON.parse(crossWorkflowRead.content[0].text).code, "result_digest_mismatch")
-  assert.equal(exchanges, 7)
+  assert.equal(exchanges, 8)
+
+  const exhausted = await client.callTool({
+    arguments: reviewInput("always-absent"),
+    name: "ego_review_candidate_and_wait",
+  })
+  const exhaustedError = JSON.parse(exhausted.content[0].text)
+  assert.equal(exhausted.isError, true)
+  assert.equal(exhaustedError.details.reason, "review_delivery_retries_exhausted")
+  assert.equal(exhaustedError.details.deliveryAttemptCount, 3)
+  assert.equal(exhaustedError.details.deliveryAbsentWorkflowIds.length, 3)
+  assert.equal(new Set(exchangeMarkers.slice(-3)).size, 3)
+  assert.equal(exchanges, 11)
+  assert.equal(reconciliations, 6)
 })

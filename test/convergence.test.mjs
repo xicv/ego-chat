@@ -194,6 +194,31 @@ test("a host-owned candidate receives the same identity-bound strict review", ()
   assert.deepEqual(completed.review, review)
 })
 
+test("proven-absent review retries keep the root operation but use deterministic unique markers", () => {
+  const target = "Retry only a review proven absent before delivery."
+  const acceptanceCriteria = ["Every delivery attempt remains identity-bound."]
+  const contract = createContract(target, acceptanceCriteria)
+  const input = {
+    acceptanceCriteria,
+    bindingKey: "ego-chat-main",
+    candidate: candidateFor(contract),
+    cycle: 1,
+    operationId: "review-delivery-retry-test",
+    target,
+  }
+  const initial = prepareAgentReview(input)
+  const replayedInitial = prepareAgentReview(input)
+  const retry = prepareAgentReview({ ...input, deliveryAttempt: 2 })
+
+  assert.equal(replayedInitial.turnMarker, initial.turnMarker)
+  assert.equal(retry.operationId, initial.operationId)
+  assert.equal(retry.candidateDigest, initial.candidateDigest)
+  assert.equal(retry.contract.targetDigest, initial.contract.targetDigest)
+  assert.notEqual(retry.turnMarker, initial.turnMarker)
+  assert.notEqual(retry.terminalMarker, initial.terminalMarker)
+  assert.equal(retry.deliveryAttempt, 2)
+})
+
 test("a blocked or secret-bearing host candidate stops before browser submission", () => {
   const target = "Stop unsafe review packets."
   const acceptanceCriteria = ["No unresolved blocker or secret is sent."]
