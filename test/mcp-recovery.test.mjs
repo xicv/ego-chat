@@ -7,6 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import { loadOrCreateBrokerToken } from "../src/auth-token.mjs"
 import { Broker } from "../src/broker.mjs"
+import { MAX_PROMPT_BYTES } from "../src/constants.mjs"
 import { prepareAgentReview } from "../src/convergence.mjs"
 import { EgoChatError } from "../src/errors.mjs"
 import { startIpcServer } from "../src/ipc-server.mjs"
@@ -104,6 +105,11 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
+  const reviewTool = tools.tools.find((tool) => tool.name === "ego_review_candidate_and_wait")
+  assert.equal(
+    reviewTool.inputSchema.properties.candidate.properties.reviewPacket.maxLength,
+    MAX_PROMPT_BYTES,
+  )
   const abandonmentTool = tools.tools.find((tool) => tool.name === "abandon_workflow_recovery")
   assert.ok(abandonmentTool)
   assert.equal(

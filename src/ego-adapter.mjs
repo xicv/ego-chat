@@ -199,6 +199,13 @@ export class EgoAdapter {
     }
   }
 
+  async refreshMailboxMetrics() {
+    return this.#withMailboxLock(async () => {
+      await this.#scanMailbox()
+      return this.getMailboxMetrics()
+    })
+  }
+
   async drain(timeoutMs = 5_000) {
     this.#draining = true
     const children = [...this.#activeChildren.values()]

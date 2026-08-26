@@ -6,6 +6,7 @@ import {
   APP_NAME,
   APP_VERSION,
   DEFAULT_CHATGPT_GENERATION_MS,
+  MAX_PROMPT_BYTES,
   MAX_RESULT_BYTES,
   MAX_WAIT_MS,
 } from "./constants.mjs"
@@ -75,7 +76,7 @@ const AGENT_REVIEW_INPUT_SCHEMA = {
   candidate: z.object({
     blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
     criteria: z.array(CRITERION_RESULT_SCHEMA).min(1).max(8),
-    reviewPacket: z.string().trim().min(1).max(28_000),
+    reviewPacket: z.string().trim().min(1).max(MAX_PROMPT_BYTES),
     status: z.enum(["candidate", "blocked"]),
     summary: z.string().trim().min(1).max(4_000),
   }).strict(),
@@ -100,6 +101,7 @@ const MCP_INSTRUCTIONS = [
   "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
+  `Finalize and UTF-8 byte-check a strict review packet before creating its operationId. The complete generated review prompt, including protocol overhead, must not exceed ${MAX_PROMPT_BYTES} bytes; prefer an accessible PR URL plus exact revisions, changed-file inventory, critical excerpts, tests, and unresolved risks over an entire diff. Never split one candidate across multiple sends automatically.`,
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
   "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
   "Use ego_converge_until_settled only when the user explicitly wants a detached broker-owned Codex implementation loop; supply an immutable target, observable acceptance criteria, and the absolute working directory.",
@@ -530,7 +532,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: "Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.",
+      description: `Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. The complete UTF-8 review prompt is limited to ${MAX_PROMPT_BYTES} bytes; finalize the packet before minting operationId and prefer exact accessible revision references plus focused evidence over a full diff. Ego Chat never auto-splits a candidate across sends. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.`,
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {

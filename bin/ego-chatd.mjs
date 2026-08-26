@@ -96,7 +96,7 @@ const dispatch = createUpgradeAwareDispatch({
     }
     return handler(params, signal)
   },
-  getStatus: () => broker.getStatus(),
+  getStatus: () => broker.getRefreshedStatus(),
   onUpgradeAccepted: async () => {
     await ipcReady
     const owner = await lease.inspect()

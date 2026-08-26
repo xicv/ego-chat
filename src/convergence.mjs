@@ -20,7 +20,7 @@ const FindingSchema = z.object({
 const AgentCandidateSchema = z.object({
   blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
   criteria: z.array(CriterionResultSchema).min(1).max(8),
-  reviewPacket: z.string().trim().min(1).max(28_000),
+  reviewPacket: z.string().trim().min(1).max(MAX_PROMPT_BYTES),
   status: z.enum(["candidate", "blocked"]),
   summary: z.string().trim().min(1).max(4_000),
 }).strict()
@@ -58,7 +58,7 @@ export const CODEX_CANDIDATE_OUTPUT_SCHEMA = Object.freeze({
       minItems: 1,
       type: "array",
     },
-    reviewPacket: { maxLength: 28_000, minLength: 1, type: "string" },
+    reviewPacket: { maxLength: MAX_PROMPT_BYTES, minLength: 1, type: "string" },
     status: { enum: ["candidate", "blocked"], type: "string" },
     summary: { maxLength: 4_000, minLength: 1, type: "string" },
   },
@@ -88,6 +88,35 @@ export function createContract(target, acceptanceCriteria) {
     target,
     targetDigest: digestJson({ criteria, target }),
   }
+}
+
+export function assertReviewPromptWithinBudget(
+  prompt,
+  reviewPacket,
+  {
+    code = "invalid_input",
+    message = `The generated review prompt exceeds ${MAX_PROMPT_BYTES} bytes.`,
+    reason = "review_prompt_too_large",
+  } = {},
+) {
+  const actualBytes = Buffer.byteLength(prompt, "utf8")
+  const reviewPacketBytes = Buffer.byteLength(reviewPacket, "utf8")
+  if (actualBytes <= MAX_PROMPT_BYTES) {
+    return {
+      actualBytes,
+      maxBytes: MAX_PROMPT_BYTES,
+      promptOverheadBytes: actualBytes - reviewPacketBytes,
+      reviewPacketBytes,
+    }
+  }
+  throw new EgoChatError(code, message, {
+    actualBytes,
+    maxBytes: MAX_PROMPT_BYTES,
+    overageBytes: actualBytes - MAX_PROMPT_BYTES,
+    promptOverheadBytes: actualBytes - reviewPacketBytes,
+    reason,
+    reviewPacketBytes,
+  })
 }
 
 function validateCriteriaCoverage(expectedCriteria, actualCriteria, source) {
@@ -339,13 +368,7 @@ export function prepareAgentReview({
       { reason: "review_packet_secret_detected", signatures },
     )
   }
-  if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) {
-    throw new EgoChatError(
-      "invalid_input",
-      `The generated review prompt exceeds ${MAX_PROMPT_BYTES} bytes.`,
-      { reason: "review_prompt_too_large" },
-    )
-  }
+  assertReviewPromptWithinBudget(prompt, validatedCandidate.reviewPacket)
   return {
     candidate: validatedCandidate,
     candidateDigest,

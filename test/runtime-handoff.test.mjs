@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import test from "node:test"
 
-import { createTestConfig, removeTestConfig } from "./helpers.mjs"
+import { createTestConfig, removeTestConfig, stopTestDaemon } from "./helpers.mjs"
 import { loadOrCreateBrokerToken } from "../src/auth-token.mjs"
 import { RUNTIME_IDENTITY } from "../src/constants.mjs"
 import { requestBroker, requestBrokerUpgrade } from "../src/ipc-client.mjs"
@@ -72,6 +72,28 @@ async function assertHandoffRefused(env, expectedCode) {
   )
 }
 
+async function requestUpgradeWhenSharedMailboxIsIdle(config, broker, targetRuntime) {
+  const deadline = Date.now() + 5_000
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      return await requestBrokerUpgrade(config, broker, targetRuntime)
+    } catch (error) {
+      if (
+        error.code !== "upgrade_blocked_active_work"
+        || error.details?.activeBindingCount !== 0
+        || error.details?.runningWorkflowCount !== 0
+        || (error.details?.mailboxFileCount ?? 0) + (error.details?.mailboxReservationCount ?? 0) < 1
+      ) {
+        throw error
+      }
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  throw lastError
+}
+
 async function waitForMissing(filePath) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
@@ -115,7 +137,10 @@ test("broker handoff asks a compatible stale runtime to drain atomically", async
 
 test("the real daemon atomically accepts a future-runtime drain and exits cleanly", async (t) => {
   const { config } = await createTestConfig()
-  t.after(() => removeTestConfig(config))
+  t.after(async () => {
+    await stopTestDaemon(config)
+    await removeTestConfig(config)
+  })
   const status = await requestBroker(config, "broker.status")
   const targetRuntime = {
     ...RUNTIME_IDENTITY,
@@ -124,7 +149,11 @@ test("the real daemon atomically accepts a future-runtime drain and exits cleanl
     runtimeGeneration: "future-runtime-generation",
   }
 
-  const result = await requestBrokerUpgrade(config, status.broker, targetRuntime)
+  const result = await requestUpgradeWhenSharedMailboxIsIdle(
+    config,
+    status.broker,
+    targetRuntime,
+  )
 
   assert.equal(result.status, "accepted")
   assert.deepEqual(result.targetRuntime, targetRuntime)
