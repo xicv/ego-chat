@@ -93,6 +93,8 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   const tools = await firstClient.listTools()
   assert.match(firstClient.getInstructions(), /binding ego-chat-main/)
   assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
+  assert.match(firstClient.getInstructions(), /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
+  assert.match(firstClient.getInstructions(), /post-settlement commit, push, merge, deploy, or release work outside the review target/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_adopt_conversation_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_conversation_adoption"))

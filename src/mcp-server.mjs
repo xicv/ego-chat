@@ -98,9 +98,10 @@ const MCP_INSTRUCTIONS = [
   "Use binding ego-chat-main unless the user explicitly names another binding.",
   "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
-  "For a strict candidate review while the current ZCode or other agent remains the implementer, use ego_review_candidate_and_wait and continue in that same host task until settled.",
+  "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
-  "For broker-owned automatic Codex/ChatGPT convergence, use ego_converge_until_settled with an immutable target, observable acceptance criteria, and the absolute working directory.",
+  "Use ego_converge_until_settled only when the user explicitly wants a detached broker-owned Codex implementation loop; supply an immutable target, observable acceptance criteria, and the absolute working directory.",
+  "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
   "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
@@ -640,7 +641,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_start_convergence",
     {
-      description: "Start a broker-owned Codex/ChatGPT convergence loop against an immutable target and explicit acceptance criteria. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately.",
+      description: "Start a detached broker-owned Codex implementation and ChatGPT review loop against an immutable target and explicit acceptance criteria. Use this only when the current host task is not the implementation owner. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately.",
       inputSchema: CONVERGENCE_INPUT_SCHEMA,
     },
     async (input) => {
@@ -655,7 +656,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_converge_until_settled",
     {
-      description: "Run the bounded Codex/ChatGPT loop and wait until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
+      description: "Run a detached broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. When the current Codex or ZCode task owns the candidate, use ego_review_candidate_and_wait instead. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
       inputSchema: {
         ...CONVERGENCE_INPUT_SCHEMA,
         waitMode: waitModeSchema(),

@@ -109,6 +109,7 @@ class FakeConvergenceAppServer {
     this.turns += 1
     this.additionalContexts.push(input.additionalContext ?? null)
     this.prompts.push(input.prompt)
+    await input.onStarted?.({ turnId: `codex-turn-${this.turns}` })
     return {
       durationMs: 10,
       responseDigest: String(this.turns).repeat(64),
@@ -1741,7 +1742,8 @@ test("convergence resumes the exact Codex thread after one pre-review App Server
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const firstClient = new FakeConvergenceAppServer()
-  firstClient.runStructuredTurn = async () => {
+  firstClient.runStructuredTurn = async (input) => {
+    await input.onStarted({ turnId: "codex-interrupted-turn" })
     throw new EgoChatError(
       "app_server_exited",
       "Codex App Server exited before the operation completed.",
@@ -1813,21 +1815,72 @@ test("convergence resumes the exact Codex thread after one pre-review App Server
   assert.equal(secondClient.closed, true)
 })
 
-test("convergence exhausts its workflow-wide App Server recovery budget before browser review", async (t) => {
+test("convergence rejects an App Server exit whose turn identity changed", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
-  const clients = Array.from({ length: 3 }, (_, index) => {
+  const appServer = new FakeConvergenceAppServer()
+  appServer.runStructuredTurn = async (input) => {
+    await input.onStarted({ turnId: "codex-accepted-turn" })
+    throw new EgoChatError(
+      "app_server_exited",
+      "Codex App Server exited before the operation completed.",
+      {
+        diagnosticDigest: "d".repeat(64),
+        signal: "SIGTERM",
+        turnId: "codex-different-turn",
+      },
+    )
+  }
+  const ego = createConvergenceEgoAdapter(() => {
+    throw new Error("a mismatched App Server turn must not reach ChatGPT")
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-app-server-identity-change-test",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["The exact accepted App Server turn remains bound."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Reject a transport exit that reports a different turn identity.",
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "app_server_exited")
+  assert.equal(stopped.humanRequired.diagnostic.turnId, "codex-different-turn")
+  assert.equal(stopped.appServerRecoveryCount, 0)
+  assert.equal(ego.exchanges, 0)
+})
+
+test("convergence keeps recovering pre-review App Server exits until real progress", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const clients = Array.from({ length: 4 }, (_, index) => {
     const client = new FakeConvergenceAppServer()
-    client.runStructuredTurn = async () => {
-      throw new EgoChatError(
-        "app_server_exited",
-        "Codex App Server exited before the operation completed.",
-        {
-          diagnosticDigest: String(index + 1).repeat(64),
-          exitCode: 70 + index,
-          turnId: `codex-interrupted-turn-${index + 1}`,
-        },
-      )
+    if (index < 3) {
+      client.runStructuredTurn = async (input) => {
+        await input.onStarted({ turnId: `codex-interrupted-turn-${index + 1}` })
+        throw new EgoChatError(
+          "app_server_exited",
+          "Codex App Server exited before the operation completed.",
+          {
+            diagnosticDigest: String(index + 1).repeat(64),
+            exitCode: 70 + index,
+            turnId: `codex-interrupted-turn-${index + 1}`,
+          },
+        )
+      }
     }
     if (index > 0) {
       client.recoverStructuredTurn = async (threadId, turnId) => {
@@ -1838,9 +1891,16 @@ test("convergence exhausts its workflow-wide App Server recovery budget before b
     }
     return client
   })
-  const ego = createConvergenceEgoAdapter(() => {
-    throw new Error("the recovery budget must stop before ChatGPT")
-  })
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "Recovery continued to a reviewed candidate.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The recovered convergence is settled.",
+  }))
   const broker = new Broker({
     appServerFactory: () => clients.shift(),
     egoAdapter: ego.adapter,
@@ -1856,18 +1916,76 @@ test("convergence exhausts its workflow-wide App Server recovery budget before b
   })
 
   const started = await broker.startConvergence({
-    acceptanceCriteria: ["Identity is bound.", "The recovery budget is bounded."],
+    acceptanceCriteria: ["Identity is bound.", "Recovery continues until real progress."],
     bindingKey: "ego-chat-main",
     cwd: process.cwd(),
-    target: "Stop after the bounded exact-turn App Server recovery budget is exhausted.",
+    target: "Recover repeated pre-review App Server exits without human relay.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.appServerRecoveryCount, 3)
+  assert.equal(completed.lastAppServerExit.turnId, "codex-interrupted-turn-3")
+  assert.equal(ego.exchanges, 1)
+})
+
+test("convergence bounds consecutive pre-review App Server exits without browser delivery", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const clients = Array.from({ length: 5 }, (_, index) => {
+    const client = new FakeConvergenceAppServer()
+    client.runStructuredTurn = async (input) => {
+      await input.onStarted({ turnId: `codex-interrupted-turn-${index + 1}` })
+      throw new EgoChatError(
+        "app_server_exited",
+        "Codex App Server exited before the operation completed.",
+        {
+          diagnosticDigest: String(index + 1).repeat(64),
+          signal: "SIGTERM",
+          turnId: `codex-interrupted-turn-${index + 1}`,
+        },
+      )
+    }
+    if (index > 0) {
+      client.recoverStructuredTurn = async (threadId, turnId) => {
+        assert.equal(threadId, "codex-convergence-thread")
+        assert.equal(turnId, `codex-interrupted-turn-${index}`)
+        return { disposition: "retry", status: "interrupted" }
+      }
+    }
+    return client
+  })
+  const ego = createConvergenceEgoAdapter(() => {
+    throw new Error("an exhausted App Server recovery budget must not reach ChatGPT")
+  })
+  const broker = new Broker({
+    appServerFactory: () => clients.shift(),
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-app-server-exhaustion-test",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "Runaway detached retries are bounded."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Stop detached recovery after repeated exits without candidate progress.",
   })
   const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
   assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "app_server_exited")
-  assert.equal(stopped.appServerRecoveryCount, 2)
-  assert.equal(stopped.lastAppServerExit.turnId, "codex-interrupted-turn-2")
-  assert.equal(stopped.humanRequired.diagnostic.turnId, "codex-interrupted-turn-3")
+  assert.equal(stopped.humanRequired.code, "app_server_recovery_exhausted")
+  assert.equal(stopped.humanRequired.diagnostic.consecutiveExitCount, 5)
+  assert.equal(stopped.humanRequired.diagnostic.recoveryLimit, 4)
+  assert.equal(stopped.humanRequired.diagnostic.turnId, "codex-interrupted-turn-5")
+  assert.equal(stopped.appServerRecoveryCount, 4)
   assert.equal(ego.exchanges, 0)
 })
 
@@ -2637,4 +2755,86 @@ test("running convergence fails closed after broker restart", async (t) => {
   assert.equal(reconciled.status, "human_required")
   assert.equal(reconciled.humanRequired.code, "broker_restarted_during_convergence")
   assert.equal("private" in reconciled, false)
+})
+
+test("running convergence resumes an exact completed pre-review Codex turn after broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const firstClient = new FakeConvergenceAppServer()
+  let turnIdentityRecorded
+  const recorded = new Promise((resolve) => {
+    turnIdentityRecorded = resolve
+  })
+  firstClient.runStructuredTurn = async (input) => {
+    firstClient.turns += 1
+    await input.onStarted({ turnId: "codex-restart-turn" })
+    turnIdentityRecorded()
+    return new Promise(() => {})
+  }
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The exact completed turn survived restart.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The restart-safe convergence is settled.",
+  }))
+  const firstBroker = new Broker({
+    appServerFactory: () => firstClient,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await firstBroker.initialize()
+  await firstBroker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-broker-restart-test",
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const started = await firstBroker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The exact completed turn survives restart."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Resume a durably identified pre-review Codex turn after broker restart.",
+  })
+  await recorded
+  assert.equal(
+    firstBroker.getWorkflow({ workflowId: started.id }).activeCodexTurn.turnId,
+    "codex-restart-turn",
+  )
+  firstBroker.close()
+
+  const secondClient = new FakeConvergenceAppServer()
+  secondClient.recoverStructuredTurn = async (threadId, turnId) => {
+    assert.equal(threadId, "codex-convergence-thread")
+    assert.equal(turnId, "codex-restart-turn")
+    return {
+      disposition: "completed",
+      result: {
+        durationMs: 10,
+        responseDigest: "a".repeat(64),
+        turnId,
+        value: convergenceCandidate(1),
+        workspaceActivity: { count: 1, types: ["commandExecution"] },
+      },
+    }
+  }
+  const secondBroker = new Broker({
+    appServerFactory: () => secondClient,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await secondBroker.initialize()
+  t.after(() => secondBroker.close())
+  const completed = await secondBroker.awaitWorkflow({
+    timeoutMs: 5_000,
+    workflowId: started.id,
+  })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.phase, "settled")
+  assert.equal(secondClient.turns, 0)
+  assert.equal(ego.exchanges, 1)
 })

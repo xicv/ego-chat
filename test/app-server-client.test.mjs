@@ -52,9 +52,13 @@ test("App Server exits retain the exact interrupted turn identity for recovery",
   await client.connect()
   t.after(() => client.close())
   const thread = await client.startThread({ cwd: process.cwd() })
+  let startedTurnId
 
   await assert.rejects(
     () => client.runStructuredTurn({
+      onStarted: async ({ turnId }) => {
+        startedTurnId = turnId
+      },
       outputSchema: CODEX_CANDIDATE_OUTPUT_SCHEMA,
       prompt: "Return the structured candidate.",
       threadId: thread.id,
@@ -63,11 +67,41 @@ test("App Server exits retain the exact interrupted turn identity for recovery",
     (error) => {
       assert.equal(error.code, "app_server_exited")
       assert.equal(error.details.exitCode, 70)
+      assert.ok(Number.isInteger(error.details.lifetimeMs))
+      assert.ok(error.details.lifetimeMs >= 0)
+      assert.ok(Number.isInteger(error.details.processId))
+      assert.ok(error.details.processId > 0)
       assert.match(error.details.diagnosticDigest, /^[a-f0-9]{64}$/)
       assert.match(error.details.turnId, /^019d0000-/)
       return true
     },
   )
+  assert.match(startedTurnId, /^019d0000-/)
+})
+
+test("closing an App Server already terminated by signal does not wait for the kill timeout", async (t) => {
+  const client = new AppServerClient({
+    args: [fixture, "--signal-after-turn-start"],
+    command: process.execPath,
+  })
+  await client.connect()
+  t.after(() => client.close())
+  const thread = await client.startThread({ cwd: process.cwd() })
+
+  await assert.rejects(
+    () => client.runStructuredTurn({
+      outputSchema: CODEX_CANDIDATE_OUTPUT_SCHEMA,
+      prompt: "Return the structured candidate.",
+      threadId: thread.id,
+      timeoutMs: 30_000,
+    }),
+    (error) => error.code === "app_server_exited"
+      && error.details.signal === "SIGTERM",
+  )
+
+  const startedAt = Date.now()
+  await client.close()
+  assert.ok(Date.now() - startedAt < 1_000)
 })
 
 test("phase-unknown App Server turns parse only the terminal compatibility message", async (t) => {
