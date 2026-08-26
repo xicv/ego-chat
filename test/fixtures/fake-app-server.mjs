@@ -4,6 +4,7 @@ const lines = readline.createInterface({ input: process.stdin })
 const threadId = "019d0000-0000-7000-8000-000000000001"
 const duplicateTurnReads = process.argv.includes("--duplicate-turn-reads")
 const exitAfterTurnStart = process.argv.includes("--exit-after-turn-start")
+const signalAfterTurnStart = process.argv.includes("--signal-after-turn-start")
 const multipleFinalMessages = process.argv.includes("--multiple-final-messages")
 const phaseUnknownMessages = process.argv.includes("--phase-unknown-messages")
 let turnNumber = 1
@@ -94,8 +95,14 @@ lines.on("line", (line) => {
     completedTurns.push(turn)
     activeReadsRemaining = 1
     send({ id: message.id, result: { turn: { ...turn, items: [], status: "inProgress" } } })
-    if (exitAfterTurnStart) {
-      setTimeout(() => process.exit(70), 10)
+    if (exitAfterTurnStart || signalAfterTurnStart) {
+      setTimeout(() => {
+        if (signalAfterTurnStart) {
+          process.kill(process.pid, "SIGTERM")
+          return
+        }
+        process.exit(70)
+      }, 10)
       return
     }
     send({ method: "turn/completed", params: { threadId, turn } })

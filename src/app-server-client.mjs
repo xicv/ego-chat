@@ -104,19 +104,23 @@ export class AppServerClient {
 
     this.#notifications = []
     this.#stderr = ""
+    const startedAt = Date.now()
     this.#process = spawn(this.#command, this.#args, {
       stdio: ["pipe", "pipe", "pipe"],
     })
+    const child = this.#process
     this.#process.stderr.setEncoding("utf8")
     this.#process.stderr.on("data", (chunk) => {
       this.#stderr = `${this.#stderr}${chunk}`.slice(-64 * 1024)
     })
-    this.#process.on("error", (error) => this.#failAll(error))
-    this.#process.on("exit", (code, signal) => {
+    child.on("error", (error) => this.#failAll(error))
+    child.on("exit", (code, signal) => {
       if (this.#pending.size > 0 || this.#waiters.size > 0) {
         this.#failAll(new EgoChatError("app_server_exited", "Codex App Server exited before the operation completed.", {
           diagnosticDigest: digest(this.#stderr),
           exitCode: code,
+          lifetimeMs: Math.max(0, Date.now() - startedAt),
+          processId: child.pid,
           signal,
         }))
       }
@@ -204,7 +208,7 @@ export class AppServerClient {
           turnId,
         })
       }
-      await delay(Math.min(50, Math.max(1, deadline - Date.now())))
+      await delay(Math.min(1_000, Math.max(1, deadline - Date.now())))
     }
     throw new EgoChatError("app_server_recovery_timeout", "The exact App Server turn did not become recoverable before the deadline.", {
       turnId,
@@ -261,7 +265,14 @@ export class AppServerClient {
     }
   }
 
-  async runStructuredTurn({ additionalContext = undefined, outputSchema, prompt, threadId, timeoutMs }) {
+  async runStructuredTurn({
+    additionalContext = undefined,
+    onStarted = undefined,
+    outputSchema,
+    prompt,
+    threadId,
+    timeoutMs,
+  }) {
     const deadline = Date.now() + timeoutMs
     await this.#waitForThreadIdle(threadId, deadline)
     const response = await this.request("turn/start", {
@@ -271,17 +282,28 @@ export class AppServerClient {
       outputSchema,
       threadId,
     }, timeoutMs)
+    const turnId = response?.turn?.id
+    if (typeof turnId !== "string" || turnId.length === 0) {
+      throw new EgoChatError("invalid_app_server_response", "App Server did not return an exact turn identity.")
+    }
+    if (onStarted) {
+      try {
+        await onStarted({ turnId })
+      } catch (error) {
+        throw withTurnIdentity(error, turnId)
+      }
+    }
     let completed
     try {
       completed = await this.waitForNotification(
         "turn/completed",
-        (params) => params?.threadId === threadId && params?.turn?.id === response?.turn?.id,
+        (params) => params?.threadId === threadId && params?.turn?.id === turnId,
         Math.max(1, deadline - Date.now()),
       )
     } catch (error) {
-      throw withTurnIdentity(error, response?.turn?.id)
+      throw withTurnIdentity(error, turnId)
     }
-    if (response?.turn?.id !== completed?.turn?.id) {
+    if (turnId !== completed?.turn?.id) {
       throw new EgoChatError("turn_identity_mismatch", "The completed App Server turn does not match the started turn.")
     }
     if (completed.turn.status !== "completed") {
@@ -345,7 +367,7 @@ export class AppServerClient {
   async close() {
     const child = this.#process
     this.#process = undefined
-    if (!child || child.exitCode !== null) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
       return
     }
 
