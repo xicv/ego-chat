@@ -35,7 +35,7 @@ async function runMalformedModelPolicyCase(attributes) {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 7,
+    browserContractRevision: 8,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -176,6 +176,7 @@ async function runPreSendDriverCase({
   changeSendControlAtRecheck = false,
   downgradeAtPresend = false,
   fenceAtRecheck = false,
+  prompt = null,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-presend-${process.pid}-${driverCase}`
@@ -183,7 +184,7 @@ async function runPreSendDriverCase({
   const ownerPath = `${mailboxDirectory}/owner.json`
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
   const input = {
-    browserContractRevision: 7,
+    browserContractRevision: 8,
     binding: {
       messageCount: 0,
       startUrl: "https://chatgpt.com/",
@@ -205,7 +206,7 @@ async function runPreSendDriverCase({
       modelSelection: "strongest_available",
       thinkingEffort: "maximum_available",
     },
-    prompt: `${turnMarker}\nReview the pre-send fence.`,
+    prompt: prompt ?? `${turnMarker}\nReview the pre-send fence.`,
     timeoutMs: 1_000,
     turnMarker,
   }
@@ -225,7 +226,14 @@ const ownerPath = ${JSON.stringify(ownerPath)}
 let policyMenuOpen = false
 let policyReads = 0
 let sendTargetReads = 0
-const counters = { insertText: 0, mouseEvents: 0, policyReads: 0, sendTargetReads: 0 }
+const counters = {
+  composerMutations: 0,
+  injectedPromptLength: 0,
+  insertText: 0,
+  mouseEvents: 0,
+  policyReads: 0,
+  sendTargetReads: 0,
+}
 globalThis.cliLog = (value) => console.log(value)
 globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
 globalThis.listTabs = async () => [{ active: true, targetId: 'presend-tab' }]
@@ -282,6 +290,16 @@ globalThis.js = async (source) => {
   if (source.includes('powerItems[0].focus()')) return true
   if (source.includes('enabledSendCount')) {
     return { composerCount: 1, draftEmpty: true, enabledSendCount: 0, sendCount: 1 }
+  }
+  if (source.includes('document.createDocumentFragment()')) {
+    const prefix = 'const value = '
+    const valueStart = source.indexOf(prefix)
+    const valueEnd = source.indexOf('\\n', valueStart)
+    const injectedPrompt = JSON.parse(source.slice(valueStart + prefix.length, valueEnd).trim())
+    if (injectedPrompt !== input.prompt) throw new Error('The injected prompt changed in transit.')
+    counters.composerMutations += 1
+    counters.injectedPromptLength = injectedPrompt.length
+    return true
   }
   if (source.includes('composer.focus()')) return true
   if (source.includes('const blockChildren')) return [input.prompt]
@@ -353,7 +371,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 7,
+    browserContractRevision: 8,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -745,7 +763,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 7,
+    browserContractRevision: 8,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -866,8 +884,11 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.match(EGO_DRIVER_SOURCE, /fingerprintVersion: "tail-v1"/)
   assert.match(EGO_DRIVER_SOURCE, /expectedPreviousMessageId/)
   assert.match(EGO_DRIVER_SOURCE, /Input\.dispatchMouseEvent/)
-  assert.match(EGO_DRIVER_SOURCE, /Input\.insertText/)
-  assert.match(EGO_DRIVER_SOURCE, /compositionChunks\(value, maximumLength = 4_000\)/)
+  assert.match(EGO_DRIVER_SOURCE, /document\.createDocumentFragment\(\)/)
+  assert.match(EGO_DRIVER_SOURCE, /composer\.replaceChildren\(fragment\)/)
+  assert.match(EGO_DRIVER_SOURCE, /inputType: 'insertText'/)
+  assert.doesNotMatch(EGO_DRIVER_SOURCE, /Input\.insertText/)
+  assert.doesNotMatch(EGO_DRIVER_SOURCE, /compositionChunks/)
   assert.match(EGO_DRIVER_SOURCE, /clearUnsentComposerDraft/)
   assert.match(EGO_DRIVER_SOURCE, /draftCleared/)
   assert.match(EGO_DRIVER_SOURCE, /buttons\[0\]\.contains\(hit\)/)
@@ -1437,7 +1458,40 @@ test("a live policy downgrade after composition stops before Send", async () => 
   assert.equal(stopped.error?.details?.evidence?.powerLevel, 4)
   assert.equal(stopped.error?.details?.evidence?.powerMax, 5)
   assert.equal(stopped.counters.policyReads, 3)
-  assert.equal(stopped.counters.insertText, 1)
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.counters.insertText, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("a maximum-size review packet reaches the rich editor in one exact bounded mutation", async () => {
+  const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
+  const prompt = `${turnMarker}\n${"0123456789abcdef 😀 line\n".repeat(2_500)}`.slice(0, 56_010)
+  const stopped = await runPreSendDriverCase({ downgradeAtPresend: true, prompt })
+
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.counters.injectedPromptLength, prompt.length)
+  assert.equal(stopped.counters.insertText, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("script-like review text remains inert exact composer data", async () => {
+  const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
+  const prompt = [
+    turnMarker,
+    "quotes: \" ' and slash: \\",
+    "template-like: ` ${globalThis.process?.exit?.(1)}",
+    "markup-like: </script><img src=x onerror=alert(1)>",
+    "unicode separators: \u2028 and \u2029",
+  ].join("\n")
+  const stopped = await runPreSendDriverCase({ downgradeAtPresend: true, prompt })
+
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.counters.injectedPromptLength, prompt.length)
+  assert.equal(stopped.counters.insertText, 0)
   assert.equal(stopped.counters.mouseEvents, 0)
 })
 
@@ -1486,6 +1540,7 @@ test("driver envelope preserves only bounded browser-interruption diagnostics", 
     () => decodeDriverResult(envelope({
       error: {
         code: "ego_driver_error",
+        compositionMethod: "dom_paragraph_input",
         diagnosticDigest: "a".repeat(64),
         draftCleared: true,
         message: "The fixed Ego Browser driver failed.",
@@ -1498,16 +1553,21 @@ test("driver envelope preserves only bounded browser-interruption diagnostics", 
           powerLevel: 5,
           powerMax: 5,
         },
-        stage: "composing_prompt",
+        promptBytes: 56_024,
+        promptCharacters: 56_010,
+        stage: "inserting_prompt_content",
       },
       ok: false,
     })),
     (error) => (
       error.code === "ego_driver_error"
+      && error.details.compositionMethod === "dom_paragraph_input"
       && error.details.diagnosticDigest === "a".repeat(64)
       && error.details.draftCleared === true
-      && error.details.driverStage === "composing_prompt"
+      && error.details.driverStage === "inserting_prompt_content"
       && error.details.evidence.modelPolicy.effortLabel === "Pro"
+      && error.details.promptBytes === 56_024
+      && error.details.promptCharacters === 56_010
     ),
   )
 })

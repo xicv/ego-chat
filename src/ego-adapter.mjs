@@ -12,6 +12,7 @@ import { EgoChatError } from "./errors.mjs"
 import {
   BROWSER_CONTRACT_REVISION,
   MAX_IPC_LINE_BYTES,
+  MAX_PROMPT_BYTES,
   MAX_RESULT_BYTES,
 } from "./constants.mjs"
 
@@ -98,6 +99,10 @@ function decodeDriverResult(stdout) {
   }
   const driverError = decoded?.error
   const details = {
+    ...(typeof driverError?.compositionMethod === "string"
+      && /^[a-z][a-z0-9_]{0,63}$/.test(driverError.compositionMethod)
+      ? { compositionMethod: driverError.compositionMethod }
+      : {}),
     ...(typeof driverError?.diagnosticDigest === "string"
       ? { diagnosticDigest: driverError.diagnosticDigest }
       : {}),
@@ -109,6 +114,16 @@ function decodeDriverResult(stdout) {
       : {}),
     ...(typeof driverError?.stage === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(driverError.stage)
       ? { driverStage: driverError.stage }
+      : {}),
+    ...(Number.isSafeInteger(driverError?.promptBytes)
+      && driverError.promptBytes >= 1
+      && driverError.promptBytes <= MAX_PROMPT_BYTES
+      ? { promptBytes: driverError.promptBytes }
+      : {}),
+    ...(Number.isSafeInteger(driverError?.promptCharacters)
+      && driverError.promptCharacters >= 1
+      && driverError.promptCharacters <= MAX_PROMPT_BYTES
+      ? { promptCharacters: driverError.promptCharacters }
       : {}),
   }
   throw new EgoChatError(
