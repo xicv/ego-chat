@@ -15,7 +15,7 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | reanchor <input-json-file> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
@@ -118,6 +118,17 @@ try {
       failUsage("conversation requires a binding key")
     }
     print(await requestBroker(config, "conversation.get", { bindingKey: args[0] }))
+  } else if (command === "reanchor") {
+    if (!args[0]) {
+      failUsage("reanchor requires a JSON input file")
+    }
+    const input = JSON.parse(await fs.readFile(args[0], "utf8"))
+    print(await requestBroker(
+      config,
+      "conversation.reanchor",
+      input,
+      { timeoutMs: 65_000 },
+    ))
   } else if (command === "reconcile") {
     if (!args[0] || !args[1]) {
       failUsage("reconcile requires a binding key and workflow ID")

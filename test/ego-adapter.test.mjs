@@ -17,6 +17,16 @@ function envelope(value) {
   return `${EGO_DRIVER_RESULT_PREFIX}${Buffer.from(JSON.stringify(value)).toString("base64url")}\n`
 }
 
+function conversationTailFingerprint(entry) {
+  return createHash("sha256").update(JSON.stringify(entry
+    ? {
+        contentDigest: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+        messageId: entry.messageId,
+        role: entry.role,
+      }
+    : null), "utf8").digest("hex")
+}
+
 let driverCase = 0
 
 async function runMalformedModelPolicyCase(attributes) {
@@ -25,7 +35,7 @@ async function runMalformedModelPolicyCase(attributes) {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 6,
+    browserContractRevision: 7,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -173,7 +183,7 @@ async function runPreSendDriverCase({
   const ownerPath = `${mailboxDirectory}/owner.json`
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
   const input = {
-    browserContractRevision: 6,
+    browserContractRevision: 7,
     binding: {
       messageCount: 0,
       startUrl: "https://chatgpt.com/",
@@ -228,6 +238,7 @@ globalThis.click = async (target) => {
   if (String(target).includes('__composer-pill')) policyMenuOpen = true
   if (target === '#prompt-textarea') policyMenuOpen = false
 }
+
 globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
 globalThis.typeText = async () => { throw new Error('unexpected typeText') }
 globalThis.pressKey = async () => {}
@@ -311,6 +322,125 @@ console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
       counters: JSON.parse(countersLine.slice("__EGO_CHAT_PRESEND_COUNTERS__".length)),
       error,
     }
+  } finally {
+    await fs.rm(mailboxDirectory, { force: true, recursive: true })
+  }
+}
+
+async function runBoundHeadDriverCase({
+  finalDraft = false,
+  finalGeneration = false,
+  finalUrl = null,
+  hydrateToBinding = false,
+  mode = "reanchor",
+} = {}) {
+  driverCase += 1
+  const driverUid = `ego-chat-reanchor-${process.pid}-${driverCase}`
+  const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
+  const ownerPath = `${mailboxDirectory}/owner.json`
+  const canonicalUrl = "https://chatgpt.com/c/reanchor-driver-test"
+  const initialEntry = { messageId: "initial-assistant", role: "assistant", text: "Initial response." }
+  const initialEntries = [
+    { messageId: "initial-user", role: "user", text: "Initial prompt." },
+    initialEntry,
+  ]
+  const observedEntries = [
+    ...initialEntries,
+    { messageId: "external-user", role: "user", text: "External follow-up." },
+    { messageId: "external-assistant", role: "assistant", text: "External response." },
+  ]
+  const entrySnapshots = hydrateToBinding
+    ? [observedEntries, initialEntries]
+    : [observedEntries, observedEntries]
+  const input = {
+    browserContractRevision: 7,
+    binding: {
+      canonicalUrl,
+      headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
+      headFingerprint: conversationTailFingerprint(initialEntry),
+      headFingerprintVersion: "tail-v1",
+      headMessageId: initialEntry.messageId,
+      headRole: initialEntry.role,
+      key: "ego-chat-main",
+      messageCount: 2,
+      revision: 1,
+      state: "bound",
+      targetId: "reanchor-tab",
+      taskSpaceId: 10,
+    },
+    brokerLease: {
+      brokerId: "reanchor-test-broker",
+      epoch: 1,
+      ownerPath,
+      pid: process.pid,
+    },
+    expectedObservedHeadFingerprint: conversationTailFingerprint(observedEntries.at(-1)),
+    mode,
+  }
+  await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
+  await fs.writeFile(ownerPath, JSON.stringify(input.brokerLease), { mode: 0o600 })
+  await fs.writeFile(`${mailboxDirectory}/input.json`, JSON.stringify(input), { mode: 0o600 })
+
+  const harness = `
+process.getuid = () => ${JSON.stringify(driverUid)}
+const entrySnapshots = ${JSON.stringify(entrySnapshots)}
+let entryReads = 0
+let generationReads = 0
+let inspectionReads = 0
+let pageInfoReads = 0
+globalThis.cliLog = (value) => console.log(value)
+globalThis.listTaskSpaces = async () => [{ id: 10, name: 'bound', ownership: 'agent' }]
+globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+globalThis.listTabs = async () => [{ active: true, targetId: 'reanchor-tab' }]
+globalThis.switchTab = async () => {}
+globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
+globalThis.pageInfo = async () => {
+  pageInfoReads += 1
+  return {
+    url: ${JSON.stringify(finalUrl)} && pageInfoReads >= 3
+      ? ${JSON.stringify(finalUrl)}
+      : ${JSON.stringify(canonicalUrl)},
+  }
+}
+globalThis.snapshotText = async () => ''
+globalThis.wait = async () => {}
+globalThis.click = async () => { throw new Error('unexpected click') }
+globalThis.fillInput = async () => { throw new Error('unexpected fill') }
+globalThis.typeText = async () => { throw new Error('unexpected type') }
+globalThis.pressKey = async () => { throw new Error('unexpected key') }
+globalThis.cdp = async () => { throw new Error('unexpected cdp') }
+globalThis.js = async (source) => {
+  if (source.includes('hasLoginAction')) {
+    inspectionReads += 1
+    return {
+      composerCount: 1,
+      composerSemanticId: true,
+      draft: ${JSON.stringify(finalDraft)} && inspectionReads >= 2 ? 'late draft' : '',
+      hasComposer: true,
+      hasLoginAction: false,
+    }
+  }
+  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+    const snapshot = entrySnapshots[Math.min(entryReads, entrySnapshots.length - 1)]
+    entryReads += 1
+    return snapshot
+  }
+  if (source.trimStart().startsWith('Boolean(')) {
+    generationReads += 1
+    return ${JSON.stringify(finalGeneration)} && generationReads >= 2
+  }
+  throw new Error('Unexpected page script: ' + source.slice(0, 120))
+}
+await ${EGO_DRIVER_SOURCE.trim()}
+`
+
+  try {
+    const executed = spawnSync(process.execPath, ["--input-type=module"], {
+      encoding: "utf8",
+      input: harness,
+    })
+    assert.equal(executed.status, 0, executed.stderr)
+    return decodeDriverResult(executed.stdout)
   } finally {
     await fs.rm(mailboxDirectory, { force: true, recursive: true })
   }
@@ -615,7 +745,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 6,
+    browserContractRevision: 7,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -780,6 +910,61 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.ok(recheckTarget < dispatchFence)
   assert.ok(dispatchFence < dispatch)
   assert.ok(EGO_DRIVER_SOURCE.indexOf("await fs.unlink(inputPath)") < composed)
+})
+
+test("the browser driver returns one stable classified external head for authorized re-anchoring", async () => {
+  const result = await runBoundHeadDriverCase()
+
+  assert.equal(result.head.fingerprintVersion, "tail-v1")
+  assert.equal(result.head.lastMessageId, "external-assistant")
+  assert.equal(result.head.lastRole, "assistant")
+  assert.equal(result.head.messageCount, 4)
+  assert.equal(result.head.renderedMessageCount, 4)
+  assert.deepEqual(result.headChange, {
+    changeKind: "message_appended",
+    expectedFingerprint: conversationTailFingerprint({
+      messageId: "initial-assistant",
+      role: "assistant",
+      text: "Initial response.",
+    }),
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: result.head.fingerprint,
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  })
+})
+
+for (const [name, options, reason] of [
+  ["a late composer draft", { finalDraft: true }, "unexpected_draft"],
+  ["late response generation", { finalGeneration: true }, "conversation_generation_in_progress"],
+  ["late canonical URL drift", { finalUrl: "https://chatgpt.com/c/other" }, "canonical_conversation_changed"],
+]) {
+  test(`re-anchoring rejects ${name} after its stable-head observation`, async () => {
+    await assert.rejects(
+      runBoundHeadDriverCase(options),
+      (error) => error.code === "human_required" && error.details?.reason === reason,
+    )
+  })
+}
+
+test("a transient hydrated tail that returns to the bound head does not stop verification", async () => {
+  const result = await runBoundHeadDriverCase({ hydrateToBinding: true, mode: "verify" })
+
+  assert.equal(result.head.lastMessageId, "initial-assistant")
+  assert.equal(result.head.lastRole, "assistant")
+  assert.equal(result.head.messageCount, 2)
+  assert.equal(result.head.renderedMessageCount, 2)
+})
+
+test("a persistent external tail returns classified evidence without changing browser state", async () => {
+  await assert.rejects(
+    runBoundHeadDriverCase({ mode: "verify" }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "conversation_head_changed"
+      && error.details?.evidence?.headChange?.changeKind === "message_appended"
+      && error.details.evidence.headChange.observedRenderedMessageCount === 4,
+  )
 })
 
 test("per-operation Ego driver source embeds only a private unique mailbox path", () => {
