@@ -199,6 +199,7 @@ const PRECLICK_DRIVER_STAGES = new Set([
   "dispatching_exchange",
   "inspecting_composer",
   "inserting_prompt_chunk",
+  "inserting_prompt_content",
   "locating_send_control",
   "reading_before_head",
   "rechecking_send_control",
@@ -2004,6 +2005,9 @@ export class Broker {
       const browserInterruption = browserInterrupted
         ? {
             errorCode,
+            ...(typeof error?.details?.compositionMethod === "string"
+              ? { compositionMethod: error.details.compositionMethod }
+              : {}),
             ...(typeof error?.details?.diagnosticDigest === "string"
               ? { diagnosticDigest: error.details.diagnosticDigest }
               : {}),
@@ -2012,6 +2016,12 @@ export class Broker {
               : {}),
             ...(typeof error?.details?.driverStage === "string"
               ? { driverStage: error.details.driverStage }
+              : {}),
+            ...(Number.isSafeInteger(error?.details?.promptBytes)
+              ? { promptBytes: error.details.promptBytes }
+              : {}),
+            ...(Number.isSafeInteger(error?.details?.promptCharacters)
+              ? { promptCharacters: error.details.promptCharacters }
               : {}),
           }
         : null

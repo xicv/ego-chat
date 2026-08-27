@@ -55,8 +55,11 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
   }
   const input = JSON.parse(inputText)
+  let compositionMethod = null
   let driverStage = "initializing"
   let observedModelPolicy = null
+  let promptBytes = null
+  let promptCharacters = null
   let sendClickStarted = false
   let unsentDraftMayExist = false
 
@@ -256,22 +259,6 @@ async function egoDriverMain(inputPathOverride = undefined) {
     return false
   }
 
-  function compositionChunks(value, maximumLength = 4_000) {
-    const chunks = []
-    let offset = 0
-    while (offset < value.length) {
-      let end = Math.min(value.length, offset + maximumLength)
-      const endsWithHighSurrogate = /[\uD800-\uDBFF]/.test(value[end - 1] ?? "")
-      const nextIsLowSurrogate = /[\uDC00-\uDFFF]/.test(value[end] ?? "")
-      if (end < value.length && endsWithHighSurrogate && nextIsLowSurrogate) {
-        end -= 1
-      }
-      chunks.push(value.slice(offset, end))
-      offset = end
-    }
-    return chunks
-  }
-
   async function composePrompt(value) {
     const ready = await js(String.raw`(() => {
       const composer = document.querySelector('#prompt-textarea')
@@ -292,33 +279,42 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
 
     unsentDraftMayExist = true
-    const chunks = compositionChunks(value)
-    for (let index = 0; index < chunks.length; index += 1) {
-      driverStage = "inserting_prompt_chunk"
-      // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
-      await cdp("Input.insertText", { text: chunks[index] })
-      if (index === chunks.length - 1) {
-        continue
+    compositionMethod = "dom_paragraph_input"
+    promptBytes = Buffer.byteLength(value, "utf8")
+    promptCharacters = value.length
+    const valueLiteral = JSON.stringify(value)
+      .replaceAll("\u2028", "\\u2028")
+      .replaceAll("\u2029", "\\u2029")
+    driverStage = "inserting_prompt_content"
+    const inserted = await js(`(() => {
+      const value = ${valueLiteral}
+      const composer = document.querySelector('#prompt-textarea')
+      if (!composer || composer.matches('input, textarea')) {
+        return false
       }
-      driverStage = "anchoring_prompt_chunk"
-      const cursorAtEnd = await js(String.raw`(() => {
-        const composer = document.querySelector('#prompt-textarea')
-        if (!composer) {
-          return false
+      const fragment = document.createDocumentFragment()
+      for (const line of value.split('\\n')) {
+        const paragraph = document.createElement('p')
+        if (line.length > 0) {
+          paragraph.textContent = line
+        } else {
+          paragraph.appendChild(document.createElement('br'))
         }
-        const selection = window.getSelection()
-        const range = document.createRange()
-        range.selectNodeContents(composer)
-        range.collapse(false)
-        selection.removeAllRanges()
-        selection.addRange(range)
-        composer.focus()
-        return document.activeElement === composer
-      })()`)
-      if (!cursorAtEnd) {
-        throw new Error("The ChatGPT composer cursor could not be anchored after a text chunk.")
+        fragment.appendChild(paragraph)
       }
+      composer.replaceChildren(fragment)
+      composer.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        data: null,
+        inputType: 'insertText',
+      }))
+      composer.focus()
+      return document.activeElement === composer
+    })()`)
+    if (!inserted) {
+      throw new Error("The ChatGPT rich-text composer rejected the exact prompt mutation.")
     }
+    await wait(1)
   }
 
   async function readConversationEntries() {
@@ -1324,7 +1320,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 7) {
+    if (input.browserContractRevision !== 8) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1431,7 +1427,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 7) {
+    if (input.browserContractRevision !== 8) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1647,7 +1643,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 7) {
+    if (input.browserContractRevision !== 8) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -2232,7 +2228,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "reanchor") {
-      if (input.browserContractRevision !== 7) {
+      if (input.browserContractRevision !== 8) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
         return
       }
@@ -2393,9 +2389,12 @@ async function egoDriverMain(inputPathOverride = undefined) {
       emit({
         error: {
           code: "ego_driver_error",
+          ...(compositionMethod ? { compositionMethod } : {}),
           diagnosticDigest: sha256(message),
           ...(typeof draftCleared === "boolean" ? { draftCleared } : {}),
           ...(observedModelPolicy ? { modelPolicy: observedModelPolicy } : {}),
+          ...(Number.isInteger(promptBytes) ? { promptBytes } : {}),
+          ...(Number.isInteger(promptCharacters) ? { promptCharacters } : {}),
           message: "The fixed Ego Browser driver failed.",
           stage: driverStage,
         },

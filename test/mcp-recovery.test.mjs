@@ -584,10 +584,13 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           "ego_driver_error",
           "The fixed Ego Browser driver failed before delivery.",
           {
+            compositionMethod: "dom_paragraph_input",
             diagnosticDigest: "e".repeat(64),
             draftCleared: true,
-            driverStage: "verifying_presend_model_policy",
+            driverStage: "inserting_prompt_content",
             evidence: { modelPolicy: modelPolicyObservation() },
+            promptBytes: Buffer.byteLength(input.prompt, "utf8"),
+            promptCharacters: input.prompt.length,
           },
         )
       }
@@ -734,6 +737,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     ["ego.start_exchange", (params) => broker.startEgoExchange(params)],
     ["result.read", (params) => broker.readResult(params)],
     ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
+    ["workflow.get", (params) => broker.getWorkflow(params)],
   ])
   const ipc = await startIpcServer({
     dispatch: async (method, params, signal) => {
@@ -895,16 +899,31 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(JSON.parse(crossWorkflowRead.content[0].text).code, "result_digest_mismatch")
   assert.equal(exchanges, 8)
 
+  const transportFailureInput = reviewInput("always-absent")
+  transportFailureInput.candidate.reviewPacket = `always-absent\n${"large exact evidence\n".repeat(1_100)}`
   const exhausted = await client.callTool({
-    arguments: reviewInput("always-absent"),
+    arguments: transportFailureInput,
     name: "ego_review_candidate_and_wait",
   })
   const exhaustedError = JSON.parse(exhausted.content[0].text)
   assert.equal(exhausted.isError, true)
-  assert.equal(exhaustedError.details.reason, "review_delivery_retries_exhausted")
-  assert.equal(exhaustedError.details.deliveryAttemptCount, 3)
-  assert.equal(exhaustedError.details.deliveryAbsentWorkflowIds.length, 3)
-  assert.equal(new Set(exchangeMarkers.slice(-3)).size, 3)
-  assert.equal(exchanges, 11)
-  assert.equal(reconciliations, 6)
+  assert.equal(exhaustedError.code, "review_packet_compaction_required")
+  assert.equal(exhaustedError.details.reason, "repeated_presend_composer_transport_failure")
+  assert.equal(exhaustedError.details.deliveryAttemptCount, 2)
+  assert.equal(exhaustedError.details.deliveryAbsentWorkflowIds.length, 2)
+  assert.equal(exhaustedError.details.deliveryState, "absent")
+  assert.equal(exhaustedError.details.newOperationIdRequired, true)
+  assert.equal(exhaustedError.details.sameBindingRequired, true)
+  assert.equal(exhaustedError.details.suggestedReviewPacketMaxBytes, 16 * 1024)
+  assert.equal(exhaustedError.details.userActionRequired, false)
+  assert.equal(exhaustedError.details.browserInterruption.compositionMethod, "dom_paragraph_input")
+  assert.equal(exhaustedError.details.browserInterruption.driverStage, "inserting_prompt_content")
+  assert.equal(exhaustedError.details.browserInterruption.diagnosticDigest, "e".repeat(64))
+  assert.equal(exhaustedError.details.browserInterruption.draftCleared, true)
+  assert.equal(exhaustedError.details.browserInterruption.promptBytes > 16 * 1024, true)
+  assert.equal(exhaustedError.details.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(exhaustedError.details.modelPolicy.powerLevel, 5)
+  assert.equal(new Set(exchangeMarkers.slice(-2)).size, 2)
+  assert.equal(exchanges, 10)
+  assert.equal(reconciliations, 5)
 })

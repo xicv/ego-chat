@@ -17,6 +17,12 @@ import { EgoChatError, asPublicError } from "./errors.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
 const MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS = 3
+const SUGGESTED_COMPACT_REVIEW_PACKET_BYTES = 16 * 1024
+const COMPOSER_TRANSPORT_STAGES = new Set([
+  "anchoring_prompt_chunk",
+  "inserting_prompt_chunk",
+  "inserting_prompt_content",
+])
 
 function waitModeSchema(defaultMode = "progress") {
   return z.enum(WAIT_MODES).default(defaultMode)
@@ -104,6 +110,7 @@ const MCP_INSTRUCTIONS = [
   `Finalize and UTF-8 byte-check a strict review packet before creating its operationId. The complete generated review prompt, including protocol overhead, must not exceed ${MAX_PROMPT_BYTES} bytes; prefer an accessible PR URL plus exact revisions, changed-file inventory, critical excerpts, tests, and unresolved risks over an entire diff. Never split one candidate across multiple sends automatically.`,
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
   "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
+  `If ego_review_candidate_and_wait returns review_packet_compaction_required, both prior deliveries were durably proven absent and no human action is required. Automatically rebuild one semantically complete review packet no larger than the returned suggestedReviewPacketMaxBytes (normally ${SUGGESTED_COMPACT_REVIEW_PACKET_BYTES}), mint a new operationId, and retry once on the same binding. Do not ask the user to log in, open ego-chat-main, or provide another conversation URL unless the exact broker code is authentication_required. Never substitute another conversation to route around a delivery fault.`,
   "Use ego_converge_until_settled only when the user explicitly wants a detached broker-owned Codex implementation loop; supply an immutable target, observable acceptance criteria, and the absolute working directory.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
   "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
@@ -179,6 +186,55 @@ function deliveryAbsenceAnchor(workflow) {
     )
   }
   return Object.fromEntries(fields.map((field) => [field, beforeHead[field]]))
+}
+
+function deliveryAbsenceEvidence(workflow, prompt) {
+  const interruption = workflow?.reconciliation?.browserInterruption
+  if (!interruption || typeof interruption !== "object") {
+    return null
+  }
+  return {
+    ...(typeof interruption.compositionMethod === "string"
+      ? { compositionMethod: interruption.compositionMethod }
+      : {}),
+    ...(typeof interruption.diagnosticDigest === "string"
+      ? { diagnosticDigest: interruption.diagnosticDigest }
+      : {}),
+    ...(typeof interruption.draftCleared === "boolean"
+      ? { draftCleared: interruption.draftCleared }
+      : {}),
+    ...(typeof interruption.driverStage === "string"
+      ? { driverStage: interruption.driverStage }
+      : {}),
+    ...(typeof interruption.errorCode === "string"
+      ? { errorCode: interruption.errorCode }
+      : {}),
+    promptBytes: Number.isSafeInteger(interruption.promptBytes)
+      ? interruption.promptBytes
+      : Buffer.byteLength(prompt, "utf8"),
+    promptCharacters: Number.isSafeInteger(interruption.promptCharacters)
+      ? interruption.promptCharacters
+      : prompt.length,
+  }
+}
+
+function repeatedComposerTransportFailure(attempts) {
+  if (attempts.length < 2) {
+    return false
+  }
+  const previous = attempts.at(-2)
+  const current = attempts.at(-1)
+  return Boolean(
+    previous
+    && current
+    && COMPOSER_TRANSPORT_STAGES.has(previous.driverStage)
+    && current.driverStage === previous.driverStage
+    && typeof previous.diagnosticDigest === "string"
+    && current.diagnosticDigest === previous.diagnosticDigest
+    && current.errorCode === previous.errorCode
+    && current.compositionMethod === previous.compositionMethod
+    && current.promptBytes === previous.promptBytes,
+  )
 }
 
 function exchangeWaitMs(requestedTimeoutMs) {
@@ -567,8 +623,38 @@ export function createMcpServer(config = loadConfig()) {
       try {
         const { waitMode } = input
         const initialPrepared = prepareAgentReview(input)
+        const deliveryAbsenceAttempts = []
         const deliveryAbsentWorkflowIds = []
         let retryAnchor
+        const recordDeliveryAbsence = (absentWorkflow, prepared, deliveryAttempt) => {
+          retryAnchor = deliveryAbsenceAnchor(absentWorkflow)
+          deliveryAbsenceAttempts.push(deliveryAbsenceEvidence(absentWorkflow, prepared.prompt))
+          deliveryAbsentWorkflowIds.push(absentWorkflow.id)
+          if (
+            Buffer.byteLength(input.candidate.reviewPacket, "utf8")
+              > SUGGESTED_COMPACT_REVIEW_PACKET_BYTES
+            && repeatedComposerTransportFailure(deliveryAbsenceAttempts)
+          ) {
+            throw new EgoChatError(
+              "review_packet_compaction_required",
+              "Repeated identical pre-send composer transport failures were durably proven not delivered. Rebuild one compact review packet and retry automatically on the same binding without human intervention.",
+              {
+                browserInterruption: deliveryAbsenceAttempts.at(-1),
+                deliveryAbsentWorkflowIds,
+                deliveryAttemptCount: deliveryAttempt,
+                deliveryState: "absent",
+                ...(absentWorkflow.reconciliation?.modelPolicyObservation
+                  ? { modelPolicy: absentWorkflow.reconciliation.modelPolicyObservation }
+                  : {}),
+                newOperationIdRequired: true,
+                reason: "repeated_presend_composer_transport_failure",
+                sameBindingRequired: true,
+                suggestedReviewPacketMaxBytes: SUGGESTED_COMPACT_REVIEW_PACKET_BYTES,
+                userActionRequired: false,
+              },
+            )
+          }
+        }
         const waitMs = exchangeWaitMs(input.timeoutMs)
         for (
           let deliveryAttempt = 1;
@@ -610,8 +696,7 @@ export function createMcpServer(config = loadConfig()) {
           let exchangeResult = completed.result
           let recoveredLateResponse = false
           if (isDurablyProvenDeliveryAbsent(completed)) {
-            retryAnchor = deliveryAbsenceAnchor(completed)
-            deliveryAbsentWorkflowIds.push(workflow.id)
+            recordDeliveryAbsence(completed, prepared, deliveryAttempt)
             continue
           }
           if (
@@ -630,8 +715,10 @@ export function createMcpServer(config = loadConfig()) {
               { timeoutMs: 65_000 },
             )
             if (reconciled.recovery?.deliveryState === "absent") {
-              retryAnchor = deliveryAbsenceAnchor(workflow)
-              deliveryAbsentWorkflowIds.push(workflow.id)
+              const absentWorkflow = await requestBroker(config, "workflow.get", {
+                workflowId: workflow.id,
+              })
+              recordDeliveryAbsence(absentWorkflow, prepared, deliveryAttempt)
               continue
             }
             if (
@@ -681,6 +768,7 @@ export function createMcpServer(config = loadConfig()) {
           "human_required",
           "ChatGPT review delivery was proven absent for every bounded automatic attempt.",
           {
+            browserInterruptions: deliveryAbsenceAttempts.filter(Boolean),
             deliveryAbsentWorkflowIds,
             deliveryAttemptCount: MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS,
             reason: "review_delivery_retries_exhausted",
