@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
+import fs from "node:fs/promises"
 import test from "node:test"
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
@@ -34,6 +35,20 @@ function modelPolicyObservation() {
     powerMax: 5,
   }
 }
+
+test("the Codex MCP gate explicitly forwards its isolated broker environment", async () => {
+  const source = await fs.readFile(
+    new URL("../scripts/codex-mcp-gate.mjs", import.meta.url),
+    "utf8",
+  )
+  for (const name of [
+    "EGO_CHAT_DATA_DIR",
+    "EGO_CHAT_EGO_BROWSER",
+    "EGO_CHAT_SOCKET_PATH",
+  ]) {
+    assert.match(source, new RegExp(`mcp_servers\\.ego_chat\\.env\\.${name}=`))
+  }
+})
 
 function strictReviewResponse(input) {
   const candidateDigest = input.prompt.match(/Candidate digest: ([a-f0-9]{64})/)?.[1]
@@ -105,6 +120,16 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
+  const reanchorTool = tools.tools.find((tool) => tool.name === "ego_reanchor_conversation")
+  assert.ok(reanchorTool)
+  assert.equal(
+    reanchorTool.inputSchema.properties.acknowledgeExternalChange.const,
+    true,
+  )
+  assert.equal(
+    reanchorTool.inputSchema.required.includes("sourceWorkflowId"),
+    true,
+  )
   const reviewTool = tools.tools.find((tool) => tool.name === "ego_review_candidate_and_wait")
   assert.equal(
     reviewTool.inputSchema.properties.candidate.properties.reviewPacket.maxLength,
@@ -241,6 +266,248 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
   assert.equal(receivedTaskSpace, "ego-chat-adoptions")
   assert.equal(receivedTimeoutMs > 0 && receivedTimeoutMs <= 15 * 60 * 1_000, true)
   assert.equal(broker.getConversationBinding({ bindingKey: derivedBindingKey }).state, "bound")
+})
+
+test("MCP re-anchors only the exact acknowledged stable head from a proven pre-send stop", async (t) => {
+  const { config, env } = await createTestConfig()
+  const canonicalUrl = "https://chatgpt.com/c/mcp-reanchor"
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "mcp-reanchor-initial-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const observedHead = {
+    fingerprint: "c".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "d".repeat(64),
+    lastMessageId: "mcp-reanchor-external-assistant",
+    lastRole: "assistant",
+    messageCount: 4,
+    renderedMessageCount: 4,
+  }
+  const headChange = {
+    changeKind: "message_appended",
+    expectedFingerprint: initialHead.fingerprint,
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: observedHead.fingerprint,
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  }
+  let reanchorCalls = 0
+  const egoAdapter = {
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: initialHead,
+      targetId: "mcp-reanchor-tab",
+      taskSpaceId: 10,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "human_required",
+        "The bound conversation head changed outside the broker workflow.",
+        { evidence: { headChange }, reason: "conversation_head_changed" },
+      )
+    },
+    reanchor: async (input) => {
+      reanchorCalls += 1
+      return {
+        canonicalUrl: input.binding.canonicalUrl,
+        head: observedHead,
+        headChange,
+        targetId: "mcp-reanchor-tab",
+        taskSpaceId: 10,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(config.dataDir) })
+  await broker.initialize()
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const token = await loadOrCreateBrokerToken(config.dataDir)
+  const methods = new Map([
+    ["conversation.reanchor", (params) => broker.reanchorConversation(params)],
+    ["ego.start_exchange", (params) => broker.startEgoExchange(params)],
+    ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
+  ])
+  const ipc = await startIpcServer({
+    dispatch: async (method, params, signal) => {
+      const handler = methods.get(method)
+      if (!handler) {
+        throw new EgoChatError("method_not_found", "Unexpected controlled re-anchor method.")
+      }
+      return handler(params, signal)
+    },
+    socketPath: config.socketPath,
+    token,
+  })
+  t.after(async () => {
+    broker.close()
+    await ipc.close()
+    await removeTestConfig(config)
+  })
+  const client = await connectClient(env)
+  t.after(() => client.close())
+
+  const turnMarker = "EGO_CHAT_MCP_REANCHOR_TEST123"
+  const stopped = await client.callTool({
+    arguments: {
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: "EGO_CHAT_MCP_REANCHOR_DONE123",
+      prompt: `${turnMarker}\nreview`,
+      timeoutMs: 30_000,
+      turnMarker,
+      waitMode: "token_saver",
+    },
+    name: "ego_exchange_and_wait",
+  })
+  assert.equal(stopped.structuredContent.status, "human_required")
+  assert.equal(stopped.structuredContent.humanRequired.code, "conversation_head_changed")
+
+  const reanchored = await client.callTool({
+    arguments: {
+      acknowledgeExternalChange: true,
+      bindingKey: "ego-chat-main",
+      expectedBindingRevision: 1,
+      expectedObservedHeadFingerprint: observedHead.fingerprint,
+      sourceWorkflowId: stopped.structuredContent.id,
+    },
+    name: "ego_reanchor_conversation",
+  })
+  assert.equal(reanchored.isError, undefined)
+  assert.equal(reanchored.structuredContent.headFingerprint, observedHead.fingerprint)
+  assert.equal(reanchored.structuredContent.reanchor.changeKind, "message_appended")
+  assert.equal(reanchored.structuredContent.revision, 2)
+  assert.equal(reanchorCalls, 1)
+})
+
+test("two MCP facades cannot interleave sends on one conversation binding", async (t) => {
+  const { config, env } = await createTestConfig()
+  const canonicalUrl = "https://chatgpt.com/c/two-facade-lease"
+  let enterExchange
+  let releaseExchange
+  const entered = new Promise((resolve) => {
+    enterExchange = resolve
+  })
+  const released = new Promise((resolve) => {
+    releaseExchange = resolve
+  })
+  let exchangeCalls = 0
+  const egoAdapter = {
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: {
+        fingerprint: "a".repeat(64),
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "b".repeat(64),
+        lastMessageId: "two-facade-initial-assistant",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "two-facade-tab",
+      taskSpaceId: 10,
+    }),
+    exchange: async (input) => {
+      exchangeCalls += 1
+      enterExchange()
+      await released
+      const responseText = input.expectedTerminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "c".repeat(64),
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "two-facade-completed-assistant",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "two-facade-tab",
+        taskSpaceId: 10,
+        turnMarker: input.turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(config.dataDir) })
+  await broker.initialize()
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const token = await loadOrCreateBrokerToken(config.dataDir)
+  const methods = new Map([
+    ["ego.start_exchange", (params) => broker.startEgoExchange(params)],
+    ["workflow.await", (params, signal) => broker.awaitWorkflow(params, signal)],
+  ])
+  const ipc = await startIpcServer({
+    dispatch: async (method, params, signal) => {
+      const handler = methods.get(method)
+      if (!handler) {
+        throw new EgoChatError("method_not_found", "Unexpected controlled concurrency method.")
+      }
+      return handler(params, signal)
+    },
+    socketPath: config.socketPath,
+    token,
+  })
+  const firstClient = await connectClient(env)
+  const secondClient = await connectClient(env)
+  t.after(async () => {
+    await firstClient.close()
+    await secondClient.close()
+    broker.close()
+    await ipc.close()
+    await removeTestConfig(config)
+  })
+
+  const firstMarker = "EGO_CHAT_TWO_FACADE_FIRST123"
+  const firstCall = firstClient.callTool({
+    arguments: {
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: "EGO_CHAT_TWO_FACADE_FIRST_DONE123",
+      prompt: `${firstMarker}\nfirst review`,
+      timeoutMs: 30_000,
+      turnMarker: firstMarker,
+      waitMode: "token_saver",
+    },
+    name: "ego_exchange_and_wait",
+  })
+  await entered
+
+  const secondMarker = "EGO_CHAT_TWO_FACADE_SECOND123"
+  const second = await secondClient.callTool({
+    arguments: {
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: "EGO_CHAT_TWO_FACADE_SECOND_DONE123",
+      prompt: `${secondMarker}\nsecond review`,
+      timeoutMs: 30_000,
+      turnMarker: secondMarker,
+      waitMode: "token_saver",
+    },
+    name: "ego_exchange_and_wait",
+  })
+  const secondError = JSON.parse(second.content[0].text)
+  assert.equal(second.isError, true)
+  assert.equal(secondError.code, "conversation_busy")
+  assert.equal(exchangeCalls, 1)
+
+  releaseExchange()
+  const first = await firstCall
+  assert.equal(first.isError, undefined)
+  assert.equal(first.structuredContent.status, "succeeded")
+  assert.equal(exchangeCalls, 1)
 })
 
 test("Token-Saver wait errors preserve the durable workflow recovery handle", async (t) => {

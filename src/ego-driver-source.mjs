@@ -378,6 +378,64 @@ async function egoDriverMain(inputPathOverride = undefined) {
       : legacyConversationFingerprint(entries) === binding.headFingerprint
   }
 
+  function classifyHeadChange(binding, observedHead) {
+    if (observedHead.renderedMessageCount === 0) {
+      return "conversation_cleared"
+    }
+    if (observedHead.lastRole !== (binding.headRole ?? null)) {
+      return Number.isInteger(binding.messageCount)
+        && observedHead.renderedMessageCount > binding.messageCount
+        ? "message_appended"
+        : "tail_role_changed"
+    }
+    if (observedHead.lastMessageId === (binding.headMessageId ?? null)) {
+      return observedHead.lastContentDigest !== (binding.headContentDigest ?? null)
+        ? "tail_content_changed"
+        : "unknown"
+    }
+    if (
+      Number.isInteger(binding.messageCount)
+      && observedHead.renderedMessageCount > binding.messageCount
+    ) {
+      return "message_appended"
+    }
+    if (observedHead.lastContentDigest === (binding.headContentDigest ?? null)) {
+      return "tail_identity_changed"
+    }
+    return "branch_changed"
+  }
+
+  function headChangeEvidence(binding, observedHead) {
+    return {
+      changeKind: classifyHeadChange(binding, observedHead),
+      expectedFingerprint: binding.headFingerprint,
+      expectedMessageCount: Number.isInteger(binding.messageCount) ? binding.messageCount : null,
+      expectedRole: binding.headRole ?? null,
+      observedFingerprint: observedHead.fingerprint,
+      observedRenderedMessageCount: observedHead.renderedMessageCount,
+      observedRole: observedHead.lastRole,
+    }
+  }
+
+  async function stabilizeBoundHead(binding, entries, head) {
+    if (bindingMatchesHead(binding, entries, head)) {
+      return { entries, head, state: "matched" }
+    }
+    await wait(1)
+    const stableEntries = await readConversationEntries()
+    const stableHead = summarizeConversationHead(stableEntries, binding.messageCount)
+    if (bindingMatchesHead(binding, stableEntries, stableHead)) {
+      return { entries: stableEntries, head: stableHead, state: "matched_after_hydration" }
+    }
+    if (
+      stableHead.fingerprint !== head.fingerprint
+      || stableHead.renderedMessageCount !== head.renderedMessageCount
+    ) {
+      return { entries: stableEntries, head: stableHead, state: "unstable" }
+    }
+    return { entries: stableEntries, head: stableHead, state: "changed" }
+  }
+
   async function readConversationHead(logicalMessageCount = undefined) {
     return summarizeConversationHead(await readConversationEntries(), logicalMessageCount)
   }
@@ -1266,7 +1324,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 6) {
+    if (input.browserContractRevision !== 7) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1373,7 +1431,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 6) {
+    if (input.browserContractRevision !== 7) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1589,7 +1647,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 6) {
+    if (input.browserContractRevision !== 7) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1610,8 +1668,8 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return
     }
     driverStage = "reading_before_head"
-    const beforeEntries = await readConversationEntries()
-    const beforeHead = summarizeConversationHead(beforeEntries, input.binding.messageCount)
+    let beforeEntries = await readConversationEntries()
+    let beforeHead = summarizeConversationHead(beforeEntries, input.binding.messageCount)
     if (input.binding.state === "unbound" && beforeHead.messageCount !== 0) {
       humanRequired("unbound_conversation_not_empty", "The create-once page already contains conversation messages.", {
         messageCount: beforeHead.messageCount,
@@ -1629,12 +1687,24 @@ async function egoDriverMain(inputPathOverride = undefined) {
         return
       }
       if (!bindingMatchesHead(input.binding, beforeEntries, beforeHead)) {
-        humanRequired("conversation_head_changed", "The bound conversation head changed outside the broker workflow.", {
-          messageCount: beforeHead.messageCount,
-          targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
-        })
-        return
+        const stabilized = await stabilizeBoundHead(input.binding, beforeEntries, beforeHead)
+        beforeEntries = stabilized.entries
+        beforeHead = stabilized.head
+        if (stabilized.state === "unstable") {
+          humanRequired("conversation_head_unstable", "The bound conversation head did not stabilize after navigation.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
+        if (stabilized.state === "changed") {
+          humanRequired("conversation_head_changed", "The bound conversation head changed outside the broker workflow.", {
+            headChange: headChangeEvidence(input.binding, beforeHead),
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
       }
     }
 
@@ -1665,14 +1735,27 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
     observedModelPolicy = modelPolicy
     driverStage = "verifying_precompose_head"
-    const preComposeHead = await readConversationHead(input.binding.messageCount)
+    let preComposeEntries = await readConversationEntries()
+    let preComposeHead = summarizeConversationHead(preComposeEntries, input.binding.messageCount)
     if (preComposeHead.fingerprint !== beforeHead.fingerprint) {
-      humanRequired("conversation_head_changed", "The bound conversation head changed while the ChatGPT model policy was being verified.", {
-        messageCount: preComposeHead.messageCount,
-        targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      })
-      return
+      const stabilized = await stabilizeBoundHead(input.binding, preComposeEntries, preComposeHead)
+      preComposeEntries = stabilized.entries
+      preComposeHead = stabilized.head
+      if (stabilized.state === "unstable") {
+        humanRequired("conversation_head_unstable", "The bound conversation head changed unstably while the ChatGPT model policy was being verified.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (preComposeHead.fingerprint !== beforeHead.fingerprint) {
+        humanRequired("conversation_head_changed", "The bound conversation head changed while the ChatGPT model policy was being verified.", {
+          headChange: headChangeEvidence(input.binding, preComposeHead),
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
     }
     if (!await assertBrokerAuthority("before_composition")) {
       return
@@ -2148,6 +2231,107 @@ async function egoDriverMain(inputPathOverride = undefined) {
       await reconcile()
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
+    } else if (input.mode === "reanchor") {
+      if (input.browserContractRevision !== 7) {
+        humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
+        return
+      }
+      const selected = await selectConversation(input.binding)
+      if (!selected) {
+        return
+      }
+      const generationRunning = await js(String.raw`Boolean(
+        document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+      )`)
+      if (generationRunning) {
+        humanRequired("conversation_generation_in_progress", "The bound conversation is still generating a response.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      const firstEntries = await readConversationEntries()
+      const firstHead = summarizeConversationHead(firstEntries)
+      await wait(1)
+      const stableEntries = await readConversationEntries()
+      const stableHead = summarizeConversationHead(stableEntries)
+      if (
+        firstHead.fingerprint !== stableHead.fingerprint
+        || firstHead.renderedMessageCount !== stableHead.renderedMessageCount
+      ) {
+        humanRequired("conversation_head_unstable", "The changed conversation head did not remain stable for re-anchoring.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (bindingMatchesHead(input.binding, stableEntries, stableHead)) {
+        humanRequired("conversation_head_unchanged", "The live conversation already matches the durable binding head.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (stableHead.fingerprint !== input.expectedObservedHeadFingerprint) {
+        humanRequired("reanchor_observation_changed", "The live conversation no longer matches the authorized observed head.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (stableHead.lastRole !== "assistant") {
+        humanRequired("reanchor_requires_assistant_head", "Re-anchoring requires one stable completed assistant response at the conversation head.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      const finalInspection = await inspectPage()
+      if (!assertReady(finalInspection, selected)) {
+        return
+      }
+      if (normalizeUrl(finalInspection.info.url) !== normalizeUrl(input.binding.canonicalUrl)) {
+        humanRequired("canonical_conversation_changed", "The bound conversation URL changed before re-anchoring completed.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      const finalGenerationRunning = await js(String.raw`Boolean(
+        document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+      )`)
+      if (finalGenerationRunning) {
+        humanRequired("conversation_generation_in_progress", "The bound conversation started generating before re-anchoring completed.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      const finalEntries = await readConversationEntries()
+      const finalHead = summarizeConversationHead(finalEntries)
+      if (
+        finalHead.fingerprint !== stableHead.fingerprint
+        || finalHead.renderedMessageCount !== stableHead.renderedMessageCount
+      ) {
+        humanRequired("conversation_head_unstable", "The changed conversation head moved before re-anchoring completed.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      if (!await assertBrokerAuthority("before_reanchor_capture")) {
+        return
+      }
+      emit({
+        ok: true,
+        result: {
+          canonicalUrl: normalizeUrl(finalInspection.info.url),
+          head: finalHead,
+          headChange: headChangeEvidence(input.binding, finalHead),
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        },
+      })
     } else if (input.mode === "verify") {
       const selected = await selectConversation(input.binding)
       if (!selected) {
@@ -2163,15 +2347,27 @@ async function egoDriverMain(inputPathOverride = undefined) {
         })
         return
       }
-      const entries = await readConversationEntries()
-      const head = summarizeConversationHead(entries, input.binding.messageCount)
+      let entries = await readConversationEntries()
+      let head = summarizeConversationHead(entries, input.binding.messageCount)
       if (input.binding.headFingerprint && !bindingMatchesHead(input.binding, entries, head)) {
-        humanRequired("conversation_head_changed", "The bound conversation head changed outside the broker workflow.", {
-          messageCount: head.messageCount,
-          targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
-        })
-        return
+        const stabilized = await stabilizeBoundHead(input.binding, entries, head)
+        entries = stabilized.entries
+        head = stabilized.head
+        if (stabilized.state === "unstable") {
+          humanRequired("conversation_head_unstable", "The bound conversation head did not stabilize after navigation.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
+        if (stabilized.state === "changed") {
+          humanRequired("conversation_head_changed", "The bound conversation head changed outside the broker workflow.", {
+            headChange: headChangeEvidence(input.binding, head),
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+          })
+          return
+        }
       }
       emit({
         ok: true,

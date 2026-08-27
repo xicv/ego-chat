@@ -66,6 +66,7 @@ const methods = new Map([
   ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
   ["conversation.bind", (params) => broker.bindConversation(params)],
   ["conversation.get", (params) => broker.getConversationBinding(params)],
+  ["conversation.reanchor", (params) => broker.reanchorConversation(params)],
   ["conversation.reconcile", (params) => broker.reconcileConversation(params)],
   ["conversation.verify", (params) => broker.verifyConversation(params)],
   ["convergence.start", (params) => broker.startConvergence(params)],

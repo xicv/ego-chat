@@ -302,6 +302,10 @@ export class EgoAdapter {
     return this.#run({ brokerLease: this.#brokerLease, mode: "reconcile_bound", ...params }, 60_000, signal)
   }
 
+  async reanchor(params, signal = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "reanchor", ...params }, 60_000, signal)
+  }
+
   async verify(params, signal = undefined) {
     return this.#run({ mode: "verify", ...params }, 60_000, signal)
   }

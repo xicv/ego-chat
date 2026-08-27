@@ -43,6 +43,9 @@ const unusedEgoAdapter = {
   reconcileBound: async () => {
     throw new Error("not expected")
   },
+  reanchor: async () => {
+    throw new Error("not expected")
+  },
   verify: async () => {
     throw new Error("not expected")
   },
@@ -213,6 +216,33 @@ test("event ledger reconstructs the latest workflow and uses private file modes"
   assert.equal(replayed.getModelPolicy("chatgpt-web-default").lastObserved.modelLabel, "GPT-5.6 Sol")
   assert.equal((await fs.stat(path.join(dataDir, "events.jsonl"))).mode & 0o777, 0o600)
   assert.equal((await fs.stat(path.join(dataDir, "state.json"))).mode & 0o777, 0o600)
+})
+
+test("binding persistence compare-and-swap rejects a stale re-anchor commit", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const initial = {
+    canonicalUrl: "https://chatgpt.com/c/binding-cas",
+    headFingerprint: "a".repeat(64),
+    key: "ego-chat-main",
+    revision: 1,
+    state: "bound",
+  }
+  await store.persistBinding("binding.created", initial)
+  const concurrent = { ...initial, headFingerprint: "b".repeat(64), revision: 2 }
+  await store.persistBinding("binding.concurrent", concurrent, initial)
+
+  await assert.rejects(
+    store.persistBinding(
+      "binding.reanchored",
+      { ...initial, headFingerprint: "c".repeat(64), revision: 2 },
+      initial,
+    ),
+    (error) => error.code === "binding_transition_conflict",
+  )
+  assert.deepEqual(store.getBinding("ego-chat-main"), concurrent)
 })
 
 test("create-once binding is promoted and reused for every later exchange", async (t) => {
@@ -2395,6 +2425,291 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
   assert.equal(exactRetry.recovery.responseText, terminalMarker)
   assert.equal(exactRetry.revision, 2)
   assert.equal(reconciliationCalls, 1)
+})
+
+test("a changed conversation head records actionable pre-send evidence", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "initial-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const headChange = {
+    changeKind: "message_appended",
+    expectedFingerprint: initialHead.fingerprint,
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: "c".repeat(64),
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  }
+  const userHeadChange = {
+    ...headChange,
+    changeKind: "message_appended",
+    observedFingerprint: "d".repeat(64),
+    observedRenderedMessageCount: 3,
+    observedRole: "user",
+  }
+  let exchangeCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: initialHead,
+      targetId: "head-change-tab",
+      taskSpaceId: 10,
+    }),
+    exchange: async () => {
+      exchangeCalls += 1
+      throw new EgoChatError(
+        "human_required",
+        "The bound conversation head changed outside the broker workflow.",
+        {
+          evidence: { headChange: exchangeCalls === 1 ? headChange : userHeadChange },
+          reason: "conversation_head_changed",
+        },
+      )
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/head-change",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const turnMarker = "EGO_CHAT_HEAD_CHANGE_TEST123"
+  const started = await broker.startEgoExchange({
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "EGO_CHAT_HEAD_CHANGE_DONE123",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.phase, "pre_send_head_changed")
+  assert.equal(stopped.humanRequired.code, "conversation_head_changed")
+  assert.deepEqual(stopped.humanRequired.headChange, headChange)
+  assert.deepEqual(stopped.humanRequired.reanchor, {
+    acknowledgeExternalChangeRequired: true,
+    bindingKey: "ego-chat-main",
+    expectedBindingRevision: 1,
+    expectedObservedHeadFingerprint: headChange.observedFingerprint,
+    sourceWorkflowId: stopped.id,
+  })
+  assert.equal(stopped.reconciliation.sendState, "not_attempted")
+
+  const userTurnMarker = "EGO_CHAT_USER_HEAD_CHANGE_TEST123"
+  const userHeadStarted = await broker.startEgoExchange({
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "EGO_CHAT_USER_HEAD_CHANGE_DONE123",
+    prompt: `${userTurnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker: userTurnMarker,
+  })
+  const userHeadStopped = await broker.awaitWorkflow({
+    timeoutMs: 2_000,
+    workflowId: userHeadStarted.id,
+  })
+  assert.equal(userHeadStopped.phase, "pre_send_head_changed")
+  assert.equal(userHeadStopped.humanRequired.reanchor, undefined)
+  assert.equal(userHeadStopped.reconciliation.sendState, "not_attempted")
+  await assert.rejects(
+    broker.reanchorConversation({
+      acknowledgeExternalChange: true,
+      bindingKey: "ego-chat-main",
+      expectedBindingRevision: 1,
+      expectedObservedHeadFingerprint: userHeadChange.observedFingerprint,
+      sourceWorkflowId: userHeadStopped.id,
+    }),
+    (error) => error.code === "reanchor_source_unsafe",
+  )
+})
+
+test("an explicitly acknowledged stable external head can re-anchor one safe stopped workflow", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "initial-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const observedHead = {
+    fingerprint: "c".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "d".repeat(64),
+    lastMessageId: "external-assistant",
+    lastRole: "assistant",
+    messageCount: 4,
+    renderedMessageCount: 4,
+  }
+  const headChange = {
+    changeKind: "message_appended",
+    expectedFingerprint: initialHead.fingerprint,
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: observedHead.fingerprint,
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  }
+  let reanchorCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: initialHead,
+      targetId: "reanchor-tab",
+      taskSpaceId: 10,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "human_required",
+        "The bound conversation head changed outside the broker workflow.",
+        { evidence: { headChange }, reason: "conversation_head_changed" },
+      )
+    },
+    reanchor: async (input) => {
+      reanchorCalls += 1
+      assert.equal(input.binding.revision, 1)
+      assert.equal(input.expectedObservedHeadFingerprint, observedHead.fingerprint)
+      return {
+        canonicalUrl: input.binding.canonicalUrl,
+        head: observedHead,
+        headChange,
+        targetId: "reanchor-tab",
+        taskSpaceId: 10,
+      }
+    },
+  }
+  const store = new EventStore(dataDir)
+  const broker = new Broker({ egoAdapter, store })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/reanchor",
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const turnMarker = "EGO_CHAT_REANCHOR_TEST123"
+  const started = await broker.startEgoExchange({
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "EGO_CHAT_REANCHOR_DONE123",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  const input = {
+    acknowledgeExternalChange: true,
+    bindingKey: "ego-chat-main",
+    expectedBindingRevision: 1,
+    expectedObservedHeadFingerprint: observedHead.fingerprint,
+    sourceWorkflowId: stopped.id,
+  }
+  const reanchored = await broker.reanchorConversation(input)
+
+  assert.equal(reanchored.headFingerprint, observedHead.fingerprint)
+  assert.equal(reanchored.headMessageId, "external-assistant")
+  assert.equal(reanchored.lastReanchorSourceWorkflowId, stopped.id)
+  assert.equal(reanchored.messageCount, 4)
+  assert.equal(reanchored.reanchor.changeKind, "message_appended")
+  assert.equal(reanchored.revision, 2)
+  const completed = broker.getWorkflow({ workflowId: stopped.id })
+  assert.equal(completed.phase, "head_reanchored")
+  assert.equal(completed.status, "cancelled")
+
+  await assert.rejects(
+    broker.reanchorConversation({
+      ...input,
+      expectedObservedHeadFingerprint: "e".repeat(64),
+    }),
+    (error) => error.code === "reanchor_replay_mismatch",
+  )
+
+  await store.persist("test.reanchor_commit_interrupted", stopped, completed)
+  const replayed = await broker.reanchorConversation(input)
+  assert.equal(replayed.revision, 2)
+  assert.equal(reanchorCalls, 1)
+  assert.equal(broker.getWorkflow({ workflowId: stopped.id }).phase, "head_reanchored")
+  assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "cancelled")
+})
+
+test("re-anchoring rejects an ambiguous possible send before browser work", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "ambiguous-initial-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  let reanchorCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: initialHead,
+      targetId: "ambiguous-reanchor-tab",
+      taskSpaceId: 10,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "human_required",
+        "The send click may have occurred.",
+        { reason: "send_confirmation_ambiguous" },
+      )
+    },
+    reanchor: async () => {
+      reanchorCalls += 1
+      throw new Error("re-anchor must not inspect the browser")
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/ambiguous-reanchor",
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const turnMarker = "EGO_CHAT_AMBIGUOUS_REANCHOR123"
+  const started = await broker.startEgoExchange({
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "EGO_CHAT_AMBIGUOUS_REANCHOR_DONE123",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  await assert.rejects(
+    broker.reanchorConversation({
+      acknowledgeExternalChange: true,
+      bindingKey: "ego-chat-main",
+      expectedBindingRevision: 1,
+      expectedObservedHeadFingerprint: "c".repeat(64),
+      sourceWorkflowId: stopped.id,
+    }),
+    (error) => error.code === "reanchor_source_unsafe",
+  )
+  assert.equal(reanchorCalls, 0)
 })
 
 test("a pre-click driver interruption preserves safe proof and can reconcile delivery absence", async (t) => {

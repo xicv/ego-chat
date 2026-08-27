@@ -111,6 +111,7 @@ const MCP_INSTRUCTIONS = [
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never retry an ambiguous send. A strict review may perform one evidence-only reconciliation of its exact durable workflow and markers, and may retry only a proven delivery absence; otherwise surface the exact human_required stop.",
   "Never abandon a stopped recovery unless the user explicitly authorizes that exact workflow and acknowledges that visible ChatGPT delivery or a Codex turn may remain ambiguous; abandonment preserves any at-most-once operation tombstone.",
+  "A conversation_head_changed stop is not retryable. Only after the user explicitly authorizes accepting that exact stable external head may ego_reanchor_conversation advance the binding, using the stopped workflow ID, binding revision, and observed fingerprint returned by the broker. Never re-anchor an ambiguous or possibly sent workflow.",
 ].join(" ")
 
 function toolResult(value, { compact = false } = {}) {
@@ -477,6 +478,32 @@ export function createMcpServer(config = loadConfig()) {
     async (input) => {
       try {
         return toolResult(await requestBroker(config, "conversation.reconcile", input, { timeoutMs: 65_000 }))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "ego_reanchor_conversation",
+    {
+      description: "Explicitly accept one stable externally changed assistant tail after an exact pre-send conversation_head_changed stop. This read-only browser observation advances the durable binding only with literal user acknowledgement, the stopped workflow ID, the expected binding revision, and the exact observed head fingerprint. It never sends a prompt and rejects ambiguous delivery state, generation, drafts, unstable heads, and races.",
+      inputSchema: {
+        acknowledgeExternalChange: z.literal(true),
+        bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
+        expectedBindingRevision: z.number().int().positive(),
+        expectedObservedHeadFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+        sourceWorkflowId: z.uuid(),
+      },
+    },
+    async (input) => {
+      try {
+        return toolResult(await requestBroker(
+          config,
+          "conversation.reanchor",
+          input,
+          { timeoutMs: 65_000 },
+        ))
       } catch (error) {
         return toolError(error)
       }

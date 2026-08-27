@@ -579,8 +579,8 @@ export class EventStore {
     return operation
   }
 
-  async persistBinding(type, binding) {
-    return this.#persistEntity(type, "binding", binding)
+  async persistBinding(type, binding, expectedBinding = undefined) {
+    return this.#persistEntity(type, "binding", binding, expectedBinding)
   }
 
   async persistModelPolicy(type, modelPolicy) {
@@ -595,6 +595,15 @@ export class EventStore {
           throw new EgoChatError(
             "workflow_transition_conflict",
             "The workflow changed before this state transition could be committed.",
+          )
+        }
+      }
+      if (entityName === "binding" && expectedEntity !== undefined) {
+        const current = this.#state.bindings[entity.key]
+        if (!isDeepStrictEqual(current, expectedEntity)) {
+          throw new EgoChatError(
+            "binding_transition_conflict",
+            "The conversation binding changed before this state transition could be committed.",
           )
         }
       }

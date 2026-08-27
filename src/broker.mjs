@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
+import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
 import {
@@ -27,9 +28,11 @@ import {
   ConversationAdoptionSchema,
   ConversationBindSchema,
   ConversationKeyInputSchema,
+  ConversationReanchorSchema,
   ConversationReconcileSchema,
   EgoExchangeSchema,
   EgoPreflightSchema,
+  HeadChangeEvidenceSchema,
   ModelPolicyObservationSchema,
   ResultReadSchema,
   StartConvergenceSchema,
@@ -102,6 +105,64 @@ function headAnchorsMatch(left, right) {
     && left.fingerprintVersion === right.fingerprintVersion
     && left.messageId === right.messageId
     && left.role === right.role
+}
+
+function safeHeadChangeEvidence(error) {
+  const result = HeadChangeEvidenceSchema.safeParse(error?.details?.evidence?.headChange)
+  return result.success ? result.data : undefined
+}
+
+function reanchorResult(binding) {
+  return {
+    ...publicBinding(binding),
+    reanchor: structuredClone(binding.lastReanchor),
+  }
+}
+
+function validateReanchorCapture(capture, binding, params, expectedHeadChange) {
+  const parsedHeadChange = HeadChangeEvidenceSchema.safeParse(capture?.headChange)
+  const head = capture?.head
+  const validHead = head
+    && typeof head === "object"
+    && typeof head.fingerprint === "string"
+    && /^[a-f0-9]{64}$/.test(head.fingerprint)
+    && head.fingerprintVersion === "tail-v1"
+    && typeof head.lastContentDigest === "string"
+    && /^[a-f0-9]{64}$/.test(head.lastContentDigest)
+    && typeof head.lastMessageId === "string"
+    && head.lastMessageId.length > 0
+    && head.lastMessageId.length <= 200
+    && head.lastRole === "assistant"
+    && Number.isInteger(head.messageCount)
+    && head.messageCount >= 1
+    && Number.isInteger(head.renderedMessageCount)
+    && head.renderedMessageCount === head.messageCount
+  const validTaskSpace = (
+    typeof capture?.taskSpaceId === "string"
+    && capture.taskSpaceId.length > 0
+    && capture.taskSpaceId.length <= 200
+  ) || (Number.isInteger(capture?.taskSpaceId) && capture.taskSpaceId > 0)
+  const validIdentity = capture?.canonicalUrl === binding.canonicalUrl
+    && typeof capture?.targetId === "string"
+    && capture.targetId.length > 0
+    && capture.targetId.length <= 200
+    && validTaskSpace
+  const validObservation = validHead
+    && parsedHeadChange.success
+    && head.fingerprint === params.expectedObservedHeadFingerprint
+    && parsedHeadChange.data.expectedFingerprint === binding.headFingerprint
+    && parsedHeadChange.data.observedFingerprint === head.fingerprint
+    && parsedHeadChange.data.observedRole === head.lastRole
+    && parsedHeadChange.data.observedRenderedMessageCount === head.renderedMessageCount
+    && isDeepStrictEqual(parsedHeadChange.data, expectedHeadChange)
+  if (!validIdentity || !validObservation) {
+    throw new EgoChatError(
+      "human_required",
+      "The live conversation no longer matches the exact stable head authorized for re-anchoring.",
+      { reason: "reanchor_observation_changed" },
+    )
+  }
+  return { ...capture, headChange: parsedHeadChange.data }
 }
 
 function isTerminal(workflow) {
@@ -582,6 +643,151 @@ export class Broker {
     }
   }
 
+  async reanchorConversation(input) {
+    const params = parse(ConversationReanchorSchema, input)
+    const binding = this.#store.getBinding(params.bindingKey)
+    if (!binding) {
+      throw new EgoChatError("binding_not_found", "No conversation binding exists with that key.")
+    }
+    if (binding.state !== "bound" || !binding.canonicalUrl) {
+      throw new EgoChatError("binding_not_bound", "Only a canonical conversation binding can be re-anchored.")
+    }
+    const source = this.#store.getWorkflow(params.sourceWorkflowId)
+    if (!source || source.bindingKey !== params.bindingKey || source.kind !== "ego_exchange") {
+      throw new EgoChatError(
+        "reanchor_source_invalid",
+        "The re-anchor source must be the exact stopped exchange for this binding.",
+      )
+    }
+    const expectedReanchorHint = {
+      acknowledgeExternalChangeRequired: true,
+      bindingKey: params.bindingKey,
+      expectedBindingRevision: params.expectedBindingRevision,
+      expectedObservedHeadFingerprint: params.expectedObservedHeadFingerprint,
+      sourceWorkflowId: params.sourceWorkflowId,
+    }
+    if (binding.lastReanchorSourceWorkflowId === source.id) {
+      const replayHeadChange = HeadChangeEvidenceSchema.safeParse(source.humanRequired?.headChange)
+      const exactReplay = binding.lastReanchor?.sourceWorkflowId === source.id
+        && binding.lastReanchor?.observedFingerprint === params.expectedObservedHeadFingerprint
+        && binding.lastReanchor?.previousFingerprint === source.reconciliation?.beforeHead?.fingerprint
+        && source.reconciliation?.bindingRevision === params.expectedBindingRevision
+        && source.reconciliation?.observedHeadFingerprint === params.expectedObservedHeadFingerprint
+        && source.reconciliation?.sendState === "not_attempted"
+      const replayState = source.status === "human_required"
+        ? source.phase === "pre_send_head_changed"
+          && source.humanRequired?.code === "conversation_head_changed"
+          && replayHeadChange.success
+          && replayHeadChange.data.changeKind === binding.lastReanchor?.changeKind
+          && replayHeadChange.data.observedFingerprint === params.expectedObservedHeadFingerprint
+          && replayHeadChange.data.observedRole === "assistant"
+          && isDeepStrictEqual(source.humanRequired?.reanchor, expectedReanchorHint)
+        : source.status === "cancelled"
+          && source.phase === "head_reanchored"
+          && isDeepStrictEqual(source.result?.reanchor, binding.lastReanchor)
+      if (!exactReplay || !replayState) {
+        throw new EgoChatError(
+          "reanchor_replay_mismatch",
+          "That re-anchor replay does not match the exact previously committed source and evidence.",
+        )
+      }
+      if (source.status === "human_required") {
+        await this.#transition(source, "workflow.cancelled", {
+          error: undefined,
+          humanRequired: undefined,
+          phase: "head_reanchored",
+          result: { reanchor: binding.lastReanchor },
+          status: "cancelled",
+        })
+      }
+      return reanchorResult(binding)
+    }
+    const expectedHeadChange = HeadChangeEvidenceSchema.safeParse(source.humanRequired?.headChange)
+    const safeSource = source.status === "human_required"
+      && source.phase === "pre_send_head_changed"
+      && source.humanRequired?.code === "conversation_head_changed"
+      && source.reconciliation?.sendState === "not_attempted"
+      && source.reconciliation?.bindingRevision === params.expectedBindingRevision
+      && expectedHeadChange.success
+      && source.reconciliation.observedHeadFingerprint === params.expectedObservedHeadFingerprint
+      && expectedHeadChange.data.observedFingerprint === params.expectedObservedHeadFingerprint
+      && expectedHeadChange.data.observedRole === "assistant"
+      && isDeepStrictEqual(source.humanRequired?.reanchor, expectedReanchorHint)
+    if (!safeSource) {
+      throw new EgoChatError(
+        "reanchor_source_unsafe",
+        "That workflow does not contain durable proof of a pre-send conversation-head mismatch.",
+      )
+    }
+    if (binding.revision !== params.expectedBindingRevision) {
+      throw new EgoChatError(
+        "binding_revision_changed",
+        "The conversation binding revision changed before re-anchoring was authorized.",
+        { actualRevision: binding.revision, expectedRevision: params.expectedBindingRevision },
+      )
+    }
+    if (!headAnchorsMatch(bindingHeadAnchor(binding), source.reconciliation.beforeHead)) {
+      throw new EgoChatError(
+        "reanchor_binding_head_changed",
+        "The durable binding no longer matches the stopped workflow's exact prior head.",
+      )
+    }
+    this.#assertBindingAvailable(params.bindingKey)
+    if (this.#activeBindings.has(params.bindingKey)) {
+      throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
+    }
+    if (typeof this.#egoAdapter.reanchor !== "function") {
+      throw new EgoChatError("reanchor_unavailable", "This Ego Chat runtime cannot safely re-anchor a conversation.")
+    }
+
+    this.#activeBindings.add(params.bindingKey)
+    try {
+      const capture = validateReanchorCapture(
+        await this.#egoAdapter.reanchor({
+          binding,
+          expectedObservedHeadFingerprint: params.expectedObservedHeadFingerprint,
+        }),
+        binding,
+        params,
+        expectedHeadChange.data,
+      )
+      await this.#assertBrokerAuthority("before_reanchor_commit")
+      const now = new Date().toISOString()
+      const nextBinding = {
+        ...binding,
+        ...bindingHeadPatch(capture.head),
+        lastReanchor: {
+          acknowledgedAt: now,
+          changeKind: capture.headChange.changeKind,
+          observedFingerprint: capture.head.fingerprint,
+          previousFingerprint: binding.headFingerprint,
+          sourceWorkflowId: source.id,
+        },
+        lastReanchorSourceWorkflowId: source.id,
+        messageCount: capture.head.messageCount,
+        revision: binding.revision + 1,
+        targetId: capture.targetId,
+        taskSpaceId: capture.taskSpaceId,
+        updatedAt: now,
+        verifiedAt: now,
+      }
+      await this.#store.persistBinding("binding.reanchored", nextBinding, binding)
+      const currentSource = this.#store.getWorkflow(source.id)
+      if (currentSource?.status === "human_required") {
+        await this.#transition(currentSource, "workflow.cancelled", {
+          error: undefined,
+          humanRequired: undefined,
+          phase: "head_reanchored",
+          result: { reanchor: nextBinding.lastReanchor },
+          status: "cancelled",
+        })
+      }
+      return reanchorResult(nextBinding)
+    } finally {
+      this.#activeBindings.delete(params.bindingKey)
+    }
+  }
+
   async reconcileConversation(input) {
     const params = parse(ConversationReconcileSchema, input)
     const { bindingKey, workflowId } = params
@@ -988,6 +1194,7 @@ export class Broker {
         },
       },
       reconciliation: {
+        bindingRevision: binding.revision,
         beforeHead: {
           contentDigest: binding.headContentDigest ?? null,
           fingerprint: binding.headFingerprint ?? null,
@@ -1772,6 +1979,13 @@ export class Broker {
       }
 
       const isHumanRequired = error instanceof EgoChatError && error.code === "human_required"
+      const headChange = current.phase === "browser_owned"
+        && error.details?.reason === "conversation_head_changed"
+        ? safeHeadChangeEvidence(error)
+        : undefined
+      const reanchorableHeadChange = headChange?.observedRole === "assistant"
+        ? headChange
+        : undefined
       const errorCode = error instanceof EgoChatError ? error.code : "browser_operation_failed"
       const browserInterrupted = !isHumanRequired && current.phase === "browser_owned"
       const requiresHuman = isHumanRequired || browserInterrupted
@@ -1816,6 +2030,18 @@ export class Broker {
                   ? "browser_operation_interrupted_before_send_confirmation"
                   : (error.details?.reason ?? "browser_intervention_required"),
                 ...(browserInterruption ? { diagnostic: browserInterruption } : {}),
+                ...(headChange ? { headChange } : {}),
+                ...(reanchorableHeadChange
+                  ? {
+                      reanchor: {
+                        acknowledgeExternalChangeRequired: true,
+                        bindingKey: current.bindingKey,
+                        expectedBindingRevision: current.reconciliation.bindingRevision,
+                        expectedObservedHeadFingerprint: reanchorableHeadChange.observedFingerprint,
+                        sourceWorkflowId: current.id,
+                      },
+                    }
+                  : {}),
                 message: browserInterrupted
                   ? "The browser driver stopped before durable send confirmation. Reconcile this exact workflow before any new send."
                   : error.message,
@@ -1832,8 +2058,15 @@ export class Broker {
                   : "The browser operation failed unexpectedly.",
               },
             }),
+        ...(headChange ? { phase: "pre_send_head_changed" } : {}),
         private: undefined,
-        reconciliation,
+        reconciliation: headChange
+          ? {
+              ...reconciliation,
+              observedHeadFingerprint: headChange.observedFingerprint,
+              sendState: "not_attempted",
+            }
+          : reconciliation,
         status: requiresHuman ? "human_required" : "failed",
       })
     } finally {

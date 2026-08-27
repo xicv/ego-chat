@@ -117,6 +117,24 @@ export const ConversationKeyInputSchema = z.object({
   bindingKey: BindingKeySchema,
 })
 
+export const HeadChangeEvidenceSchema = z.object({
+  changeKind: z.enum([
+    "branch_changed",
+    "conversation_cleared",
+    "message_appended",
+    "tail_content_changed",
+    "tail_identity_changed",
+    "tail_role_changed",
+    "unknown",
+  ]),
+  expectedFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  expectedMessageCount: z.number().int().min(0).nullable(),
+  expectedRole: z.enum(["assistant", "user"]).nullable(),
+  observedFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  observedRenderedMessageCount: z.number().int().min(0),
+  observedRole: z.enum(["assistant", "user"]).nullable(),
+}).strict()
+
 const ModelPolicyLabelSchema = z.string().trim().min(1).max(120)
   .refine((value) => !/[\u0000-\u001F\u007F]/.test(value), "Label must not contain control characters")
 
@@ -141,6 +159,14 @@ export const ConversationReconcileSchema = z.object({
   turnMarker: z.string().regex(/^EGO_CHAT_[A-Z0-9_-]{8,160}$/).optional(),
   workflowId: WorkflowIdSchema,
 })
+
+export const ConversationReanchorSchema = z.object({
+  acknowledgeExternalChange: z.literal(true),
+  bindingKey: BindingKeySchema,
+  expectedBindingRevision: z.number().int().positive(),
+  expectedObservedHeadFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceWorkflowId: WorkflowIdSchema,
+}).strict()
 
 const ConversationHeadAnchorSchema = z.object({
   contentDigest: z.string().min(1).max(256).nullable(),
