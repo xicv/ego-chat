@@ -29,13 +29,18 @@ function conversationTailFingerprint(entry) {
 
 let driverCase = 0
 
-async function runMalformedModelPolicyCase(attributes) {
+async function runMalformedModelPolicyCase(attributes, {
+  currentModelLabels = null,
+  pillCount = 1,
+  selectedModelIndexes = [0],
+  sliderCount = 1,
+} = {}) {
   driverCase += 1
   const driverUid = `ego-chat-test-${process.pid}-${driverCase}`
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 8,
+    browserContractRevision: 9,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -70,26 +75,68 @@ async function runMalformedModelPolicyCase(attributes) {
 
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
-const counters = { cdp: 0, fillInput: 0, pressKey: 0, typeText: 0 }
+const counters = { cdp: 0, click: 0, fillInput: 0, pressKey: 0, typeText: 0 }
 const attributes = ${JSON.stringify(attributes)}
+const currentModelLabels = ${JSON.stringify(currentModelLabels)}
+const pillCount = ${JSON.stringify(pillCount)}
+const selectedModelIndexes = ${JSON.stringify(selectedModelIndexes)}
+const sliderCount = ${JSON.stringify(sliderCount)}
 const visible = { getClientRects: () => [{}] }
 const slider = {
+  ...visible,
   getAttribute(name) {
     return Object.hasOwn(attributes, name) ? attributes[name] : null
   },
 }
 const powerItem = {
   ...visible,
+  innerText: '',
+  textContent: '',
+  getAttribute: (name) => name === 'aria-label' ? 'Power' : null,
   querySelector: (selector) => selector === '[role="slider"]' ? slider : null,
+  querySelectorAll: (selector) => selector === '[role="slider"]'
+    ? Array.from({ length: sliderCount }, () => slider)
+    : [],
 }
-const row = (text) => ({ ...visible, innerText: text, textContent: text })
+const row = (text) => ({
+  ...visible,
+  innerText: text,
+  textContent: text,
+  getAttribute: (name) => name === 'aria-haspopup' ? 'menu' : null,
+})
+const modelRow = row('Model GPT-5.6 Sol')
+const effortRow = row('Effort Pro')
+const modelTrigger = {
+  ...visible,
+  innerText: 'Pro',
+  textContent: 'Pro',
+  getAttribute(name) {
+    if (name === 'aria-haspopup') return 'menu'
+    if (name === 'aria-label') return 'Select model'
+    return null
+  },
+}
+const modelChoices = (currentModelLabels || []).map((label, index) => ({
+  ...visible,
+  innerText: label,
+  textContent: label,
+  getAttribute(name) {
+    if (name === 'aria-checked') return selectedModelIndexes.includes(index) ? 'true' : 'false'
+    if (name === 'aria-disabled') return 'false'
+    return null
+  },
+}))
 const menu = {
   ...visible,
+  querySelector(selector) {
+    return selector === '[role="menuitem"][aria-label="Power"]' ? powerItem : null
+  },
   querySelectorAll(selector) {
     if (selector === '[role="menuitem"][aria-label="Power"]') return [powerItem]
-    if (selector === '[role="menuitem"][aria-haspopup="menu"]') {
-      return [row('Model GPT-5.6 Sol'), row('Effort Pro')]
+    if (selector === '[role="menuitem"]') {
+      return currentModelLabels ? [powerItem, modelTrigger] : [powerItem, modelRow, effortRow]
     }
+    if (selector === '[role="menuitemradio"]') return modelChoices
     return []
   },
 }
@@ -103,9 +150,23 @@ const pill = {
     return null
   },
 }
+const pills = Array.from({ length: pillCount }, () => pill)
+const composer = {
+  ...visible,
+  closest: () => pageDocument,
+  parentElement: null,
+}
 const pageDocument = {
   getElementById: (id) => id === 'policy-menu' ? menu : null,
-  querySelectorAll: (selector) => selector === 'button.__composer-pill[aria-haspopup="menu"]' ? [pill] : [],
+  querySelector: (selector) => selector === '#prompt-textarea' ? composer : null,
+  querySelectorAll(selector) {
+    if (selector === 'button.__composer-pill[aria-haspopup="menu"]') return pills
+    if (selector === 'button[aria-haspopup="menu"]') return pills
+    if (selector === '[role="menu"]') return [menu]
+    if (selector === '[role="menuitemradio"]') return modelChoices
+    if (selector === '#prompt-textarea') return [composer]
+    return []
+  },
 }
 globalThis.cliLog = (value) => console.log(value)
 globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
@@ -115,10 +176,12 @@ globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation
 globalThis.pageInfo = async () => ({ url: 'https://chatgpt.com/' })
 globalThis.snapshotText = async () => ''
 globalThis.wait = async () => {}
-globalThis.click = async () => {}
+globalThis.click = async () => { counters.click += 1 }
 globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
-globalThis.pressKey = async () => { counters.pressKey += 1 }
+globalThis.pressKey = async (key) => {
+  if (key === 'ARROWRIGHT' || key === 'ENTER') counters.pressKey += 1
+}
 globalThis.cdp = async () => { counters.cdp += 1 }
 globalThis.js = async (source) => {
   if (source.includes('hasLoginAction')) {
@@ -130,11 +193,20 @@ globalThis.js = async (source) => {
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) {
     return 0
   }
-  if (source.includes('aria-valuemin')) {
+  if (
+    (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount'))
+    || source.includes('aria-valuemin')
+  ) {
     return Function('document', 'return ' + source)(pageDocument)
   }
-  if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
-    return { composerCount: 1, count: 1, expanded: 'false' }
+  if (source.includes('visibleModelChoiceCount')) {
+    return {
+      composerCount: 1,
+      count: 1,
+      expanded: 'false',
+      policyMenuCount: 0,
+      visibleModelChoiceCount: 0,
+    }
   }
   if (source.includes('button.__composer-pill[aria-haspopup="menu"]')) {
     return Function('document', 'return ' + source)(pageDocument)
@@ -174,8 +246,10 @@ console.log('__EGO_CHAT_TEST_COUNTERS__' + JSON.stringify(counters))
 
 async function runPreSendDriverCase({
   changeSendControlAtRecheck = false,
+  currentSelectedModelIndex = 0,
   downgradeAtPresend = false,
   fenceAtRecheck = false,
+  policyUiVariant = "legacy",
   prompt = null,
 } = {}) {
   driverCase += 1
@@ -184,7 +258,7 @@ async function runPreSendDriverCase({
   const ownerPath = `${mailboxDirectory}/owner.json`
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
   const input = {
-    browserContractRevision: 8,
+    browserContractRevision: 9,
     binding: {
       messageCount: 0,
       startUrl: "https://chatgpt.com/",
@@ -224,6 +298,9 @@ const fs = await import('node:fs/promises')
 const input = ${JSON.stringify(input)}
 const ownerPath = ${JSON.stringify(ownerPath)}
 let policyMenuOpen = false
+let modelChoicesOpen = false
+let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
+let focusedPolicyControl = null
 let policyReads = 0
 let sendTargetReads = 0
 const counters = {
@@ -231,6 +308,7 @@ const counters = {
   injectedPromptLength: 0,
   insertText: 0,
   mouseEvents: 0,
+  modelSelections: 0,
   policyReads: 0,
   sendTargetReads: 0,
 }
@@ -243,13 +321,25 @@ globalThis.pageInfo = async () => ({ url: 'https://chatgpt.com/' })
 globalThis.snapshotText = async () => ''
 globalThis.wait = async () => {}
 globalThis.click = async (target) => {
-  if (String(target).includes('__composer-pill')) policyMenuOpen = true
+  if (String(target).includes('__composer-pill')) policyMenuOpen = !policyMenuOpen
   if (target === '#prompt-textarea') policyMenuOpen = false
 }
 
 globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
 globalThis.typeText = async () => { throw new Error('unexpected typeText') }
-globalThis.pressKey = async () => {}
+globalThis.pressKey = async (key) => {
+  if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') modelChoicesOpen = true
+  if (key === 'ENTER' && focusedPolicyControl === 'first_model') {
+    selectedModelIndex = 0
+    counters.modelSelections += 1
+    policyMenuOpen = false
+    modelChoicesOpen = false
+  }
+  if (key === 'ESCAPE') {
+    policyMenuOpen = false
+    modelChoicesOpen = false
+  }
+}
 globalThis.cdp = async (method) => {
   if (method === 'Input.insertText') counters.insertText += 1
   if (method === 'Input.dispatchMouseEvent') counters.mouseEvents += 1
@@ -267,8 +357,23 @@ globalThis.js = async (source) => {
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) return []
   if (source.trimStart().startsWith('Boolean(')) return false
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) return 0
+  if (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount')) {
+    return {
+      count: 1,
+      expanded: policyMenuOpen,
+      label: 'Pro',
+      selectorKind: 'composer_pill',
+    }
+  }
   if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
-    return { composerCount: 1, count: 1, expanded: policyMenuOpen ? 'true' : 'false' }
+    return {
+      composerCount: 1,
+      count: 1,
+      expanded: policyMenuOpen ? 'true' : 'false',
+      policyMenuCount: policyMenuOpen || modelChoicesOpen ? 1 : 0,
+      selectorKind: 'composer_pill',
+      visibleModelChoiceCount: modelChoicesOpen ? 2 : 0,
+    }
   }
   if (source.includes("expanded: pills[0]?.getAttribute('aria-expanded') === 'true'")) {
     return { count: 1, expanded: policyMenuOpen }
@@ -276,7 +381,25 @@ globalThis.js = async (source) => {
   if (source.includes('aria-valuemin')) {
     policyReads += 1
     counters.policyReads = policyReads
-    const current = ${JSON.stringify(downgradeAtPresend)} && policyReads >= 3 ? 3 : 4
+    const downgradeRead = ${JSON.stringify(policyUiVariant)} === 'current' ? 8 : 2
+    const current = ${JSON.stringify(downgradeAtPresend)} && policyReads >= downgradeRead ? 3 : 4
+    if (${JSON.stringify(policyUiVariant)} === 'current') {
+      return {
+        current,
+        effortLabel: 'Pro',
+        maximum: 4,
+        minimum: 0,
+        modelChoiceCount: modelChoicesOpen ? 2 : 0,
+        modelChoicesOpen,
+        modelLabel: modelChoicesOpen
+          ? (selectedModelIndex === 0 ? 'GPT-5.6 Sol' : 'GPT-5.5')
+          : null,
+        ok: true,
+        pillLabel: 'Thinking effort',
+        policyVariant: 'separate_model',
+        selectedModelIndex: modelChoicesOpen ? selectedModelIndex : null,
+      }
+    }
     return {
       current,
       effortLabel: current === 4 ? 'Pro' : 'Extended',
@@ -285,9 +408,17 @@ globalThis.js = async (source) => {
       modelLabel: 'GPT-5.6 Sol',
       ok: true,
       pillLabel: current === 4 ? 'Pro' : 'Extended',
+      policyVariant: 'coupled_power',
     }
   }
-  if (source.includes('powerItems[0].focus()')) return true
+  if (source.includes('items[0].focus()')) {
+    focusedPolicyControl = source.includes('Select model') ? 'model_trigger' : 'power'
+    return true
+  }
+  if (source.includes('choices[0].focus()')) {
+    focusedPolicyControl = 'first_model'
+    return true
+  }
   if (source.includes('enabledSendCount')) {
     return { composerCount: 1, draftEmpty: true, enabledSendCount: 0, sendCount: 1 }
   }
@@ -371,7 +502,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 8,
+    browserContractRevision: 9,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -465,6 +596,7 @@ await ${EGO_DRIVER_SOURCE.trim()}
 }
 
 async function runAdoptionDriverCase({
+  currentSelectedModelIndex = 0,
   fallbackTaskSpaceOwnership = null,
   hydrateAnchorPrefix = false,
   interleave = false,
@@ -473,6 +605,8 @@ async function runAdoptionDriverCase({
   pageStates = ["authenticated"],
   pageUrl = null,
   pageUrls = null,
+  policyInspectionFailures = 0,
+  policyUiVariant = "legacy",
   policyInitiallyMaximum = true,
   redirectAfterModelVerification = false,
   taskSpaceAvailable = true,
@@ -528,6 +662,9 @@ process.getuid = () => ${JSON.stringify(driverUid)}
 let generating = ${JSON.stringify(initiallyGenerating)}
 let waits = 0
 let policyMenuOpen = false
+let modelChoicesOpen = false
+let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
+let policyInspections = 0
 let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
 let pageInspection = 0
 let pageInfoRead = 0
@@ -609,14 +746,21 @@ globalThis.wait = async () => {
 globalThis.click = async (target) => {
   counters.click += 1
   if (String(target).includes('send-button')) counters.sendClick += 1
-  if (String(target).includes('__composer-pill')) policyMenuOpen = true
+  if (String(target).includes('__composer-pill')) policyMenuOpen = !policyMenuOpen
   if (target === '#prompt-textarea') policyMenuOpen = false
 }
 globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
-globalThis.pressKey = async () => {
-  counters.pressKey += 1
-  policyCurrent = 4
+globalThis.pressKey = async (key) => {
+  if (key === 'ARROWRIGHT') {
+    counters.pressKey += 1
+    policyCurrent = 4
+  }
+  if (key === 'ENTER' && policyMenuOpen) modelChoicesOpen = true
+  if (key === 'ESCAPE') {
+    policyMenuOpen = false
+    modelChoicesOpen = false
+  }
 }
 globalThis.cdp = async () => {}
 globalThis.js = async (source) => {
@@ -661,7 +805,39 @@ globalThis.js = async (source) => {
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
     return messages()
   }
+  if (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount')) {
+    return {
+      count: 1,
+      expanded: policyMenuOpen,
+      label: 'Pro',
+      selectorKind: 'composer_pill',
+    }
+  }
   if (source.includes('aria-valuemin')) {
+    policyInspections += 1
+    if (policyInspections <= ${JSON.stringify(policyInspectionFailures)}) {
+      return { ok: false, reason: 'policy_menu_not_open' }
+    }
+    if (${JSON.stringify(policyUiVariant)} === 'current') {
+      if (${JSON.stringify(redirectAfterModelVerification)}) {
+        pageUrlOverride = 'https://chatgpt.com/g/g-p-adoption-test/project'
+      }
+      return {
+        current: policyCurrent,
+        effortLabel: 'Pro',
+        maximum: 4,
+        minimum: 0,
+        modelChoiceCount: modelChoicesOpen ? 2 : 0,
+        modelChoicesOpen,
+        modelLabel: modelChoicesOpen
+          ? (selectedModelIndex === 0 ? 'GPT-5.6 Sol' : 'GPT-5.5')
+          : null,
+        ok: true,
+        pillLabel: 'Thinking effort',
+        policyVariant: 'separate_model',
+        selectedModelIndex: modelChoicesOpen ? selectedModelIndex : null,
+      }
+    }
     if (${JSON.stringify(redirectAfterModelVerification)}) {
       pageUrlOverride = 'https://chatgpt.com/g/g-p-adoption-test/project'
     }
@@ -673,13 +849,21 @@ globalThis.js = async (source) => {
       modelLabel: 'GPT-5.6 Sol',
       ok: true,
       pillLabel: 'Pro',
+      policyVariant: 'coupled_power',
     }
   }
-  if (source.includes('powerItems[0].focus()')) {
+  if (source.includes('items[0].focus()') || source.includes('choices[0].focus()')) {
     return true
   }
   if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
-    return { composerCount: 1, count: 1, expanded: policyMenuOpen ? 'true' : 'false' }
+    return {
+      composerCount: 1,
+      count: 1,
+      expanded: policyMenuOpen ? 'true' : 'false',
+      policyMenuCount: policyMenuOpen || modelChoicesOpen ? 1 : 0,
+      selectorKind: 'composer_pill',
+      visibleModelChoiceCount: modelChoicesOpen ? 2 : 0,
+    }
   }
   if (source.includes("expanded: pills[0]?.getAttribute('aria-expanded') === 'true'")) {
     return { count: 1, expanded: policyMenuOpen }
@@ -763,7 +947,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 8,
+    browserContractRevision: 9,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -1447,7 +1631,36 @@ test("malformed model-policy attributes stop before composition or send", async 
 
   for (const attributes of cases) {
     const counters = await runMalformedModelPolicyCase(attributes)
-    assert.deepEqual(counters, { cdp: 0, fillInput: 0, pressKey: 0, typeText: 0 })
+    assert.deepEqual(counters, { cdp: 0, click: 0, fillInput: 0, pressKey: 0, typeText: 0 })
+  }
+})
+
+test("ambiguous model-policy controls stop before composition or send", async () => {
+  const valid = {
+    "aria-valuemax": "4",
+    "aria-valuemin": "0",
+    "aria-valuenow": "4",
+  }
+  const cases = [
+    { options: { pillCount: 2 } },
+    { options: { sliderCount: 2 } },
+    {
+      options: {
+        currentModelLabels: ["GPT-5.6 Sol", "GPT-5.6 Sol"],
+        selectedModelIndexes: [0],
+      },
+    },
+    {
+      options: {
+        currentModelLabels: ["GPT-5.6 Sol", "GPT-5.5"],
+        selectedModelIndexes: [0, 1],
+      },
+    },
+  ]
+
+  for (const { options } of cases) {
+    const counters = await runMalformedModelPolicyCase(valid, options)
+    assert.deepEqual(counters, { cdp: 0, click: 0, fillInput: 0, pressKey: 0, typeText: 0 })
   }
 })
 
@@ -1457,9 +1670,23 @@ test("a live policy downgrade after composition stops before Send", async () => 
   assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
   assert.equal(stopped.error?.details?.evidence?.powerLevel, 4)
   assert.equal(stopped.error?.details?.evidence?.powerMax, 5)
-  assert.equal(stopped.counters.policyReads, 3)
+  assert.equal(stopped.counters.policyReads, 2)
   assert.equal(stopped.counters.composerMutations, 1)
   assert.equal(stopped.counters.insertText, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("current policy repair selects the provider-first model before composition", async () => {
+  const stopped = await runPreSendDriverCase({
+    currentSelectedModelIndex: 1,
+    downgradeAtPresend: true,
+    policyUiVariant: "current",
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.counters.modelSelections, 1)
+  assert.equal(stopped.counters.policyReads, 8)
+  assert.equal(stopped.counters.composerMutations, 1)
   assert.equal(stopped.counters.mouseEvents, 0)
 })
 
@@ -1499,7 +1726,7 @@ test("a changed Send control after final prompt verification stops before dispat
   const stopped = await runPreSendDriverCase({ changeSendControlAtRecheck: true })
   assert.equal(stopped.error?.code, "human_required")
   assert.equal(stopped.error?.details?.reason, "send_control_changed")
-  assert.equal(stopped.counters.policyReads, 3)
+  assert.equal(stopped.counters.policyReads, 2)
   assert.equal(stopped.counters.sendTargetReads, 2)
   assert.equal(stopped.counters.mouseEvents, 0)
 })
@@ -1508,7 +1735,7 @@ test("a broker fence change after Send hit-testing stops before dispatch", async
   const stopped = await runPreSendDriverCase({ fenceAtRecheck: true })
   assert.equal(stopped.error?.code, "human_required")
   assert.equal(stopped.error?.details?.reason, "broker_fence_lost")
-  assert.equal(stopped.counters.policyReads, 3)
+  assert.equal(stopped.counters.policyReads, 2)
   assert.equal(stopped.counters.sendTargetReads, 2)
   assert.equal(stopped.counters.mouseEvents, 0)
 })
@@ -1736,6 +1963,50 @@ test("conversation adoption rechecks the URL after maximum-model verification", 
   assert.equal(adopted.counters.typeText, 0)
 })
 
+test("conversation adoption reads the current semantic model policy", async () => {
+  const adopted = await runAdoptionDriverCase({ policyUiVariant: "current" })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(adopted.result.modelPolicy.effortLabel, "Pro")
+  assert.equal(adopted.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.result.modelPolicy.powerMax, 5)
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption reopens one transiently unresolved policy menu", async () => {
+  const adopted = await runAdoptionDriverCase({
+    policyInspectionFailures: 5,
+    policyUiVariant: "current",
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(adopted.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.result.modelPolicy.powerMax, 5)
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption rejects a non-leading current model without changing it", async () => {
+  const adopted = await runAdoptionDriverCase({
+    currentSelectedModelIndex: 1,
+    policyUiVariant: "current",
+  })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(adopted.error?.details?.evidence?.modelPosition, 2)
+  assert.equal(adopted.error?.details?.evidence?.modelCount, 2)
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
 test("conversation adoption never routes around a user-controlled bound task space", async () => {
   const adopted = await runAdoptionDriverCase({ taskSpaceOwnership: "user" })
   assert.equal(adopted.result, undefined)
@@ -1795,14 +2066,15 @@ test("bound recovery ignores a recycled agent-owned numeric task space", async (
   assert.equal(reconciled.taskSpaceRequests.length, 1)
 })
 
-test("bound recovery stops instead of bypassing a user-controlled stale task space", async () => {
+test("bound recovery ignores a recycled user-controlled numeric task space", async () => {
   const reconciled = await runTaskSpaceReconciliationCase({
     requestedTaskSpaceOwnership: "user",
   })
-  assert.equal(reconciled.result, undefined)
-  assert.equal(reconciled.error?.code, "human_required")
-  assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
-  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 11)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.equal(reconciled.taskSpaceRequests.length, 1)
 })
 
 test("bound recovery stops instead of bypassing a user-controlled deterministic task space", async () => {

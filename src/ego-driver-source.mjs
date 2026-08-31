@@ -481,11 +481,9 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
     const fallbackName = boundTaskSpaceName(binding)
     const fallback = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, fallbackName))
-    const controlled = [requested, fallback]
-      .find((taskSpace) => taskSpace?.ownership && taskSpace.ownership !== "agent")
-    if (controlled) {
+    if (fallback?.ownership && fallback.ownership !== "agent") {
       humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
-        taskSpaceId: controlled.id,
+        taskSpaceId: fallback.id,
       })
       return null
     }
@@ -564,25 +562,105 @@ async function egoDriverMain(inputPathOverride = undefined) {
     return { ...inspection, accountState: "unknown" }
   }
 
+  function safePolicyLabel(value) {
+    return typeof value === "string"
+      && value.length > 0
+      && value.length <= 120
+      && !/[\u0000-\u001F\u007F]/.test(value)
+  }
+
+  async function inspectModelPolicyTrigger() {
+    return js(String.raw`(() => {
+      const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composer = document.querySelector('#prompt-textarea')
+      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
+      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+        .filter(visible)
+      const semanticPills = classPills.length > 0
+        ? classPills
+        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
+      return {
+        count: semanticPills.length,
+        expanded: semanticPills[0]?.getAttribute('aria-expanded') === 'true',
+        label: clean(semanticPills[0]?.innerText || semanticPills[0]?.textContent),
+        selectorKind: classPills.length === 1 ? 'composer_pill' : 'semantic_menu_button',
+      }
+    })()`)
+  }
+
+  async function focusModelPolicyTrigger() {
+    return js(String.raw`(() => {
+      const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composer = document.querySelector('#prompt-textarea')
+      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
+      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+        .filter(visible)
+      const pills = classPills.length > 0
+        ? classPills
+        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
+      if (pills.length !== 1) {
+        return false
+      }
+      pills[0].focus()
+      return document.activeElement === pills[0]
+    })()`)
+  }
+
   async function inspectModelPolicyMenu() {
     return js(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
-      const pills = [...document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composer = document.querySelector('#prompt-textarea')
+      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
+      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
         .filter(visible)
+      const pills = classPills.length > 0
+        ? classPills
+        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
       if (pills.length !== 1) {
         return { ok: false, pillCount: pills.length, reason: 'policy_trigger_count' }
       }
 
       const pill = pills[0]
       const menuId = pill.getAttribute('aria-controls')
-      const menu = menuId ? document.getElementById(menuId) : null
+      const controlledMenu = menuId ? document.getElementById(menuId) : null
+      const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+        .filter(visible)
+        .filter((menu) => menu.querySelector('[role="menuitem"][aria-label="Power"]'))
+      const menu = visible(controlledMenu) && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
+        ? controlledMenu
+        : policyMenus.length === 1 ? policyMenus[0] : null
       if (pill.getAttribute('aria-expanded') !== 'true' || !visible(menu)) {
-        return { ok: false, reason: 'policy_menu_not_open' }
+        return {
+          ok: false,
+          policyMenuCount: policyMenus.length,
+          reason: 'policy_menu_not_open',
+        }
       }
 
       const powerItems = [...menu.querySelectorAll('[role="menuitem"][aria-label="Power"]')]
         .filter(visible)
-      const slider = powerItems[0]?.querySelector('[role="slider"]')
+      const sliders = powerItems.length === 1
+        ? [...powerItems[0].querySelectorAll('[role="slider"]')].filter(visible)
+        : []
+      const slider = sliders[0]
       const strictInteger = (raw) => {
         if (typeof raw !== 'string') {
           return null
@@ -597,15 +675,24 @@ async function egoDriverMain(inputPathOverride = undefined) {
       const minimum = strictInteger(slider?.getAttribute('aria-valuemin'))
       const maximum = strictInteger(slider?.getAttribute('aria-valuemax'))
       const current = strictInteger(slider?.getAttribute('aria-valuenow'))
-      const rows = [...menu.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')]
-        .filter(visible)
-        .map((row) => String(row.innerText || row.textContent || '').trim().replace(/\s+/g, ' '))
+      const menuItems = [...menu.querySelectorAll('[role="menuitem"]')].filter(visible)
+      const rows = menuItems
+        .filter((row) => row.getAttribute('aria-haspopup') === 'menu')
+        .map((row) => clean(row.innerText || row.textContent))
       const modelRows = rows.filter((row) => row.startsWith('Model '))
       const effortRows = rows.filter((row) => row.startsWith('Effort '))
+      const modelTriggers = menuItems.filter((row) => row.getAttribute('aria-label') === 'Select model')
+      const modelChoices = [...menu.querySelectorAll('[role="menuitemradio"]')]
+        .filter(visible)
+        .filter((row) => row.getAttribute('aria-disabled') !== 'true')
+      const modelLabels = modelChoices.map((row) => clean(row.innerText || row.textContent))
+      const selectedModelIndexes = modelChoices
+        .map((row, index) => row.getAttribute('aria-checked') === 'true' ? index : -1)
+        .filter((index) => index >= 0)
 
       if (
         powerItems.length !== 1
-        || !slider
+        || sliders.length !== 1
         || !Number.isInteger(minimum)
         || !Number.isInteger(maximum)
         || !Number.isInteger(current)
@@ -613,8 +700,6 @@ async function egoDriverMain(inputPathOverride = undefined) {
         || current < minimum
         || maximum < current
         || maximum - minimum + 1 > 20
-        || modelRows.length !== 1
-        || effortRows.length !== 1
       ) {
         return {
           current,
@@ -624,27 +709,78 @@ async function egoDriverMain(inputPathOverride = undefined) {
           modelRowCount: modelRows.length,
           ok: false,
           powerItemCount: powerItems.length,
+          sliderCount: sliders.length,
           reason: 'policy_menu_structure',
         }
       }
 
+      if (modelRows.length === 1 && effortRows.length === 1 && modelTriggers.length === 0) {
+        return {
+          current,
+          effortLabel: effortRows[0].slice('Effort '.length).trim(),
+          maximum,
+          minimum,
+          modelLabel: modelRows[0].slice('Model '.length).trim(),
+          ok: true,
+          pillLabel: clean(pill.innerText || pill.textContent),
+          policyVariant: 'coupled_power',
+        }
+      }
+
+      if (modelTriggers.length === 1 && modelRows.length === 0 && effortRows.length === 0) {
+        const modelChoicesOpen = modelChoices.length > 0
+        const modelLabelsValid = !modelChoicesOpen || (
+          modelChoices.length <= 20
+          && selectedModelIndexes.length === 1
+          && modelLabels.every((label) => (
+            label.length > 0
+            && label.length <= 120
+            && !/[\u0000-\u001F\u007F]/.test(label)
+          ))
+          && new Set(modelLabels).size === modelLabels.length
+        )
+        if (!modelLabelsValid) {
+          return {
+            modelChoiceCount: modelChoices.length,
+            ok: false,
+            reason: 'policy_model_choices',
+            selectedModelCount: selectedModelIndexes.length,
+          }
+        }
+        return {
+          current,
+          effortLabel: clean(modelTriggers[0].innerText || modelTriggers[0].textContent),
+          maximum,
+          minimum,
+          modelChoiceCount: modelChoices.length,
+          modelChoicesOpen,
+          modelLabel: modelChoicesOpen ? modelLabels[selectedModelIndexes[0]] : null,
+          ok: true,
+          pillLabel: clean(pill.innerText || pill.textContent),
+          policyVariant: 'separate_model',
+          selectedModelIndex: modelChoicesOpen ? selectedModelIndexes[0] : null,
+        }
+      }
+
       return {
-        current,
-        effortLabel: effortRows[0].slice('Effort '.length).trim(),
-        maximum,
-        minimum,
-        modelLabel: modelRows[0].slice('Model '.length).trim(),
-        ok: true,
-        pillLabel: String(pill.innerText || pill.textContent || '').trim().replace(/\s+/g, ' '),
+        effortRowCount: effortRows.length,
+        modelChoiceCount: modelChoices.length,
+        modelRowCount: modelRows.length,
+        modelTriggerCount: modelTriggers.length,
+        ok: false,
+        reason: 'policy_model_structure',
       }
     })()`)
   }
 
-  async function waitForModelPolicyMenu() {
+  async function waitForModelPolicyMenu(requireModelChoices = false) {
     let inspection
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       inspection = await inspectModelPolicyMenu()
-      if (inspection.ok) {
+      if (
+        inspection.ok
+        && (!requireModelChoices || inspection.policyVariant !== "separate_model" || inspection.modelChoicesOpen)
+      ) {
         return inspection
       }
       await wait(1)
@@ -653,37 +789,153 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function closeModelPolicyMenu() {
-    let dismissalAttempted = false
-    for (let attempt = 0; attempt < 6; attempt += 1) {
+    let composerDismissalAttempted = false
+    for (let attempt = 0; attempt < 8; attempt += 1) {
       const state = await js(String.raw`(() => {
-        const pills = [...document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
-          .filter((element) => element.getClientRects().length > 0)
+        const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+        const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+        const composer = document.querySelector('#prompt-textarea')
+        const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
+        const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+          .filter(visible)
+        const pills = classPills.length > 0
+          ? classPills
+          : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+              .filter(visible)
+              .filter((element) => (
+                element.getAttribute('data-testid') !== 'composer-plus-btn'
+                && clean(element.innerText || element.textContent).length > 0
+              ))
+        const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+          .filter(visible)
+          .filter((menu) => (
+            menu.querySelector('[role="menuitem"][aria-label="Power"]')
+            || menu.querySelector('[role="menuitemradio"]')
+          ))
         return {
           composerCount: document.querySelectorAll('#prompt-textarea').length,
           count: pills.length,
           expanded: pills[0]?.getAttribute('aria-expanded'),
+          policyMenuCount: policyMenus.length,
+          selectorKind: classPills.length === 1 ? 'composer_pill' : 'semantic_menu_button',
+          visibleModelChoiceCount: [...document.querySelectorAll('[role="menuitemradio"]')]
+            .filter(visible).length,
         }
       })()`)
-      if (state.count !== 1) {
-        await wait(1)
-        continue
-      }
-      if (state.expanded === "false") {
+      if (
+        state.count === 1
+        && state.expanded === "false"
+        && state.policyMenuCount === 0
+        && state.visibleModelChoiceCount === 0
+      ) {
         return true
       }
-      if (state.expanded !== "true") {
+      if (state.count === 1 && state.expanded === "true") {
+        if (state.selectorKind === "composer_pill") {
+          await click('button.__composer-pill[aria-haspopup="menu"]', { label: "close ChatGPT policy menu" })
+        } else {
+          const focused = await focusModelPolicyTrigger()
+          if (!focused) {
+            await wait(1)
+            continue
+          }
+          await pressKey("ENTER")
+        }
         await wait(1)
         continue
       }
-      if (state.composerCount !== 1 || dismissalAttempted) {
+      if (state.policyMenuCount > 0 || state.visibleModelChoiceCount > 0) {
+        await pressKey("ESCAPE")
+        await wait(1)
+        continue
+      }
+      if (state.count !== 1 || state.composerCount !== 1 || composerDismissalAttempted) {
         await wait(1)
         continue
       }
       await click('#prompt-textarea', { label: "dismiss ChatGPT policy menu" })
-      dismissalAttempted = true
+      composerDismissalAttempted = true
       await wait(1)
     }
     return false
+  }
+
+  async function focusPolicyMenuItem(ariaLabel) {
+    const labelLiteral = JSON.stringify(ariaLabel)
+    return js(String.raw`(() => {
+      const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+      const items = [...document.querySelectorAll('[role="menuitem"]')]
+        .filter(visible)
+        .filter((element) => element.getAttribute('aria-label') === ${labelLiteral})
+      if (items.length !== 1) {
+        return false
+      }
+      items[0].focus()
+      return document.activeElement === items[0]
+    })()`)
+  }
+
+  async function focusFirstModelChoice() {
+    return js(String.raw`(() => {
+      const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+      const choices = [...document.querySelectorAll('[role="menuitemradio"]')]
+        .filter(visible)
+        .filter((element) => element.getAttribute('aria-disabled') !== 'true')
+      if (choices.length < 1 || choices.length > 20) {
+        return false
+      }
+      choices[0].focus()
+      return document.activeElement === choices[0]
+    })()`)
+  }
+
+  async function openModelPolicyState(requireModelChoices = true) {
+    const trigger = await inspectModelPolicyTrigger()
+    if (trigger.count !== 1 || !safePolicyLabel(trigger.label)) {
+      return { ok: false, reason: "policy_trigger_count", trigger }
+    }
+    if (!trigger.expanded) {
+      if (trigger.selectorKind === "composer_pill") {
+        await click('button.__composer-pill[aria-haspopup="menu"]', { label: "open ChatGPT policy menu" })
+      } else {
+        const focused = await focusModelPolicyTrigger()
+        if (!focused) {
+          return { ok: false, reason: "policy_trigger_focus", trigger }
+        }
+        await pressKey("ENTER")
+      }
+      await wait(1)
+    }
+
+    let state = await waitForModelPolicyMenu()
+    if (!state.ok) {
+      return { ok: false, reason: state.reason, state, trigger }
+    }
+    if (requireModelChoices && state.policyVariant === "separate_model" && !state.modelChoicesOpen) {
+      const focused = await focusPolicyMenuItem("Select model")
+      if (!focused) {
+        return { ok: false, reason: "policy_model_trigger_focus", state, trigger }
+      }
+      await pressKey("ENTER")
+      await wait(1)
+      state = await waitForModelPolicyMenu(true)
+      if (!state.ok || !state.modelChoicesOpen) {
+        return { ok: false, reason: state.reason ?? "policy_model_choices_closed", state, trigger }
+      }
+    }
+    return { ok: true, state, trigger }
+  }
+
+  async function openStableModelPolicyState(requireModelChoices = true) {
+    const first = await openModelPolicyState(requireModelChoices)
+    if (first.ok) {
+      return first
+    }
+    if (!await closeModelPolicyMenu()) {
+      return { ...first, reason: "policy_menu_recovery_close" }
+    }
+    await wait(1)
+    return openModelPolicyState(requireModelChoices)
   }
 
   async function ensureMaximumModelPolicy(selected) {
@@ -702,77 +954,88 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return null
     }
 
-    const trigger = await js(String.raw`(() => {
-      const pills = [...document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
-        .filter((element) => element.getClientRects().length > 0)
-      return {
-        count: pills.length,
-        expanded: pills[0]?.getAttribute('aria-expanded') === 'true',
-      }
-    })()`)
-    if (trigger.count !== 1) {
-      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not be identified unambiguously.", {
-        pillCount: trigger.count,
+    let opened = await openStableModelPolicyState()
+    if (!opened.ok) {
+      await closeModelPolicyMenu()
+      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power menu did not expose a safe semantic policy control.", {
+        reason: opened.reason,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return null
     }
-    if (!trigger.expanded) {
-      await click('button.__composer-pill[aria-haspopup="menu"]', { label: "open ChatGPT policy menu" })
+    const before = opened.state
+    let adjusted = false
+    if (before.policyVariant === "separate_model" && before.selectedModelIndex !== 0) {
+      const focused = await focusFirstModelChoice()
+      if (!focused) {
+        await closeModelPolicyMenu()
+        humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not receive safe keyboard input.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return null
+      }
+      await pressKey("ENTER")
+      adjusted = true
+      await wait(1)
+      if (!await closeModelPolicyMenu()) {
+        humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close after selecting the strongest model.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return null
+      }
+      opened = await openStableModelPolicyState()
+      if (!opened.ok) {
+        await closeModelPolicyMenu()
+        humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not be verified after selection.", {
+          reason: opened.reason,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return null
+      }
+    }
+
+    const currentState = opened.state
+    if (currentState.current < currentState.maximum) {
+      const focused = await focusPolicyMenuItem("Power")
+      if (!focused) {
+        await closeModelPolicyMenu()
+        humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not receive safe keyboard input.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return null
+      }
+      for (let step = currentState.current; step < currentState.maximum; step += 1) {
+        await pressKey("ARROWRIGHT")
+      }
+      adjusted = true
       await wait(1)
     }
 
-    const before = await waitForModelPolicyMenu()
-    if (!before.ok) {
-      await closeModelPolicyMenu()
-      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power menu did not expose a safe semantic policy control.", {
-        reason: before.reason,
+    if (!await closeModelPolicyMenu()) {
+      humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close cleanly before final verification.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
       return null
     }
-
-    const focused = await js(String.raw`(() => {
-      const pill = document.querySelector('button.__composer-pill[aria-haspopup="menu"]')
-      const menu = pill?.getAttribute('aria-controls')
-        ? document.getElementById(pill.getAttribute('aria-controls'))
-        : null
-      const powerItems = [...(menu?.querySelectorAll('[role="menuitem"][aria-label="Power"]') || [])]
-        .filter((element) => element.getClientRects().length > 0)
-      if (powerItems.length !== 1) {
-        return false
-      }
-      powerItems[0].focus()
-      return document.activeElement === powerItems[0]
-    })()`)
-    if (!focused) {
-      await closeModelPolicyMenu()
-      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not receive safe keyboard input.", {
-        targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      })
-      return null
-    }
-
-    const keyPressCount = Math.max(1, before.maximum - before.current)
-    for (let step = 0; step < keyPressCount; step += 1) {
-      await pressKey("ARROWRIGHT")
-    }
-    await wait(1)
-
-    const after = await waitForModelPolicyMenu()
-    const labelsValid = after.ok
-      && after.modelLabel.length <= 120
-      && after.effortLabel.length <= 120
-      && after.pillLabel.length <= 120
-      && !/[\u0000-\u001F\u007F]/.test(`${after.modelLabel}${after.effortLabel}${after.pillLabel}`)
+    const afterRead = adjusted ? await openStableModelPolicyState() : opened
+    const after = afterRead.state
+    const labelsValid = afterRead.ok
+      && safePolicyLabel(after.modelLabel)
+      && safePolicyLabel(after.effortLabel)
+      && (after.policyVariant !== "separate_model" || after.selectedModelIndex === 0)
     if (!labelsValid || after.current !== after.maximum) {
       await closeModelPolicyMenu()
       humanRequired("model_policy_mismatch", "ChatGPT did not confirm its strongest available model and maximum thinking setting.", {
-        powerLevel: after.ok ? after.current - after.minimum + 1 : null,
-        powerMax: after.ok ? after.maximum - after.minimum + 1 : null,
+        modelCount: after?.modelChoiceCount ?? null,
+        modelPosition: Number.isInteger(after?.selectedModelIndex) ? after.selectedModelIndex + 1 : null,
+        powerLevel: after?.ok ? after.current - after.minimum + 1 : null,
+        powerMax: after?.ok ? after.maximum - after.minimum + 1 : null,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
@@ -788,12 +1051,24 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return null
     }
 
+    const finalTrigger = await inspectModelPolicyTrigger()
+    const pillLabel = finalTrigger.count === 1 && !finalTrigger.expanded
+      ? finalTrigger.label
+      : null
+    if (!safePolicyLabel(pillLabel)) {
+      humanRequired("model_policy_ui_unknown", "The closed ChatGPT model policy control could not be read safely.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return null
+    }
+
     return {
-      adjusted: before.current !== before.maximum,
-      effortLabel: after.effortLabel,
+      adjusted,
+      effortLabel: after.policyVariant === "separate_model" ? pillLabel : after.effortLabel,
       key: policy.key,
       modelLabel: after.modelLabel,
-      pillLabel: after.pillLabel,
+      pillLabel,
       powerLevel: after.current - after.minimum + 1,
       powerMax: after.maximum - after.minimum + 1,
     }
@@ -815,36 +1090,20 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return null
     }
 
-    const trigger = await js(String.raw`(() => {
-      const pills = [...document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
-        .filter((element) => element.getClientRects().length > 0)
-      return {
-        count: pills.length,
-        expanded: pills[0]?.getAttribute('aria-expanded') === 'true',
-      }
-    })()`)
-    if (trigger.count !== 1) {
-      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not be identified unambiguously.", {
-        pillCount: trigger.count,
-        targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      })
-      return null
-    }
-    if (!trigger.expanded) {
-      await click('button.__composer-pill[aria-haspopup="menu"]', { label: "inspect ChatGPT policy menu" })
-      await wait(1)
-    }
-
-    const observed = await waitForModelPolicyMenu()
-    const labelsValid = observed.ok
-      && observed.modelLabel.length <= 120
-      && observed.effortLabel.length <= 120
-      && observed.pillLabel.length <= 120
-      && !/[\u0000-\u001F\u007F]/.test(`${observed.modelLabel}${observed.effortLabel}${observed.pillLabel}`)
+    const opened = await openStableModelPolicyState()
+    const observed = opened.state
     const closed = await closeModelPolicyMenu()
+    const finalTrigger = closed ? await inspectModelPolicyTrigger() : null
+    const pillLabel = finalTrigger?.count === 1 && !finalTrigger.expanded
+      ? finalTrigger.label
+      : null
+    const labelsValid = opened.ok
+      && safePolicyLabel(observed.modelLabel)
+      && safePolicyLabel(observed.effortLabel)
+      && safePolicyLabel(pillLabel)
     if (!labelsValid || !closed) {
       humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power policy could not be read safely during adoption.", {
+        reason: opened.reason ?? null,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
@@ -853,10 +1112,15 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
     const powerLevel = observed.current - observed.minimum + 1
     const powerMax = observed.maximum - observed.minimum + 1
-    if (observed.current !== observed.maximum) {
+    if (
+      observed.current !== observed.maximum
+      || (observed.policyVariant === "separate_model" && observed.selectedModelIndex !== 0)
+    ) {
       humanRequired("adoption_live_model_not_maximum", "The existing response cannot be adopted because the conversation's live policy is not currently at ChatGPT's maximum setting.", {
         effortLabel: observed.effortLabel,
+        modelCount: observed.modelChoiceCount ?? null,
         modelLabel: observed.modelLabel,
+        modelPosition: Number.isInteger(observed.selectedModelIndex) ? observed.selectedModelIndex + 1 : null,
         powerLevel,
         powerMax,
         targetId: selected.targetId,
@@ -867,10 +1131,10 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
     return {
       adjusted: false,
-      effortLabel: observed.effortLabel,
+      effortLabel: observed.policyVariant === "separate_model" ? pillLabel : observed.effortLabel,
       key: policy.key,
       modelLabel: observed.modelLabel,
-      pillLabel: observed.pillLabel,
+      pillLabel,
       powerLevel,
       powerMax,
     }
@@ -1320,7 +1584,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 8) {
+    if (input.browserContractRevision !== 9) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1427,7 +1691,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 8) {
+    if (input.browserContractRevision !== 9) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1643,7 +1907,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 8) {
+    if (input.browserContractRevision !== 9) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -2228,7 +2492,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "reanchor") {
-      if (input.browserContractRevision !== 8) {
+      if (input.browserContractRevision !== 9) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
         return
       }
