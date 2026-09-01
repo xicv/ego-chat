@@ -107,12 +107,15 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
 
   const firstClient = await connectClient(env)
   const tools = await firstClient.listTools()
-  assert.match(firstClient.getInstructions(), /binding ego-chat-main/)
-  assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
-  assert.match(firstClient.getInstructions(), /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
-  assert.match(firstClient.getInstructions(), /retry internally with a deterministic fresh marker only after durable reconciliation proves/)
-  assert.match(firstClient.getInstructions(), /explicitly authorizes reclaiming the exact binding-owned Ego task space/)
-  assert.match(firstClient.getInstructions(), /post-settlement commit, push, merge, deploy, or release work outside the review target/)
+  const instructions = firstClient.getInstructions()
+  assert.match(instructions, /binding ego-chat-main/)
+  assert.match(instructions, /ego_converge_until_settled/)
+  assert.match(instructions, /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
+  assert.match(instructions, /retry internally with a deterministic fresh marker only after durable reconciliation proves/)
+  assert.match(instructions, /explicitly authorizes reclaiming the exact binding-owned Ego task space/)
+  assert.match(instructions, /post-settlement commit, push, merge, deploy, or release work outside the review target/)
+  assert.match(instructions, /Never call ego_verify_conversation as a preflight for a fresh send/)
+  assert.match(instructions, /use ego_get_conversation instead/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_adopt_conversation_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_conversation_adoption"))
@@ -121,6 +124,22 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
+  const getBindingTool = tools.tools.find((tool) => tool.name === "ego_get_conversation")
+  assert.match(getBindingTool.description, /preferred preflight for binding identity/)
+  const verifyTool = tools.tools.find((tool) => tool.name === "ego_verify_conversation")
+  assert.match(verifyTool.description, /maintenance checkpoint/)
+  assert.match(verifyTool.description, /never reclaims browser control/)
+  assert.match(verifyTool.description, /not a preflight for an exchange or review/)
+  for (const toolName of [
+    "ego_exchange_and_wait",
+    "ego_review_candidate_and_wait",
+    "ego_start_exchange",
+    "ego_start_convergence",
+    "ego_converge_until_settled",
+  ]) {
+    const freshSendTool = tools.tools.find((tool) => tool.name === toolName)
+    assert.match(freshSendTool.description, /do not call ego_verify_conversation first/)
+  }
   const reanchorTool = tools.tools.find((tool) => tool.name === "ego_reanchor_conversation")
   assert.ok(reanchorTool)
   assert.equal(

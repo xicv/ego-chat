@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 
 export const APP_NAME = "ego-chat"
-export const APP_VERSION = "0.2.10"
+export const APP_VERSION = "0.2.11"
 export const BROWSER_CONTRACT_REVISION = 10
 export const IPC_VERSION = 1
 
@@ -10,7 +10,7 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 6,
-  runtimeGeneration: "2026-09-01.1",
+  runtimeGeneration: "2026-09-01.2",
   storeSchemaRevision: 4,
 }
 

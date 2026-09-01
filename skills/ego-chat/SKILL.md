@@ -7,7 +7,7 @@ description: Use the local Ego Chat MCP server from Codex or ZCode for Token-Sav
 
 Use the `ego_chat` MCP server. Choose the loop by implementation ownership, not merely by whether the current host is Codex or ZCode. If the tools are unavailable, stop and tell the user to run `ego-chat setup` for Codex or `ego-chat setup-zcode` for ZCode, then restart that app. Do not substitute another browser or manually copy messages.
 
-Use binding `ego-chat-main` unless the user explicitly names another binding. Read or verify the binding when identity is uncertain. Never replace an existing binding or create another persistent chat without explicit authorization.
+Use binding `ego-chat-main` unless the user explicitly names another binding. When binding identity is uncertain, inspect durable state with `ego_get_conversation`; it does not touch the browser. Never call `ego_verify_conversation` as a preflight for an exchange or review: every fresh send already verifies its canonical URL, stable head, live model policy, and browser readiness, and only that fresh-send path can apply an authorized task-space reclaim. Reserve `ego_verify_conversation` for an explicitly requested maintenance checkpoint or the documented migration/reconciliation cases that require establishing a head. Never replace an existing binding or create another persistent chat without explicit authorization.
 
 Different bindings may operate concurrently only when their canonical conversations and Ego task spaces are also different. Never start two adoptions or sends against the same private conversation. Let the broker's reservation errors stop before browser work rather than evading them with another binding or task space.
 
