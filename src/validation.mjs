@@ -177,6 +177,7 @@ const ConversationHeadAnchorSchema = z.object({
 }).strict()
 
 export const EgoExchangeSchema = z.object({
+  allowTaskSpaceReclaim: z.literal(true).optional(),
   bindingKey: BindingKeySchema,
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
@@ -190,6 +191,7 @@ const ConvergenceTextSchema = (maximum) => z.string().trim().min(1).max(maximum)
 
 export const StartConvergenceSchema = z.object({
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
+  allowTaskSpaceReclaim: z.literal(true).optional(),
   bindingKey: BindingKeySchema,
   chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),

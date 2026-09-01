@@ -136,6 +136,7 @@ class FakeConvergenceAppServer {
 
 function createConvergenceEgoAdapter(reviewFactory) {
   let exchanges = 0
+  const taskSpaceReclaimAuthorizations = []
   return {
     adapter: {
       ...unusedEgoAdapter,
@@ -147,6 +148,7 @@ function createConvergenceEgoAdapter(reviewFactory) {
       }),
       exchange: async (input) => {
         exchanges += 1
+        taskSpaceReclaimAuthorizations.push(input.allowTaskSpaceReclaim === true)
         assert.equal(input.modelPolicy.modelSelection, "strongest_available")
         assert.equal(input.modelPolicy.thinkingEffort, "maximum_available")
         const review = reviewFactory(parseConvergenceIdentity(input.prompt), exchanges)
@@ -173,6 +175,9 @@ function createConvergenceEgoAdapter(reviewFactory) {
     },
     get exchanges() {
       return exchanges
+    },
+    get taskSpaceReclaimAuthorizations() {
+      return [...taskSpaceReclaimAuthorizations]
     },
   }
 }
@@ -343,6 +348,94 @@ test("create-once binding is promoted and reused for every later exchange", asyn
   assert.equal(modelPolicy.thinkingEffort, "maximum_available")
   assert.equal(modelPolicy.revision, 2)
   assert.equal(modelPolicy.lastObserved.powerLevel, 5)
+})
+
+test("fresh-send task-space reclaim authority is durable for Send but stripped from capture", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-reclaim"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECLAIM_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECLAIM_TEST"
+  let captures = 0
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "task-space-reclaim-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "task-space-reclaim-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "task-space-reclaim-tab",
+      taskSpaceId: 12,
+    }),
+    captureExchange: async (input) => {
+      captures += 1
+      assert.equal(Object.hasOwn(input, "allowTaskSpaceReclaim"), false)
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "task-space-reclaim-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "task-space-reclaim-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "task-space-reclaim-tab",
+        taskSpaceId: 12,
+        turnMarker,
+      }
+    },
+    sendExchange: async (input) => {
+      sends += 1
+      assert.equal(input.allowTaskSpaceReclaim, true)
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "task-space-reclaim-user",
+        sentAt: new Date().toISOString(),
+        targetId: "task-space-reclaim-tab",
+        taskSpaceControlRecovery: { method: "claim", taskSpaceId: 12 },
+        taskSpaceId: 12,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 12,
+  })
+
+  const started = await broker.startEgoExchange({
+    allowTaskSpaceReclaim: true,
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nReview with explicit task-space recovery.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.deepEqual(completed.result.taskSpaceControlRecovery, {
+    method: "claim",
+    taskSpaceId: 12,
+  })
+  assert.equal(sends, 1)
+  assert.equal(captures, 1)
 })
 
 test("event checkpoints bound the active ledger and result blobs are digest verified", async (t) => {
@@ -1597,9 +1690,17 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
     return {
       ...identity,
       criteria: [
-        { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
         {
-          evidence: settled ? "The second cycle resolved the review." : "Another cycle is required.",
+          ...(settled
+            ? { evidence: "The target digest is exact." }
+            : { assessment: "The target digest is exact." }),
+          id: "AC-1",
+          status: "pass",
+        },
+        {
+          ...(settled
+            ? { evidence: "The second cycle resolved the review." }
+            : { assessment: "Another cycle is required." }),
           id: "AC-2",
           status: settled ? "pass" : "fail",
         },
@@ -1635,6 +1736,7 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
       "Every turn binds the immutable target identity.",
       "An independent second-cycle review settles the candidate.",
     ],
+    allowTaskSpaceReclaim: true,
     bindingKey: "ego-chat-main",
     codexSandbox: "read-only",
     cwd: process.cwd(),
@@ -1652,6 +1754,7 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(appServer.additionalContexts[0], null)
   assert.equal(appServer.additionalContexts[1].chatgpt_review.kind, "untrusted")
   assert.equal(ego.exchanges, 2)
+  assert.deepEqual(ego.taskSpaceReclaimAuthorizations, [true, true])
   assert.equal(appServer.closed, true)
   assert.equal(broker.getConversationBinding({ bindingKey: "ego-chat-main" }).revision, 3)
   assert.equal(broker.getModelPolicy().revision, 2)

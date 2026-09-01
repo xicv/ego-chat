@@ -75,6 +75,57 @@ test("settlement binds exact target, candidate, cycle, and complete criterion ev
   assert.deepEqual(evaluateReview(parsed), { settled: true })
 })
 
+test("an unambiguous ChatGPT assessment alias is normalized without another browser send", () => {
+  const contract = createContract("Consume one already-delivered review safely.", [
+    "The delivered criterion assessment remains available as evidence.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_ALIAS1234"
+  const aliased = reviewFor(contract, candidateDigest, {
+    criteria: [{ assessment: "The exact candidate was independently verified.", id: "AC-1", status: "pass" }],
+  })
+
+  const parsed = parseChatGptReview(`${JSON.stringify(aliased)}\n${terminalMarker}`, {
+    candidateDigest,
+    criteria: contract.criteria,
+    cycle: 1,
+    targetDigest: contract.targetDigest,
+    terminalMarker,
+  })
+
+  assert.deepEqual(parsed.criteria, [{
+    evidence: "The exact candidate was independently verified.",
+    id: "AC-1",
+    status: "pass",
+  }])
+
+  for (const criteria of [
+    [{
+      assessment: "Conflicting alias.",
+      evidence: "Canonical evidence.",
+      id: "AC-1",
+      status: "pass",
+    }],
+    [{
+      assessment: "Aliased evidence.",
+      id: "AC-1",
+      note: "Unexpected extra field.",
+      status: "pass",
+    }],
+  ]) {
+    assert.throws(
+      () => parseChatGptReview(`${JSON.stringify(reviewFor(contract, candidateDigest, { criteria }))}\n${terminalMarker}`, {
+        candidateDigest,
+        criteria: contract.criteria,
+        cycle: 1,
+        targetDigest: contract.targetDigest,
+        terminalMarker,
+      }),
+      (error) => error.details?.reason === "convergence_protocol_invalid",
+    )
+  }
+})
+
 test("forged identities and incomplete settlement claims fail closed", () => {
   const contract = createContract("Settle safely.", ["One criterion passes."])
   const candidateDigest = digestJson(candidateFor(contract))
@@ -134,7 +185,7 @@ test("continuation must be actionable and browser feedback stays explicitly untr
     cycle: 1,
     terminalMarker: "EGO_CHAT_REVIEW_DONE_SCHEMA123",
     turnMarker: "EGO_CHAT_CONVERGENCE_SCHEMA123_C1",
-  }), /finding id must start with B-/)
+  }), /Each criteria item must contain exactly id, status, and evidence/)
 })
 
 test("Codex convergence prompts require workspace inspection before final-only JSON", () => {
@@ -194,6 +245,7 @@ test("a host-owned candidate receives the same identity-bound strict review", ()
   )
   assert.equal(completed.settled, true)
   assert.deepEqual(completed.review, review)
+  assert.deepEqual(completed.protocolNormalization, { applied: false, rules: [] })
 })
 
 test("review packet admission defers to the exact UTF-8 prompt byte budget", () => {

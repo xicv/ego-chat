@@ -184,7 +184,43 @@ function stripOptionalJsonFence(value) {
   return match ? match[1].trim() : value
 }
 
-export function parseChatGptReview(responseText, expected) {
+const ASSESSMENT_ALIAS_KEYS = new Set(["assessment", "id", "status"])
+
+function normalizeChatGptReviewEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.criteria)) {
+    return { normalizations: [], value }
+  }
+
+  let assessmentAliases = 0
+  const criteria = value.criteria.map((criterion) => {
+    if (
+      !criterion
+      || typeof criterion !== "object"
+      || Array.isArray(criterion)
+      || !Object.hasOwn(criterion, "assessment")
+      || Object.hasOwn(criterion, "evidence")
+      || Object.keys(criterion).some((key) => !ASSESSMENT_ALIAS_KEYS.has(key))
+    ) {
+      return criterion
+    }
+    const { assessment, ...canonical } = criterion
+    assessmentAliases += 1
+    return { ...canonical, evidence: assessment }
+  })
+
+  if (assessmentAliases === 0) {
+    return { normalizations: [], value }
+  }
+  return {
+    normalizations: [{
+      count: assessmentAliases,
+      rule: "criteria.assessment_to_evidence",
+    }],
+    value: { ...value, criteria },
+  }
+}
+
+export function parseChatGptReviewEnvelope(responseText, expected) {
   const markerCount = responseText.split(expected.terminalMarker).length - 1
   if (markerCount !== 1 || !responseText.trimEnd().endsWith(expected.terminalMarker)) {
     throw new EgoChatError(
@@ -204,7 +240,8 @@ export function parseChatGptReview(responseText, expected) {
       { reason: "convergence_protocol_invalid" },
     )
   }
-  const review = parseWithSchema(ChatGptReviewSchema, decoded, "ChatGPT")
+  const normalized = normalizeChatGptReviewEnvelope(decoded)
+  const review = parseWithSchema(ChatGptReviewSchema, normalized.value, "ChatGPT")
   if (
     review.targetDigest !== expected.targetDigest
     || review.candidateDigest !== expected.candidateDigest
@@ -217,7 +254,17 @@ export function parseChatGptReview(responseText, expected) {
     )
   }
   validateCriteriaCoverage(expected.criteria, review.criteria, "ChatGPT")
-  return review
+  return {
+    protocolNormalization: {
+      applied: normalized.normalizations.length > 0,
+      rules: normalized.normalizations,
+    },
+    review,
+  }
+}
+
+export function parseChatGptReview(responseText, expected) {
+  return parseChatGptReviewEnvelope(responseText, expected).review
 }
 
 export function evaluateReview(review) {
@@ -308,7 +355,7 @@ export function buildChatGptPrompt({ candidate, candidateDigest, contract, cycle
     "Implementing-agent review packet:",
     candidate.reviewPacket,
     "Return exactly one JSON object with these fields: targetDigest, candidateDigest, cycle, decision, summary, criteria, findings.",
-    "decision must be settled, continue, or blocked. Settlement is permitted only when every criterion is pass and there are no blocking findings. Continue must contain at least one blocking finding or a fail/unknown criterion. Each finding needs id, severity (blocking or advisory), title, and action. Every finding id must start with B- and match B-[A-Z0-9_-]{1,40}. Report every acceptance criterion exactly once and in contract order using the supplied AC-N ids.",
+    "decision must be settled, continue, or blocked. Settlement is permitted only when every criterion is pass and there are no blocking findings. Continue must contain at least one blocking finding or a fail/unknown criterion. Each criteria item must contain exactly id, status, and evidence; status must be pass, fail, or unknown, and evidence must be a non-empty string. Do not rename evidence to assessment, rationale, or another field. Each finding must contain exactly id, severity, title, and action; severity must be blocking or advisory. Every finding id must start with B- and match B-[A-Z0-9_-]{1,40}. Report every acceptance criterion exactly once and in contract order using the supplied AC-N ids.",
     "After the JSON object, output the following terminal marker on its own final line. Do not use Markdown prose and do not repeat the outbound turn marker.",
     terminalMarker,
   ].join("\n\n")
@@ -383,14 +430,14 @@ export function prepareAgentReview({
 }
 
 export function completeAgentReview(prepared, responseText) {
-  const review = parseChatGptReview(responseText, {
+  const { protocolNormalization, review } = parseChatGptReviewEnvelope(responseText, {
     candidateDigest: prepared.candidateDigest,
     criteria: prepared.contract.criteria,
     cycle: prepared.cycle,
     targetDigest: prepared.contract.targetDigest,
     terminalMarker: prepared.terminalMarker,
   })
-  return { review, ...evaluateReview(review) }
+  return { protocolNormalization, review, ...evaluateReview(review) }
 }
 
 export function reviewSignature(review) {

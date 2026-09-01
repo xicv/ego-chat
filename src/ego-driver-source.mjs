@@ -61,6 +61,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   let promptBytes = null
   let promptCharacters = null
   let sendClickStarted = false
+  let taskSpaceControlRecovery = null
   let unsentDraftMayExist = false
 
   function emit(value) {
@@ -467,6 +468,71 @@ async function egoDriverMain(inputPathOverride = undefined) {
     return `ego-chat-bound-${sha256(String(identity)).slice(0, 16)}`
   }
 
+  function canReclaimBoundTaskSpace(binding) {
+    return input.allowTaskSpaceReclaim === true
+      && typeof binding.key === "string"
+      && binding.key.length > 0
+      && input.mode === "exchange"
+      && (input.exchangeStage === undefined || input.exchangeStage === "send_only")
+  }
+
+  async function reclaimBoundTaskSpace(taskSpace, identifier) {
+    const method = taskSpace.ownership === "agentDelegatedToUser" ? "take_over" : "claim"
+    if (!await assertBrokerAuthority("before_task_space_reclaim")) {
+      return null
+    }
+    try {
+      if (method === "take_over") {
+        await globalThis.takeOverTaskSpace(taskSpace.id)
+      } else {
+        await globalThis.claimTaskSpace(taskSpace.id)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      humanRequired("browser_control_reclaim_failed", "Ego Chat could not reclaim its exact bound task space before Send.", {
+        diagnosticDigest: sha256(message),
+        method,
+        taskSpaceId: taskSpace.id,
+      })
+      return null
+    }
+
+    let verified = null
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const taskSpaces = await globalThis.listTaskSpaces()
+      verified = taskSpaces.find((candidate) => (
+        candidate.id === taskSpace.id && taskSpaceMatches(candidate, identifier)
+      ))
+      if (verified?.ownership === "agent") {
+        break
+      }
+      if (attempt < 2) {
+        await wait(1)
+      }
+    }
+    if (verified?.ownership !== "agent") {
+      humanRequired("browser_control_reclaim_failed", "Ego Chat could not verify agent control of its exact bound task space before Send.", {
+        method,
+        taskSpaceId: taskSpace.id,
+      })
+      return null
+    }
+
+    const selected = await useOrCreateTaskSpace(verified.id)
+    if (selected.id !== verified.id) {
+      humanRequired("browser_control_reclaim_failed", "Ego Chat selected a different task space after reclaiming browser control.", {
+        method,
+        taskSpaceId: taskSpace.id,
+      })
+      return null
+    }
+    taskSpaceControlRecovery = {
+      method,
+      taskSpaceId: verified.id,
+    }
+    return selected
+  }
+
   async function useBoundTaskSpace(binding) {
     const taskSpaces = await globalThis.listTaskSpaces()
     const requested = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, binding.taskSpaceId))
@@ -481,7 +547,14 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
     const fallbackName = boundTaskSpaceName(binding)
     const fallback = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, fallbackName))
-    if (fallback?.ownership && fallback.ownership !== "agent") {
+    if (
+      fallback
+      && Object.hasOwn(fallback, "ownership")
+      && fallback.ownership !== "agent"
+    ) {
+      if (canReclaimBoundTaskSpace(binding)) {
+        return reclaimBoundTaskSpace(fallback, fallbackName)
+      }
       humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
         taskSpaceId: fallback.id,
       })
@@ -1584,7 +1657,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 9) {
+    if (input.browserContractRevision !== 10) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1691,7 +1764,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 9) {
+    if (input.browserContractRevision !== 10) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1907,7 +1980,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 9) {
+    if (input.browserContractRevision !== 10) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -2303,6 +2376,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
           promptMessageId: markedUsers[0].messageId,
           sentAt: new Date(sentAt).toISOString(),
           targetId: selected.targetId,
+          ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
           taskSpaceId: selected.task.id,
           turnMarker: input.turnMarker,
         },
@@ -2439,6 +2513,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
             responseDigest: sha256(stableText),
             responseText: stableText,
             targetId: selected.targetId,
+            ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
             taskSpaceId: selected.task.id,
             turnMarker: input.turnMarker,
           },
@@ -2492,7 +2567,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "reanchor") {
-      if (input.browserContractRevision !== 9) {
+      if (input.browserContractRevision !== 10) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
         return
       }
