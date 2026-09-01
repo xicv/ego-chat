@@ -111,6 +111,7 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.match(firstClient.getInstructions(), /ego_converge_until_settled/)
   assert.match(firstClient.getInstructions(), /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
   assert.match(firstClient.getInstructions(), /retry internally with a deterministic fresh marker only after durable reconciliation proves/)
+  assert.match(firstClient.getInstructions(), /explicitly authorizes reclaiming the exact binding-owned Ego task space/)
   assert.match(firstClient.getInstructions(), /post-settlement commit, push, merge, deploy, or release work outside the review target/)
   assert.ok(tools.tools.some((tool) => tool.name === "ego_exchange_and_wait"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_adopt_conversation_and_wait"))
@@ -131,6 +132,10 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
     true,
   )
   const reviewTool = tools.tools.find((tool) => tool.name === "ego_review_candidate_and_wait")
+  assert.equal(
+    reviewTool.inputSchema.properties.allowTaskSpaceReclaim.const,
+    true,
+  )
   assert.equal(
     reviewTool.inputSchema.properties.candidate.properties.reviewPacket.maxLength,
     MAX_PROMPT_BYTES,
@@ -578,6 +583,9 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     exchange: async (input) => {
       exchanges += 1
       exchangeMarkers.push(input.turnMarker)
+      if (input.prompt.includes("Controlled review packet for direct.")) {
+        assert.equal(input.allowTaskSpaceReclaim, true)
+      }
       if (input.prompt.includes("always-absent")) {
         pendingRecovery = { kind: "absent" }
         throw new EgoChatError(
@@ -603,6 +611,47 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
             fingerprintVersion: "tail-v1",
             lastContentDigest: digest(responseText),
             lastMessageId: "controlled-large-result-assistant",
+            lastRole: "assistant",
+            messageCount: input.binding.messageCount + 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "controlled-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      }
+      if (input.prompt.includes("Controlled review packet for assessment-alias.")) {
+        const candidateDigest = input.prompt.match(/Candidate digest: ([a-f0-9]{64})/)?.[1]
+        const cycle = Number(input.prompt.match(/Cycle: (\d+)/)?.[1])
+        const targetDigest = input.prompt.match(/Target digest: ([a-f0-9]{64})/)?.[1]
+        const responseText = `${JSON.stringify({
+          candidateDigest,
+          criteria: [{
+            assessment: "One exact correction remains before settlement.",
+            id: "AC-1",
+            status: "fail",
+          }],
+          cycle,
+          decision: "continue",
+          findings: [{
+            action: "Apply the exact correction and submit cycle 2 automatically.",
+            id: "B-NEXT-CYCLE",
+            severity: "blocking",
+            title: "One correction remains",
+          }],
+          summary: "Continue in the same host task without a human relay.",
+          targetDigest,
+        })}\n${input.expectedTerminalMarker}`
+        responseDigests.set(exchanges, digest(responseText))
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: `controlled-head-${exchanges}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: `controlled-assistant-${exchanges}`,
             lastRole: "assistant",
             messageCount: input.binding.messageCount + 2,
           },
@@ -758,7 +807,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   const client = await connectClient(env)
   t.after(() => client.close())
 
-  const directInput = reviewInput("direct")
+  const directInput = { ...reviewInput("direct"), allowTaskSpaceReclaim: true }
   const expectedDirect = prepareAgentReview({
     ...directInput,
     markerToken: "A".repeat(32),
@@ -926,4 +975,29 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(new Set(exchangeMarkers.slice(-2)).size, 2)
   assert.equal(exchanges, 10)
   assert.equal(reconciliations, 5)
+
+  const aliasedContinuation = await client.callTool({
+    arguments: reviewInput("assessment-alias"),
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(aliasedContinuation.isError, undefined)
+  assert.equal(aliasedContinuation.structuredContent.settled, false)
+  assert.equal(
+    aliasedContinuation.structuredContent.nextAction,
+    "address_review_and_submit_next_cycle",
+  )
+  assert.equal(aliasedContinuation.structuredContent.nextCycle, 2)
+  assert.deepEqual(aliasedContinuation.structuredContent.protocolNormalization, {
+    applied: true,
+    rules: [{ count: 1, rule: "criteria.assessment_to_evidence" }],
+  })
+  assert.equal(
+    aliasedContinuation.structuredContent.review.criteria[0].evidence,
+    "One exact correction remains before settlement.",
+  )
+  const compactContinuation = JSON.parse(aliasedContinuation.content[0].text)
+  assert.equal(compactContinuation.nextAction, "address_review_and_submit_next_cycle")
+  assert.equal(compactContinuation.nextCycle, 2)
+  assert.deepEqual(compactContinuation.review, aliasedContinuation.structuredContent.review)
+  assert.equal(exchanges, 11)
 })

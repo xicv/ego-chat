@@ -40,7 +40,7 @@ async function runMalformedModelPolicyCase(attributes, {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 9,
+    browserContractRevision: 10,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -245,6 +245,8 @@ console.log('__EGO_CHAT_TEST_COUNTERS__' + JSON.stringify(counters))
 }
 
 async function runPreSendDriverCase({
+  allowTaskSpaceReclaim = false,
+  boundTaskSpaceOwnership = null,
   changeSendControlAtRecheck = false,
   currentSelectedModelIndex = 0,
   downgradeAtPresend = false,
@@ -257,15 +259,38 @@ async function runPreSendDriverCase({
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
+  const bindingKey = "presend-driver-test"
+  const canonicalUrl = "https://chatgpt.com/c/presend-driver-test"
+  const fallbackName = `ego-chat-bound-${createHash("sha256").update(bindingKey, "utf8").digest("hex").slice(0, 16)}`
+  const priorAssistant = {
+    messageId: "presend-assistant-before",
+    role: "assistant",
+    text: "Prior assistant response.",
+  }
   const input = {
-    browserContractRevision: 9,
-    binding: {
-      messageCount: 0,
-      startUrl: "https://chatgpt.com/",
-      state: "unbound",
-      targetId: "presend-tab",
-      taskSpaceId: 10,
-    },
+    ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
+    browserContractRevision: 10,
+    binding: boundTaskSpaceOwnership === null
+      ? {
+          messageCount: 0,
+          startUrl: "https://chatgpt.com/",
+          state: "unbound",
+          targetId: "presend-tab",
+          taskSpaceId: 10,
+        }
+      : {
+          canonicalUrl,
+          headContentDigest: createHash("sha256").update(priorAssistant.text, "utf8").digest("hex"),
+          headFingerprint: conversationTailFingerprint(priorAssistant),
+          headFingerprintVersion: "tail-v1",
+          headMessageId: priorAssistant.messageId,
+          headRole: priorAssistant.role,
+          key: bindingKey,
+          messageCount: 2,
+          state: "bound",
+          targetId: "presend-tab",
+          taskSpaceId: 10,
+        },
     brokerLease: {
       brokerId: "presend-test-broker",
       epoch: 1,
@@ -273,6 +298,7 @@ async function runPreSendDriverCase({
       pid: process.pid,
     },
     expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_PRESEND_TEST",
+    exchangeStage: "send_only",
     mode: "exchange",
     modelPolicy: {
       enforcement: "repair_then_verify",
@@ -296,6 +322,10 @@ async function runPreSendDriverCase({
 process.getuid = () => ${JSON.stringify(driverUid)}
 const fs = await import('node:fs/promises')
 const input = ${JSON.stringify(input)}
+const beforeEntries = ${JSON.stringify([
+    { messageId: "presend-user-before", role: "user", text: "Prior user request." },
+    priorAssistant,
+  ])}
 const ownerPath = ${JSON.stringify(ownerPath)}
 let policyMenuOpen = false
 let modelChoicesOpen = false
@@ -303,7 +333,9 @@ let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
 let focusedPolicyControl = null
 let policyReads = 0
 let sendTargetReads = 0
+let taskSpaceOwnership = ${JSON.stringify(boundTaskSpaceOwnership)}
 const counters = {
+  claimTaskSpace: 0,
   composerMutations: 0,
   injectedPromptLength: 0,
   insertText: 0,
@@ -311,13 +343,31 @@ const counters = {
   modelSelections: 0,
   policyReads: 0,
   sendTargetReads: 0,
+  takeOverTaskSpace: 0,
 }
 globalThis.cliLog = (value) => console.log(value)
-globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+globalThis.listTaskSpaces = async () => taskSpaceOwnership === null
+  ? []
+  : [{ id: 12, name: ${JSON.stringify(fallbackName)}, ownership: taskSpaceOwnership, taskId: ${JSON.stringify(fallbackName)} }]
+globalThis.claimTaskSpace = async (taskSpaceId) => {
+  if (taskSpaceId !== 12) throw new Error('unexpected claim target')
+  counters.claimTaskSpace += 1
+  taskSpaceOwnership = 'agent'
+  return { id: 12, ownership: 'agent' }
+}
+globalThis.takeOverTaskSpace = async (taskSpaceId) => {
+  if (taskSpaceId !== 12) throw new Error('unexpected takeover target')
+  counters.takeOverTaskSpace += 1
+  taskSpaceOwnership = 'agent'
+  return { id: 12, ownership: 'agent' }
+}
+globalThis.useOrCreateTaskSpace = async (value) => ({ id: value === 12 ? 12 : 10 })
 globalThis.listTabs = async () => [{ active: true, targetId: 'presend-tab' }]
 globalThis.switchTab = async () => {}
 globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
-globalThis.pageInfo = async () => ({ url: 'https://chatgpt.com/' })
+globalThis.pageInfo = async () => ({
+  url: taskSpaceOwnership === null ? 'https://chatgpt.com/' : ${JSON.stringify(canonicalUrl)},
+})
 globalThis.snapshotText = async () => ''
 globalThis.wait = async () => {}
 globalThis.click = async (target) => {
@@ -354,7 +404,9 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) return []
+  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+    return taskSpaceOwnership === null ? [] : beforeEntries
+  }
   if (source.trimStart().startsWith('Boolean(')) return false
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) return 0
   if (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount')) {
@@ -502,7 +554,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 9,
+    browserContractRevision: 10,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -911,6 +963,7 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 }
 
 async function runTaskSpaceReconciliationCase({
+  allowTaskSpaceReclaim = false,
   fallbackTaskSpaceOwnership = null,
   requestedTaskSpaceOwnership = null,
 } = {}) {
@@ -932,6 +985,7 @@ async function runTaskSpaceReconciliationCase({
   const previousDigest = createHash("sha256").update(previousText, "utf8").digest("hex")
   const input = {
     allowDeliveryAbsent: true,
+    ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     binding: {
       canonicalUrl,
       headRole: "assistant",
@@ -947,7 +1001,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 9,
+    browserContractRevision: 10,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -969,10 +1023,12 @@ async function runTaskSpaceReconciliationCase({
 process.getuid = () => ${JSON.stringify(driverUid)}
 let opened = false
 const taskSpaceRequests = []
-const counters = { click: 0, fillInput: 0, pressKey: 0, typeText: 0 }
+const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
 globalThis.cliLog = (value) => console.log(value)
 const fallbackName = ${JSON.stringify(fallbackName)}
 globalThis.listTaskSpaces = async () => ${JSON.stringify(listedTaskSpaces)}
+globalThis.claimTaskSpace = async () => { counters.claimTaskSpace += 1 }
+globalThis.takeOverTaskSpace = async () => { counters.takeOverTaskSpace += 1 }
 globalThis.useOrCreateTaskSpace = async (value) => {
   taskSpaceRequests.push(value)
   if (value === 10) return { id: 10 }
@@ -1085,6 +1141,9 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.match(EGO_DRIVER_SOURCE, /before_presend_policy_verification/)
   assert.match(EGO_DRIVER_SOURCE, /immediately_before_send_click/)
   assert.match(EGO_DRIVER_SOURCE, /before_head_commit/)
+  assert.match(EGO_DRIVER_SOURCE, /before_task_space_reclaim/)
+  assert.match(EGO_DRIVER_SOURCE, /claimTaskSpace/)
+  assert.match(EGO_DRIVER_SOURCE, /takeOverTaskSpace/)
   assert.match(EGO_DRIVER_SOURCE, /broker_fence_lost/)
   assert.match(EGO_DRIVER_SOURCE, /process\.kill\(owner\.pid, 0\)/)
   assert.match(EGO_DRIVER_SOURCE, /browser_contract_mismatch/)
@@ -1104,11 +1163,13 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /finishedHead\.messageCount !== beforeHead\.messageCount/)
 
   const composed = EGO_DRIVER_SOURCE.indexOf('await composePrompt(input.prompt)')
+  const reclaimFence = EGO_DRIVER_SOURCE.indexOf('assertBrokerAuthority("before_task_space_reclaim")')
   const presendPolicy = EGO_DRIVER_SOURCE.indexOf('driverStage = "verifying_presend_model_policy"')
   const preClickPrompt = EGO_DRIVER_SOURCE.indexOf('driverStage = "verifying_preclick_prompt"')
   const recheckTarget = EGO_DRIVER_SOURCE.indexOf('driverStage = "rechecking_send_control"')
   const dispatchFence = EGO_DRIVER_SOURCE.indexOf('driverStage = "checking_send_dispatch_fence"')
   const dispatch = EGO_DRIVER_SOURCE.indexOf('driverStage = "dispatching_send_click"')
+  assert.ok(reclaimFence < composed)
   assert.ok(composed < presendPolicy)
   assert.ok(presendPolicy < preClickPrompt)
   assert.ok(preClickPrompt < recheckTarget)
@@ -1676,6 +1737,47 @@ test("a live policy downgrade after composition stops before Send", async () => 
   assert.equal(stopped.counters.mouseEvents, 0)
 })
 
+test("an explicitly authorized fresh exchange claims its exact user-controlled binding space before composition", async () => {
+  const stopped = await runPreSendDriverCase({
+    allowTaskSpaceReclaim: true,
+    boundTaskSpaceOwnership: "user",
+    downgradeAtPresend: true,
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.counters.claimTaskSpace, 1)
+  assert.equal(stopped.counters.takeOverTaskSpace, 0)
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("an explicitly authorized fresh exchange takes back its exact delegated binding space before composition", async () => {
+  const stopped = await runPreSendDriverCase({
+    allowTaskSpaceReclaim: true,
+    boundTaskSpaceOwnership: "agentDelegatedToUser",
+    downgradeAtPresend: true,
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.counters.claimTaskSpace, 0)
+  assert.equal(stopped.counters.takeOverTaskSpace, 1)
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("a fresh exchange without explicit authorization does not reclaim its binding space", async () => {
+  const stopped = await runPreSendDriverCase({
+    boundTaskSpaceOwnership: "user",
+    downgradeAtPresend: true,
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "browser_control_unavailable")
+  assert.equal(stopped.counters.claimTaskSpace, 0)
+  assert.equal(stopped.counters.takeOverTaskSpace, 0)
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
 test("current policy repair selects the provider-first model before composition", async () => {
   const stopped = await runPreSendDriverCase({
     currentSelectedModelIndex: 1,
@@ -2048,9 +2150,11 @@ test("bound recovery reopens a canonical conversation after its task space disap
   assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
   assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
     click: 0,
     fillInput: 0,
     pressKey: 0,
+    takeOverTaskSpace: 0,
     typeText: 0,
   })
 })
@@ -2084,6 +2188,19 @@ test("bound recovery stops instead of bypassing a user-controlled deterministic 
   assert.equal(reconciled.result, undefined)
   assert.equal(reconciled.error?.code, "human_required")
   assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("read-only reconciliation never inherits fresh-send task-space reclaim authority", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    allowTaskSpaceReclaim: true,
+    fallbackTaskSpaceOwnership: "agentDelegatedToUser",
+  })
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
+  assert.equal(reconciled.counters.claimTaskSpace, 0)
+  assert.equal(reconciled.counters.takeOverTaskSpace, 0)
   assert.deepEqual(reconciled.taskSpaceRequests, [])
 })
 

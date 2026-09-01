@@ -29,6 +29,7 @@ function waitModeSchema(defaultMode = "progress") {
 }
 
 const EGO_EXCHANGE_INPUT_SCHEMA = {
+  allowTaskSpaceReclaim: z.literal(true).optional().describe("Set only when the user explicitly authorizes Ego Chat to reclaim the exact deterministic task space owned by this binding before a fresh Send. This authority never applies after Send or during capture/reconciliation."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: z.string().min(1).max(64 * 1024),
@@ -60,6 +61,7 @@ const CONVERSATION_ADOPTION_INPUT_SCHEMA = {
 
 const CONVERGENCE_INPUT_SCHEMA = {
   acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
+  allowTaskSpaceReclaim: z.literal(true).optional().describe("Set only when the user explicitly authorizes every fresh ChatGPT review cycle to reclaim this binding's exact deterministic Ego task space. It never authorizes capture/reconciliation takeover."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),
@@ -78,6 +80,7 @@ const CRITERION_RESULT_SCHEMA = z.object({
 
 const AGENT_REVIEW_INPUT_SCHEMA = {
   acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
+  allowTaskSpaceReclaim: z.literal(true).optional().describe("Set only when the user explicitly authorizes this fresh review send to reclaim the exact deterministic Ego task space owned by the binding. It never authorizes post-Send takeover."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   candidate: z.object({
     blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
@@ -107,9 +110,11 @@ const MCP_INSTRUCTIONS = [
   "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
+  "A successful strict review with settled false is a machine continuation, not a stopping condition. Read its complete review, address the in-scope blocking findings, and immediately submit nextCycle in the same host task without asking the user to relay or approve the review. A protocolNormalization result records a bounded local schema normalization and does not require another browser send.",
   `Finalize and UTF-8 byte-check a strict review packet before creating its operationId. The complete generated review prompt, including protocol overhead, must not exceed ${MAX_PROMPT_BYTES} bytes; prefer an accessible PR URL plus exact revisions, changed-file inventory, critical excerpts, tests, and unresolved risks over an entire diff. Never split one candidate across multiple sends automatically.`,
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
   "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
+  "When the user explicitly authorizes reclaiming the exact binding-owned Ego task space, including an explicit request for Ego Chat to take it back for an unattended until-settled loop, set allowTaskSpaceReclaim to true on every fresh review cycle. This permits one verified pre-Send claim or take-back of only the deterministic binding space; it never applies to capture, reconciliation, another task space, or a possibly delivered operation.",
   `If ego_review_candidate_and_wait returns review_packet_compaction_required, both prior deliveries were durably proven absent and no human action is required. Automatically rebuild one semantically complete review packet no larger than the returned suggestedReviewPacketMaxBytes (normally ${SUGGESTED_COMPACT_REVIEW_PACKET_BYTES}), mint a new operationId, and retry once on the same binding. Do not ask the user to log in, open ego-chat-main, or provide another conversation URL unless the exact broker code is authentication_required. Never substitute another conversation to route around a delivery fault.`,
   "Use ego_converge_until_settled only when the user explicitly wants a detached broker-owned Codex implementation loop; supply an immutable target, observable acceptance criteria, and the absolute working directory.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
@@ -153,6 +158,14 @@ function waitedToolResult(value, waitMode) {
       : {}),
     ...(result.responseRef ? { responseRef: result.responseRef } : {}),
     ...(structured.settled !== undefined ? { settled: structured.settled } : {}),
+    ...(structured.nextAction ? { nextAction: structured.nextAction } : {}),
+    ...(Number.isInteger(structured.nextCycle) ? { nextCycle: structured.nextCycle } : {}),
+    ...(structured.protocolNormalization?.applied
+      ? { protocolNormalization: structured.protocolNormalization }
+      : {}),
+    ...(structured.settled === false && structured.review
+      ? { review: structured.review }
+      : {}),
     ...(structured.status ? { status: structured.status } : {}),
     waitMode,
     ...(structured.id ? { workflowId: structured.id } : {}),
@@ -586,7 +599,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_exchange_and_wait",
     {
-      description: "Send one uniquely marked free-form prompt through a durable named ChatGPT binding and return the complete captured review into this same agent turn. Set waitMode to token_saver for one silent durable wait without progress chatter.",
+      description: "Send one uniquely marked free-form prompt through a durable named ChatGPT binding and return the complete captured review into this same agent turn. Set waitMode to token_saver for one silent durable wait without progress chatter. Set allowTaskSpaceReclaim only after explicit user authorization to recover the binding-owned space before this fresh Send.",
       inputSchema: {
         ...EGO_EXCHANGE_INPUT_SCHEMA,
         waitMode: waitModeSchema(),
@@ -615,7 +628,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: `Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. The complete UTF-8 review prompt is limited to ${MAX_PROMPT_BYTES} bytes; finalize the packet before minting operationId and prefer exact accessible revision references plus focused evidence over a full diff. Ego Chat never auto-splits a candidate across sends. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. Set waitMode to token_saver for a silent durable wait.`,
+      description: `Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. The complete UTF-8 review prompt is limited to ${MAX_PROMPT_BYTES} bytes; finalize the packet before minting operationId and prefer exact accessible revision references plus focused evidence over a full diff. Ego Chat never auto-splits a candidate across sends. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. When settled is false, nextAction and nextCycle direct the current host to address the complete returned review and continue immediately without human relay. Set allowTaskSpaceReclaim only after explicit user authorization to recover the binding-owned space before each fresh review Send. Set waitMode to token_saver for a silent durable wait.`,
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
@@ -675,6 +688,7 @@ export function createMcpServer(config = loadConfig()) {
                 operationId: initialPrepared.operationId,
               })
           workflow = await requestBroker(config, "ego.start_exchange", {
+            ...(input.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
             bindingKey: input.bindingKey,
             ...(deliveryAttempt > 1 ? { expectedPreviousHead: retryAnchor } : {}),
             expectedTerminalMarker: prepared.terminalMarker,
@@ -747,7 +761,8 @@ export function createMcpServer(config = loadConfig()) {
             )
           }
           const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
-          const { review, settled } = completeAgentReview(prepared, responseText)
+          const { protocolNormalization, review, settled } = completeAgentReview(prepared, responseText)
+          const canContinue = !settled && input.cycle < 6
           return waitedToolResult({
             bindingKey: input.bindingKey,
             candidateDigest: prepared.candidateDigest,
@@ -756,7 +771,14 @@ export function createMcpServer(config = loadConfig()) {
             deliveryAttemptCount: deliveryAttempt,
             exchangeWorkflowId: workflow.id,
             modelPolicy: exchangeResult.modelPolicy,
+            nextAction: settled
+              ? "settled"
+              : (canContinue
+                  ? "address_review_and_submit_next_cycle"
+                  : "cycle_limit_reached"),
+            ...(canContinue ? { nextCycle: input.cycle + 1 } : {}),
             operationId: prepared.operationId,
+            protocolNormalization,
             recoveredLateResponse,
             responseDigest: exchangeResult.responseDigest,
             review,
@@ -810,7 +832,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_start_exchange",
     {
-      description: "Submit one uniquely marked prompt through a durable named ChatGPT conversation binding. Returns a workflow ID immediately; call await_workflow next.",
+      description: "Submit one uniquely marked prompt through a durable named ChatGPT conversation binding. Returns a workflow ID immediately; call await_workflow next. Set allowTaskSpaceReclaim only after explicit user authorization to recover the binding-owned space before this fresh Send.",
       inputSchema: EGO_EXCHANGE_INPUT_SCHEMA,
     },
     async (input) => {
@@ -825,7 +847,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_start_convergence",
     {
-      description: "Start a detached broker-owned Codex implementation and ChatGPT review loop against an immutable target and explicit acceptance criteria. Use this only when the current host task is not the implementation owner. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately.",
+      description: "Start a detached broker-owned Codex implementation and ChatGPT review loop against an immutable target and explicit acceptance criteria. Use this only when the current host task is not the implementation owner. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send.",
       inputSchema: CONVERGENCE_INPUT_SCHEMA,
     },
     async (input) => {
@@ -840,7 +862,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_converge_until_settled",
     {
-      description: "Run a detached broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. When the current Codex or ZCode task owns the candidate, use ego_review_candidate_and_wait instead. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
+      description: "Run a detached broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. When the current Codex or ZCode task owns the candidate, use ego_review_candidate_and_wait instead. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
       inputSchema: {
         ...CONVERGENCE_INPUT_SCHEMA,
         waitMode: waitModeSchema(),

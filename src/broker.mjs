@@ -17,7 +17,7 @@ import {
   createContract,
   digestJson,
   evaluateReview,
-  parseChatGptReview,
+  parseChatGptReviewEnvelope,
   reviewSignature,
   scanForSecrets,
   validateCodexCandidate,
@@ -43,6 +43,34 @@ import {
 
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
+}
+
+function withoutFreshSendControlAuthority(request) {
+  const captureRequest = { ...request }
+  delete captureRequest.allowTaskSpaceReclaim
+  return captureRequest
+}
+
+function validateTaskSpaceControlRecovery(value) {
+  if (value === undefined) {
+    return undefined
+  }
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || !["claim", "take_over"].includes(value.method)
+    || !Number.isSafeInteger(value.taskSpaceId)
+    || value.taskSpaceId < 1
+    || Object.keys(value).some((key) => !["method", "taskSpaceId"].includes(key))
+  ) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser returned invalid task-space control recovery evidence.",
+      { reason: "task_space_reclaim_proof_invalid" },
+    )
+  }
+  return structuredClone(value)
 }
 
 function responseExcerpt(value, maximumBytes = 4 * 1024) {
@@ -1735,6 +1763,9 @@ export class Broker {
               controller.signal,
             )
             const observation = this.#validateModelPolicyObservation(sent.modelPolicy)
+            const taskSpaceControlRecovery = validateTaskSpaceControlRecovery(
+              sent.taskSpaceControlRecovery,
+            )
             current = this.#store.getWorkflow(workflow.id)
             if (!current || current.status !== "running") {
               return
@@ -1747,6 +1778,7 @@ export class Broker {
                 send: {
                   ...sent,
                   modelPolicy: observation,
+                  ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
                 },
               },
               reconciliation: {
@@ -1785,7 +1817,7 @@ export class Broker {
             try {
               result = await this.#egoAdapter.captureExchange(
                 {
-                  ...current.private.request,
+                  ...withoutFreshSendControlAuthority(current.private.request),
                   binding,
                   canonicalUrl: current.private.send.canonicalUrl,
                   expectedPreviousContentDigest: current.reconciliation.beforeHead.contentDigest,
@@ -1796,6 +1828,12 @@ export class Broker {
                 controller.signal,
               )
               result.modelPolicy = current.private.send.modelPolicy
+              const taskSpaceControlRecovery = validateTaskSpaceControlRecovery(
+                current.private.send.taskSpaceControlRecovery,
+              )
+              if (taskSpaceControlRecovery) {
+                result.taskSpaceControlRecovery = taskSpaceControlRecovery
+              }
               break
             } catch (error) {
               if (controller.signal.aborted) {
@@ -1829,6 +1867,7 @@ export class Broker {
         }
 
         const observation = this.#validateModelPolicyObservation(result.modelPolicy)
+        validateTaskSpaceControlRecovery(result.taskSpaceControlRecovery)
         if (
           typeof result.responseText !== "string"
           || result.responseText.length === 0
@@ -2380,6 +2419,7 @@ export class Broker {
           request.chatGptTimeoutMs,
         )
         const child = await this.#startEgoExchange({
+          ...(request.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
           bindingKey: current.bindingKey,
           expectedTerminalMarker: terminalMarker,
           prompt: reviewPrompt,
@@ -2416,13 +2456,16 @@ export class Broker {
             },
           )
         }
-        const review = parseChatGptReview(await this.#readResponseText(reviewed.result), {
-          candidateDigest,
-          criteria: contract.criteria,
-          cycle,
-          targetDigest: contract.targetDigest,
-          terminalMarker,
-        })
+        const { protocolNormalization, review } = parseChatGptReviewEnvelope(
+          await this.#readResponseText(reviewed.result),
+          {
+            candidateDigest,
+            criteria: contract.criteria,
+            cycle,
+            targetDigest: contract.targetDigest,
+            terminalMarker,
+          },
+        )
         const signature = reviewSignature(review)
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
@@ -2443,6 +2486,7 @@ export class Broker {
                 ...completedCycle,
                 chatGpt: {
                   childWorkflowId: child.id,
+                  protocolNormalization,
                   responseDigest: reviewed.result.digest,
                 },
                 review,

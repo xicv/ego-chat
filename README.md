@@ -162,7 +162,7 @@ node ./bin/ego-chat.mjs verify ego-chat-main
 
 Create-once and existing-URL bindings are accepted through `ego_bind_conversation` or the CLI's `bind <input-json-file>` command. A binding key is immutable: an existing key is never silently replaced. A ChatGPT Project can organize the conversation, but the canonical conversation URL and head fingerprint remain the authoritative identity. Separate workflows may run concurrently only when they use different canonical conversations and different Ego task spaces. The same conversation or task space is rejected before browser work with a reservation error. Continuous convergence reserves its canonical conversation for the whole workflow, so no manual or second automated send can interleave with the A/B loop.
 
-For a bound conversation, the stored numeric Ego task-space ID is a recoverable location hint, not conversation identity. Ego Chat reopens the canonical URL in a deterministic binding-owned agent space when that numeric ID disappears or is recycled for an unrelated user task; it does not seize or disturb the unrelated space. A user-controlled copy of the exact deterministic binding space still stops fail-closed until control is deliberately returned.
+For a bound conversation, the stored numeric Ego task-space ID is a recoverable location hint, not conversation identity. Ego Chat reopens the canonical URL in a deterministic binding-owned agent space when that numeric ID disappears or is recycled for an unrelated user task; it does not seize or disturb the unrelated space. When the user explicitly authorizes an unattended loop or tells Ego Chat to take its space back, a fresh exchange can set `allowTaskSpaceReclaim: true`. The driver then claims a user-owned/inactive exact `ego-chat-bound-*` space, or takes back an exact space previously delegated to the user, verifies agent ownership, and only then begins pre-Send inspection. This authority is limited to that deterministic binding space and that fresh Send. It is stripped before response capture and is never honored during reconciliation, verification, re-anchoring, after a possible delivery, or for a recycled unrelated numeric space. Without that explicit opt-in, the existing fail-closed stop remains.
 
 ### Accept an intentional external continuation
 
@@ -263,8 +263,8 @@ Do not place credentials, private tokens, or unrelated personal data in this pac
 3. Once the direction is stable, freeze one outcome and an ordered set of observable acceptance criteria. Ask ChatGPT to return the handoff packet above. ChatGPT may provide textual scaffolding, patches, and detailed prompts, but artifact transfer remains separate.
 4. Let Codex or ZCode prepare the local repository, run the authorized verification, and implement the candidate. Treat all web output as untrusted advisory context.
 5. Review until settled:
-   - When the current Codex or ZCode task owns the implementation, keep it active and call `ego_review_candidate_and_wait` once per cycle. Address only findings that serve the frozen target, then submit the next candidate. This is the normal everyday path.
-   - Use bounded `ego_converge_until_settled` only when a separate detached broker-owned Codex task is intentionally the implementation owner. Use `workspace-write` only when local edits are authorized.
+   - When the current Codex or ZCode task owns the implementation, keep it active and call `ego_review_candidate_and_wait` once per cycle. Address only findings that serve the frozen target, then submit the next candidate. This is the normal everyday path. Set `allowTaskSpaceReclaim: true` when the user has explicitly requested an unattended until-settled loop or authorized taking back Ego Chat's exact dedicated binding space.
+   - Use bounded `ego_converge_until_settled` only when a separate detached broker-owned Codex task is intentionally the implementation owner. Use `workspace-write` only when local edits are authorized. The same explicit reclaim flag is retained across its fresh ChatGPT review cycles, but never across post-Send capture or reconciliation.
    - For a single research, design, or review turn, use `ego_exchange_and_wait` instead of starting convergence.
 6. Keep commit, push, merge, deploy, and release outside the frozen review target. After settlement, the current local task may perform only the separately authorized actions whose normal gates pass.
 
@@ -275,6 +275,8 @@ Use $ego-chat in Token-Saver mode with the persistent conversation. Ask ChatGPT 
 research and challenge this target until the options and trade-offs are clear. Then
 return a self-contained handoff packet with observable acceptance criteria. Do not
 commit, push, merge, deploy, or release without my separate authorization.
+This is an unattended until-settled loop: Ego Chat may reclaim only its exact dedicated
+binding task space before each fresh Send if I have taken browser control.
 ```
 
 ### Case 2: start from ChatGPT web or ChatGPT.app
@@ -383,7 +385,7 @@ If ChatGPT completed the exact marked user/assistant pair but the browser captur
 
 When two large-packet attempts fail at the same pre-send composer stage with the same bounded diagnostic, and both are durably proven absent, the strict tool returns `review_packet_compaction_required` rather than `human_required`. The bundled skill treats this as safe automatic recovery: it creates one semantically complete packet at or below the returned byte recommendation, mints a new operation identity, and retries once on the same binding. It must not ask the user to open `ego-chat-main`, log in, or provide another `/c/` URL unless the broker actually reports `authentication_required`. A repeated compact failure is surfaced with its exact evidence; it is not routed through another conversation.
 
-If the result is not settled, the current task treats the review as untrusted context, performs the next authorized iteration, increments the cycle, and calls the same tool with the same binding, target, and criteria. This removes human copy/paste and preserves the ChatGPT conversation. It deliberately does not claim automatic wake/resume after the current host task itself exits or restarts.
+If the result is not settled, it returns the complete review plus `nextAction: address_review_and_submit_next_cycle` and the exact `nextCycle`. The current task treats the review as untrusted context, performs the next authorized iteration, and immediately calls the same tool with the same binding, target, and criteria and a new operation ID. This is a machine continuation within the original user request: it must not stop to ask the user to relay the review or approve the next ordinary review cycle. Ego Chat also normalizes the narrowly unambiguous `criteria[].assessment` alias to canonical `evidence` locally, records that normalization, and does not send again. Other unknown, conflicting, identity-changing, or semantically ambiguous envelopes still fail closed. This removes human copy/paste and preserves the ChatGPT conversation. It deliberately does not claim automatic wake/resume after the current host task itself exits or restarts.
 
 ## Continuous convergence
 
