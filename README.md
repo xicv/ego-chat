@@ -154,11 +154,13 @@ Inspect the existing default binding without touching the browser:
 node ./bin/ego-chat.mjs conversation ego-chat-main
 ```
 
-Verify its canonical URL and current conversation head without sending:
+Run a browser-backed maintenance checkpoint of its canonical URL and current conversation head without sending:
 
 ```sh
 node ./bin/ego-chat.mjs verify ego-chat-main
 ```
+
+Do not use `verify` as a preflight for an exchange or review. Fresh sends perform their own canonical URL, stable-head, browser-readiness, and live model-policy checks. When an unattended loop has explicit reclaim authorization, the fresh send is also the only path allowed to reclaim the exact binding-owned task space. If you only need to confirm binding identity before a send, use `conversation` or `ego_get_conversation`; both read durable state without touching the browser.
 
 Create-once and existing-URL bindings are accepted through `ego_bind_conversation` or the CLI's `bind <input-json-file>` command. A binding key is immutable: an existing key is never silently replaced. A ChatGPT Project can organize the conversation, but the canonical conversation URL and head fingerprint remain the authoritative identity. Separate workflows may run concurrently only when they use different canonical conversations and different Ego task spaces. The same conversation or task space is rejected before browser work with a reservation error. Continuous convergence reserves its canonical conversation for the whole workflow, so no manual or second automated send can interleave with the A/B loop.
 
