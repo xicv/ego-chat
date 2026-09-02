@@ -13,12 +13,16 @@ import {
   CODEX_CANDIDATE_OUTPUT_SCHEMA,
   assertReviewPromptWithinBudget,
   buildChatGptPrompt,
+  buildChatGptProtocolRepairPrompt,
   buildCodexInspectionCorrectionPrompt,
   buildCodexPrompt,
   createContract,
   digestJson,
   evaluateReview,
+  isRecoverableReviewProtocolError,
   parseChatGptReviewEnvelope,
+  reviewProtocolFailureSignature,
+  reviewResponseHeadAnchor,
   reviewSignature,
   scanForSecrets,
   validateCodexCandidate,
@@ -913,6 +917,8 @@ export class Broker {
       const expectedTerminalMarker = params.expectedTerminalMarker
         ?? persisted.expectedTerminalMarker
       const turnMarker = params.turnMarker ?? persisted.turnMarker
+      const allowProtocolRepairCapture = params.allowProtocolRepairCapture === true
+        || persisted.allowProtocolRepairCapture === true
       if (persisted.expectedTerminalMarker && params.expectedTerminalMarker
         && persisted.expectedTerminalMarker !== params.expectedTerminalMarker) {
         throw new EgoChatError("invalid_input", "The supplied terminal marker does not match the durable workflow marker.")
@@ -943,6 +949,7 @@ export class Broker {
               turnMarker,
             })
           : await this.#egoAdapter.reconcileBound({
+              ...(allowProtocolRepairCapture ? { allowProtocolRepairCapture: true } : {}),
               binding,
               expectedPreviousContentDigest,
               expectedPreviousMessageId,
@@ -1007,7 +1014,10 @@ export class Broker {
         typeof verified.responseText !== "string"
         || verified.responseText.length === 0
         || !expectedTerminalMarker
-        || !verified.responseText.trimEnd().endsWith(expectedTerminalMarker)
+        || (
+          !verified.responseText.trimEnd().endsWith(expectedTerminalMarker)
+          && !allowProtocolRepairCapture
+        )
         || verified.turnMarker !== turnMarker
       ) {
         throw new EgoChatError(
@@ -1264,6 +1274,7 @@ export class Broker {
         },
       },
       reconciliation: {
+        allowProtocolRepairCapture: params.allowProtocolRepairCapture === true,
         bindingRevision: binding.revision,
         beforeHead: {
           contentDigest: binding.headContentDigest ?? null,
@@ -2455,23 +2466,27 @@ export class Broker {
         }
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
-        const markerToken = randomUUID().replaceAll("-", "").toUpperCase()
-        const turnMarker = `EGO_CHAT_CONVERGENCE_${markerToken}_C${cycle}`
-        const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}`
-        const reviewPrompt = buildChatGptPrompt({
+        const initialMarkerToken = digestJson({
+          cycle,
+          purpose: "review",
+          workflowId,
+        }).slice(0, 32).toUpperCase()
+        const initialTurnMarker = `EGO_CHAT_CONVERGENCE_${initialMarkerToken}_C${cycle}`
+        const initialTerminalMarker = `EGO_CHAT_REVIEW_DONE_${initialMarkerToken}`
+        const initialReviewPrompt = buildChatGptPrompt({
           candidate,
           candidateDigest,
           contract,
           cycle,
-          terminalMarker,
-          turnMarker,
+          terminalMarker: initialTerminalMarker,
+          turnMarker: initialTurnMarker,
         })
-        assertReviewPromptWithinBudget(reviewPrompt, candidate.reviewPacket, {
+        assertReviewPromptWithinBudget(initialReviewPrompt, candidate.reviewPacket, {
           code: "human_required",
           message: "The exact ChatGPT review prompt exceeds the transport limit.",
           reason: "review_packet_too_large",
         })
-        const secretSignatures = scanForSecrets(reviewPrompt)
+        const secretSignatures = scanForSecrets(initialReviewPrompt)
         if (secretSignatures.length > 0) {
           throw new EgoChatError(
             "human_required",
@@ -2482,58 +2497,146 @@ export class Broker {
             },
           )
         }
-        const chatGptTimeoutMs = this.#boundedChatGptTimeout(
-          current,
-          request.chatGptTimeoutMs,
-        )
-        const child = await this.#startEgoExchange({
-          ...(request.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-          bindingKey: current.bindingKey,
-          expectedTerminalMarker: terminalMarker,
-          prompt: reviewPrompt,
-          timeoutMs: chatGptTimeoutMs,
-          turnMarker,
-        }, workflowId)
-        this.#convergenceChildren.set(workflowId, child.id)
-        current = this.#requireRunningConvergence(workflowId, controller.signal)
-        await this.#transition(current, "convergence.chatgpt_review_started", {
-          childWorkflowId: child.id,
-          cycle,
-          phase: "chatgpt_running",
-          private: current.private,
-        })
+        const protocolFailureSignatures = new Set()
+        const protocolRepairWorkflowIds = []
+        let child
+        let evaluation
+        let expectedPreviousHead
+        let protocolFailure
+        let protocolNormalization
+        let protocolRepairAttempt = 0
+        let review
+        let reviewed
 
-        current = this.#requireRunningConvergence(workflowId, controller.signal)
-        const childWaitMs = this.#boundedConvergenceTimeout(
-          current,
-          chatGptTimeoutMs + CHATGPT_TRANSPORT_GRACE_MS,
-          1,
-        )
-        const reviewed = await this.awaitWorkflow(
-          { timeoutMs: childWaitMs, workflowId: child.id },
-          controller.signal,
-        )
-        this.#convergenceChildren.delete(workflowId)
-        if (reviewed.status !== "succeeded") {
-          throw new EgoChatError(
-            "human_required",
-            "The ChatGPT browser review did not complete unambiguously.",
-            {
-              childStatus: reviewed.status,
-              reason: reviewed.humanRequired?.code ?? reviewed.error?.code ?? "chatgpt_review_incomplete",
-            },
+        while (true) {
+          let reviewPrompt = initialReviewPrompt
+          let terminalMarker = initialTerminalMarker
+          let turnMarker = initialTurnMarker
+          if (protocolRepairAttempt > 0) {
+            const repairMarkerToken = digestJson({
+              cycle,
+              protocolRepairAttempt,
+              purpose: "protocol_repair",
+              workflowId,
+            }).slice(0, 32).toUpperCase()
+            turnMarker = `EGO_CHAT_CONVERGENCE_${repairMarkerToken}_C${cycle}_R${protocolRepairAttempt}`
+            terminalMarker = `EGO_CHAT_REVIEW_DONE_${repairMarkerToken}_R${protocolRepairAttempt}`
+            reviewPrompt = buildChatGptProtocolRepairPrompt({
+              candidateDigest,
+              contract,
+              cycle,
+              failureReason: protocolFailure.reason,
+              previousResponseDigest: protocolFailure.responseDigest,
+              terminalMarker,
+              turnMarker,
+            })
+            assertReviewPromptWithinBudget(reviewPrompt, "", {
+              code: "human_required",
+              message: "The exact ChatGPT protocol-repair prompt exceeds the transport limit.",
+              reason: "review_protocol_repair_prompt_too_large",
+            })
+            const repairSecretSignatures = scanForSecrets(reviewPrompt)
+            if (repairSecretSignatures.length > 0) {
+              throw new EgoChatError(
+                "human_required",
+                "The outbound ChatGPT protocol-repair prompt matched a protected secret signature and was not sent.",
+                {
+                  reason: "review_packet_secret_detected",
+                  signatures: repairSecretSignatures,
+                },
+              )
+            }
+          }
+
+          current = this.#requireRunningConvergence(workflowId, controller.signal)
+          const chatGptTimeoutMs = this.#boundedChatGptTimeout(
+            current,
+            request.chatGptTimeoutMs,
           )
-        }
-        const { protocolNormalization, review } = parseChatGptReviewEnvelope(
-          await this.#readResponseText(reviewed.result),
-          {
-            candidateDigest,
-            criteria: contract.criteria,
+          child = await this.#startEgoExchange({
+            allowProtocolRepairCapture: true,
+            ...(request.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
+            bindingKey: current.bindingKey,
+            ...(expectedPreviousHead ? { expectedPreviousHead } : {}),
+            expectedTerminalMarker: terminalMarker,
+            prompt: reviewPrompt,
+            timeoutMs: chatGptTimeoutMs,
+            turnMarker,
+          }, workflowId)
+          if (protocolRepairAttempt > 0) {
+            protocolRepairWorkflowIds.push(child.id)
+          }
+          this.#convergenceChildren.set(workflowId, child.id)
+          current = this.#requireRunningConvergence(workflowId, controller.signal)
+          await this.#transition(current, "convergence.chatgpt_review_started", {
+            childWorkflowId: child.id,
             cycle,
-            targetDigest: contract.targetDigest,
-            terminalMarker,
-          },
-        )
+            phase: "chatgpt_running",
+            private: current.private,
+            protocolRepairAttempt,
+          })
+
+          current = this.#requireRunningConvergence(workflowId, controller.signal)
+          const childWaitMs = this.#boundedConvergenceTimeout(
+            current,
+            chatGptTimeoutMs + CHATGPT_TRANSPORT_GRACE_MS,
+            1,
+          )
+          reviewed = await this.awaitWorkflow(
+            { timeoutMs: childWaitMs, workflowId: child.id },
+            controller.signal,
+          )
+          this.#convergenceChildren.delete(workflowId)
+          if (reviewed.status !== "succeeded") {
+            throw new EgoChatError(
+              "human_required",
+              "The ChatGPT browser review did not complete unambiguously.",
+              {
+                childStatus: reviewed.status,
+                reason: reviewed.humanRequired?.code ?? reviewed.error?.code ?? "chatgpt_review_incomplete",
+              },
+            )
+          }
+          const responseText = await this.#readResponseText(reviewed.result)
+          try {
+            const parsed = parseChatGptReviewEnvelope(responseText, {
+              candidateDigest,
+              criteria: contract.criteria,
+              cycle,
+              targetDigest: contract.targetDigest,
+              terminalMarker,
+            })
+            protocolNormalization = parsed.protocolNormalization
+            review = parsed.review
+            evaluation = evaluateReview(review)
+            break
+          } catch (error) {
+            if (!isRecoverableReviewProtocolError(error)) {
+              throw error
+            }
+            const reason = error.details.reason
+            const failureSignature = reviewProtocolFailureSignature(reason, responseText)
+            if (protocolFailureSignatures.has(failureSignature)) {
+              throw new EgoChatError(
+                "review_protocol_stagnated",
+                "ChatGPT repeated an identical invalid review state after automatic protocol correction, so convergence cannot make safe progress.",
+                {
+                  protocolRepairAttempt,
+                  protocolRepairWorkflowIds,
+                  reason: "review_protocol_stagnated",
+                  userActionRequired: false,
+                },
+              )
+            }
+            protocolFailureSignatures.add(failureSignature)
+            expectedPreviousHead = reviewResponseHeadAnchor(reviewed.result, child.id)
+            protocolFailure = {
+              reason,
+              responseDigest: reviewed.result.responseDigest,
+            }
+            protocolRepairAttempt += 1
+          }
+        }
         const signature = reviewSignature(review)
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
@@ -2555,7 +2658,9 @@ export class Broker {
                 chatGpt: {
                   childWorkflowId: child.id,
                   protocolNormalization,
-                  responseDigest: reviewed.result.digest,
+                  protocolRepairCount: protocolRepairAttempt,
+                  protocolRepairWorkflowIds,
+                  responseDigest: reviewed.result.responseDigest,
                 },
                 review,
                 reviewSignature: signature,
@@ -2564,6 +2669,7 @@ export class Broker {
             priorReview: review,
           },
         })
+        current = this.#requireRunningConvergence(workflowId, controller.signal)
         if (priorDuplicate) {
           throw new EgoChatError(
             "human_required",
@@ -2572,7 +2678,10 @@ export class Broker {
           )
         }
 
-        const evaluation = evaluateReview(review)
+        const totalProtocolRepairCount = current.private.cycles.reduce(
+          (total, record) => total + (record.chatGpt?.protocolRepairCount ?? 0),
+          0,
+        )
         if (evaluation.settled) {
           current = this.#requireRunningConvergence(workflowId, controller.signal)
           await client.unsubscribeThread(threadId)
@@ -2591,6 +2700,7 @@ export class Broker {
               criteria: review.criteria,
               cycleCount: cycle,
               findings: review.findings,
+              protocolRepairCount: totalProtocolRepairCount,
               reviewSummary: review.summary,
               targetDigest: contract.targetDigest,
             },
@@ -2619,9 +2729,11 @@ export class Broker {
         return
       }
       const isKnown = error instanceof EgoChatError
+      const userActionRequired = error.details?.userActionRequired !== false
       const diagnostic = appServerDiagnostic(error)
-      await this.#transition(current, isKnown ? "workflow.human_required" : "workflow.failed", {
-        ...(isKnown
+      const requiresHuman = isKnown && userActionRequired
+      await this.#transition(current, requiresHuman ? "workflow.human_required" : "workflow.failed", {
+        ...(requiresHuman
           ? {
               humanRequired: {
                 code: error.details?.reason ?? error.code,
@@ -2631,13 +2743,15 @@ export class Broker {
             }
           : {
               error: {
-                code: "convergence_failed",
-                message: "The convergence workflow failed unexpectedly.",
+                code: isKnown ? (error.details?.reason ?? error.code) : "convergence_failed",
+                message: isKnown
+                  ? error.message
+                  : "The convergence workflow failed unexpectedly.",
               },
             }),
         phase: "stopped",
         private: undefined,
-        status: isKnown ? "human_required" : "failed",
+        status: requiresHuman ? "human_required" : "failed",
       })
     } finally {
       if (client && threadId) {

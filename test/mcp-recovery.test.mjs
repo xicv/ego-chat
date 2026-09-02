@@ -111,7 +111,9 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.match(instructions, /binding ego-chat-main/)
   assert.match(instructions, /ego_converge_until_settled/)
   assert.match(instructions, /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
-  assert.match(instructions, /retry internally with a deterministic fresh marker only after durable reconciliation proves/)
+  assert.match(instructions, /retry delivery internally with a deterministic fresh marker only after durable reconciliation proves/)
+  assert.match(instructions, /recoverable envelope fault is not a human-approval boundary/)
+  assert.match(instructions, /review_protocol_stagnated is a non-human failure/)
   assert.match(instructions, /explicitly authorizes reclaiming the exact binding-owned Ego task space/)
   assert.match(instructions, /post-settlement commit, push, merge, deploy, or release work outside the review target/)
   assert.match(instructions, /Never call ego_verify_conversation as a preflight for a fresh send/)
@@ -592,6 +594,9 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   const responseDigests = new Map()
   let exchanges = 0
   const exchangeMarkers = []
+  let ambiguousThrown = false
+  let deliveryAbsentThrown = false
+  let lateRecoveryThrown = false
   let pendingRecovery = null
   let reconciliations = 0
   const egoAdapter = {
@@ -611,6 +616,9 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     exchange: async (input) => {
       exchanges += 1
       exchangeMarkers.push(input.turnMarker)
+      if (input.turnMarker.startsWith("EGO_CHAT_AGENT_REVIEW_")) {
+        assert.equal(input.allowProtocolRepairCapture, true)
+      }
       if (input.prompt.includes("Controlled review packet for direct.")) {
         assert.equal(input.allowTaskSpaceReclaim, true)
       }
@@ -691,9 +699,50 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           turnMarker: input.turnMarker,
         }
       }
+      if (input.prompt.includes("Controlled review packet for inconsistent-settlement.")) {
+        const candidateDigest = input.prompt.match(/Candidate digest: ([a-f0-9]{64})/)?.[1]
+        const cycle = Number(input.prompt.match(/Cycle: (\d+)/)?.[1])
+        const targetDigest = input.prompt.match(/Target digest: ([a-f0-9]{64})/)?.[1]
+        const responseText = `${JSON.stringify({
+          candidateDigest,
+          criteria: [{ evidence: "One criterion still fails.", id: "AC-1", status: "fail" }],
+          cycle,
+          decision: "settled",
+          findings: [{
+            action: "Correct the criterion before settlement.",
+            id: "B-INCONSISTENT",
+            severity: "blocking",
+            title: "Settlement is internally inconsistent",
+          }],
+          summary: "The response incorrectly claims settlement.",
+          targetDigest,
+        })}\n${input.expectedTerminalMarker}`
+        responseDigests.set(exchanges, digest(responseText))
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: `controlled-head-${exchanges}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: `controlled-assistant-${exchanges}`,
+            lastRole: "assistant",
+            messageCount: input.binding.messageCount + 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "controlled-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      }
       const responseText = strictReviewResponse(input)
       responseDigests.set(exchanges, digest(responseText))
-      if (exchanges === 3) {
+      if (
+        input.prompt.includes("Controlled review packet for late-recovery.")
+        && !lateRecoveryThrown
+      ) {
+        lateRecoveryThrown = true
         pendingRecovery = { kind: "recover", responseText }
         throw new EgoChatError(
           "human_required",
@@ -704,7 +753,11 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           },
         )
       }
-      if (exchanges === 4) {
+      if (
+        input.prompt.includes("Controlled review packet for ambiguous.")
+        && !ambiguousThrown
+      ) {
+        ambiguousThrown = true
         pendingRecovery = { kind: "reject", responseText }
         throw new EgoChatError(
           "human_required",
@@ -715,7 +768,11 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           },
         )
       }
-      if (exchanges === 5) {
+      if (
+        input.prompt.includes("Controlled review packet for delivery-absent.")
+        && !deliveryAbsentThrown
+      ) {
+        deliveryAbsentThrown = true
         pendingRecovery = { kind: "absent" }
         throw new EgoChatError(
           "ego_driver_error",
@@ -728,9 +785,13 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
           },
         )
       }
-      const returnedText = exchanges === 2
+      const returnedText = input.prompt.includes("Settle controlled candidate protocol-stagnation.")
         ? `not-json\n${input.expectedTerminalMarker}`
-        : responseText
+        : input.prompt.includes("Controlled review packet for malformed.")
+          ? `not-json\n${input.expectedTerminalMarker}`
+          : input.prompt.includes("Controlled review packet for markerless.")
+            ? responseText.slice(0, responseText.lastIndexOf("\n"))
+            : responseText
       responseDigests.set(exchanges, digest(returnedText))
       return {
         canonicalUrl,
@@ -871,8 +932,12 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     arguments: reviewInput("malformed"),
     name: "ego_review_candidate_and_wait",
   })
-  assert.equal(malformed.isError, true)
-  assert.equal(JSON.parse(malformed.content[0].text).details.reason, "convergence_protocol_invalid")
+  assert.equal(malformed.isError, undefined)
+  assert.equal(malformed.structuredContent.settled, true)
+  assert.equal(malformed.structuredContent.protocolRepairCount, 1)
+  assert.equal(malformed.structuredContent.protocolRepairWorkflowIds.length, 1)
+  assert.equal(JSON.parse(malformed.content[0].text).protocolRepairCount, 1)
+  assert.notEqual(exchangeMarkers[1], exchangeMarkers[2])
 
   const recovered = await client.callTool({
     arguments: reviewInput("late-recovery"),
@@ -882,7 +947,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(recovered.structuredContent.settled, true)
   assert.equal(recovered.structuredContent.recoveredLateResponse, true)
   assert.equal(recovered.structuredContent.modelPolicy.powerLevel, 5)
-  assert.equal(recovered.structuredContent.responseDigest, responseDigests.get(3))
+  assert.equal(recovered.structuredContent.responseDigest, responseDigests.get(4))
 
   const ambiguous = await client.callTool({
     arguments: reviewInput("ambiguous"),
@@ -901,7 +966,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(absent.structuredContent.deliveryAttemptCount, 2)
   assert.equal(absent.structuredContent.deliveryAbsentWorkflowIds.length, 1)
   assert.notEqual(exchangeMarkers[4], exchangeMarkers[5])
-  assert.equal(exchanges, 6)
+  assert.equal(exchanges, 7)
   assert.equal(reconciliations, 3)
 
   const replayedAbsent = await client.callTool({
@@ -914,7 +979,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     replayedAbsent.structuredContent.deliveryAbsentWorkflowIds,
     absent.structuredContent.deliveryAbsentWorkflowIds,
   )
-  assert.equal(exchanges, 6)
+  assert.equal(exchanges, 7)
 
   const explicitOperationId = "review-conflict-operation-20260825"
   const firstConflict = await client.callTool({
@@ -929,7 +994,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(conflictingRetry.isError, true)
   assert.equal(JSON.parse(conflictingRetry.content[0].text).code, "operation_key_conflict")
-  assert.equal(exchanges, 7)
+  assert.equal(exchanges, 8)
 
   const largeTurnMarker = "EGO_CHAT_MCP_LARGE_RESULT_20260825"
   const largeResult = await client.callTool({
@@ -974,7 +1039,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(crossWorkflowRead.isError, true)
   assert.equal(JSON.parse(crossWorkflowRead.content[0].text).code, "result_digest_mismatch")
-  assert.equal(exchanges, 8)
+  assert.equal(exchanges, 9)
 
   const transportFailureInput = reviewInput("always-absent")
   transportFailureInput.candidate.reviewPacket = `always-absent\n${"large exact evidence\n".repeat(1_100)}`
@@ -1001,7 +1066,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(exhaustedError.details.modelPolicy.modelLabel, "GPT-5.6 Sol")
   assert.equal(exhaustedError.details.modelPolicy.powerLevel, 5)
   assert.equal(new Set(exchangeMarkers.slice(-2)).size, 2)
-  assert.equal(exchanges, 10)
+  assert.equal(exchanges, 11)
   assert.equal(reconciliations, 5)
 
   const aliasedContinuation = await client.callTool({
@@ -1027,7 +1092,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(compactContinuation.nextAction, "address_review_and_submit_next_cycle")
   assert.equal(compactContinuation.nextCycle, 2)
   assert.deepEqual(compactContinuation.review, aliasedContinuation.structuredContent.review)
-  assert.equal(exchanges, 11)
+  assert.equal(exchanges, 12)
 
   const seventhCycle = await client.callTool({
     arguments: { ...reviewInput("cycle-seven"), cycle: 7 },
@@ -1037,5 +1102,35 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(seventhCycle.structuredContent.settled, true)
   assert.equal(seventhCycle.structuredContent.cycle, 7)
   assert.equal(seventhCycle.structuredContent.nextAction, "settled")
-  assert.equal(exchanges, 12)
+  assert.equal(exchanges, 13)
+
+  const markerless = await client.callTool({
+    arguments: reviewInput("markerless"),
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(markerless.isError, undefined)
+  assert.equal(markerless.structuredContent.settled, true)
+  assert.equal(markerless.structuredContent.protocolRepairCount, 1)
+  assert.equal(exchanges, 15)
+
+  const inconsistentSettlement = await client.callTool({
+    arguments: reviewInput("inconsistent-settlement"),
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(inconsistentSettlement.isError, undefined)
+  assert.equal(inconsistentSettlement.structuredContent.settled, true)
+  assert.equal(inconsistentSettlement.structuredContent.protocolRepairCount, 1)
+  assert.equal(exchanges, 17)
+
+  const stagnated = await client.callTool({
+    arguments: reviewInput("protocol-stagnation"),
+    name: "ego_review_candidate_and_wait",
+  })
+  const stagnatedError = JSON.parse(stagnated.content[0].text)
+  assert.equal(stagnated.isError, true)
+  assert.equal(stagnatedError.code, "review_protocol_stagnated")
+  assert.equal(stagnatedError.details.reason, "review_protocol_stagnated")
+  assert.equal(stagnatedError.details.userActionRequired, false)
+  assert.equal(stagnatedError.details.protocolRepairAttempt, 1)
+  assert.equal(exchanges, 19)
 })

@@ -1657,7 +1657,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 10) {
+    if (input.browserContractRevision !== 11) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1764,7 +1764,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 10) {
+    if (input.browserContractRevision !== 11) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1910,7 +1910,14 @@ async function egoDriverMain(inputPathOverride = undefined) {
     )
     const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
     const responseEndsWithTerminal = response?.text.trimEnd().endsWith(input.expectedTerminalMarker) ?? false
-    const terminalPairReady = (
+    const exactTerminalResponse = terminalCount === 1 && responseEndsWithTerminal
+    const protocolRepairResponse = (
+      input.allowProtocolRepairCapture === true
+      && !exactTerminalResponse
+      && typeof response?.text === "string"
+      && response.text.trim().length > 0
+    )
+    const reviewPairReady = (
       committed.length === 2
       && prompt?.role === "user"
       && response?.role === "assistant"
@@ -1918,8 +1925,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       && Boolean(response?.messageId)
       && promptMessageIdMatches
       && prompt.messageId !== response.messageId
-      && terminalCount === 1
-      && responseEndsWithTerminal
+      && (exactTerminalResponse || protocolRepairResponse)
     )
     const incompleteCaptureCanContinue = (
       input.mode === "capture_exchange"
@@ -1938,7 +1944,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
         && (!response.messageId || response.messageId !== prompt.messageId)
         && (!Number.isInteger(terminalCount) || terminalCount <= 1)
       ))
-      && !terminalPairReady
+      && !reviewPairReady
     )
     if (incompleteCaptureCanContinue) {
       const pendingInfo = await pageInfo()
@@ -2032,8 +2038,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       && prompt.messageId !== response.messageId
       && promptMarkerCount === 1
       && renderedMarkerCount === 1
-      && terminalCount === 1
-      && responseEndsWithTerminal
+      && (exactTerminalResponse || protocolRepairResponse)
     )
     if (!attributablePair) {
       humanRequired("bound_reconciliation_mismatch", "The browser does not contain exactly one stable late user/assistant pair attributable to that workflow.", {
@@ -2055,7 +2060,12 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return
     }
 
-    await wait(1)
+    await wait(protocolRepairResponse ? 5 : 1)
+    const stableGenerationRunning = protocolRepairResponse
+      ? await js(String.raw`Boolean(
+          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+        )`)
+      : false
     const stableEntries = await readConversationEntries()
     const stablePrompt = stableEntries.find((entry) => entry.messageId === prompt.messageId)
     const stablePromptMarkerCount = stablePrompt?.text.split(input.turnMarker).length - 1
@@ -2069,6 +2079,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     )
     if (
       stableHead.fingerprint !== firstHead.fingerprint
+      || stableGenerationRunning
       || stableHead.lastMessageId !== response.messageId
       || stableEntries.length !== entries.length
       || stablePrompt?.role !== "user"
@@ -2099,7 +2110,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 10) {
+    if (input.browserContractRevision !== 11) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -2543,7 +2554,11 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
       const terminal = !state.running
         && state.composerAvailable
-        && state.assistantText.includes(input.expectedTerminalMarker)
+        && state.assistantText.length > 0
+        && (
+          state.assistantText.includes(input.expectedTerminalMarker)
+          || input.allowProtocolRepairCapture === true
+        )
       if (terminal && state.assistantText === stableText) {
         stableCount += 1
       } else if (terminal) {
@@ -2598,8 +2613,14 @@ async function egoDriverMain(inputPathOverride = undefined) {
           && committed[0].messageId !== committed[1].messageId
           && userMarkerCount === 1
           && renderedMarkerCount === 1
-          && terminalCount === 1
-          && responseEndsWithTerminal
+          && (
+            (terminalCount === 1 && responseEndsWithTerminal)
+            || (
+              input.allowProtocolRepairCapture === true
+              && typeof committed[1]?.text === "string"
+              && committed[1].text.trim().length > 0
+            )
+          )
         )
         const finishedHead = summarizeConversationHead(
           finishedEntries,
@@ -2686,7 +2707,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "reanchor") {
-      if (input.browserContractRevision !== 10) {
+      if (input.browserContractRevision !== 11) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
         return
       }

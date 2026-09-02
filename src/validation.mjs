@@ -152,6 +152,7 @@ export const ModelPolicyObservationSchema = z.object({
 )
 
 export const ConversationReconcileSchema = z.object({
+  allowProtocolRepairCapture: z.literal(true).optional(),
   bindingKey: BindingKeySchema,
   expectedPreviousContentDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   expectedPreviousMessageId: TargetIdSchema.optional(),
@@ -177,6 +178,7 @@ const ConversationHeadAnchorSchema = z.object({
 }).strict()
 
 export const EgoExchangeSchema = z.object({
+  allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).optional(),
   bindingKey: BindingKeySchema,
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),

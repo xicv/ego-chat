@@ -40,7 +40,7 @@ async function runMalformedModelPolicyCase(attributes, {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 10,
+    browserContractRevision: 11,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -269,7 +269,7 @@ async function runPreSendDriverCase({
   }
   const input = {
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-    browserContractRevision: 10,
+    browserContractRevision: 11,
     binding: boundTaskSpaceOwnership === null
       ? {
           messageCount: 0,
@@ -554,7 +554,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 10,
+    browserContractRevision: 11,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -963,6 +963,7 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 }
 
 async function runTaskSpaceReconciliationCase({
+  allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
   captureContinuationAllowed = false,
   fallbackTaskSpaceOwnership = null,
@@ -1000,6 +1001,7 @@ async function runTaskSpaceReconciliationCase({
   ]
   const input = {
     allowDeliveryAbsent: true,
+    ...(allowProtocolRepairCapture ? { allowProtocolRepairCapture: true } : {}),
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     ...(captureContinuationAllowed ? { captureContinuationAllowed: true } : {}),
     binding: {
@@ -1017,7 +1019,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 10,
+    browserContractRevision: 11,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -2338,6 +2340,24 @@ test("bounded capture tolerates a transient missing generation control", async (
   assert.equal(captured.result.captureState, "pending")
   assert.equal(captured.result.generationRunning, false)
   assert.equal(captured.result.promptMessageId, "reconcile-user")
+})
+
+test("strict bounded capture commits a stable markerless review for automatic protocol repair", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    allowProtocolRepairCapture: true,
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.responseText, "Partial review")
+  assert.equal(
+    captured.result.responseDigest,
+    createHash("sha256").update("Partial review", "utf8").digest("hex"),
+  )
+  assert.equal(captured.result.head.lastMessageId, "partial-assistant")
+  assert.equal(captured.result.head.lastRole, "assistant")
 })
 
 test("bounded capture fails closed when the confirmed prompt identity changes", async () => {
