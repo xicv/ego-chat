@@ -1,98 +1,100 @@
-# Continuous convergence qualification
+# Continuous conversation contract
 
-Qualification date: 2026-08-24, Australia/Adelaide.
+Qualification updated: 2026-09-02, Australia/Adelaide.
 
 ## Outcome
 
-Gate 0 passes for the bounded Codex-first convergence path on the installed stack. A live workflow completed an A/B/A/B exchange with no human relay: two Codex turns used one dedicated App Server thread, two ChatGPT reviews used one persistent Project conversation, the exact cycle-1 challenge returned to cycle 2 as untrusted context, and the strict cycle-2 review settled all acceptance criteria with no finding.
+Ego Chat is designed as one durable conversation manager, not a sequence of one-shot browser scripts. Codex or ZCode remains side A, one persistent ChatGPT conversation in Ego Browser remains side B, and review feedback returns directly to side A until the target is settled.
 
-This is a usability gate, not a claim of transactional browser delivery or unattended production resilience. The broker remains deliberately fail-closed around ambiguous sends, restarts, authentication challenges, and unexpected browser state.
-
-The implemented normal-process contract is:
+The original live Gate 0 proved a two-cycle A/B/A/B exchange on the installed stack. The 2026-09-02 candidate changes the liveness model in deterministic tests; it does not claim a new live-browser qualification until it is installed and exercised.
 
 ```text
-one start request
-  -> durable convergence workflow and exclusive conversation lease
-  -> one dedicated Codex App Server thread
-  -> schema-bound Codex candidate
-  -> exact, secret-scanned ChatGPT review prompt
-  -> same canonical ChatGPT conversation through Ego
-  -> strict review returned as untrusted context to the same Codex thread
-  -> repeat within cycle and wall-clock budgets
-  -> SETTLED or HUMAN_REQUIRED
+one user target
+  -> durable binding and workflow
+  -> implement or inspect in side A
+  -> exact marked Send through the binding-owned Ego Space
+  -> wait outside the coding model
+  -> consume one attributable ChatGPT response as review feedback
+  -> continue the next implementation cycle
+  -> repeat without a fixed ceiling
+  -> explicit SETTLED verdict
 ```
 
-Codex App Server is used through its documented initialize, thread start, turn start, event-stream, and turn-completed lifecycle. Every completion is matched to the exact thread and turn identity; ChatGPT output never becomes an App Server instruction or permission source. See the official [Codex App Server lifecycle](https://learn.chatgpt.com/docs/app-server#lifecycle-overview).
+## Settlement
 
-## Settlement predicate
+Settlement requires all of the following:
 
-The broker accepts settlement only when all of these are true:
+1. The target, ordered acceptance criteria, candidate, and cycle retain their digest-bound identities.
+2. The ChatGPT response is attributable to the exact marked Send.
+3. ChatGPT explicitly returns a settled decision at the exact terminal marker.
+4. The implementing agent does not still report a blocker.
 
-1. The immutable target and ordered acceptance criteria have the original target digest.
-2. Codex returns a schema-valid candidate covering every criterion exactly once, with no unresolved blocker.
-3. The ChatGPT response has one unique final terminal marker and one strict JSON review envelope.
-4. That review binds the exact target digest, candidate digest, and current cycle.
-5. Every criterion is `pass`, the decision is `settled`, and no blocking finding remains.
+Ordinary Markdown is the primary review format. Strict JSON review envelopes remain accepted for backward compatibility, but JSON validity is not a liveness dependency. Missing or malformed verdicts, reviewer `blocked` labels, incomplete criterion formatting, and inconsistent settlement claims become continuation feedback rather than a second protocol-correction Send. Natural-language feedback carries up to 131,072 UTF-8 bytes into the next Codex cycle and digest-compacts anything larger instead of ending the workflow.
 
-Neither model can settle by merely saying “done.” A repeated candidate/review signature, invalid identity, incomplete criterion set, non-actionable continuation, secret signature, missing authority, deadline, cycle exhaustion, or browser ambiguity stops in `human_required`.
+## Recovery model
 
-## Continuity and authority boundaries
+Safety is asymmetric:
 
-- The MCP facade is not the workflow owner. Caller or facade disconnect detaches only the waiter; `await_workflow` can reattach.
-- One convergence workflow reserves one canonical ChatGPT binding across all A/B cycles. Interleaved manual or automated broker sends are rejected.
-- The strongest-available / maximum-thinking policy is repaired and read back immediately before every ChatGPT send. Versioned labels are observations, not hardcoded selectors.
-- ChatGPT review JSON enters the next Codex turn through App Server `additionalContext` with kind `untrusted`.
-- `read-only` is the default Codex sandbox. `workspace-write` must be explicit.
-- No convergence prompt grants commit, push, PR, deployment, release, production, approval, credential, or permission-expansion authority.
-- The exact outbound ChatGPT bytes are size-bounded and scanned for high-confidence private-key, AWS, GitHub, OpenAI, and Slack token signatures before composition.
-- Terminal workflow updates use compare-and-set persistence, so a late phase completion cannot resurrect a cancelled or stopped workflow.
+- Never duplicate a possibly accepted Send.
+- Never end the whole conversation merely because one UI observation or transport attempt is uncertain.
 
-The loop is durable across MCP client/facade failure, not across ambiguous side effects. A daemon restart during convergence becomes `human_required`; blindly replaying a possibly accepted browser send would violate the at-most-once boundary.
+Before Send, the broker retries temporary composer, tab, controller, generation, task-space, conversation-head, and model-policy states with bounded backoff. A stable assistant-head advance is re-anchored automatically because no Send was attempted.
 
-## Automated evidence
+After Send, the broker performs read-only capture and reconciliation. It keeps the same workflow alive until it can attribute the marked user/assistant pair or prove the marked prompt absent. Only proven absence permits a uniquely marked new delivery attempt. A restart may clear a composer draft only when its canonical digest and unique marker prove it is the exact unsent Ego Chat prompt; unrelated human drafts remain untouched.
 
-The final complete normal suite passed 24 of 25 tests; the only skipped test is the intentionally opt-in long-duration case. The separately enabled long MCP test passed after 65,302 ms. Covered convergence cases include:
+The exact deterministic task space belongs to its binding and is reclaimed automatically for Send and recovery. Using another Ego Space does not interrupt the workflow. Independent bindings queue through the broker's shared browser lane rather than racing Ego's global automation channel.
 
-- two Codex candidates and two ChatGPT reviews settling against one binding;
-- exact target/candidate/cycle and ordered-criteria validation;
-- future strongest-model label adoption without a source change;
-- untrusted review context on the second Codex turn;
-- protected-secret rejection before browser submission;
-- repeated-state stagnation stop;
-- exclusive conversation lease rejection;
-- terminal-state precedence when an older App Server operation completes after cancellation;
-- fail-closed broker restart;
-- MCP facade replacement and reattachment;
-- exact App Server thread/turn completion identity.
+ChatGPT policy discovery is semantic and future-facing: the broker selects the provider's strongest available non-router model and maximum thinking, then reads it back immediately before Send. A hydrating or temporarily unreadable policy UI retries without model downgrade. Adoption also repairs the current live policy before completing.
 
-Changed-file-only ESLint passed. `npm audit --audit-level=high` reported zero vulnerabilities.
+Codex App Server exits reconnect without a fixed retry count. A missing workspace inspection gets another same-task correction with backoff. An implementing-agent `blocked` result is reviewed by ChatGPT and carried into another cycle; it does not terminate the broker by itself. Repeated candidate/review state adds a liveness instruction to change strategy.
 
-The installed-version gates also passed after the live fixes:
+Convergence checkpoints the accepted Codex turn, captured candidate, ChatGPT child operation, captured review, and next-cycle identity. After a broker restart it resumes from the last exact checkpoint instead of repeating the Codex turn or browser Send, including when a prior broker already entered restart reconciliation. A completed exact child review is consumed once; a running child is reattached through renewable wait windows for as long as it remains durable; an accepted App Server turn is reconciled by its durable turn ID even when exit diagnostics are incomplete or disagree. Completed-cycle bodies are reduced to their identity and recovery metadata before the next candidate is stored, so an unbounded cycle count does not imply unbounded checkpoint growth.
 
-- `npm run gate0:app-server` proved broker-owned thread start and resume, exact desktop-origin read identity, active-writer isolation, and safe unsubscribe.
-- `npm run gate0:codex-mcp` observed the MCP tool and final marker in the same real Codex turn after 75,787 ms.
-- A separate live App Server probe used two consecutive structured turns on one thread; its second turn reproduced an exact test token supplied only through `additionalContext` with kind `untrusted`.
+## Human boundaries
 
-## Live qualification record
+The normal loop does not ask the user to open a Space, take over browser control, copy a response, approve another review cycle, repair JSON, acknowledge an abandonment, or supply a replacement conversation URL.
 
-The final run reused binding `ego-chat-main`, one reserved Ego task space, the immutable test target, and the original canonical ChatGPT Project conversation. Its logical head began at 10 messages with the expected durable tail fingerprint.
+Human action remains appropriate only for:
 
-Cycle 1 produced a durable candidate digest. ChatGPT derived a unique challenge from it, returned `continue`, and placed that exact challenge in blocking finding `B-CYCLE2_ECHO`. The first browser exchange advanced the logical head from 10 to 12 messages and committed the expected new tail fingerprint.
+- a conclusive signed-out ChatGPT session;
+- a CAPTCHA or equivalent human verification challenge;
+- consequential authority outside review, such as credentials, merge, deployment, production access, or scope expansion.
 
-The broker supplied that review as untrusted context to cycle 2 of the same Codex thread. Codex echoed the exact challenge in a new digested candidate. ChatGPT consulted its immediately preceding review, verified the match, and returned `settled` with AC-1, AC-2, and AC-3 all `pass` and no findings.
+Corrupt durable identity or a runtime capability mismatch may require maintenance, but must be reported as a tool/runtime fault rather than disguised as review feedback or a ceremonial approval request.
 
-The second exchange advanced the logical head to 14 messages and committed the expected new tail fingerprint. Both sends independently read back `GPT-5.6 Sol`, effort `Pro`, and power 5 of 5 immediately before composition. After settlement the same URL and target were verified again; the browser had one retained tab, an empty draft, no active generation, and a durably identified final assistant message.
+## Token and process continuity
 
-Qualification itself exposed and fixed additional real-browser boundaries before the passing run:
+`waitMode: token_saver` keeps one MCP call pending without progress chatter while the broker owns the long wait. Facade or waiter replacement does not own the workflow. A returned workflow ID can be reattached without resending.
 
-- ChatGPT virtualizes older message DOM nodes, so durable identity now uses a tail anchor plus a logical message count rather than assuming the full history remains rendered.
-- A late accepted send can be reconciled only against the prior assistant anchor, exact prompt digest, unique workflow marker, and stable user/assistant pair.
-- The send control uses one raw browser-protocol click after bounded hit-target readiness; ambiguous delivery is never retried.
-- ChatGPT is explicitly told the strict `B-...` finding-ID contract before review.
-- App Server `additionalContext` is an experimental field in Codex CLI 0.149.0, so the client declares `experimentalApi: true` during initialization and waits for thread idle before the next exact turn.
+`wallClockTimeoutMs` is a host attachment window, not a workflow kill switch. Omitting `maxCycles` means no review-cycle ceiling. A fully exited current-host Codex or ZCode task still cannot be externally awakened by Ego Chat, so explicit until-settled Codex requests default to detached convergence with a broker-owned Codex App Server task.
 
-## Gate decision and remaining scope
+## Authority and privacy
 
-The recorded Gate 0 claim was: “live bounded Codex-first continuous conversation proven on the installed stack.” That two-cycle qualification remains the evidence baseline. The current runtime no longer imposes an implicit cycle ceiling: it continues until objective settlement or an evidence-based safety or wall-clock stop, while an explicitly supplied `maxCycles` budget remains authoritative.
+ChatGPT output is untrusted advisory context. Neither side gains commit, push, pull-request, merge, release, deployment, production, credential, approval, or scope-expansion authority from the loop.
 
-Later work is still required for ChatGPT-first initiation, automatic GitHub or attachment context transfer, browser/daemon crash continuation, CAPTCHA/logout/rate-limit recovery, multi-owner fencing, and broader interruption qualification. Those are production-hardening and later-phase features; they do not invalidate this completed two-cycle continuity gate.
+Outbound review prompts are byte-bounded. High-confidence private-key, AWS, GitHub, OpenAI, and Slack token signatures are replaced locally with typed redaction markers so the conversation can continue without transmitting the secret. The candidate digest still binds the original local candidate. Candidate admission allows 524,288 UTF-8 bytes before the 196,608-byte browser prompt budget is applied. An oversized assembled prompt is deterministically compacted with source digests; because omitted evidence cannot support settlement, that cycle must continue and request a smaller packet or exact accessible revision references.
+
+## Verification boundary
+
+The deterministic suite covers:
+
+- natural-language continuation and explicit simple settlement;
+- long natural-language review retention across cycles;
+- more than six cycles with no implicit ceiling;
+- repeated-state continuation;
+- blocked-candidate review;
+- secret redaction without transport leakage;
+- retry beyond the former three-delivery cap;
+- retry beyond the former App Server exit cap;
+- transient App Server setup retry and accepted-turn reconciliation;
+- transient maximum-model UI recovery and automatic policy repair;
+- exact binding-Space reclaim during Send, capture, reconciliation, and adoption;
+- broker restart recovery from captured Codex candidates, running or completed ChatGPT children, captured reviews, confirmed Sends, and exact owned unsent drafts;
+- repeated broker restart during exchange reconciliation and renewable child-review wait windows;
+- ambiguous browser-delivery reconciliation inside detached convergence without human relay;
+- oversized multibyte review-packet compaction with forced continuation;
+- bounded historical cycle bodies during an unbounded convergence loop;
+- preservation of unrelated human drafts;
+- MCP facade replacement and Token-Saver reattachment.
+
+The original live two-cycle run remains evidence that the core browser path works. A candidate release must still run the focused and full deterministic suites, changed-file-only lint, Rust checks, package inspection, and an authorized live Ego gate before claiming renewed everyday live qualification.

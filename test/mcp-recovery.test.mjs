@@ -8,7 +8,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import { loadOrCreateBrokerToken } from "../src/auth-token.mjs"
 import { Broker } from "../src/broker.mjs"
-import { MAX_PROMPT_BYTES } from "../src/constants.mjs"
+import {
+  MAX_REVIEW_PACKET_BYTES,
+} from "../src/constants.mjs"
 import { prepareAgentReview } from "../src/convergence.mjs"
 import { EgoChatError } from "../src/errors.mjs"
 import { startIpcServer } from "../src/ipc-server.mjs"
@@ -100,21 +102,25 @@ async function connectClient(env) {
 
 test("a new MCP facade reattaches to a broker workflow after the first facade exits", async (t) => {
   const { config, env } = await createTestConfig()
+  const clients = []
   t.after(async () => {
+    await Promise.all(clients.map((client) => client.close().catch(() => {})))
     await stopTestDaemon(config)
     await removeTestConfig(config)
   })
 
   const firstClient = await connectClient(env)
+  clients.push(firstClient)
   const tools = await firstClient.listTools()
   const instructions = firstClient.getInstructions()
   assert.match(instructions, /binding ego-chat-main/)
   assert.match(instructions, /ego_converge_until_settled/)
-  assert.match(instructions, /Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait/)
-  assert.match(instructions, /retry delivery internally with a deterministic fresh marker only after durable reconciliation proves/)
-  assert.match(instructions, /recoverable envelope fault is not a human-approval boundary/)
-  assert.match(instructions, /review_protocol_stagnated is a non-human failure/)
-  assert.match(instructions, /explicitly authorizes reclaiming the exact binding-owned Ego task space/)
+  assert.match(instructions, /Use ego_review_candidate_and_wait for a one-candidate review or only as a fallback/)
+  assert.match(instructions, /proven pre-Send delivery absence is retried automatically/)
+  assert.match(instructions, /Ordinary prose and imperfect formatting are consumed as continuation feedback/)
+  assert.match(instructions, /There is no fixed retry ceiling/)
+  assert.match(instructions, /automatic for the exact deterministic binding space/)
+  assert.match(instructions, /Keep its durable workflow alive and reconcile it/)
   assert.match(instructions, /post-settlement commit, push, merge, deploy, or release work outside the review target/)
   assert.match(instructions, /Never call ego_verify_conversation as a preflight for a fresh send/)
   assert.match(instructions, /use ego_get_conversation instead/)
@@ -159,7 +165,7 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   )
   assert.equal(
     reviewTool.inputSchema.properties.candidate.properties.reviewPacket.maxLength,
-    MAX_PROMPT_BYTES,
+    MAX_REVIEW_PACKET_BYTES,
   )
   assert.equal(reviewTool.inputSchema.properties.cycle.maximum, Number.MAX_SAFE_INTEGER)
   for (const toolName of ["ego_start_convergence", "ego_converge_until_settled"]) {
@@ -202,7 +208,7 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   await firstClient.close()
 
   const secondClient = await connectClient(env)
-  t.after(() => secondClient.close())
+  clients.push(secondClient)
   const completed = await secondClient.callTool({
     arguments: { timeoutMs: 5_000, waitMode: "token_saver", workflowId },
     name: "await_workflow",
@@ -223,11 +229,13 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
   const responseDigest = digest(responseText)
   let adoptionCalls = 0
   let exchangeCalls = 0
+  let receivedAllowTaskSpaceReclaim
   let receivedTaskSpace
   let receivedTimeoutMs
   const egoAdapter = {
     adopt: async (input) => {
       adoptionCalls += 1
+      receivedAllowTaskSpaceReclaim = input.allowTaskSpaceReclaim
       receivedTaskSpace = input.taskSpace
       receivedTimeoutMs = input.timeoutMs
       return {
@@ -298,7 +306,8 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
   assert.equal(adopted.content[0].text.includes("\n"), false)
   assert.equal(adoptionCalls, 1)
   assert.equal(exchangeCalls, 0)
-  assert.equal(receivedTaskSpace, "ego-chat-adoptions")
+  assert.equal(receivedAllowTaskSpaceReclaim, true)
+  assert.equal(receivedTaskSpace, `ego-chat-adopt-${digest(canonicalUrl).slice(0, 16)}`)
   assert.equal(receivedTimeoutMs > 0 && receivedTimeoutMs <= 15 * 60 * 1_000, true)
   assert.equal(broker.getConversationBinding({ bindingKey: derivedBindingKey }).state, "bound")
 })
@@ -588,7 +597,7 @@ test("Token-Saver wait errors preserve the durable workflow recovery handle", as
   assert.equal(error.details.workflowId, workflowId)
 })
 
-test("strict candidate review crosses MCP, validates settlement, and reconciles without resending", async (t) => {
+test("candidate review crosses MCP, keeps retrying proven absence, and consumes prose without resending", async (t) => {
   const { config, env } = await createTestConfig()
   const canonicalUrl = "https://chatgpt.com/c/controlled-mcp-review"
   const responseDigests = new Map()
@@ -597,6 +606,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   let ambiguousThrown = false
   let deliveryAbsentThrown = false
   let lateRecoveryThrown = false
+  let alwaysAbsentAttempts = 0
   let pendingRecovery = null
   let reconciliations = 0
   const egoAdapter = {
@@ -623,20 +633,26 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
         assert.equal(input.allowTaskSpaceReclaim, true)
       }
       if (input.prompt.includes("always-absent")) {
-        pendingRecovery = { kind: "absent" }
-        throw new EgoChatError(
-          "ego_driver_error",
-          "The fixed Ego Browser driver failed before delivery.",
-          {
-            compositionMethod: "dom_paragraph_input",
-            diagnosticDigest: "e".repeat(64),
-            draftCleared: true,
-            driverStage: "inserting_prompt_content",
-            evidence: { modelPolicy: modelPolicyObservation() },
-            promptBytes: Buffer.byteLength(input.prompt, "utf8"),
-            promptCharacters: input.prompt.length,
-          },
-        )
+        alwaysAbsentAttempts += 1
+        if (alwaysAbsentAttempts > 4) {
+          // Fall through to the attributable successful response below. This
+          // proves the current-host tool continues beyond the former ceiling.
+        } else {
+          pendingRecovery = { kind: "absent" }
+          throw new EgoChatError(
+            "ego_driver_error",
+            "The fixed Ego Browser driver failed before delivery.",
+            {
+              compositionMethod: "dom_paragraph_input",
+              diagnosticDigest: "e".repeat(64),
+              draftCleared: true,
+              driverStage: "inserting_prompt_content",
+              evidence: { modelPolicy: modelPolicyObservation() },
+              promptBytes: Buffer.byteLength(input.prompt, "utf8"),
+              promptCharacters: input.prompt.length,
+            },
+          )
+        }
       }
       if (input.turnMarker === "EGO_CHAT_MCP_LARGE_RESULT_20260825") {
         const responseText = `${"😀large-token-saver-result ".repeat(900)}${input.expectedTerminalMarker}`
@@ -933,11 +949,10 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     name: "ego_review_candidate_and_wait",
   })
   assert.equal(malformed.isError, undefined)
-  assert.equal(malformed.structuredContent.settled, true)
-  assert.equal(malformed.structuredContent.protocolRepairCount, 1)
-  assert.equal(malformed.structuredContent.protocolRepairWorkflowIds.length, 1)
-  assert.equal(JSON.parse(malformed.content[0].text).protocolRepairCount, 1)
-  assert.notEqual(exchangeMarkers[1], exchangeMarkers[2])
+  assert.equal(malformed.structuredContent.settled, false)
+  assert.equal(malformed.structuredContent.protocolRepairCount, 0)
+  assert.equal(malformed.structuredContent.protocolRepairWorkflowIds.length, 0)
+  assert.match(malformed.structuredContent.review.summary, /not-json/)
 
   const recovered = await client.callTool({
     arguments: reviewInput("late-recovery"),
@@ -947,7 +962,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(recovered.structuredContent.settled, true)
   assert.equal(recovered.structuredContent.recoveredLateResponse, true)
   assert.equal(recovered.structuredContent.modelPolicy.powerLevel, 5)
-  assert.equal(recovered.structuredContent.responseDigest, responseDigests.get(4))
+  assert.equal(recovered.structuredContent.responseDigest, responseDigests.get(3))
 
   const ambiguous = await client.callTool({
     arguments: reviewInput("ambiguous"),
@@ -966,7 +981,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(absent.structuredContent.deliveryAttemptCount, 2)
   assert.equal(absent.structuredContent.deliveryAbsentWorkflowIds.length, 1)
   assert.notEqual(exchangeMarkers[4], exchangeMarkers[5])
-  assert.equal(exchanges, 7)
+  assert.equal(exchanges, 6)
   assert.equal(reconciliations, 3)
 
   const replayedAbsent = await client.callTool({
@@ -979,7 +994,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
     replayedAbsent.structuredContent.deliveryAbsentWorkflowIds,
     absent.structuredContent.deliveryAbsentWorkflowIds,
   )
-  assert.equal(exchanges, 7)
+  assert.equal(exchanges, 6)
 
   const explicitOperationId = "review-conflict-operation-20260825"
   const firstConflict = await client.callTool({
@@ -994,7 +1009,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(conflictingRetry.isError, true)
   assert.equal(JSON.parse(conflictingRetry.content[0].text).code, "operation_key_conflict")
-  assert.equal(exchanges, 8)
+  assert.equal(exchanges, 7)
 
   const largeTurnMarker = "EGO_CHAT_MCP_LARGE_RESULT_20260825"
   const largeResult = await client.callTool({
@@ -1039,35 +1054,21 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   })
   assert.equal(crossWorkflowRead.isError, true)
   assert.equal(JSON.parse(crossWorkflowRead.content[0].text).code, "result_digest_mismatch")
-  assert.equal(exchanges, 9)
+  assert.equal(exchanges, 8)
 
   const transportFailureInput = reviewInput("always-absent")
   transportFailureInput.candidate.reviewPacket = `always-absent\n${"large exact evidence\n".repeat(1_100)}`
-  const exhausted = await client.callTool({
+  const recoveredAfterAbsence = await client.callTool({
     arguments: transportFailureInput,
     name: "ego_review_candidate_and_wait",
   })
-  const exhaustedError = JSON.parse(exhausted.content[0].text)
-  assert.equal(exhausted.isError, true)
-  assert.equal(exhaustedError.code, "review_packet_compaction_required")
-  assert.equal(exhaustedError.details.reason, "repeated_presend_composer_transport_failure")
-  assert.equal(exhaustedError.details.deliveryAttemptCount, 2)
-  assert.equal(exhaustedError.details.deliveryAbsentWorkflowIds.length, 2)
-  assert.equal(exhaustedError.details.deliveryState, "absent")
-  assert.equal(exhaustedError.details.newOperationIdRequired, true)
-  assert.equal(exhaustedError.details.sameBindingRequired, true)
-  assert.equal(exhaustedError.details.suggestedReviewPacketMaxBytes, 16 * 1024)
-  assert.equal(exhaustedError.details.userActionRequired, false)
-  assert.equal(exhaustedError.details.browserInterruption.compositionMethod, "dom_paragraph_input")
-  assert.equal(exhaustedError.details.browserInterruption.driverStage, "inserting_prompt_content")
-  assert.equal(exhaustedError.details.browserInterruption.diagnosticDigest, "e".repeat(64))
-  assert.equal(exhaustedError.details.browserInterruption.draftCleared, true)
-  assert.equal(exhaustedError.details.browserInterruption.promptBytes > 16 * 1024, true)
-  assert.equal(exhaustedError.details.modelPolicy.modelLabel, "GPT-5.6 Sol")
-  assert.equal(exhaustedError.details.modelPolicy.powerLevel, 5)
-  assert.equal(new Set(exchangeMarkers.slice(-2)).size, 2)
-  assert.equal(exchanges, 11)
-  assert.equal(reconciliations, 5)
+  assert.equal(recoveredAfterAbsence.isError, undefined)
+  assert.equal(recoveredAfterAbsence.structuredContent.settled, true)
+  assert.equal(recoveredAfterAbsence.structuredContent.deliveryAttemptCount, 5)
+  assert.equal(recoveredAfterAbsence.structuredContent.deliveryAbsentWorkflowIds.length, 4)
+  assert.equal(new Set(exchangeMarkers.slice(-5)).size, 5)
+  assert.equal(exchanges, 13)
+  assert.equal(reconciliations, 7)
 
   const aliasedContinuation = await client.callTool({
     arguments: reviewInput("assessment-alias"),
@@ -1092,7 +1093,7 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(compactContinuation.nextAction, "address_review_and_submit_next_cycle")
   assert.equal(compactContinuation.nextCycle, 2)
   assert.deepEqual(compactContinuation.review, aliasedContinuation.structuredContent.review)
-  assert.equal(exchanges, 12)
+  assert.equal(exchanges, 14)
 
   const seventhCycle = await client.callTool({
     arguments: { ...reviewInput("cycle-seven"), cycle: 7 },
@@ -1102,35 +1103,33 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(seventhCycle.structuredContent.settled, true)
   assert.equal(seventhCycle.structuredContent.cycle, 7)
   assert.equal(seventhCycle.structuredContent.nextAction, "settled")
-  assert.equal(exchanges, 13)
+  assert.equal(exchanges, 15)
 
   const markerless = await client.callTool({
     arguments: reviewInput("markerless"),
     name: "ego_review_candidate_and_wait",
   })
   assert.equal(markerless.isError, undefined)
-  assert.equal(markerless.structuredContent.settled, true)
-  assert.equal(markerless.structuredContent.protocolRepairCount, 1)
-  assert.equal(exchanges, 15)
+  assert.equal(markerless.structuredContent.settled, false)
+  assert.equal(markerless.structuredContent.protocolRepairCount, 0)
+  assert.equal(exchanges, 16)
 
   const inconsistentSettlement = await client.callTool({
     arguments: reviewInput("inconsistent-settlement"),
     name: "ego_review_candidate_and_wait",
   })
   assert.equal(inconsistentSettlement.isError, undefined)
-  assert.equal(inconsistentSettlement.structuredContent.settled, true)
-  assert.equal(inconsistentSettlement.structuredContent.protocolRepairCount, 1)
+  assert.equal(inconsistentSettlement.structuredContent.settled, false)
+  assert.equal(inconsistentSettlement.structuredContent.protocolRepairCount, 0)
   assert.equal(exchanges, 17)
 
   const stagnated = await client.callTool({
     arguments: reviewInput("protocol-stagnation"),
     name: "ego_review_candidate_and_wait",
   })
-  const stagnatedError = JSON.parse(stagnated.content[0].text)
-  assert.equal(stagnated.isError, true)
-  assert.equal(stagnatedError.code, "review_protocol_stagnated")
-  assert.equal(stagnatedError.details.reason, "review_protocol_stagnated")
-  assert.equal(stagnatedError.details.userActionRequired, false)
-  assert.equal(stagnatedError.details.protocolRepairAttempt, 1)
-  assert.equal(exchanges, 19)
+  assert.equal(stagnated.isError, undefined)
+  assert.equal(stagnated.structuredContent.settled, false)
+  assert.match(stagnated.structuredContent.review.summary, /not-json/)
+  assert.equal(stagnated.structuredContent.protocolRepairCount, 0)
+  assert.equal(exchanges, 18)
 })

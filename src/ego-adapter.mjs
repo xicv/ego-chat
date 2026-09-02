@@ -12,6 +12,7 @@ import { EgoChatError } from "./errors.mjs"
 import {
   BROWSER_CONTRACT_REVISION,
   DEFAULT_BROWSER_CAPTURE_SLICE_MS,
+  MAX_DRIVER_INPUT_BYTES,
   MAX_IPC_LINE_BYTES,
   MAX_PROMPT_BYTES,
   MAX_RESULT_BYTES,
@@ -27,7 +28,6 @@ const LEGACY_DRIVER_INPUT_PATTERN = new RegExp(`^input-(${DRIVER_INPUT_UUID})\\.
 const DEFAULT_DRIVER_MAILBOX_MAX_BYTES = 4 * 1024 * 1024
 const DEFAULT_DRIVER_MAILBOX_MAX_FILES = 16
 const DEFAULT_DRIVER_MAILBOX_RETENTION_MS = 5 * 60 * 1_000
-const DEFAULT_DRIVER_INPUT_MAX_BYTES = 256 * 1024
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -183,7 +183,7 @@ export class EgoAdapter {
     captureSliceMs = DEFAULT_BROWSER_CAPTURE_SLICE_MS,
     command,
     mailboxDirectory = undefined,
-    mailboxInputMaxBytes = DEFAULT_DRIVER_INPUT_MAX_BYTES,
+    mailboxInputMaxBytes = MAX_DRIVER_INPUT_BYTES,
     mailboxMaxBytes = DEFAULT_DRIVER_MAILBOX_MAX_BYTES,
     mailboxMaxFiles = DEFAULT_DRIVER_MAILBOX_MAX_FILES,
     mailboxRetentionMs = DEFAULT_DRIVER_MAILBOX_RETENTION_MS,

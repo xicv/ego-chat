@@ -1,6 +1,15 @@
+import {
+  BROWSER_CONTRACT_REVISION,
+  MAX_DRIVER_INPUT_BYTES,
+} from "./constants.mjs"
+
 export const EGO_DRIVER_RESULT_PREFIX = "__EGO_CHAT_DRIVER_RESULT__"
 
-async function egoDriverMain(inputPathOverride = undefined) {
+async function egoDriverMain(
+  inputPathOverride = undefined,
+  expectedBrowserContractRevision = undefined,
+  inputMaxBytes = undefined,
+) {
   const fsConstants = (await import("node:fs")).constants
   const fs = await import("node:fs/promises")
   const crypto = await import("node:crypto")
@@ -36,7 +45,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
         || stat.nlink !== 1
         || (typeof process.getuid === "function" && stat.uid !== process.getuid())
         || (stat.mode & 0o777) !== 0o600
-        || stat.size > 256 * 1024
+        || stat.size > inputMaxBytes
       ) {
         throw new Error("The Ego driver input is not a private bounded regular file.")
       }
@@ -210,15 +219,20 @@ async function egoDriverMain(inputPathOverride = undefined) {
           ? "authenticated"
           : (dom.hasLoginAction ? "unauthenticated" : "unknown"))
 
+    const canonicalDraft = String(dom.draft || '').replaceAll("\u00a0", " ")
     return {
       accountState,
       blockedReason: hasCaptcha ? "verification_challenge" : null,
       composerCount,
       composerSemanticId: dom.composerSemanticId ?? composerCount === 1,
+      draftDigest: canonicalDraft.trim().length > 0 ? sha256(canonicalDraft) : null,
+      draftMarkerCount: typeof input.turnMarker === "string"
+        ? canonicalDraft.split(input.turnMarker).length - 1
+        : 0,
       hasComposer: composerCount === 1,
       info,
       snapshotDigest: sha256(snapshot),
-      unexpectedDraft: dom.draft.trim().length > 0,
+      unexpectedDraft: canonicalDraft.trim().length > 0,
     }
   }
 
@@ -230,7 +244,11 @@ async function egoDriverMain(inputPathOverride = undefined) {
           if (!composer) {
             return false
           }
-          composer.replaceChildren()
+          if (composer.matches('input, textarea')) {
+            composer.value = ''
+          } else {
+            composer.replaceChildren()
+          }
           composer.dispatchEvent(new InputEvent('input', {
             bubbles: true,
             inputType: 'deleteContentBackward',
@@ -470,10 +488,11 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   function canReclaimBoundTaskSpace(binding) {
     return input.allowTaskSpaceReclaim === true
-      && typeof binding.key === "string"
-      && binding.key.length > 0
-      && input.mode === "exchange"
-      && (input.exchangeStage === undefined || input.exchangeStage === "send_only")
+      && (
+        (typeof binding.key === "string" && binding.key.length > 0)
+        || (input.mode === "adopt" && typeof binding.bindingKey === "string" && binding.bindingKey.length > 0)
+      )
+      && ["adopt", "capture_exchange", "exchange", "reanchor", "reconcile_bound"].includes(input.mode)
   }
 
   async function reclaimBoundTaskSpace(taskSpace, identifier) {
@@ -538,6 +557,9 @@ async function egoDriverMain(inputPathOverride = undefined) {
     const requested = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, binding.taskSpaceId))
     if (!binding.key) {
       if (requested?.ownership && requested.ownership !== "agent") {
+        if (canReclaimBoundTaskSpace(binding)) {
+          return reclaimBoundTaskSpace(requested, binding.taskSpaceId)
+        }
         humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
           taskSpaceId: requested.id,
         })
@@ -561,6 +583,15 @@ async function egoDriverMain(inputPathOverride = undefined) {
       return null
     }
     return useOrCreateTaskSpace(fallback?.id ?? fallbackName)
+  }
+
+  function isExactOwnedUnsentDraft(inspection) {
+    return input.mode === "reconcile_bound"
+      && input.allowDeliveryAbsent === true
+      && inspection.unexpectedDraft === true
+      && typeof input.inputDigest === "string"
+      && inspection.draftDigest === input.inputDigest
+      && inspection.draftMarkerCount === 1
   }
 
   function assertReady(inspection, selected) {
@@ -592,7 +623,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       )
       return false
     }
-    if (inspection.unexpectedDraft) {
+    if (inspection.unexpectedDraft && !isExactOwnedUnsentDraft(inspection)) {
       humanRequired("unexpected_draft", "The selected ChatGPT composer contains an unexpected draft.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
@@ -691,6 +722,28 @@ async function egoDriverMain(inputPathOverride = undefined) {
     })()`)
   }
 
+  async function settleComposerFocusForPolicyMenu() {
+    const settled = await js(String.raw`(() => {
+      const composer = document.querySelector('#prompt-textarea')
+      if (!composer) {
+        return { blurred: false, ok: false }
+      }
+      const active = document.activeElement
+      if (active !== composer && !composer.contains(active)) {
+        return { blurred: false, ok: true }
+      }
+      composer.blur()
+      return {
+        blurred: true,
+        ok: document.activeElement !== composer && !composer.contains(document.activeElement),
+      }
+    })()`)
+    if (settled.blurred) {
+      await wait(1)
+    }
+    return settled.ok
+  }
+
   async function inspectModelPolicyMenu() {
     return js(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
@@ -758,10 +811,30 @@ async function egoDriverMain(inputPathOverride = undefined) {
       const modelChoices = [...menu.querySelectorAll('[role="menuitemradio"]')]
         .filter(visible)
         .filter((row) => row.getAttribute('aria-disabled') !== 'true')
-      const modelLabels = modelChoices.map((row) => clean(row.innerText || row.textContent))
+      const modelChoiceLines = modelChoices.map((row) => String(row.innerText || row.textContent || '')
+        .split('\n')
+        .map(clean)
+        .filter(Boolean))
+      const modelLabels = modelChoiceLines.map((lines) => lines[0] || '')
       const selectedModelIndexes = modelChoices
         .map((row, index) => row.getAttribute('aria-checked') === 'true' ? index : -1)
         .filter((index) => index >= 0)
+      const automaticModelIndexes = modelChoiceLines
+        .map((lines, index) => {
+          const label = lines[0] || ''
+          const description = clean(lines.slice(1).join(' '))
+          const automatic = /^(?:auto|default)$/i.test(label)
+            || /(?:frontier models|recommended selection|automatic model selection)/i.test(description)
+          return automatic ? index : -1
+        })
+        .filter((index) => index >= 0)
+      const strongestModelIndex = automaticModelIndexes.length === 0
+        ? 0
+        : automaticModelIndexes.length === 1
+          && automaticModelIndexes[0] === 0
+          && modelChoices.length > 1
+          ? 1
+          : null
 
       if (
         powerItems.length !== 1
@@ -811,6 +884,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
             && !/[\u0000-\u001F\u007F]/.test(label)
           ))
           && new Set(modelLabels).size === modelLabels.length
+          && Number.isInteger(strongestModelIndex)
         )
         if (!modelLabelsValid) {
           return {
@@ -832,6 +906,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
           pillLabel: clean(pill.innerText || pill.textContent),
           policyVariant: 'separate_model',
           selectedModelIndex: modelChoicesOpen ? selectedModelIndexes[0] : null,
+          strongestModelIndex: modelChoicesOpen ? strongestModelIndex : null,
         }
       }
 
@@ -948,26 +1023,38 @@ async function egoDriverMain(inputPathOverride = undefined) {
     })()`)
   }
 
-  async function focusFirstModelChoice() {
+  async function focusModelChoice(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= 20) {
+      return false
+    }
+    const indexLiteral = JSON.stringify(index)
     return js(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const choices = [...document.querySelectorAll('[role="menuitemradio"]')]
         .filter(visible)
         .filter((element) => element.getAttribute('aria-disabled') !== 'true')
-      if (choices.length < 1 || choices.length > 20) {
+      const choiceIndex = ${indexLiteral}
+      if (choices.length < 1 || choices.length > 20 || choiceIndex >= choices.length) {
         return false
       }
-      choices[0].focus()
-      return document.activeElement === choices[0]
+      choices[choiceIndex].focus()
+      return document.activeElement === choices[choiceIndex]
     })()`)
   }
 
   async function openModelPolicyState(requireModelChoices = true) {
-    const trigger = await inspectModelPolicyTrigger()
+    let trigger = await inspectModelPolicyTrigger()
     if (trigger.count !== 1 || !safePolicyLabel(trigger.label)) {
       return { ok: false, reason: "policy_trigger_count", trigger }
     }
     if (!trigger.expanded) {
+      if (!await settleComposerFocusForPolicyMenu()) {
+        return { ok: false, reason: "policy_composer_blur", trigger }
+      }
+      trigger = await inspectModelPolicyTrigger()
+      if (trigger.count !== 1 || !safePolicyLabel(trigger.label)) {
+        return { ok: false, reason: "policy_trigger_changed", trigger }
+      }
       if (trigger.selectorKind === "composer_pill") {
         await click('button.__composer-pill[aria-haspopup="menu"]', { label: "open ChatGPT policy menu" })
       } else {
@@ -978,6 +1065,15 @@ async function egoDriverMain(inputPathOverride = undefined) {
         await pressKey("ENTER")
       }
       await wait(1)
+      const postActivationTrigger = await inspectModelPolicyTrigger()
+      if (
+        trigger.selectorKind === "composer_pill"
+        && postActivationTrigger.count === 1
+        && !postActivationTrigger.expanded
+      ) {
+        await click('button.__composer-pill[aria-haspopup="menu"]', { label: "retry ChatGPT policy menu" })
+        await wait(1)
+      }
     }
 
     let state = await waitForModelPolicyMenu()
@@ -1039,8 +1135,11 @@ async function egoDriverMain(inputPathOverride = undefined) {
     }
     const before = opened.state
     let adjusted = false
-    if (before.policyVariant === "separate_model" && before.selectedModelIndex !== 0) {
-      const focused = await focusFirstModelChoice()
+    if (
+      before.policyVariant === "separate_model"
+      && before.selectedModelIndex !== before.strongestModelIndex
+    ) {
+      const focused = await focusModelChoice(before.strongestModelIndex)
       if (!focused) {
         await closeModelPolicyMenu()
         humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not receive safe keyboard input.", {
@@ -1101,12 +1200,18 @@ async function egoDriverMain(inputPathOverride = undefined) {
     const labelsValid = afterRead.ok
       && safePolicyLabel(after.modelLabel)
       && safePolicyLabel(after.effortLabel)
-      && (after.policyVariant !== "separate_model" || after.selectedModelIndex === 0)
+      && (
+        after.policyVariant !== "separate_model"
+        || after.selectedModelIndex === after.strongestModelIndex
+      )
     if (!labelsValid || after.current !== after.maximum) {
       await closeModelPolicyMenu()
       humanRequired("model_policy_mismatch", "ChatGPT did not confirm its strongest available model and maximum thinking setting.", {
         modelCount: after?.modelChoiceCount ?? null,
         modelPosition: Number.isInteger(after?.selectedModelIndex) ? after.selectedModelIndex + 1 : null,
+        strongestModelPosition: Number.isInteger(after?.strongestModelIndex)
+          ? after.strongestModelIndex + 1
+          : null,
         powerLevel: after?.ok ? after.current - after.minimum + 1 : null,
         powerMax: after?.ok ? after.maximum - after.minimum + 1 : null,
         targetId: selected.targetId,
@@ -1175,7 +1280,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       && safePolicyLabel(observed.effortLabel)
       && safePolicyLabel(pillLabel)
     if (!labelsValid || !closed) {
-      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power policy could not be read safely during adoption.", {
+      humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power policy could not be read safely immediately before Send.", {
         reason: opened.reason ?? null,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
@@ -1187,13 +1292,19 @@ async function egoDriverMain(inputPathOverride = undefined) {
     const powerMax = observed.maximum - observed.minimum + 1
     if (
       observed.current !== observed.maximum
-      || (observed.policyVariant === "separate_model" && observed.selectedModelIndex !== 0)
+      || (
+        observed.policyVariant === "separate_model"
+        && observed.selectedModelIndex !== observed.strongestModelIndex
+      )
     ) {
-      humanRequired("adoption_live_model_not_maximum", "The existing response cannot be adopted because the conversation's live policy is not currently at ChatGPT's maximum setting.", {
+      humanRequired("model_policy_mismatch", "ChatGPT no longer shows its strongest available model and maximum thinking immediately before Send.", {
         effortLabel: observed.effortLabel,
         modelCount: observed.modelChoiceCount ?? null,
         modelLabel: observed.modelLabel,
         modelPosition: Number.isInteger(observed.selectedModelIndex) ? observed.selectedModelIndex + 1 : null,
+        strongestModelPosition: Number.isInteger(observed.strongestModelIndex)
+          ? observed.strongestModelIndex + 1
+          : null,
         powerLevel,
         powerMax,
         targetId: selected.targetId,
@@ -1582,7 +1693,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
           })
           return
         }
-        const modelPolicy = await verifyExistingMaximumModelPolicy(selected)
+        const modelPolicy = await ensureMaximumModelPolicy(selected)
         if (!modelPolicy) {
           return
         }
@@ -1657,7 +1768,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcile() {
-    if (input.browserContractRevision !== 11) {
+    if (input.browserContractRevision !== expectedBrowserContractRevision) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1764,7 +1875,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
   }
 
   async function reconcileBound() {
-    if (input.browserContractRevision !== 11) {
+    if (input.browserContractRevision !== expectedBrowserContractRevision) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -1776,7 +1887,24 @@ async function egoDriverMain(inputPathOverride = undefined) {
     if (!selected) {
       return
     }
-    const inspection = selected.inspection
+    let inspection = selected.inspection
+    if (isExactOwnedUnsentDraft(inspection)) {
+      if (!await assertBrokerAuthority("before_owned_draft_recovery")) {
+        return
+      }
+      const draftCleared = await clearUnsentComposerDraft()
+      if (!draftCleared) {
+        humanRequired("owned_draft_clear_failed", "The exact broker-owned unsent draft could not be cleared for restart recovery.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      inspection = await waitForReadyInspection()
+      if (!assertReady(inspection, selected)) {
+        return
+      }
+    }
     if (!expectedCanonicalUrl || normalizeUrl(inspection.info.url) !== normalizeUrl(expectedCanonicalUrl)) {
       humanRequired("reconciliation_url_mismatch", "The late send is not in the bound canonical conversation.", {
         targetId: selected.targetId,
@@ -2110,7 +2238,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 
   async function exchange() {
     driverStage = "checking_browser_contract"
-    if (input.browserContractRevision !== 11) {
+    if (input.browserContractRevision !== expectedBrowserContractRevision) {
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
@@ -2707,7 +2835,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
     } else if (input.mode === "reanchor") {
-      if (input.browserContractRevision !== 11) {
+      if (input.browserContractRevision !== expectedBrowserContractRevision) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
         return
       }
@@ -2884,7 +3012,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
 }
 
 export function egoDriverSourceForInput(inputPath) {
-  return `(${egoDriverMain.toString()})(${JSON.stringify(inputPath)})\n`
+  return `(${egoDriverMain.toString()})(${JSON.stringify(inputPath)}, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES})\n`
 }
 
-export const EGO_DRIVER_SOURCE = `(${egoDriverMain.toString()})()\n`
+export const EGO_DRIVER_SOURCE = `(${egoDriverMain.toString()})(undefined, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES})\n`

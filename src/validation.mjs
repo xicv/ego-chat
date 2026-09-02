@@ -105,6 +105,7 @@ export const ConversationBindSchema = z.discriminatedUnion("mode", [
 ])
 
 export const ConversationAdoptionSchema = z.object({
+  allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema.optional(),
   canonicalUrl: CanonicalConversationUrlSchema,
   projectUrl: ChatGptUrlSchema.optional(),
@@ -153,6 +154,7 @@ export const ModelPolicyObservationSchema = z.object({
 
 export const ConversationReconcileSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
+  allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,
   expectedPreviousContentDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   expectedPreviousMessageId: TargetIdSchema.optional(),
@@ -179,7 +181,7 @@ const ConversationHeadAnchorSchema = z.object({
 
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
-  allowTaskSpaceReclaim: z.literal(true).optional(),
+  allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
@@ -193,7 +195,7 @@ const ConvergenceTextSchema = (maximum) => z.string().trim().min(1).max(maximum)
 
 export const StartConvergenceSchema = z.object({
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
-  allowTaskSpaceReclaim: z.literal(true).optional(),
+  allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,
   chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),

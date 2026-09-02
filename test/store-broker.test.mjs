@@ -6,6 +6,12 @@ import path from "node:path"
 import test from "node:test"
 
 import { Broker } from "../src/broker.mjs"
+import {
+  buildChatGptPrompt,
+  createContract,
+  digestJson,
+  reviewSignature,
+} from "../src/convergence.mjs"
 import { EgoChatError } from "../src/errors.mjs"
 import { EventStore } from "../src/store.mjs"
 
@@ -85,6 +91,111 @@ function convergenceCandidate(cycle, reviewPacket = `Candidate packet for cycle 
   }
 }
 
+async function seedRestartBinding(dataDir, canonicalUrl) {
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: {
+          fingerprint: "restart-initial-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: "a".repeat(64),
+          lastMessageId: "restart-initial-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        targetId: "restart-tab",
+        taskSpaceId: 10,
+      }),
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 10,
+  })
+  broker.close()
+}
+
+function convergenceRestartWorkflow({
+  candidate,
+  childWorkflowId = undefined,
+  contract,
+  cycle = 1,
+  id,
+  phase,
+  review = undefined,
+}) {
+  const candidateDigest = digestJson(candidate)
+  const cycleRecord = {
+    candidate,
+    candidateDigest,
+    codex: {
+      appServerRecoveryCount: 0,
+      durationMs: 10,
+      inspectionRetryCount: 0,
+      responseDigest: "b".repeat(64),
+      turnId: `codex-restart-captured-${cycle}`,
+      workspaceActivity: { count: 1, types: ["commandExecution"] },
+    },
+    cycle,
+    ...(review
+      ? {
+          chatGpt: {
+            childWorkflowId: childWorkflowId ?? `captured-review-${cycle}`,
+            protocolNormalization: "natural_language",
+            protocolRepairCount: 0,
+            protocolRepairWorkflowIds: [],
+            redactedSecretSignatures: [],
+            responseDigest: "c".repeat(64),
+          },
+          review,
+          reviewSignature: reviewSignature(review),
+        }
+      : {}),
+  }
+  return {
+    appServerRecoveryCount: 0,
+    bindingKey: "ego-chat-main",
+    candidateDigest,
+    childWorkflowId,
+    codexSandbox: "read-only",
+    codexThreadId: "codex-convergence-thread",
+    createdAt: new Date().toISOString(),
+    cwd: process.cwd(),
+    cycle,
+    deadlineAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    id,
+    inputDigest: digestJson({ contract, cwd: process.cwd(), sandbox: "read-only" }),
+    kind: "convergence",
+    maxCycles: null,
+    phase,
+    private: {
+      contract,
+      cycles: [cycleRecord],
+      priorReview: review ?? null,
+      request: {
+        acceptanceCriteria: contract.criteria.map(({ text }) => text),
+        allowTaskSpaceReclaim: true,
+        bindingKey: "ego-chat-main",
+        chatGptTimeoutMs: 30_000,
+        codexSandbox: "read-only",
+        codexTurnTimeoutMs: 30_000,
+        cwd: process.cwd(),
+        target: contract.target,
+        wallClockTimeoutMs: 60 * 60_000,
+      },
+    },
+    status: "running",
+    targetDigest: contract.targetDigest,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
 class FakeConvergenceAppServer {
   constructor(candidateFactory = (cycle) => convergenceCandidate(cycle)) {
     this.additionalContexts = []
@@ -134,6 +245,23 @@ class FakeConvergenceAppServer {
   }
 }
 
+class ConvergenceHistoryStore extends EventStore {
+  constructor(dataDir) {
+    super(dataDir)
+    this.candidateCaptureHistory = []
+  }
+
+  async persist(type, workflow, expectedWorkflow = undefined) {
+    if (type === "convergence.codex_candidate_captured") {
+      this.candidateCaptureHistory.push(workflow.private.cycles.map((record) => ({
+        hasCandidate: Object.hasOwn(record, "candidate"),
+        hasReview: Object.hasOwn(record, "review"),
+      })))
+    }
+    return super.persist(type, workflow, expectedWorkflow)
+  }
+}
+
 function createConvergenceEgoAdapter(reviewFactory) {
   let exchanges = 0
   const taskSpaceReclaimAuthorizations = []
@@ -151,7 +279,7 @@ function createConvergenceEgoAdapter(reviewFactory) {
         taskSpaceReclaimAuthorizations.push(input.allowTaskSpaceReclaim === true)
         assert.equal(input.modelPolicy.modelSelection, "strongest_available")
         assert.equal(input.modelPolicy.thinkingEffort, "maximum_available")
-        const review = reviewFactory(parseConvergenceIdentity(input.prompt), exchanges)
+        const review = await reviewFactory(parseConvergenceIdentity(input.prompt), exchanges, input)
         const responseText = `${typeof review === "string" ? review : JSON.stringify(review)}\n${input.expectedTerminalMarker}`
         return {
           canonicalUrl: input.binding.canonicalUrl,
@@ -350,7 +478,7 @@ test("create-once binding is promoted and reused for every later exchange", asyn
   assert.equal(modelPolicy.lastObserved.powerLevel, 5)
 })
 
-test("fresh-send task-space reclaim authority is durable for Send but stripped from capture", async (t) => {
+test("binding-owned task-space reclaim remains available during read-only capture", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const canonicalUrl = "https://chatgpt.com/c/task-space-reclaim"
@@ -375,7 +503,7 @@ test("fresh-send task-space reclaim authority is durable for Send but stripped f
     }),
     captureExchange: async (input) => {
       captures += 1
-      assert.equal(Object.hasOwn(input, "allowTaskSpaceReclaim"), false)
+      assert.equal(input.allowTaskSpaceReclaim, true)
       const responseText = terminalMarker
       return {
         canonicalUrl,
@@ -534,6 +662,306 @@ test("confirmed exchanges resume after a bounded pending capture without another
   )
   assert.equal(sends, 1)
   assert.equal(captures, 2)
+})
+
+test("recoverable maximum-model UI uncertainty stays in the same exchange until Send succeeds", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/model-policy-recovery"
+  const terminalMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_DONE"
+  const turnMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_TEST"
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "model-policy-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "model-policy-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "model-policy-tab",
+      taskSpaceId: 21,
+    }),
+    captureExchange: async () => {
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "model-policy-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "model-policy-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "model-policy-tab",
+        taskSpaceId: 21,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => {
+      sends += 1
+      if (sends < 3) {
+        throw new EgoChatError(
+          "human_required",
+          "The maximum-power control could not be read during this observation.",
+          { reason: "model_policy_ui_unknown" },
+        )
+      }
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "model-policy-user",
+        sentAt: new Date().toISOString(),
+        targetId: "model-policy-tab",
+        taskSpaceId: 21,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "model-policy-recovery",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 21,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "model-policy-recovery",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nContinue after transient model-policy UI uncertainty.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.recoveryCount, 2)
+  assert.equal(completed.lastRecovery.code, "model_policy_ui_unknown")
+  assert.equal(sends, 3)
+})
+
+test("a stable external assistant turn is automatically re-anchored before the same fresh Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/automatic-reanchor"
+  const terminalMarker = "EGO_CHAT_AUTOMATIC_REANCHOR_DONE"
+  const turnMarker = "EGO_CHAT_AUTOMATIC_REANCHOR_TEST"
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "automatic-reanchor-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const observedHead = {
+    fingerprint: "c".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "d".repeat(64),
+    lastMessageId: "automatic-reanchor-external-assistant",
+    lastRole: "assistant",
+    messageCount: 4,
+    renderedMessageCount: 4,
+  }
+  const headChange = {
+    changeKind: "message_appended",
+    expectedFingerprint: initialHead.fingerprint,
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: observedHead.fingerprint,
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  }
+  let sends = 0
+  let reanchors = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: initialHead,
+      targetId: "automatic-reanchor-tab",
+      taskSpaceId: 23,
+    }),
+    captureExchange: async () => {
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "e".repeat(64),
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "automatic-reanchor-after",
+          lastRole: "assistant",
+          messageCount: 6,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "automatic-reanchor-tab",
+        taskSpaceId: 23,
+        turnMarker,
+      }
+    },
+    reanchor: async (input) => {
+      reanchors += 1
+      assert.equal(input.binding.headFingerprint, initialHead.fingerprint)
+      assert.equal(input.expectedObservedHeadFingerprint, observedHead.fingerprint)
+      return {
+        canonicalUrl,
+        head: observedHead,
+        headChange,
+        targetId: "automatic-reanchor-tab",
+        taskSpaceId: 23,
+      }
+    },
+    sendExchange: async (input) => {
+      sends += 1
+      if (sends === 1) {
+        throw new EgoChatError(
+          "human_required",
+          "The stable assistant head advanced before composition.",
+          { evidence: { headChange }, reason: "conversation_head_changed" },
+        )
+      }
+      assert.equal(input.binding.headFingerprint, observedHead.fingerprint)
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "automatic-reanchor-user",
+        sentAt: new Date().toISOString(),
+        targetId: "automatic-reanchor-tab",
+        taskSpaceId: 23,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "automatic-reanchor",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 23,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "automatic-reanchor",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nContinue on the latest stable assistant head.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.automaticReanchorCount, 1)
+  assert.equal(reanchors, 1)
+  assert.equal(sends, 2)
+  assert.equal(
+    broker.getConversationBinding({ bindingKey: "automatic-reanchor" }).revision,
+    3,
+  )
+})
+
+test("confirmed response capture retries beyond three transient transport failures", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/capture-recovery"
+  const terminalMarker = "EGO_CHAT_CAPTURE_RECOVERY_DONE"
+  const turnMarker = "EGO_CHAT_CAPTURE_RECOVERY_TEST"
+  let captures = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "capture-recovery-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "capture-recovery-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "capture-recovery-tab",
+      taskSpaceId: 22,
+    }),
+    captureExchange: async () => {
+      captures += 1
+      if (captures <= 4) {
+        throw new EgoChatError("ego_driver_error", "Transient browser transport failure.")
+      }
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "capture-recovery-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "capture-recovery-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "capture-recovery-tab",
+        taskSpaceId: 22,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "capture-recovery-user",
+      sentAt: new Date().toISOString(),
+      targetId: "capture-recovery-tab",
+      taskSpaceId: 22,
+      turnMarker,
+    }),
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "capture-recovery",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 22,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "capture-recovery",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nKeep waiting for the confirmed response.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.captureRecoveryCount, 4)
+  assert.equal(captures, 5)
 })
 
 test("event checkpoints bound the active ledger and result blobs are digest verified", async (t) => {
@@ -1400,6 +1828,67 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(adoptionCalls, 1)
 })
 
+test("conversation adoption keeps retrying transient browser and model-policy state", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/recovering-adoption"
+  const responseText = "Recovered adoption response."
+  const responseDigest = digest(responseText)
+  let adoptionCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async (input) => {
+        adoptionCalls += 1
+        assert.equal(input.allowTaskSpaceReclaim, true)
+        if (adoptionCalls === 1) {
+          throw new EgoChatError(
+            "human_required",
+            "The maximum-model UI is still hydrating.",
+            { reason: "model_policy_ui_unknown" },
+          )
+        }
+        return {
+          adoptedWhileGenerating: false,
+          anchor: { contentDigest: "a".repeat(64), messageId: "recovering-user" },
+          canonicalUrl,
+          durationMs: 1_000,
+          head: {
+            fingerprint: "recovering-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: responseDigest,
+            lastMessageId: "recovering-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+            renderedMessageCount: 2,
+          },
+          modelPolicy: modelPolicyObservation({ adjusted: true }),
+          responseDigest,
+          responseText,
+          targetId: "recovering-tab",
+          taskSpaceId: 14,
+        }
+      },
+    },
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const started = await broker.startConversationAdoption({
+    bindingKey: "recovering-adoption",
+    canonicalUrl,
+    taskSpace: 14,
+    timeoutMs: 30_000,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.responseText, responseText)
+  assert.equal(adoptionCalls, 2)
+})
+
 test("a read-only conversation adoption resumes safely after a broker restart", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -1858,13 +2347,62 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(broker.getModelPolicy().revision, 2)
 })
 
-test("broker repairs an invalid delivered review inside the same implementation cycle", async (t) => {
+test("broker renews its ChatGPT child wait without ending convergence", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter(async (identity) => {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+        { evidence: "The long review remained attached.", id: "AC-2", status: "pass" },
+      ],
+      decision: "settled",
+      findings: [],
+      summary: "The review settled after multiple broker wait windows.",
+    }
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    convergenceChildWaitSliceMs: 5,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-child-wait-renewal",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: [
+      "Every turn binds the immutable target identity.",
+      "A long ChatGPT review stays attached until completion.",
+    ],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Keep convergence alive across parent wait-window expiry.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.ok(completed.chatGptWaitWindowCount >= 1)
+  assert.equal(ego.exchanges, 1)
+})
+
+test("broker carries an invalid delivered review into the next implementation cycle", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  const detailedReview = `Keep the complete review available. ${"evidence ".repeat(2_000)}`
   const ego = createConvergenceEgoAdapter((identity, exchanges) => {
     if (exchanges === 1) {
-      return "not-json"
+      return detailedReview
     }
     return {
       ...identity,
@@ -1899,23 +2437,32 @@ test("broker repairs an invalid delivered review inside the same implementation 
     bindingKey: "ego-chat-main",
     codexSandbox: "read-only",
     cwd: process.cwd(),
-    maxCycles: 1,
-    target: "Repair malformed review protocol without another implementation cycle.",
+    maxCycles: 2,
+    target: "Use malformed review prose as feedback without another browser correction turn.",
   })
   const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
   assert.equal(completed.status, "succeeded")
-  assert.equal(completed.result.cycleCount, 1)
-  assert.equal(completed.result.protocolRepairCount, 1)
-  assert.equal(appServer.turns, 1)
+  assert.equal(completed.result.cycleCount, 2)
+  assert.equal(completed.result.protocolRepairCount, 0)
+  assert.equal(appServer.turns, 2)
+  assert.equal(
+    JSON.parse(appServer.additionalContexts[1].chatgpt_review.value).summary,
+    detailedReview.trim(),
+  )
   assert.equal(ego.exchanges, 2)
 })
 
-test("broker reports repeated invalid review state as a non-human failure", async (t) => {
+test("broker consumes repeated free-form review as feedback instead of stopping for protocol", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const appServer = new FakeConvergenceAppServer()
-  const ego = createConvergenceEgoAdapter(() => "not-json")
+  const ego = createConvergenceEgoAdapter((identity) => identity.cycle === 3
+    ? [
+        "The third candidate resolves the prior feedback.",
+        "EGO_CHAT_DECISION: SETTLED",
+      ].join("\n")
+    : "Add a restart regression and continue.")
   const broker = new Broker({
     appServerFactory: () => appServer,
     egoAdapter: ego.adapter,
@@ -1938,22 +2485,22 @@ test("broker reports repeated invalid review state as a non-human failure", asyn
     bindingKey: "ego-chat-main",
     codexSandbox: "read-only",
     cwd: process.cwd(),
-    maxCycles: 1,
-    target: "Stop only after the same unusable protocol state repeats.",
+    target: "Continue through free-form review until substantive settlement.",
   })
   const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(completed.status, "failed")
-  assert.equal(completed.error.code, "review_protocol_stagnated")
-  assert.equal(completed.humanRequired, undefined)
-  assert.equal(appServer.turns, 1)
-  assert.equal(ego.exchanges, 2)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 3)
+  assert.equal(appServer.turns, 3)
+  assert.equal(ego.exchanges, 3)
+  assert.deepEqual(ego.taskSpaceReclaimAuthorizations, [true, true, true])
 })
 
 test("broker-owned convergence has no implicit cycle ceiling", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const appServer = new FakeConvergenceAppServer()
+  const store = new ConvergenceHistoryStore(dataDir)
   const ego = createConvergenceEgoAdapter((identity) => {
     const settled = identity.cycle === 7
     return {
@@ -1985,7 +2532,7 @@ test("broker-owned convergence has no implicit cycle ceiling", async (t) => {
   const broker = new Broker({
     appServerFactory: () => appServer,
     egoAdapter: ego.adapter,
-    store: new EventStore(dataDir),
+    store,
   })
   await broker.initialize()
   t.after(() => broker.close())
@@ -2012,6 +2559,174 @@ test("broker-owned convergence has no implicit cycle ceiling", async (t) => {
   assert.equal(completed.result.cycleCount, 7)
   assert.equal(appServer.turns, 7)
   assert.equal(ego.exchanges, 7)
+  assert.equal(store.candidateCaptureHistory.length, 7)
+  for (const [index, history] of store.candidateCaptureHistory.entries()) {
+    assert.equal(history.length, index + 1)
+    assert.deepEqual(history.at(-1), { hasCandidate: true, hasReview: false })
+    assert.ok(history.slice(0, -1).every((record) => (
+      record.hasCandidate === false && record.hasReview === false
+    )))
+  }
+})
+
+test("broker-owned convergence turns an oversized review packet into continuation", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer((cycle) => convergenceCandidate(
+    cycle,
+    cycle === 1 ? "界".repeat(70_000) : "Compact exact evidence for cycle 2.",
+  ))
+  const ego = createConvergenceEgoAdapter((identity, _exchanges, input) => {
+    if (identity.cycle === 1) {
+      assert.match(input.prompt, /deterministically compacted/)
+    }
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The immutable identity is exact.", id: "AC-1", status: "pass" },
+        { evidence: "The visible packet appears settled.", id: "AC-2", status: "pass" },
+      ],
+      decision: "settled",
+      findings: [],
+      summary: "The visible review evidence is settled.",
+    }
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-oversized-review-packet",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The exact candidate is settled."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Keep an oversized review packet inside the continuous loop.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 2)
+  assert.equal(appServer.turns, 2)
+  assert.match(
+    appServer.additionalContexts[1].chatgpt_review.value,
+    /Review evidence was compacted for transport/,
+  )
+  assert.equal(ego.exchanges, 2)
+})
+
+test("broker-owned convergence reconciles an ambiguous review send without human relay", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/convergence-ambiguous-send-recovery"
+  const beforeHead = {
+    fingerprint: "ambiguous-review-before",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "a".repeat(64),
+    lastMessageId: "ambiguous-review-assistant-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  let exchanges = 0
+  let reconciliations = 0
+  const appServer = new FakeConvergenceAppServer()
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: beforeHead,
+        targetId: "ambiguous-review-tab",
+        taskSpaceId: 10,
+      }),
+      exchange: async (input) => {
+        exchanges += 1
+        if (exchanges === 1) {
+          throw new EgoChatError(
+            "human_required",
+            "The review Send may have been accepted.",
+            {
+              evidence: { modelPolicy: modelPolicyObservation() },
+              reason: "send_confirmation_ambiguous",
+            },
+          )
+        }
+        const identity = parseConvergenceIdentity(input.prompt)
+        const responseText = `${JSON.stringify({
+          ...identity,
+          criteria: [
+            { evidence: "The target identity is exact.", id: "AC-1", status: "pass" },
+            { evidence: "The recovered review delivery is settled.", id: "AC-2", status: "pass" },
+          ],
+          decision: "settled",
+          findings: [],
+          summary: "The proven-absent retry is settled.",
+        })}\n${input.expectedTerminalMarker}`
+        return {
+          canonicalUrl,
+          durationMs: 20,
+          head: {
+            fingerprint: "ambiguous-review-after",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "ambiguous-review-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "ambiguous-review-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+      reconcileBound: async (input) => {
+        reconciliations += 1
+        assert.equal(input.allowDeliveryAbsent, true)
+        assert.equal(input.allowTaskSpaceReclaim, true)
+        return {
+          canonicalUrl,
+          deliveryState: "absent",
+          head: beforeHead,
+          targetId: "ambiguous-review-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The recovered review is settled."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Keep an ambiguous review Send inside durable reconciliation.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(exchanges, 2)
+  assert.equal(reconciliations, 1)
 })
 
 test("an explicit convergence cycle budget remains authoritative", async (t) => {
@@ -2130,7 +2845,68 @@ test("convergence corrects one schema-only Codex turn before sending to ChatGPT"
   assert.equal(ego.exchanges, 1)
 })
 
-test("convergence stops before ChatGPT after two Codex turns without workspace activity", async (t) => {
+test("convergence repairs an inconsistent Codex candidate without stopping", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  appServer.runStructuredTurn = async (input) => {
+    appServer.turns += 1
+    appServer.prompts.push(input.prompt)
+    await input.onStarted?.({ turnId: `codex-candidate-correction-${appServer.turns}` })
+    return {
+      durationMs: 10,
+      responseDigest: String(appServer.turns).repeat(64),
+      turnId: `codex-candidate-correction-${appServer.turns}`,
+      value: appServer.turns === 1
+        ? {
+            ...convergenceCandidate(1),
+            blockers: ["A contradictory blocker remained in a candidate envelope."],
+          }
+        : convergenceCandidate(1),
+      workspaceActivity: { count: 1, types: ["commandExecution"] },
+    }
+  }
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The corrected candidate is settled.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The corrected candidate is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-candidate-correction",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The corrected candidate is settled."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Correct an inconsistent implementing-agent candidate internally.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.candidateCorrectionCount, 1)
+  assert.equal(appServer.turns, 2)
+  assert.match(appServer.prompts[1], /internal correction turn/)
+  assert.equal(ego.exchanges, 1)
+})
+
+test("convergence keeps correcting Codex until workspace inspection is observable", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const appServer = new FakeConvergenceAppServer()
@@ -2142,12 +2918,21 @@ test("convergence stops before ChatGPT after two Codex turns without workspace a
       responseDigest: String(appServer.turns).repeat(64),
       turnId: `codex-turn-${appServer.turns}`,
       value: convergenceCandidate(1),
-      workspaceActivity: { count: 0, types: [] },
+      workspaceActivity: appServer.turns === 3
+        ? { count: 1, types: ["commandExecution"] }
+        : { count: 0, types: [] },
     }
   }
-  const ego = createConvergenceEgoAdapter(() => {
-    throw new Error("an uninspected candidate must not reach ChatGPT")
-  })
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "Identity is bound.", id: "AC-1", status: "pass" },
+      { evidence: "The third turn inspected the workspace.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The inspected candidate is settled.",
+  }))
   const broker = new Broker({
     appServerFactory: () => appServer,
     egoAdapter: ego.adapter,
@@ -2168,13 +2953,12 @@ test("convergence stops before ChatGPT after two Codex turns without workspace a
     cwd: process.cwd(),
     target: "Require workspace evidence before external review.",
   })
-  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "codex_workspace_not_inspected")
-  assert.equal(stopped.codexInspectionRetryCount, 1)
-  assert.equal(appServer.turns, 2)
-  assert.equal(ego.exchanges, 0)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.codexInspectionRetryCount, 2)
+  assert.equal(appServer.turns, 3)
+  assert.equal(ego.exchanges, 1)
 })
 
 test("convergence resumes the exact Codex thread after one pre-review App Server exit", async (t) => {
@@ -2219,6 +3003,7 @@ test("convergence resumes the exact Codex thread after one pre-review App Server
   const broker = new Broker({
     appServerFactory: () => clients.shift(),
     egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
     store: new EventStore(dataDir),
   })
   await broker.initialize()
@@ -2254,11 +3039,64 @@ test("convergence resumes the exact Codex thread after one pre-review App Server
   assert.equal(secondClient.closed, true)
 })
 
-test("convergence rejects an App Server exit whose turn identity changed", async (t) => {
+test("convergence retries transient App Server setup without ending the workflow", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
-  const appServer = new FakeConvergenceAppServer()
-  appServer.runStructuredTurn = async (input) => {
+  const firstClient = new FakeConvergenceAppServer()
+  firstClient.connect = async () => {
+    throw new EgoChatError(
+      "app_server_exited",
+      "Codex App Server exited during initialization.",
+      { signal: "SIGTERM" },
+    )
+  }
+  const secondClient = new FakeConvergenceAppServer()
+  const clients = [firstClient, secondClient]
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The setup recovered.", id: "AC-1", status: "pass" },
+      { evidence: "The candidate was reviewed.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The recovered setup is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => clients.shift(),
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-app-server-setup-recovery",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["The setup recovers.", "The candidate is reviewed."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Retry a transient App Server setup exit.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.appServerSetupRecoveryCount, 1)
+  assert.equal(firstClient.closed, true)
+  assert.equal(secondClient.turns, 1)
+  assert.equal(ego.exchanges, 1)
+})
+
+test("convergence reconciles the accepted turn when an App Server exit reports another identity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const firstClient = new FakeConvergenceAppServer()
+  firstClient.runStructuredTurn = async (input) => {
     await input.onStarted({ turnId: "codex-accepted-turn" })
     throw new EgoChatError(
       "app_server_exited",
@@ -2270,12 +3108,38 @@ test("convergence rejects an App Server exit whose turn identity changed", async
       },
     )
   }
-  const ego = createConvergenceEgoAdapter(() => {
-    throw new Error("a mismatched App Server turn must not reach ChatGPT")
-  })
+  const secondClient = new FakeConvergenceAppServer()
+  secondClient.recoverStructuredTurn = async (_threadId, turnId) => {
+    assert.equal(turnId, "codex-accepted-turn")
+    return {
+      disposition: "completed",
+      result: {
+        durationMs: 10,
+        responseDigest: "e".repeat(64),
+        turnId,
+        value: {
+          blockers: [],
+          criteria: [{ evidence: "The accepted turn was recovered.", id: "AC-1", status: "pass" }],
+          reviewPacket: "Exact recovery evidence.",
+          status: "candidate",
+          summary: "The accepted turn completed before transport exit.",
+        },
+        workspaceActivity: { count: 1, types: ["commandExecution"] },
+      },
+    }
+  }
+  const clients = [firstClient, secondClient]
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [{ evidence: "The accepted turn is exact.", id: "AC-1", status: "pass" }],
+    decision: "settled",
+    findings: [],
+    summary: "The exact accepted turn is settled.",
+  }))
   const broker = new Broker({
-    appServerFactory: () => appServer,
+    appServerFactory: () => clients.shift(),
     egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
     store: new EventStore(dataDir),
   })
   await broker.initialize()
@@ -2291,15 +3155,14 @@ test("convergence rejects an App Server exit whose turn identity changed", async
     acceptanceCriteria: ["The exact accepted App Server turn remains bound."],
     bindingKey: "ego-chat-main",
     cwd: process.cwd(),
-    target: "Reject a transport exit that reports a different turn identity.",
+    target: "Recover the accepted turn even when exit diagnostics report another identity.",
   })
-  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "app_server_exited")
-  assert.equal(stopped.humanRequired.diagnostic.turnId, "codex-different-turn")
-  assert.equal(stopped.appServerRecoveryCount, 0)
-  assert.equal(ego.exchanges, 0)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.appServerRecoveryCount, 1)
+  assert.equal(completed.lastAppServerExit.turnId, "codex-different-turn")
+  assert.equal(ego.exchanges, 1)
 })
 
 test("convergence keeps recovering pre-review App Server exits until real progress", async (t) => {
@@ -2343,6 +3206,7 @@ test("convergence keeps recovering pre-review App Server exits until real progre
   const broker = new Broker({
     appServerFactory: () => clients.shift(),
     egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
     store: new EventStore(dataDir),
   })
   await broker.initialize()
@@ -2368,22 +3232,24 @@ test("convergence keeps recovering pre-review App Server exits until real progre
   assert.equal(ego.exchanges, 1)
 })
 
-test("convergence bounds consecutive pre-review App Server exits without browser delivery", async (t) => {
+test("convergence keeps recovering beyond the old App Server exit ceiling", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
-  const clients = Array.from({ length: 5 }, (_, index) => {
+  const clients = Array.from({ length: 6 }, (_, index) => {
     const client = new FakeConvergenceAppServer()
-    client.runStructuredTurn = async (input) => {
-      await input.onStarted({ turnId: `codex-interrupted-turn-${index + 1}` })
-      throw new EgoChatError(
-        "app_server_exited",
-        "Codex App Server exited before the operation completed.",
-        {
-          diagnosticDigest: String(index + 1).repeat(64),
-          signal: "SIGTERM",
-          turnId: `codex-interrupted-turn-${index + 1}`,
-        },
-      )
+    if (index < 5) {
+      client.runStructuredTurn = async (input) => {
+        await input.onStarted({ turnId: `codex-interrupted-turn-${index + 1}` })
+        throw new EgoChatError(
+          "app_server_exited",
+          "Codex App Server exited before the operation completed.",
+          {
+            diagnosticDigest: String(index + 1).repeat(64),
+            signal: "SIGTERM",
+            turnId: `codex-interrupted-turn-${index + 1}`,
+          },
+        )
+      }
     }
     if (index > 0) {
       client.recoverStructuredTurn = async (threadId, turnId) => {
@@ -2394,12 +3260,20 @@ test("convergence bounds consecutive pre-review App Server exits without browser
     }
     return client
   })
-  const ego = createConvergenceEgoAdapter(() => {
-    throw new Error("an exhausted App Server recovery budget must not reach ChatGPT")
-  })
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "Identity remained bound across every reconnect.", id: "AC-1", status: "pass" },
+      { evidence: "The sixth App Server produced reviewable progress.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The recovered candidate is settled.",
+  }))
   const broker = new Broker({
     appServerFactory: () => clients.shift(),
     egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
     store: new EventStore(dataDir),
   })
   await broker.initialize()
@@ -2412,31 +3286,39 @@ test("convergence bounds consecutive pre-review App Server exits without browser
   })
 
   const started = await broker.startConvergence({
-    acceptanceCriteria: ["Identity is bound.", "Runaway detached retries are bounded."],
+    acceptanceCriteria: ["Identity is bound.", "Recovery continues until progress."],
     bindingKey: "ego-chat-main",
     cwd: process.cwd(),
-    target: "Stop detached recovery after repeated exits without candidate progress.",
+    target: "Keep the durable convergence alive across repeated App Server exits.",
   })
-  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "app_server_recovery_exhausted")
-  assert.equal(stopped.humanRequired.diagnostic.consecutiveExitCount, 5)
-  assert.equal(stopped.humanRequired.diagnostic.recoveryLimit, 4)
-  assert.equal(stopped.humanRequired.diagnostic.turnId, "codex-interrupted-turn-5")
-  assert.equal(stopped.appServerRecoveryCount, 4)
-  assert.equal(ego.exchanges, 0)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.appServerRecoveryCount, 5)
+  assert.equal(completed.lastAppServerExit.turnId, "codex-interrupted-turn-5")
+  assert.equal(ego.exchanges, 1)
 })
 
-test("convergence blocks a secret-bearing review packet before browser submission", async (t) => {
+test("convergence redacts a secret-bearing review packet and keeps progressing", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const appServer = new FakeConvergenceAppServer(() => convergenceCandidate(
     1,
     `Unsafe token ${OPENAI_LIKE_TEST_TOKEN} must not leave the broker.`,
   ))
-  const ego = createConvergenceEgoAdapter(() => {
-    throw new Error("secret-bearing packet must not reach ChatGPT")
+  const ego = createConvergenceEgoAdapter((identity, _exchange, input) => {
+    assert.doesNotMatch(input.prompt, new RegExp(OPENAI_LIKE_TEST_TOKEN))
+    assert.match(input.prompt, /EGO_CHAT_REDACTED_OPENAI_API_KEY/)
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The review identity remains bound.", id: "AC-1", status: "pass" },
+        { evidence: "The protected token was redacted before transport.", id: "AC-2", status: "pass" },
+      ],
+      decision: "settled",
+      findings: [],
+      summary: "The redacted candidate is settled.",
+    }
   })
   const broker = new Broker({
     appServerFactory: () => appServer,
@@ -2458,14 +3340,13 @@ test("convergence blocks a secret-bearing review packet before browser submissio
     cwd: process.cwd(),
     target: "Prepare a safe review packet.",
   })
-  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "review_packet_secret_detected")
-  assert.equal(ego.exchanges, 0)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(ego.exchanges, 1)
 })
 
-test("convergence detects repeated candidate and review state instead of looping forever", async (t) => {
+test("convergence challenges repeated candidate and review state without terminating", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const repeatedCandidate = convergenceCandidate(1, "The unchanged candidate packet.")
@@ -2474,16 +3355,24 @@ test("convergence detects repeated candidate and review state instead of looping
     ...identity,
     criteria: [
       { evidence: "Identity remains correct.", id: "AC-1", status: "pass" },
-      { evidence: "The same unresolved issue remains.", id: "AC-2", status: "fail" },
+      {
+        evidence: identity.cycle === 3
+          ? "The third independent pass settles the blocker."
+          : "The same unresolved issue remains.",
+        id: "AC-2",
+        status: identity.cycle === 3 ? "pass" : "fail",
+      },
     ],
-    decision: "continue",
-    findings: [{
+    decision: identity.cycle === 3 ? "settled" : "continue",
+    findings: identity.cycle === 3 ? [] : [{
       action: "Supply evidence that changes the candidate state.",
       id: "B-STAGNANT",
       severity: "blocking",
       title: "Candidate did not change",
     }],
-    summary: "The same blocking state remains.",
+    summary: identity.cycle === 3
+      ? "The repeated candidate is now independently settled."
+      : "The same blocking state remains.",
   }))
   const broker = new Broker({
     appServerFactory: () => appServer,
@@ -2504,14 +3393,14 @@ test("convergence detects repeated candidate and review state instead of looping
     bindingKey: "ego-chat-main",
     cwd: process.cwd(),
     maxCycles: 4,
-    target: "Stop if neither side changes the review state.",
+    target: "Challenge repetition but keep the convergence conversation alive.",
   })
-  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
-  assert.equal(stopped.status, "human_required")
-  assert.equal(stopped.humanRequired.code, "convergence_stagnated")
-  assert.equal(appServer.turns, 2)
-  assert.equal(ego.exchanges, 2)
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 3)
+  assert.equal(appServer.turns, 3)
+  assert.equal(ego.exchanges, 3)
 })
 
 test("an active convergence lease blocks interleaved sends to its conversation", async (t) => {
@@ -2541,17 +3430,24 @@ test("an active convergence lease blocks interleaved sends to its conversation",
       workspaceActivity: { count: 1, types: ["commandExecution"] },
     }
   }
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "Identity is bound.", id: "AC-1", status: "pass" },
+      { evidence: "The implementing agent still reports a blocker.", id: "AC-2", status: "unknown" },
+    ],
+    decision: "continue",
+    findings: [{
+      action: "Re-evaluate the implementing-agent blocker.",
+      id: "B-IMPLEMENTER",
+      severity: "blocking",
+      title: "Implementer blocker remains",
+    }],
+    summary: "Continue after reviewing the blocker.",
+  }))
   const broker = new Broker({
     appServerFactory: () => appServer,
-    egoAdapter: {
-      ...unusedEgoAdapter,
-      bind: async (input) => ({
-        canonicalUrl: input.canonicalUrl,
-        head: { fingerprint: "lease-head", lastRole: "assistant", messageCount: 2 },
-        targetId: "lease-tab",
-        taskSpaceId: 10,
-      }),
-    },
+    egoAdapter: ego.adapter,
     store: new EventStore(dataDir),
   })
   await broker.initialize()
@@ -2566,6 +3462,7 @@ test("an active convergence lease blocks interleaved sends to its conversation",
     acceptanceCriteria: ["Identity is bound.", "The lease is exclusive."],
     bindingKey: "ego-chat-main",
     cwd: process.cwd(),
+    maxCycles: 1,
     target: "Hold the conversation lease while Codex is working.",
   })
   await entered
@@ -2584,7 +3481,8 @@ test("an active convergence lease blocks interleaved sends to its conversation",
 
   releaseTurn()
   const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
-  assert.equal(stopped.humanRequired.code, "codex_reported_blocked")
+  assert.equal(stopped.humanRequired.code, "convergence_cycle_limit_reached")
+  assert.equal(ego.exchanges, 1)
 })
 
 test("cancellation remains terminal when an older App Server phase finishes later", async (t) => {
@@ -3293,6 +4191,180 @@ test("browser workflows fail closed after broker restart", async (t) => {
   assert.equal("private" in reconciled, false)
 })
 
+test("a fully identified pre-send exchange reconciles and continues after broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const now = new Date().toISOString()
+  const canonicalUrl = "https://chatgpt.com/c/restart-presend-recovery"
+  const terminalMarker = "EGO_CHAT_RESTART_PRESEND_DONE"
+  const turnMarker = "EGO_CHAT_RESTART_PRESEND_TEST"
+  const prompt = `${turnMarker}\nContinue after broker restart.`
+  const beforeHead = {
+    contentDigest: "a".repeat(64),
+    fingerprint: "b".repeat(64),
+    fingerprintVersion: "tail-v1",
+    messageId: "restart-presend-assistant-before",
+    role: "assistant",
+  }
+  await store.persistBinding("binding.created", {
+    canonicalUrl,
+    createdAt: now,
+    headContentDigest: beforeHead.contentDigest,
+    headFingerprint: beforeHead.fingerprint,
+    headFingerprintVersion: beforeHead.fingerprintVersion,
+    headMessageId: beforeHead.messageId,
+    headRole: beforeHead.role,
+    key: "restart-presend",
+    messageCount: 2,
+    mode: "existing",
+    modelPolicyKey: "chatgpt-web-default",
+    projectUrl: null,
+    revision: 1,
+    startUrl: canonicalUrl,
+    state: "bound",
+    targetId: "restart-presend-tab",
+    taskSpaceId: 24,
+    updatedAt: now,
+    verifiedAt: now,
+  })
+  const workflow = {
+    bindingKey: "restart-presend",
+    createdAt: now,
+    deadlineAt: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
+    id: "962529e6-3486-4a2b-ad9c-b62102556776",
+    inputDigest: digest(prompt),
+    kind: "ego_exchange",
+    operationKey: `exchange:restart-presend:${turnMarker}`,
+    phase: "browser_owned",
+    private: {
+      modelPolicy: {
+        enforcement: "repair_then_verify",
+        key: "chatgpt-web-default",
+        modelSelection: "strongest_available",
+        thinkingEffort: "maximum_available",
+      },
+      request: {
+        allowProtocolRepairCapture: true,
+        allowTaskSpaceReclaim: true,
+        bindingKey: "restart-presend",
+        expectedTerminalMarker: terminalMarker,
+        prompt,
+        requestedTimeoutMs: 30_000,
+        timeoutMs: 2 * 60 * 60 * 1_000,
+        turnMarker,
+      },
+    },
+    reconciliation: {
+      allowProtocolRepairCapture: true,
+      beforeHead,
+      bindingRevision: 1,
+      expectedTerminalMarker: terminalMarker,
+      turnMarker,
+    },
+    status: "running",
+    updatedAt: now,
+  }
+  await store.persist("workflow.started", workflow)
+
+  let captures = 0
+  let reconciliations = 0
+  let sends = 0
+  let firstReconciliationStarted
+  const reconciliationStarted = new Promise((resolve) => {
+    firstReconciliationStarted = resolve
+  })
+  const firstBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      reconcileBound: async () => {
+        reconciliations += 1
+        firstReconciliationStarted()
+        return new Promise(() => {})
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await firstBroker.initialize()
+  await reconciliationStarted
+  assert.equal(
+    firstBroker.getWorkflow({ workflowId: workflow.id }).phase,
+    "restart_reconciling",
+  )
+  firstBroker.close()
+
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureExchange: async () => {
+        captures += 1
+        const responseText = terminalMarker
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "c".repeat(64),
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "restart-presend-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "restart-presend-tab",
+          taskSpaceId: 24,
+          turnMarker,
+        }
+      },
+      reconcileBound: async (input) => {
+        reconciliations += 1
+        assert.equal(input.allowDeliveryAbsent, true)
+        assert.equal(input.allowTaskSpaceReclaim, true)
+        return {
+          canonicalUrl,
+          deliveryState: "absent",
+          head: {
+            fingerprint: beforeHead.fingerprint,
+            fingerprintVersion: beforeHead.fingerprintVersion,
+            lastContentDigest: beforeHead.contentDigest,
+            lastMessageId: beforeHead.messageId,
+            lastRole: beforeHead.role,
+            messageCount: 2,
+          },
+          targetId: "restart-presend-tab",
+          taskSpaceId: 24,
+          turnMarker,
+        }
+      },
+      sendExchange: async () => {
+        sends += 1
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "restart-presend-user",
+          sentAt: new Date().toISOString(),
+          targetId: "restart-presend-tab",
+          taskSpaceId: 24,
+          turnMarker,
+        }
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: workflow.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.restartRecoveryCount, 1)
+  assert.equal(reconciliations, 2)
+  assert.equal(sends, 1)
+  assert.equal(captures, 1)
+})
+
 test("a confirmed send resumes read-only capture after broker restart without resending", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -3485,7 +4557,7 @@ test("a confirmed send resumes read-only capture after broker restart without re
   assert.equal(resumedBroker.getModelPolicy().revision, committedPolicy.revision)
 })
 
-test("running convergence fails closed after broker restart", async (t) => {
+test("incomplete legacy convergence metadata remains non-resumable after broker restart", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const store = new EventStore(dataDir)
@@ -3591,4 +4663,366 @@ test("running convergence resumes an exact completed pre-review Codex turn after
   assert.equal(completed.phase, "settled")
   assert.equal(secondClient.turns, 0)
   assert.equal(ego.exchanges, 1)
+})
+
+test("running convergence resumes a captured Codex candidate after broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  await seedRestartBinding(
+    dataDir,
+    "https://chatgpt.com/c/convergence-restart-codex-captured",
+  )
+  const contract = createContract(
+    "Resume a durably captured candidate without repeating its Codex turn.",
+    ["Identity is bound.", "The captured candidate is independently settled."],
+  )
+  const candidate = convergenceCandidate(1)
+  const workflow = convergenceRestartWorkflow({
+    candidate,
+    contract,
+    id: "4dd5f6d7-762f-4cf9-8ec0-cbe7c365c4a1",
+    phase: "codex_captured",
+  })
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("workflow.started", workflow)
+
+  const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The captured candidate is settled.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The captured candidate remained reviewable after restart.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: workflow.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 1)
+  assert.equal(appServer.turns, 0)
+  assert.equal(ego.exchanges, 1)
+})
+
+test("running convergence continues after a captured review survives broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  await seedRestartBinding(
+    dataDir,
+    "https://chatgpt.com/c/convergence-restart-review-captured",
+  )
+  const contract = createContract(
+    "Continue from durable review feedback without asking a human to restart the cycle.",
+    ["Identity is bound.", "The second candidate settles the prior review."],
+  )
+  const firstCandidate = convergenceCandidate(1)
+  const firstReview = {
+    candidateDigest: digestJson(firstCandidate),
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "One implementation correction remains.", id: "AC-2", status: "fail" },
+    ],
+    cycle: 1,
+    decision: "continue",
+    findings: [{
+      action: "Apply the remaining implementation correction.",
+      id: "B-RESTART-CONTINUE",
+      severity: "blocking",
+      title: "One correction remains",
+    }],
+    summary: "Continue with the durable review feedback.",
+    targetDigest: contract.targetDigest,
+  }
+  const workflow = convergenceRestartWorkflow({
+    candidate: firstCandidate,
+    contract,
+    id: "a9432978-ec53-49c6-bf95-4cf7a2d55cb7",
+    phase: "review_captured",
+    review: firstReview,
+  })
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("workflow.started", workflow)
+
+  const appServer = new FakeConvergenceAppServer(() => convergenceCandidate(2))
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The second candidate resolves the review.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The resumed second cycle is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: workflow.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 2)
+  assert.equal(appServer.turns, 1)
+  assert.equal(ego.exchanges, 1)
+  assert.equal(appServer.additionalContexts[0].chatgpt_review.value, JSON.stringify(firstReview))
+})
+
+test("running convergence consumes its exact completed ChatGPT child after broker restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/convergence-restart-chatgpt-running"
+  await seedRestartBinding(dataDir, canonicalUrl)
+  const contract = createContract(
+    "Consume a completed browser review without sending a duplicate after restart.",
+    ["Identity is bound.", "The completed browser review settles the candidate."],
+  )
+  const candidate = convergenceCandidate(1)
+  const candidateDigest = digestJson(candidate)
+  const workflowId = "ba5a0697-ee25-413f-b8ce-e48d1d37b372"
+  const markerToken = digestJson({
+    cycle: 1,
+    purpose: "review",
+    workflowId,
+  }).slice(0, 32).toUpperCase()
+  const turnMarker = `EGO_CHAT_CONVERGENCE_${markerToken}_C1`
+  const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}`
+  const prompt = buildChatGptPrompt({
+    candidate,
+    candidateDigest,
+    contract,
+    cycle: 1,
+    terminalMarker,
+    turnMarker,
+  })
+  const review = {
+    candidateDigest,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The completed review settles the candidate.", id: "AC-2", status: "pass" },
+    ],
+    cycle: 1,
+    decision: "settled",
+    findings: [],
+    summary: "The completed child review is settled.",
+    targetDigest: contract.targetDigest,
+  }
+  const responseText = `${JSON.stringify(review)}\n${terminalMarker}`
+  let browserSends = 0
+  const firstBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      exchange: async (input) => {
+        browserSends += 1
+        return {
+          canonicalUrl,
+          durationMs: 20,
+          head: {
+            fingerprint: "completed-child-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "completed-child-assistant",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "restart-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await firstBroker.initialize()
+  const child = await firstBroker.startEgoExchange({
+    allowProtocolRepairCapture: true,
+    allowTaskSpaceReclaim: true,
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: terminalMarker,
+    prompt,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  await firstBroker.awaitWorkflow({ timeoutMs: 5_000, workflowId: child.id })
+  firstBroker.close()
+
+  const workflow = convergenceRestartWorkflow({
+    candidate,
+    childWorkflowId: child.id,
+    contract,
+    id: workflowId,
+    phase: "chatgpt_running",
+  })
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("workflow.started", workflow)
+
+  const appServer = new FakeConvergenceAppServer()
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: unusedEgoAdapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 1)
+  assert.equal(appServer.turns, 0)
+  assert.equal(browserSends, 1)
+})
+
+test("running convergence resumes confirmed ChatGPT capture after broker restart without resending", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/convergence-restart-confirmed-review"
+  let captureEntered
+  const captureStarted = new Promise((resolve) => {
+    captureEntered = resolve
+  })
+  let captures = 0
+  let sends = 0
+  let sentPrompt
+  const firstClient = new FakeConvergenceAppServer()
+  const firstBroker = new Broker({
+    appServerFactory: () => firstClient,
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: {
+          fingerprint: "confirmed-review-before",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: "a".repeat(64),
+          lastMessageId: "confirmed-review-assistant-before",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        targetId: "confirmed-review-tab",
+        taskSpaceId: 10,
+      }),
+      captureExchange: async (_input, signal) => {
+        captures += 1
+        captureEntered()
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+        })
+      },
+      sendExchange: async (input) => {
+        sends += 1
+        sentPrompt = input.prompt
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "confirmed-review-user",
+          sentAt: new Date().toISOString(),
+          targetId: "confirmed-review-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await firstBroker.initialize()
+  await firstBroker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 10,
+  })
+  const started = await firstBroker.startConvergence({
+    acceptanceCriteria: [
+      "The exact confirmed send is preserved.",
+      "Restart capture never duplicates the review prompt.",
+    ],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Resume a confirmed ChatGPT review after broker restart.",
+  })
+  await captureStarted
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (firstBroker.getWorkflow({ workflowId: started.id }).phase === "chatgpt_running") {
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(firstBroker.getWorkflow({ workflowId: started.id }).phase, "chatgpt_running")
+  firstBroker.close()
+  await new Promise((resolve) => globalThis.setImmediate(resolve))
+  await new Promise((resolve) => globalThis.setImmediate(resolve))
+
+  const identity = parseConvergenceIdentity(sentPrompt)
+  const secondClient = new FakeConvergenceAppServer()
+  const secondBroker = new Broker({
+    appServerFactory: () => secondClient,
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureExchange: async (input) => {
+        captures += 1
+        const responseText = `${JSON.stringify({
+          ...identity,
+          criteria: [
+            { evidence: "The confirmed send identity is exact.", id: "AC-1", status: "pass" },
+            { evidence: "No duplicate review prompt was sent.", id: "AC-2", status: "pass" },
+          ],
+          decision: "settled",
+          findings: [],
+          summary: "The restarted capture is settled without a resend.",
+        })}\n${input.expectedTerminalMarker}`
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "confirmed-review-after",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "confirmed-review-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "confirmed-review-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+      sendExchange: async () => {
+        sends += 1
+        throw new Error("the confirmed review prompt must not be sent again")
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await secondBroker.initialize()
+  t.after(() => secondBroker.close())
+  const completed = await secondBroker.awaitWorkflow({
+    timeoutMs: 5_000,
+    workflowId: started.id,
+  })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 1)
+  assert.equal(firstClient.turns, 1)
+  assert.equal(secondClient.turns, 0)
+  assert.equal(sends, 1)
+  assert.equal(captures, 2)
 })

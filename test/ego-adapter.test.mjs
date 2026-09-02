@@ -40,7 +40,7 @@ async function runMalformedModelPolicyCase(attributes, {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 11,
+    browserContractRevision: 13,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -187,6 +187,9 @@ globalThis.js = async (source) => {
   if (source.includes('hasLoginAction')) {
     return { draft: '', hasComposer: true, hasLoginAction: false }
   }
+  if (source.includes('composer.contains(active)')) {
+    return { blurred: false, ok: true }
+  }
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
     return []
   }
@@ -248,7 +251,9 @@ async function runPreSendDriverCase({
   allowTaskSpaceReclaim = false,
   boundTaskSpaceOwnership = null,
   changeSendControlAtRecheck = false,
+  currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
+  deferFirstPolicyOpenWithDraft = false,
   downgradeAtPresend = false,
   fenceAtRecheck = false,
   policyUiVariant = "legacy",
@@ -269,7 +274,7 @@ async function runPreSendDriverCase({
   }
   const input = {
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-    browserContractRevision: 11,
+    browserContractRevision: 13,
     binding: boundTaskSpaceOwnership === null
       ? {
           messageCount: 0,
@@ -329,6 +334,12 @@ const beforeEntries = ${JSON.stringify([
 const ownerPath = ${JSON.stringify(ownerPath)}
 let policyMenuOpen = false
 let modelChoicesOpen = false
+let composerHasDraft = false
+let composerFocused = false
+let deferredPolicyActivation = false
+let deferredPolicyActivationWaits = 0
+let focusedModelIndex = null
+const currentModelLabels = ${JSON.stringify(currentModelLabels)}
 let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
 let focusedPolicyControl = null
 let policyReads = 0
@@ -336,11 +347,14 @@ let sendTargetReads = 0
 let taskSpaceOwnership = ${JSON.stringify(boundTaskSpaceOwnership)}
 const counters = {
   claimTaskSpace: 0,
+  composerFocusSettlements: 0,
   composerMutations: 0,
   injectedPromptLength: 0,
   insertText: 0,
   mouseEvents: 0,
   modelSelections: 0,
+  policyActivationDeferrals: 0,
+  policyActivationRetries: 0,
   policyReads: 0,
   sendTargetReads: 0,
   takeOverTaskSpace: 0,
@@ -369,9 +383,39 @@ globalThis.pageInfo = async () => ({
   url: taskSpaceOwnership === null ? 'https://chatgpt.com/' : ${JSON.stringify(canonicalUrl)},
 })
 globalThis.snapshotText = async () => ''
-globalThis.wait = async () => {}
+globalThis.wait = async () => {
+  if (deferredPolicyActivation) {
+    deferredPolicyActivationWaits += 1
+    if (deferredPolicyActivationWaits >= 3) {
+      deferredPolicyActivation = false
+      deferredPolicyActivationWaits = 0
+    }
+  }
+}
 globalThis.click = async (target) => {
-  if (String(target).includes('__composer-pill')) policyMenuOpen = !policyMenuOpen
+  if (String(target).includes('__composer-pill')) {
+    if (
+      ${JSON.stringify(deferFirstPolicyOpenWithDraft)}
+      && composerHasDraft
+      && composerFocused
+      && !policyMenuOpen
+    ) {
+      if (deferredPolicyActivation) {
+        policyMenuOpen = true
+        deferredPolicyActivation = false
+        deferredPolicyActivationWaits = 0
+        counters.policyActivationRetries += 1
+      } else {
+        deferredPolicyActivation = true
+        deferredPolicyActivationWaits = 0
+        counters.policyActivationDeferrals += 1
+      }
+    } else {
+      policyMenuOpen = !policyMenuOpen
+      deferredPolicyActivation = false
+      deferredPolicyActivationWaits = 0
+    }
+  }
   if (target === '#prompt-textarea') policyMenuOpen = false
 }
 
@@ -379,8 +423,8 @@ globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
 globalThis.typeText = async () => { throw new Error('unexpected typeText') }
 globalThis.pressKey = async (key) => {
   if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') modelChoicesOpen = true
-  if (key === 'ENTER' && focusedPolicyControl === 'first_model') {
-    selectedModelIndex = 0
+  if (key === 'ENTER' && focusedPolicyControl === 'model_choice') {
+    selectedModelIndex = focusedModelIndex
     counters.modelSelections += 1
     policyMenuOpen = false
     modelChoicesOpen = false
@@ -433,6 +477,9 @@ globalThis.js = async (source) => {
   if (source.includes('aria-valuemin')) {
     policyReads += 1
     counters.policyReads = policyReads
+    if (${JSON.stringify(deferFirstPolicyOpenWithDraft)} && !policyMenuOpen) {
+      return { ok: false, reason: 'policy_menu_not_open' }
+    }
     const downgradeRead = ${JSON.stringify(policyUiVariant)} === 'current' ? 8 : 2
     const current = ${JSON.stringify(downgradeAtPresend)} && policyReads >= downgradeRead ? 3 : 4
     if (${JSON.stringify(policyUiVariant)} === 'current') {
@@ -441,11 +488,14 @@ globalThis.js = async (source) => {
         effortLabel: 'Pro',
         maximum: 4,
         minimum: 0,
-        modelChoiceCount: modelChoicesOpen ? 2 : 0,
+        modelChoiceCount: modelChoicesOpen ? currentModelLabels.length : 0,
         modelChoicesOpen,
         modelLabel: modelChoicesOpen
-          ? (selectedModelIndex === 0 ? 'GPT-5.6 Sol' : 'GPT-5.5')
+          ? currentModelLabels[selectedModelIndex]
           : null,
+        strongestModelIndex: currentModelLabels[0]?.startsWith('Default ')
+          ? 1
+          : 0,
         ok: true,
         pillLabel: 'Thinking effort',
         policyVariant: 'separate_model',
@@ -467,8 +517,10 @@ globalThis.js = async (source) => {
     focusedPolicyControl = source.includes('Select model') ? 'model_trigger' : 'power'
     return true
   }
-  if (source.includes('choices[0].focus()')) {
-    focusedPolicyControl = 'first_model'
+  if (source.includes('choices[0].focus()') || source.includes('choices[choiceIndex].focus()')) {
+    const match = source.match(/const choiceIndex =\\s*(\\d+)/)
+    focusedModelIndex = match ? Number(match[1]) : 0
+    focusedPolicyControl = 'model_choice'
     return true
   }
   if (source.includes('enabledSendCount')) {
@@ -482,7 +534,15 @@ globalThis.js = async (source) => {
     if (injectedPrompt !== input.prompt) throw new Error('The injected prompt changed in transit.')
     counters.composerMutations += 1
     counters.injectedPromptLength = injectedPrompt.length
+    composerHasDraft = true
+    composerFocused = true
     return true
+  }
+  if (source.includes('composer.contains(active)')) {
+    const blurred = composerFocused
+    composerFocused = false
+    if (blurred) counters.composerFocusSettlements += 1
+    return { blurred, ok: true }
   }
   if (source.includes('composer.focus()')) return true
   if (source.includes('const blockChildren')) return [input.prompt]
@@ -495,7 +555,10 @@ globalThis.js = async (source) => {
     if (sendTargetReads === 2 && ${JSON.stringify(changeSendControlAtRecheck)}) return { ok: false }
     return { hit: true, ok: true, x: 10, y: 20 }
   }
-  if (source.includes('composer.replaceChildren()')) return true
+  if (source.includes('composer.replaceChildren()')) {
+    composerHasDraft = false
+    return true
+  }
   if (source.includes("return String(draft).trim().length === 0")) return true
   throw new Error('Unexpected page script: ' + source.slice(0, 120))
 }
@@ -554,7 +617,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 11,
+    browserContractRevision: 13,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -648,6 +711,8 @@ await ${EGO_DRIVER_SOURCE.trim()}
 }
 
 async function runAdoptionDriverCase({
+  allowTaskSpaceReclaim = false,
+  currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
   fallbackTaskSpaceOwnership = null,
   hydrateAnchorPrefix = false,
@@ -682,6 +747,7 @@ async function runAdoptionDriverCase({
       : []),
   ]
   const input = {
+    ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     bindingKey: "adoption-driver-test",
     brokerLease: {
       brokerId: "adoption-test-broker",
@@ -715,7 +781,10 @@ let generating = ${JSON.stringify(initiallyGenerating)}
 let waits = 0
 let policyMenuOpen = false
 let modelChoicesOpen = false
+const currentModelLabels = ${JSON.stringify(currentModelLabels)}
 let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
+let focusedModelIndex = null
+let focusedPolicyControl = null
 let policyInspections = 0
 let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
 let pageInspection = 0
@@ -753,7 +822,14 @@ const messages = () => {
   return values
 }
 globalThis.cliLog = (value) => console.log(value)
-globalThis.listTaskSpaces = async () => ${JSON.stringify(listedTaskSpaces)}
+let listedTaskSpaces = ${JSON.stringify(listedTaskSpaces)}
+globalThis.listTaskSpaces = async () => listedTaskSpaces
+globalThis.claimTaskSpace = async (id) => {
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+}
+globalThis.takeOverTaskSpace = async (id) => {
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+}
 globalThis.useOrCreateTaskSpace = async (value) => {
   taskSpaceRequests.push(value)
   if (!${JSON.stringify(taskSpaceAvailable)} && value === 10) {
@@ -808,7 +884,15 @@ globalThis.pressKey = async (key) => {
     counters.pressKey += 1
     policyCurrent = 4
   }
-  if (key === 'ENTER' && policyMenuOpen) modelChoicesOpen = true
+  if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') {
+    modelChoicesOpen = true
+  } else if (key === 'ENTER' && focusedPolicyControl === 'model_choice') {
+    selectedModelIndex = focusedModelIndex
+    focusedModelIndex = null
+    focusedPolicyControl = null
+    modelChoicesOpen = false
+    policyMenuOpen = false
+  }
   if (key === 'ESCAPE') {
     policyMenuOpen = false
     modelChoicesOpen = false
@@ -854,6 +938,9 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
+  if (source.includes('composer.contains(active)')) {
+    return { blurred: false, ok: true }
+  }
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
     return messages()
   }
@@ -879,15 +966,18 @@ globalThis.js = async (source) => {
         effortLabel: 'Pro',
         maximum: 4,
         minimum: 0,
-        modelChoiceCount: modelChoicesOpen ? 2 : 0,
+        modelChoiceCount: modelChoicesOpen ? currentModelLabels.length : 0,
         modelChoicesOpen,
         modelLabel: modelChoicesOpen
-          ? (selectedModelIndex === 0 ? 'GPT-5.6 Sol' : 'GPT-5.5')
+          ? currentModelLabels[selectedModelIndex]
           : null,
         ok: true,
         pillLabel: 'Thinking effort',
         policyVariant: 'separate_model',
         selectedModelIndex: modelChoicesOpen ? selectedModelIndex : null,
+        strongestModelIndex: modelChoicesOpen
+          ? (currentModelLabels[0]?.startsWith('Default ') ? 1 : 0)
+          : null,
       }
     }
     if (${JSON.stringify(redirectAfterModelVerification)}) {
@@ -904,7 +994,14 @@ globalThis.js = async (source) => {
       policyVariant: 'coupled_power',
     }
   }
-  if (source.includes('items[0].focus()') || source.includes('choices[0].focus()')) {
+  if (source.includes('items[0].focus()')) {
+    focusedPolicyControl = source.includes('Select model') ? 'model_trigger' : 'power'
+    return true
+  }
+  if (source.includes('choices[0].focus()') || source.includes('choices[choiceIndex].focus()')) {
+    const match = source.match(/const choiceIndex =\\s*(\\d+)/)
+    focusedModelIndex = match ? Number(match[1]) : 0
+    focusedPolicyControl = 'model_choice'
     return true
   }
   if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
@@ -966,6 +1063,7 @@ async function runTaskSpaceReconciliationCase({
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
   captureContinuationAllowed = false,
+  composerDraft = "",
   fallbackTaskSpaceOwnership = null,
   generationRunning = false,
   mode = "reconcile_bound",
@@ -1019,7 +1117,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 11,
+    browserContractRevision: 13,
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
@@ -1041,13 +1139,21 @@ async function runTaskSpaceReconciliationCase({
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
 let opened = false
+let composerDraft = ${JSON.stringify(composerDraft)}
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
 globalThis.cliLog = (value) => console.log(value)
 const fallbackName = ${JSON.stringify(fallbackName)}
-globalThis.listTaskSpaces = async () => ${JSON.stringify(listedTaskSpaces)}
-globalThis.claimTaskSpace = async () => { counters.claimTaskSpace += 1 }
-globalThis.takeOverTaskSpace = async () => { counters.takeOverTaskSpace += 1 }
+let listedTaskSpaces = ${JSON.stringify(listedTaskSpaces)}
+globalThis.listTaskSpaces = async () => listedTaskSpaces
+globalThis.claimTaskSpace = async (id) => {
+  counters.claimTaskSpace += 1
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+}
+globalThis.takeOverTaskSpace = async (id) => {
+  counters.takeOverTaskSpace += 1
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+}
 globalThis.useOrCreateTaskSpace = async (value) => {
   taskSpaceRequests.push(value)
   if (value === 10) return { id: 10 }
@@ -1070,11 +1176,18 @@ globalThis.typeText = async () => { counters.typeText += 1 }
 globalThis.pressKey = async () => { counters.pressKey += 1 }
 globalThis.cdp = async () => {}
 globalThis.js = async (source) => {
+  if (source.includes("composer.replaceChildren()") && source.includes("deleteContentBackward")) {
+    composerDraft = ''
+    return true
+  }
+  if (source.includes("String(draft).trim().length === 0")) {
+    return composerDraft.trim().length === 0
+  }
   if (source.includes('hasLoginAction')) {
     return {
       composerCount: 1,
       composerSemanticId: true,
-      draft: '',
+      draft: composerDraft,
       hasComposer: true,
       hasLoginAction: false,
     }
@@ -1606,7 +1719,8 @@ process.stdin.on("data", (chunk) => { source += chunk })
 process.stdin.on("end", () => {
   const invocation = source.trim()
   const argumentStart = invocation.lastIndexOf(")(")
-  const inputPath = JSON.parse(invocation.slice(argumentStart + 2, -1))
+  const argumentEnd = invocation.indexOf(",", argumentStart + 2)
+  const inputPath = JSON.parse(invocation.slice(argumentStart + 2, argumentEnd))
   const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))
   fs.unlinkSync(inputPath)
   const envelope = Buffer.from(JSON.stringify({
@@ -1832,7 +1946,7 @@ test("ambiguous model-policy controls stop before composition or send", async ()
 test("a live policy downgrade after composition stops before Send", async () => {
   const stopped = await runPreSendDriverCase({ downgradeAtPresend: true })
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.error?.details?.evidence?.powerLevel, 4)
   assert.equal(stopped.error?.details?.evidence?.powerMax, 5)
   assert.equal(stopped.counters.policyReads, 2)
@@ -1848,7 +1962,7 @@ test("an explicitly authorized fresh exchange claims its exact user-controlled b
     downgradeAtPresend: true,
   })
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.counters.claimTaskSpace, 1)
   assert.equal(stopped.counters.takeOverTaskSpace, 0)
   assert.equal(stopped.counters.composerMutations, 1)
@@ -1862,7 +1976,7 @@ test("an explicitly authorized fresh exchange takes back its exact delegated bin
     downgradeAtPresend: true,
   })
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.counters.claimTaskSpace, 0)
   assert.equal(stopped.counters.takeOverTaskSpace, 1)
   assert.equal(stopped.counters.composerMutations, 1)
@@ -1889,20 +2003,54 @@ test("current policy repair selects the provider-first model before composition"
     policyUiVariant: "current",
   })
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.counters.modelSelections, 1)
   assert.equal(stopped.counters.policyReads, 8)
   assert.equal(stopped.counters.composerMutations, 1)
   assert.equal(stopped.counters.mouseEvents, 0)
 })
 
+test("pre-send policy verification settles a populated composer before opening policy", async () => {
+  const stopped = await runPreSendDriverCase({
+    changeSendControlAtRecheck: true,
+    deferFirstPolicyOpenWithDraft: true,
+    policyUiVariant: "current",
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "send_control_changed")
+  assert.equal(stopped.counters.composerFocusSettlements, 1)
+  assert.equal(stopped.counters.policyActivationDeferrals, 0)
+  assert.equal(stopped.counters.policyActivationRetries, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("current policy repair skips a leading automatic router choice", async () => {
+  const stopped = await runPreSendDriverCase({
+    changeSendControlAtRecheck: true,
+    currentModelLabels: [
+      "Default Recommended selection of frontier models",
+      "GPT-5.6 Sol",
+      "GPT-5.6 Terra",
+      "GPT-5.6 Luna",
+      "GPT-5.5",
+    ],
+    currentSelectedModelIndex: 0,
+    policyUiVariant: "current",
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "send_control_changed")
+  assert.equal(stopped.counters.modelSelections, 1)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
 test("a maximum-size review packet reaches the rich editor in one exact bounded mutation", async () => {
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
-  const prompt = `${turnMarker}\n${"0123456789abcdef 😀 line\n".repeat(2_500)}`.slice(0, 56_010)
+  const prompt = `${turnMarker}\n${"0123456789abcdef line\n".repeat(9_000)}`.slice(0, 190_000)
   const stopped = await runPreSendDriverCase({ downgradeAtPresend: true, prompt })
 
+  assert.ok(Buffer.byteLength(prompt, "utf8") > 65_536)
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.counters.composerMutations, 1)
   assert.equal(stopped.counters.injectedPromptLength, prompt.length)
   assert.equal(stopped.counters.insertText, 0)
@@ -1921,7 +2069,7 @@ test("script-like review text remains inert exact composer data", async () => {
   const stopped = await runPreSendDriverCase({ downgradeAtPresend: true, prompt })
 
   assert.equal(stopped.error?.code, "human_required")
-  assert.equal(stopped.error?.details?.reason, "adoption_live_model_not_maximum")
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
   assert.equal(stopped.counters.composerMutations, 1)
   assert.equal(stopped.counters.injectedPromptLength, prompt.length)
   assert.equal(stopped.counters.insertText, 0)
@@ -2197,16 +2345,35 @@ test("conversation adoption reopens one transiently unresolved policy menu", asy
   assert.equal(adopted.counters.typeText, 0)
 })
 
-test("conversation adoption rejects a non-leading current model without changing it", async () => {
+test("conversation adoption selects and verifies the strongest current model", async () => {
   const adopted = await runAdoptionDriverCase({
     currentSelectedModelIndex: 1,
     policyUiVariant: "current",
   })
-  assert.equal(adopted.result, undefined)
-  assert.equal(adopted.error?.code, "human_required")
-  assert.equal(adopted.error?.details?.reason, "adoption_live_model_not_maximum")
-  assert.equal(adopted.error?.details?.evidence?.modelPosition, 2)
-  assert.equal(adopted.error?.details?.evidence?.modelCount, 2)
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(adopted.result.modelPolicy.powerLevel, adopted.result.modelPolicy.powerMax)
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption replaces a leading automatic router with the strongest model", async () => {
+  const adopted = await runAdoptionDriverCase({
+    currentModelLabels: [
+      "Default Recommended selection of frontier models",
+      "GPT-5.6 Sol",
+      "GPT-5.6 Terra",
+      "GPT-5.6 Luna",
+      "GPT-5.5",
+    ],
+    currentSelectedModelIndex: 0,
+    policyUiVariant: "current",
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.modelLabel, "GPT-5.6 Sol")
+  assert.equal(adopted.result.modelPolicy.powerLevel, adopted.result.modelPolicy.powerMax)
   assert.equal(adopted.counters.sendClick, 0)
   assert.equal(adopted.counters.fillInput, 0)
   assert.equal(adopted.counters.pressKey, 0)
@@ -2223,6 +2390,17 @@ test("conversation adoption never routes around a user-controlled bound task spa
   assert.equal(adopted.counters.fillInput, 0)
   assert.equal(adopted.counters.pressKey, 0)
   assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption reclaims only its explicitly selected task space", async () => {
+  const adopted = await runAdoptionDriverCase({
+    allowTaskSpaceReclaim: true,
+    taskSpaceOwnership: "agentDelegatedToUser",
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.taskSpaceId, 10)
+  assert.deepEqual(adopted.taskSpaceRequests, [10])
+  assert.equal(adopted.counters.sendClick, 0)
 })
 
 test("conversation adoption stays in its explicit space when an unrelated fallback is user-controlled", async () => {
@@ -2295,17 +2473,41 @@ test("bound recovery stops instead of bypassing a user-controlled deterministic 
   assert.deepEqual(reconciled.taskSpaceRequests, [])
 })
 
-test("read-only reconciliation never inherits fresh-send task-space reclaim authority", async () => {
+test("read-only reconciliation reclaims only its deterministic binding-owned task space", async () => {
   const reconciled = await runTaskSpaceReconciliationCase({
     allowTaskSpaceReclaim: true,
     fallbackTaskSpaceOwnership: "agentDelegatedToUser",
   })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 12)
+  assert.equal(reconciled.counters.claimTaskSpace, 0)
+  assert.equal(reconciled.counters.takeOverTaskSpace, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [12])
+})
+
+test("restart reconciliation clears only its exact broker-owned unsent prompt", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    allowTaskSpaceReclaim: true,
+    composerDraft: "EGO_CHAT_RECONCILE_TEST_MARKER\nReview this candidate.",
+    fallbackTaskSpaceOwnership: "agentDelegatedToUser",
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 12)
+})
+
+test("restart reconciliation preserves an unrelated human composer draft", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    allowTaskSpaceReclaim: true,
+    composerDraft: "A human draft that Ego Chat does not own.",
+    fallbackTaskSpaceOwnership: "agentDelegatedToUser",
+  })
+
   assert.equal(reconciled.result, undefined)
   assert.equal(reconciled.error?.code, "human_required")
-  assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
-  assert.equal(reconciled.counters.claimTaskSpace, 0)
-  assert.equal(reconciled.counters.takeOverTaskSpace, 0)
-  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.equal(reconciled.error?.details?.reason, "unexpected_draft")
 })
 
 test("bounded capture yields only with the exact confirmed prompt identity", async () => {
@@ -2388,15 +2590,13 @@ test("conversation adoption fails closed when another message interleaves", asyn
   })
 })
 
-test("conversation adoption rejects a response when the live policy is below maximum", async () => {
+test("conversation adoption repairs and verifies a below-maximum thinking policy", async () => {
   const adopted = await runAdoptionDriverCase({ policyInitiallyMaximum: false })
-  assert.equal(adopted.result, undefined)
-  assert.equal(adopted.error?.code, "human_required")
-  assert.equal(adopted.error?.details?.reason, "adoption_live_model_not_maximum")
-  assert.equal(adopted.error?.details?.evidence?.powerLevel, 4)
-  assert.equal(adopted.error?.details?.evidence?.powerMax, 5)
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.result.modelPolicy.powerMax, 5)
   assert.equal(adopted.counters.sendClick, 0)
   assert.equal(adopted.counters.fillInput, 0)
-  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.pressKey, 1)
   assert.equal(adopted.counters.typeText, 0)
 })

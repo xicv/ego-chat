@@ -1,6 +1,6 @@
 [package]
 name = "ego-chat"
-version = "0.2.13"
+version = "0.2.16"
 edition = "2024"
 rust-version = "1.85"
 description = "Portable launcher for durable Codex, ZCode, and ChatGPT review loops through Ego Browser"
