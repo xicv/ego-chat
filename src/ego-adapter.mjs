@@ -11,6 +11,7 @@ import {
 import { EgoChatError } from "./errors.mjs"
 import {
   BROWSER_CONTRACT_REVISION,
+  DEFAULT_BROWSER_CAPTURE_SLICE_MS,
   MAX_IPC_LINE_BYTES,
   MAX_PROMPT_BYTES,
   MAX_RESULT_BYTES,
@@ -161,6 +162,10 @@ export class EgoAdapter {
   #activeChildren = new Map()
   #activeInputPaths = new Map()
   #brokerLease
+  #browserLaneActive = 0
+  #browserLaneQueued = 0
+  #browserTail = Promise.resolve()
+  #captureSliceMs
   #command
   #draining = false
   #mailboxDirectory
@@ -175,6 +180,7 @@ export class EgoAdapter {
 
   constructor({
     brokerLease = undefined,
+    captureSliceMs = DEFAULT_BROWSER_CAPTURE_SLICE_MS,
     command,
     mailboxDirectory = undefined,
     mailboxInputMaxBytes = DEFAULT_DRIVER_INPUT_MAX_BYTES,
@@ -182,7 +188,11 @@ export class EgoAdapter {
     mailboxMaxFiles = DEFAULT_DRIVER_MAILBOX_MAX_FILES,
     mailboxRetentionMs = DEFAULT_DRIVER_MAILBOX_RETENTION_MS,
   }) {
+    if (!Number.isSafeInteger(captureSliceMs) || captureSliceMs < 1) {
+      throw new TypeError("captureSliceMs must be a positive safe integer")
+    }
     this.#brokerLease = brokerLease
+    this.#captureSliceMs = captureSliceMs
     this.#command = command
     const uid = typeof process.getuid === "function" ? process.getuid() : "user"
     this.#mailboxDirectory = mailboxDirectory ?? `/tmp/egc-driver-${uid}`
@@ -202,6 +212,7 @@ export class EgoAdapter {
 
   getMailboxMetrics() {
     return {
+      activeBrowserOperations: this.#browserLaneActive,
       byteLimit: this.#mailboxMaxBytes,
       bytes: this.#mailboxMetrics.bytes,
       fileLimit: this.#mailboxMaxFiles,
@@ -211,6 +222,7 @@ export class EgoAdapter {
         .reduce((total, size) => total + size, 0),
       reservations: this.#mailboxReservations.size,
       retentionMs: this.#mailboxRetentionMs,
+      queuedBrowserOperations: this.#browserLaneQueued,
     }
   }
 
@@ -298,11 +310,14 @@ export class EgoAdapter {
   }
 
   async captureExchange(params, signal = undefined) {
+    const timeoutMs = Math.min(params.timeoutMs, this.#captureSliceMs)
     return this.#run({
       brokerLease: this.#brokerLease,
-      mode: "capture_exchange",
       ...params,
-    }, params.timeoutMs + 60_000, signal)
+      captureContinuationAllowed: params.timeoutMs > timeoutMs,
+      mode: "capture_exchange",
+      timeoutMs,
+    }, timeoutMs + 60_000, signal)
   }
 
   async ensureModelPolicy(params, signal = undefined) {
@@ -328,6 +343,21 @@ export class EgoAdapter {
   async #withMailboxLock(operation) {
     const pending = this.#mailboxTail.then(operation)
     this.#mailboxTail = pending.catch(() => {})
+    return pending
+  }
+
+  async #withBrowserLane(operation) {
+    this.#browserLaneQueued += 1
+    const pending = this.#browserTail.then(async () => {
+      this.#browserLaneQueued -= 1
+      this.#browserLaneActive = 1
+      try {
+        return await operation()
+      } finally {
+        this.#browserLaneActive = 0
+      }
+    })
+    this.#browserTail = pending.catch(() => {})
     return pending
   }
 
@@ -541,6 +571,10 @@ export class EgoAdapter {
   }
 
   async #run(input, timeoutMs, signal = undefined) {
+    return this.#withBrowserLane(() => this.#runExclusive(input, timeoutMs, signal))
+  }
+
+  async #runExclusive(input, timeoutMs, signal = undefined) {
     if (this.#draining) {
       throw new EgoChatError(
         "ego_adapter_draining",

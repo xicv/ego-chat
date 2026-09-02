@@ -49,6 +49,7 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - One strict `ego_review_candidate_and_wait` call for a current-host-owned candidate, with exact target/candidate/cycle binding and objective settlement validation.
 - Detached `ego_start_exchange`, `await_workflow`, `workflow_status`, and `cancel_workflow` operations for recovery, plus an explicit acknowledged recovery-abandonment tool that preserves the at-most-once operation tombstone.
 - A staged browser lifecycle that durably records `send_confirmed`, performs response capture read-only, and resumes that capture after a facade or broker restart without resending.
+- One broker-wide FIFO browser lane across every binding and supported host. Confirmed-send response capture uses at most 15-second read-only slices, yields between slices, and revalidates the canonical conversation, prior head, prompt message ID, and unique marker before continuing; it never repeats Send.
 - A two-hour default broker-owned ChatGPT generation budget, a six-hour transport ceiling, and separate caller attachment from browser-workflow ownership.
 - Compact Token-Saver text summaries plus digest-bound `ego_read_result` ranges for responses larger than 16 KiB.
 - Persistent `ego-chat-main` conversation binding with exact canonical-URL verification.
@@ -59,11 +60,19 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - Codex App Server spikes for broker-owned thread start/resume and desktop active-writer isolation.
 - Broker-owned `ego_start_convergence` and `ego_converge_until_settled` workflows that alternate Codex and ChatGPT without human copy/paste.
 - Immutable target and acceptance-contract digests, strict implementing-agent candidate and ChatGPT review schemas, exact cycle identity, and objective settlement checks.
-- Exclusive conversation leases across every cycle, bounded time/cycle budgets, stagnation detection, secret scanning of exact outbound review bytes, and terminal-state compare-and-set protection.
+- Exclusive conversation leases across every cycle, an optional caller-selected cycle budget, a wall-clock deadline, stagnation detection, secret scanning of exact outbound review bytes, and terminal-state compare-and-set protection.
 - ChatGPT feedback injected into the next Codex turn as explicitly untrusted App Server context.
 - Native Rust setup, conflict-safe MCP configuration, and the same host-aware skill for both Codex and ZCode.
 
 The delivery claim is deliberately limited: automatic sends are fail-closed and effectively at-most-once. Ego Chat does not claim exactly-once delivery across a browser UI and a remote service.
+
+### Concurrent hosts and Ego Spaces
+
+Codex.app and ZCode.app share one authoritative Ego Chat broker and the same default `ego-chat-main` binding. They do not silently create separate conversations or task spaces. One binding remains an exclusive ordered conversation lease: if another host already owns it, a different fresh operation receives `conversation_busy` instead of interleaving a stale prompt. An exact retry with the same operation identity still rediscovers its existing workflow.
+
+Independent host tasks may use explicitly distinct bindings only when they also use different canonical ChatGPT conversations and deterministic Ego task spaces. Ego Chat serializes all of its browser-driver children even across those independent bindings, so Codex and ZCode queue rather than racing Ego Lite's global automation channel. A long confirmed-send capture releases that lane every 15 seconds while ChatGPT keeps thinking remotely; the caller remains in one Token-Saver wait and no second Send is created.
+
+Using another Ego Space manually does not change a durable Ego Chat binding. Do not take over, close, stop, or type into the exact bound Space or its ChatGPT conversation while a workflow is active. Automation started outside Ego Chat is not part of its broker lane; until Ego Lite provides per-task-space CDP channels, simultaneous unrelated agent automation can still interfere despite separate Spaces. Track the upstream limitation in [`citrolabs/ego-lite#213`](https://github.com/citrolabs/ego-lite/issues/213).
 
 ## Requirements
 
@@ -234,7 +243,8 @@ Ego Chat transports prompts, responses, and bounded review packets. It deliberat
 | Start from ChatGPT web or ChatGPT.app and continue locally from a URL | Supported | Adoption accepts a private canonical `/c/` URL, never a public `/share/` URL. |
 | Wait while an already-running ChatGPT response performs a long think | Supported | Adoption waits read-only. For Ego Chat sends, `send_confirmed` is durable and capture continues independently of the caller's original wait. |
 | Import the entire earlier transcript into the local task | Not provided | Adoption returns the latest stable assistant tail; the web conversation itself retains the earlier history. Use a self-contained final handoff packet. |
-| Iterate implementation and review without human copy and paste | Supported | Codex can use broker-owned bounded convergence; ZCode keeps its current task active and submits one strict candidate per cycle. |
+| Iterate implementation and review without human copy and paste | Supported | Codex can use broker-owned durable convergence; ZCode keeps its current task active and submits one strict candidate per cycle. Neither path has an implicit cycle ceiling. |
+| Use Codex and ZCode at the same time | Supported with separate bindings | Both hosts share one broker. Distinct conversations queue through one browser lane; the same binding remains exclusive and is never auto-forked. |
 | Always use ChatGPT's strongest current model and maximum thinking | Supported | Every send repairs and verifies the live provider-defined maximum. Adoption is read-only and requires that maximum to be selected already. |
 | Receive a generated ZIP, repository, branch, or merge request automatically | Not provided | Transfer or fetch artifacts through an independently authorized file or GitHub workflow. Ego Chat carries text and bounded review evidence only. |
 | Wake a Codex or ZCode task after that host task has fully exited | Not provided | The broker remains durable, but automatic external task wake is not claimed. Reattach once by workflow ID when possible. |
@@ -405,11 +415,12 @@ Create a convergence input file with an immutable target and observable acceptan
   "codexSandbox": "read-only",
   "codexTurnTimeoutMs": 900000,
   "cwd": "/absolute/path/to/project",
-  "maxCycles": 4,
   "target": "Describe the exact result that A and B must settle.",
   "wallClockTimeoutMs": 1800000
 }
 ```
+
+Omit `maxCycles` for the normal until-settled behavior. Set it to a positive integer only when the caller explicitly wants a cycle budget; reaching that budget remains a fail-closed stop. The wall-clock deadline, stagnation detection, identity checks, and delivery-ambiguity fences still apply.
 
 `read-only` is the default and supports research, planning, and review. Select `workspace-write` explicitly when the target authorizes Codex to implement local changes. Neither mode grants commit, push, PR, deployment, production, approval, credential, or permission-expansion authority.
 
@@ -429,7 +440,7 @@ Each cycle is bound as follows:
 3. ChatGPT returns one strict review bound to the target digest, candidate digest, and cycle number.
 4. `settled` is accepted only when every criterion is `pass` and no blocking finding remains. Otherwise the review enters the same Codex thread as untrusted context for the next cycle.
 
-The broker stops rather than loops indefinitely when either side reports a blocker, an identity or schema is invalid, a secret signature is detected, the same candidate/review state repeats, a storage/identity admission limit is reached, the consecutive App Server exit limit or another cycle/wall-clock deadline expires, browser delivery is ambiguous, or durable phase identity cannot be reconciled after a restart. This is deliberate: automatic crash replay across a possibly accepted browser send could duplicate a message. App Server exit diagnostics retain a bounded recent history containing only identity, exit, signal, status, and digest fields; raw stderr is not placed in workflow state.
+The broker has no implicit cycle ceiling. It stops when either side reports a blocker, an identity or schema is invalid, a secret signature is detected, the same candidate/review state repeats, a storage/identity admission limit is reached, the consecutive App Server exit limit, an explicit caller-selected cycle budget, or the wall-clock deadline expires, browser delivery is ambiguous, or durable phase identity cannot be reconciled after a restart. This is deliberate: automatic crash replay across a possibly accepted browser send could duplicate a message. App Server exit diagnostics retain a bounded recent history containing only identity, exit, signal, status, and digest fields; raw stderr is not placed in workflow state.
 
 Current qualification status: the deterministic path, interruption behavior, long-lived MCP transport, and a fresh live two-cycle ChatGPT run all pass. The recorded run used one Codex App Server thread and the existing persistent ChatGPT Project conversation, returned the first review as untrusted context without human relay, and settled every criterion on cycle 2. See [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for exact identities, digests, and remaining fail-closed boundaries.
 
@@ -463,7 +474,7 @@ npm run gate0:app-server
 
 `npm run gate0:ego` can send live ChatGPT turns. It requires `EGO_CHAT_GATE0_CONFIRM_SEND=1`. Once the binding already contains messages, it also requires `EGO_CHAT_GATE0_ALLOW_REPEAT=1`, preventing accidental repeat runs.
 
-See [GATE0.md](https://github.com/xicv/ego-chat/blob/main/GATE0.md) for the original component qualification, [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for the bounded convergence contract and evidence, and [RESEARCH.md](https://github.com/xicv/ego-chat/blob/main/RESEARCH.md) for the research and architectural decision record.
+See [GATE0.md](https://github.com/xicv/ego-chat/blob/main/GATE0.md) for the original component qualification, [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for the convergence contract and evidence, and [RESEARCH.md](https://github.com/xicv/ego-chat/blob/main/RESEARCH.md) for the research and architectural decision record.
 
 ## Release verification
 
@@ -478,6 +489,7 @@ The crate carries the MIT license and canonical repository metadata needed for p
 - Automatic attachment/context-capsule construction beyond the bounded, secret-scanned implementing-agent review packet.
 - Externally waking a Codex desktop task after its MCP adoption waiter has exited; adoption continues the same task while `ego_adopt_conversation_and_wait` remains open, while convergence owns a dedicated App Server thread.
 - Externally waking or resuming a ZCode task after ZCode exits; ZCode-owned loops remain continuous while their current task or Goal is active.
+- True simultaneous CDP automation between Ego Chat and unrelated external `ego-browser` clients. Ego Chat serializes its own children, but cannot serialize another process outside its authoritative broker while upstream per-Space CDP isolation remains unresolved.
 - Automatic replay of a browser operation that stopped before `send_confirmed` without exact delivery-absence proof, or after an unattributable click. Those cases remain `human_required` because replay could duplicate a message. Exact reconciliation may retry only a durably proven absence; a durably confirmed send resumes read-only capture automatically.
 - Automatic bypass of CAPTCHA, login, changed history, an unknown ChatGPT capability contract, or a stale runtime. These remain explicit fail-closed stops.
 

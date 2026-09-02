@@ -964,7 +964,11 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 
 async function runTaskSpaceReconciliationCase({
   allowTaskSpaceReclaim = false,
+  captureContinuationAllowed = false,
   fallbackTaskSpaceOwnership = null,
+  generationRunning = false,
+  mode = "reconcile_bound",
+  promptIdentityMatches = true,
   requestedTaskSpaceOwnership = null,
 } = {}) {
   driverCase += 1
@@ -983,9 +987,21 @@ async function runTaskSpaceReconciliationCase({
   ]
   const previousText = "Prior assistant response."
   const previousDigest = createHash("sha256").update(previousText, "utf8").digest("hex")
+  const promptText = "EGO_CHAT_RECONCILE_TEST_MARKER\nReview this candidate."
+  const promptMessageId = "reconcile-user"
+  const captureEntries = [
+    { messageId: "previous-assistant", role: "assistant", text: previousText },
+    {
+      messageId: promptIdentityMatches ? promptMessageId : "different-user",
+      role: "user",
+      text: promptText,
+    },
+    { messageId: "partial-assistant", role: "assistant", text: "Partial review" },
+  ]
   const input = {
     allowDeliveryAbsent: true,
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
+    ...(captureContinuationAllowed ? { captureContinuationAllowed: true } : {}),
     binding: {
       canonicalUrl,
       headRole: "assistant",
@@ -1006,9 +1022,10 @@ async function runTaskSpaceReconciliationCase({
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
     expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
-    inputDigest: "0".repeat(64),
-    mode: "reconcile_bound",
-    timeoutMs: 1_000,
+    inputDigest: createHash("sha256").update(promptText, "utf8").digest("hex"),
+    mode,
+    promptMessageId,
+    timeoutMs: mode === "capture_exchange" ? 1 : 1_000,
     turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
@@ -1061,9 +1078,11 @@ globalThis.js = async (source) => {
     }
   }
   if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
-    return [{ messageId: 'previous-assistant', role: 'assistant', text: ${JSON.stringify(previousText)} }]
+    return ${JSON.stringify(mode === "capture_exchange"
+      ? captureEntries
+      : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
   }
-  if (source.trimStart().startsWith('Boolean(')) return false
+  if (source.trimStart().startsWith('Boolean(')) return ${JSON.stringify(generationRunning)}
   throw new Error('Unexpected page script: ' + source.slice(0, 100))
 }
 await ${EGO_DRIVER_SOURCE.trim()}
@@ -1527,6 +1546,89 @@ process.stdin.on("end", () => {
   assert.equal(lifecycle[0][0], "register")
   assert.equal(lifecycle[1][0], "unregister")
   assert.equal(lifecycle[1][1], lifecycle[0][1])
+})
+
+test("Ego adapter serializes browser children across independent operations", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-adapter-lane-test-"))
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  const laneDirectory = path.join(fixtureDirectory, "browser-lane")
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from "node:fs"
+
+let source = ""
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => { source += chunk })
+process.stdin.on("end", async () => {
+  let ownsLane = false
+  let overlapped = false
+  try {
+    fs.mkdirSync(${JSON.stringify(laneDirectory)})
+    ownsLane = true
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error
+    overlapped = true
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (ownsLane) fs.rmdirSync(${JSON.stringify(laneDirectory)})
+  const envelope = Buffer.from(JSON.stringify({ ok: true, result: { overlapped } }), "utf8").toString("base64url")
+  process.stdout.write("${EGO_DRIVER_RESULT_PREFIX}" + envelope + "\\n")
+})
+`, { mode: 0o700 })
+  const adapter = new EgoAdapter({
+    command,
+    mailboxDirectory: path.join(fixtureDirectory, "mailbox"),
+  })
+
+  const results = await Promise.all([
+    adapter.preflight({ taskSpace: 10 }),
+    adapter.preflight({ taskSpace: 11 }),
+  ])
+
+  assert.deepEqual(results, [
+    { overlapped: false },
+    { overlapped: false },
+  ])
+})
+
+test("Ego adapter bounds one capture turn and preserves the durable outer deadline", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-adapter-slice-test-"))
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from "node:fs"
+
+let source = ""
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => { source += chunk })
+process.stdin.on("end", () => {
+  const invocation = source.trim()
+  const argumentStart = invocation.lastIndexOf(")(")
+  const inputPath = JSON.parse(invocation.slice(argumentStart + 2, -1))
+  const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))
+  fs.unlinkSync(inputPath)
+  const envelope = Buffer.from(JSON.stringify({
+    ok: true,
+    result: {
+      captureContinuationAllowed: input.captureContinuationAllowed,
+      timeoutMs: input.timeoutMs,
+    },
+  }), "utf8").toString("base64url")
+  process.stdout.write("${EGO_DRIVER_RESULT_PREFIX}" + envelope + "\\n")
+})
+`, { mode: 0o700 })
+  const adapter = new EgoAdapter({
+    captureSliceMs: 25,
+    command,
+    mailboxDirectory: path.join(fixtureDirectory, "mailbox"),
+  })
+
+  const result = await adapter.captureExchange({ timeoutMs: 1_000 })
+
+  assert.deepEqual(result, {
+    captureContinuationAllowed: true,
+    timeoutMs: 25,
+  })
 })
 
 test("failed child registration drains the unregistered browser process group", async (t) => {
@@ -2202,6 +2304,53 @@ test("read-only reconciliation never inherits fresh-send task-space reclaim auth
   assert.equal(reconciled.counters.claimTaskSpace, 0)
   assert.equal(reconciled.counters.takeOverTaskSpace, 0)
   assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("bounded capture yields only with the exact confirmed prompt identity", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: true,
+    mode: "capture_exchange",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.deepEqual(captured.result, {
+    canonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    captureReason: "generation_running",
+    captureState: "pending",
+    generationRunning: true,
+    promptMessageId: "reconcile-user",
+    targetId: "recovered-bound-tab",
+    taskSpaceId: 11,
+    turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
+  })
+})
+
+test("bounded capture tolerates a transient missing generation control", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureReason, "response_not_terminal")
+  assert.equal(captured.result.captureState, "pending")
+  assert.equal(captured.result.generationRunning, false)
+  assert.equal(captured.result.promptMessageId, "reconcile-user")
+})
+
+test("bounded capture fails closed when the confirmed prompt identity changes", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: true,
+    mode: "capture_exchange",
+    promptIdentityMatches: false,
+  })
+
+  assert.equal(captured.result, undefined)
+  assert.equal(captured.error?.code, "human_required")
+  assert.equal(captured.error?.details?.reason, "capture_pending_identity_mismatch")
 })
 
 test("conversation adoption fails closed when another message interleaves", async () => {
