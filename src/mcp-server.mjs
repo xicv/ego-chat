@@ -12,7 +12,14 @@ import {
 } from "./constants.mjs"
 import { loadConfig } from "./config.mjs"
 import { requestBroker } from "./ipc-client.mjs"
-import { completeAgentReview, prepareAgentReview } from "./convergence.mjs"
+import {
+  completeAgentReview,
+  isRecoverableReviewProtocolError,
+  prepareAgentReview,
+  prepareAgentReviewProtocolRepair,
+  reviewProtocolFailureSignature,
+  reviewResponseHeadAnchor,
+} from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
@@ -112,10 +119,12 @@ const MCP_INSTRUCTIONS = [
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
   "A successful strict review with settled false is a machine continuation, not a stopping condition. Read its complete review, address the in-scope blocking findings, and immediately submit nextCycle in the same host task without asking the user to relay or approve the review. A protocolNormalization result records a bounded local schema normalization and does not require another browser send.",
+  "A durably captured strict review with a recoverable envelope fault is not a human-approval boundary. Ego Chat first applies only deterministic local syntax normalization; if strict validation still fails, it sends a uniquely marked protocol-only correction at the exact committed head, in the same conversation, candidate, target, criteria, and cycle. Do not ask the user to authorize the correction or paste the prior response. protocolRepairCount reports these internal corrections.",
+  "If an identical invalid review state repeats after automatic correction, review_protocol_stagnated is a non-human failure. Report that evidence-based inability to progress; do not demand an acknowledgement, claim that user approval would make the operation retryable, or start a substitute workflow.",
   "Do not invent a cycle ceiling for an until-settled loop. Current-host reviews have no fixed cycle limit. Detached convergence also continues without a cycle limit when maxCycles is omitted; set maxCycles only when the user explicitly requests that budget.",
   `Finalize and UTF-8 byte-check a strict review packet before creating its operationId. The complete generated review prompt, including protocol overhead, must not exceed ${MAX_PROMPT_BYTES} bytes; prefer an accessible PR URL plus exact revisions, changed-file inventory, critical excerpts, tests, and unresolved risks over an entire diff. Never split one candidate across multiple sends automatically.`,
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
-  "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
+  "A strict review may retry delivery internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send. A protocol-only correction after an attributable committed response is a new anchored turn, not a retry of that delivered prompt.",
   "When the user explicitly authorizes reclaiming the exact binding-owned Ego task space, including an explicit request for Ego Chat to take it back for an unattended until-settled loop, set allowTaskSpaceReclaim to true on every fresh review cycle. This permits one verified pre-Send claim or take-back of only the deterministic binding space; it never applies to capture, reconciliation, another task space, or a possibly delivered operation.",
   "Never call ego_verify_conversation as a preflight for a fresh send. A fresh exchange or review performs its own canonical URL, stable-head, browser-readiness, and live model-policy checks, and is the only operation that may apply an explicitly authorized task-space reclaim. If binding identity is uncertain before a send, use ego_get_conversation instead because it reads durable state without browser control. Reserve ego_verify_conversation for an explicitly requested maintenance checkpoint or a documented migration or reconciliation case.",
   `If ego_review_candidate_and_wait returns review_packet_compaction_required, both prior deliveries were durably proven absent and no human action is required. Automatically rebuild one semantically complete review packet no larger than the returned suggestedReviewPacketMaxBytes (normally ${SUGGESTED_COMPACT_REVIEW_PACKET_BYTES}), mint a new operationId, and retry once on the same binding. Do not ask the user to log in, open ego-chat-main, or provide another conversation URL unless the exact broker code is authentication_required. Never substitute another conversation to route around a delivery fault.`,
@@ -165,6 +174,9 @@ function waitedToolResult(value, waitMode) {
     ...(Number.isInteger(structured.nextCycle) ? { nextCycle: structured.nextCycle } : {}),
     ...(structured.protocolNormalization?.applied
       ? { protocolNormalization: structured.protocolNormalization }
+      : {}),
+    ...(Number.isInteger(structured.protocolRepairCount)
+      ? { protocolRepairCount: structured.protocolRepairCount }
       : {}),
     ...(structured.settled === false && structured.review
       ? { review: structured.review }
@@ -631,7 +643,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_review_candidate_and_wait",
     {
-      description: `Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. This fresh review performs its own canonical URL, stable-head, browser-readiness, and live model-policy checks; do not call ego_verify_conversation first. The complete UTF-8 review prompt is limited to ${MAX_PROMPT_BYTES} bytes; finalize the packet before minting operationId and prefer exact accessible revision references plus focused evidence over a full diff. Ego Chat never auto-splits a candidate across sends. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before the send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. When settled is false, nextAction and nextCycle direct the current host to address the complete returned review and continue immediately without human relay. Set allowTaskSpaceReclaim only after explicit user authorization to recover the binding-owned space before each fresh review Send. Set waitMode to token_saver for a silent durable wait.`,
+      description: `Review one schema-constrained candidate from the current ZCode, Codex, or compatible host against an immutable target. This fresh review performs its own canonical URL, stable-head, browser-readiness, and live model-policy checks; do not call ego_verify_conversation first. The complete UTF-8 review prompt is limited to ${MAX_PROMPT_BYTES} bytes; finalize the packet before minting operationId and prefer exact accessible revision references plus focused evidence over a full diff. Ego Chat never auto-splits a candidate across sends. A stable operationId makes an exact lost-result retry rediscover its original workflow and rejects changed content. Ego Chat creates exact target/candidate/cycle digests, enforces strongest-available ChatGPT plus maximum thinking before every send, reconciles a completed late browser turn without resending, and retries a proven non-delivery only with a deterministic fresh marker and unchanged prior-head anchor. It normalizes deterministic JSON defects locally and automatically issues an exact-head, same-cycle protocol-only correction when an attributable delivered response remains invalid; no human authorization or copy/paste is required. It validates the strict review envelope and returns settled only when every criterion passes with no blocking finding. When settled is false, nextAction and nextCycle direct the current host to address the complete returned review and continue immediately without human relay. Set allowTaskSpaceReclaim only after explicit user authorization to recover the binding-owned space before each fresh review Send. Set waitMode to token_saver for a silent durable wait.`,
       inputSchema: AGENT_REVIEW_INPUT_SCHEMA,
     },
     async (input, extra) => {
@@ -641,12 +653,14 @@ export function createMcpServer(config = loadConfig()) {
         const initialPrepared = prepareAgentReview(input)
         const deliveryAbsenceAttempts = []
         const deliveryAbsentWorkflowIds = []
-        let retryAnchor
+        const protocolFailureSignatures = new Set()
+        const protocolRepairWorkflowIds = []
         const recordDeliveryAbsence = (absentWorkflow, prepared, deliveryAttempt) => {
-          retryAnchor = deliveryAbsenceAnchor(absentWorkflow)
           deliveryAbsenceAttempts.push(deliveryAbsenceEvidence(absentWorkflow, prepared.prompt))
           deliveryAbsentWorkflowIds.push(absentWorkflow.id)
           if (
+            !prepared.protocolRepairAttempt
+            &&
             Buffer.byteLength(input.candidate.reviewPacket, "utf8")
               > SUGGESTED_COMPACT_REVIEW_PACKET_BYTES
             && repeatedComposerTransportFailure(deliveryAbsenceAttempts)
@@ -670,131 +684,203 @@ export function createMcpServer(config = loadConfig()) {
               },
             )
           }
+          return deliveryAbsenceAnchor(absentWorkflow)
         }
         const waitMs = exchangeWaitMs(input.timeoutMs)
-        for (
-          let deliveryAttempt = 1;
-          deliveryAttempt <= MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS;
-          deliveryAttempt += 1
-        ) {
-          if (extra.signal?.aborted) {
-            throw new EgoChatError(
-              "client_disconnected",
-              "The host disconnected before the next proven-absent review attempt could start.",
-            )
-          }
-          const prepared = deliveryAttempt === 1
-            ? initialPrepared
-            : prepareAgentReview({
-                ...input,
-                deliveryAttempt,
-                operationId: initialPrepared.operationId,
-              })
-          workflow = await requestBroker(config, "ego.start_exchange", {
-            ...(input.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-            bindingKey: input.bindingKey,
-            ...(deliveryAttempt > 1 ? { expectedPreviousHead: retryAnchor } : {}),
-            expectedTerminalMarker: prepared.terminalMarker,
-            prompt: prepared.prompt,
-            timeoutMs: input.timeoutMs,
-            turnMarker: prepared.turnMarker,
-          })
-          const completed = await withWaitMode(
-            extra,
-            `Waiting for strict candidate review ${workflow.id} attempt ${deliveryAttempt}`,
-            waitMode,
-            () => requestBroker(
-              config,
-              "workflow.await",
-              { timeoutMs: waitMs, workflowId: workflow.id },
-              { signal: extra.signal, timeoutMs: waitMs + 5_000 },
-            ),
-          )
-          let exchangeResult = completed.result
-          let recoveredLateResponse = false
-          if (isDurablyProvenDeliveryAbsent(completed)) {
-            recordDeliveryAbsence(completed, prepared, deliveryAttempt)
-            continue
-          }
-          if (
-            completed.status === "human_required"
-            && RECOVERABLE_AGENT_REVIEW_CODES.has(completed.humanRequired?.code)
+        let anyRecoveredLateResponse = false
+        let protocolFailure
+        let protocolRepairAttempt = 0
+        let protocolRepairAnchor
+
+        while (true) {
+          let delivered
+          let retryAnchor = protocolRepairAnchor
+          for (
+            let deliveryAttempt = 1;
+            deliveryAttempt <= MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS;
+            deliveryAttempt += 1
           ) {
-            const reconciled = await requestBroker(
-              config,
-              "conversation.reconcile",
-              {
-                bindingKey: input.bindingKey,
-                expectedTerminalMarker: prepared.terminalMarker,
-                turnMarker: prepared.turnMarker,
-                workflowId: workflow.id,
-              },
-              { timeoutMs: 65_000 },
+            if (extra.signal?.aborted) {
+              throw new EgoChatError(
+                "client_disconnected",
+                "The host disconnected before the next strict review operation could start.",
+              )
+            }
+            const prepared = protocolRepairAttempt > 0
+              ? prepareAgentReviewProtocolRepair(initialPrepared, {
+                  deliveryAttempt,
+                  failureReason: protocolFailure.reason,
+                  previousResponseDigest: protocolFailure.responseDigest,
+                  protocolRepairAttempt,
+                })
+              : deliveryAttempt === 1
+                ? initialPrepared
+                : prepareAgentReview({
+                    ...input,
+                    deliveryAttempt,
+                    operationId: initialPrepared.operationId,
+                  })
+            workflow = await requestBroker(config, "ego.start_exchange", {
+              allowProtocolRepairCapture: true,
+              ...(input.allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
+              bindingKey: input.bindingKey,
+              ...(retryAnchor ? { expectedPreviousHead: retryAnchor } : {}),
+              expectedTerminalMarker: prepared.terminalMarker,
+              prompt: prepared.prompt,
+              timeoutMs: input.timeoutMs,
+              turnMarker: prepared.turnMarker,
+            })
+            if (protocolRepairAttempt > 0 && !protocolRepairWorkflowIds.includes(workflow.id)) {
+              protocolRepairWorkflowIds.push(workflow.id)
+            }
+            const completed = await withWaitMode(
+              extra,
+              `Waiting for strict candidate review ${workflow.id} attempt ${deliveryAttempt}`,
+              waitMode,
+              () => requestBroker(
+                config,
+                "workflow.await",
+                { timeoutMs: waitMs, workflowId: workflow.id },
+                { signal: extra.signal, timeoutMs: waitMs + 5_000 },
+              ),
             )
-            if (reconciled.recovery?.deliveryState === "absent") {
-              const absentWorkflow = await requestBroker(config, "workflow.get", {
-                workflowId: workflow.id,
-              })
-              recordDeliveryAbsence(absentWorkflow, prepared, deliveryAttempt)
+            let exchangeResult = completed.result
+            let recoveredLateResponse = false
+            if (isDurablyProvenDeliveryAbsent(completed)) {
+              retryAnchor = recordDeliveryAbsence(completed, prepared, deliveryAttempt)
               continue
             }
             if (
-              typeof reconciled.recovery?.responseText !== "string"
-              || typeof reconciled.recovery?.responseDigest !== "string"
-              || !reconciled.recovery.modelPolicy
+              completed.status === "human_required"
+              && RECOVERABLE_AGENT_REVIEW_CODES.has(completed.humanRequired?.code)
             ) {
+              const reconciled = await requestBroker(
+                config,
+                "conversation.reconcile",
+                {
+                  allowProtocolRepairCapture: true,
+                  bindingKey: input.bindingKey,
+                  expectedTerminalMarker: prepared.terminalMarker,
+                  turnMarker: prepared.turnMarker,
+                  workflowId: workflow.id,
+                },
+                { timeoutMs: 65_000 },
+              )
+              if (reconciled.recovery?.deliveryState === "absent") {
+                const absentWorkflow = await requestBroker(config, "workflow.get", {
+                  workflowId: workflow.id,
+                })
+                retryAnchor = recordDeliveryAbsence(absentWorkflow, prepared, deliveryAttempt)
+                continue
+              }
+              if (
+                typeof reconciled.recovery?.responseText !== "string"
+                || typeof reconciled.recovery?.responseDigest !== "string"
+                || !reconciled.recovery.modelPolicy
+              ) {
+                throw new EgoChatError(
+                  "human_required",
+                  "The late ChatGPT review was attributable, but its exact response and pre-send maximum-model proof were not both recoverable.",
+                  { reason: "review_recovery_proof_missing", workflowId: workflow.id },
+                )
+              }
+              exchangeResult = reconciled.recovery
+              recoveredLateResponse = true
+              anyRecoveredLateResponse = true
+            } else if (completed.status !== "succeeded") {
               throw new EgoChatError(
                 "human_required",
-                "The late ChatGPT review was attributable, but its exact response and pre-send maximum-model proof were not both recoverable.",
-                { reason: "review_recovery_proof_missing", workflowId: workflow.id },
+                "The ChatGPT browser review did not complete unambiguously.",
+                {
+                  reason: completed.humanRequired?.code
+                    ?? completed.error?.code
+                    ?? "chatgpt_review_incomplete",
+                  workflowId: workflow.id,
+                },
               )
             }
-            exchangeResult = reconciled.recovery
-            recoveredLateResponse = true
-          } else if (completed.status !== "succeeded") {
+            delivered = {
+              deliveryAttempt,
+              exchangeResult,
+              prepared,
+              recoveredLateResponse,
+              responseText: await resolveResponseText(config, workflow.id, exchangeResult),
+              workflowId: workflow.id,
+            }
+            break
+          }
+
+          if (!delivered) {
             throw new EgoChatError(
               "human_required",
-              "The ChatGPT browser review did not complete unambiguously.",
+              "The current strict review turn was proven absent for every bounded automatic delivery attempt.",
               {
-                reason: completed.humanRequired?.code
-                  ?? completed.error?.code
-                  ?? "chatgpt_review_incomplete",
-                workflowId: workflow.id,
+                browserInterruptions: deliveryAbsenceAttempts.filter(Boolean),
+                deliveryAbsentWorkflowIds,
+                deliveryAttemptCount: MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS,
+                protocolRepairAttempt,
+                reason: "review_delivery_retries_exhausted",
+                workflowId: workflow?.id,
               },
             )
           }
-          const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
-          const { protocolNormalization, review, settled } = completeAgentReview(prepared, responseText)
-          return waitedToolResult({
-            bindingKey: input.bindingKey,
-            candidateDigest: prepared.candidateDigest,
-            cycle: input.cycle,
-            deliveryAbsentWorkflowIds,
-            deliveryAttemptCount: deliveryAttempt,
-            exchangeWorkflowId: workflow.id,
-            modelPolicy: exchangeResult.modelPolicy,
-            nextAction: settled ? "settled" : "address_review_and_submit_next_cycle",
-            ...(!settled ? { nextCycle: input.cycle + 1 } : {}),
-            operationId: prepared.operationId,
-            protocolNormalization,
-            recoveredLateResponse,
-            responseDigest: exchangeResult.responseDigest,
-            review,
-            settled,
-            targetDigest: prepared.contract.targetDigest,
-          }, waitMode)
+
+          try {
+            const { protocolNormalization, review, settled } = completeAgentReview(
+              delivered.prepared,
+              delivered.responseText,
+            )
+            return waitedToolResult({
+              bindingKey: input.bindingKey,
+              candidateDigest: delivered.prepared.candidateDigest,
+              cycle: input.cycle,
+              deliveryAbsentWorkflowIds,
+              deliveryAttemptCount: delivered.deliveryAttempt,
+              exchangeWorkflowId: delivered.workflowId,
+              modelPolicy: delivered.exchangeResult.modelPolicy,
+              nextAction: settled ? "settled" : "address_review_and_submit_next_cycle",
+              ...(!settled ? { nextCycle: input.cycle + 1 } : {}),
+              operationId: delivered.prepared.operationId,
+              protocolNormalization,
+              protocolRepairCount: protocolRepairAttempt,
+              protocolRepairWorkflowIds,
+              recoveredLateResponse: anyRecoveredLateResponse || delivered.recoveredLateResponse,
+              responseDigest: delivered.exchangeResult.responseDigest,
+              review,
+              settled,
+              targetDigest: delivered.prepared.contract.targetDigest,
+            }, waitMode)
+          } catch (error) {
+            if (!isRecoverableReviewProtocolError(error)) {
+              throw error
+            }
+            const reason = error.details.reason
+            const failureSignature = reviewProtocolFailureSignature(reason, delivered.responseText)
+            if (protocolFailureSignatures.has(failureSignature)) {
+              throw new EgoChatError(
+                "review_protocol_stagnated",
+                "ChatGPT repeated an identical invalid review state after automatic protocol correction, so continuation cannot make safe progress.",
+                {
+                  protocolRepairAttempt,
+                  protocolRepairWorkflowIds,
+                  reason: "review_protocol_stagnated",
+                  userActionRequired: false,
+                  workflowId: delivered.workflowId,
+                },
+              )
+            }
+            protocolFailureSignatures.add(failureSignature)
+            protocolRepairAnchor = reviewResponseHeadAnchor(
+              delivered.exchangeResult,
+              delivered.workflowId,
+            )
+            protocolFailure = {
+              reason,
+              responseDigest: delivered.exchangeResult.responseDigest,
+            }
+            protocolRepairAttempt += 1
+          }
         }
-        throw new EgoChatError(
-          "human_required",
-          "ChatGPT review delivery was proven absent for every bounded automatic attempt.",
-          {
-            browserInterruptions: deliveryAbsenceAttempts.filter(Boolean),
-            deliveryAbsentWorkflowIds,
-            deliveryAttemptCount: MAX_AGENT_REVIEW_DELIVERY_ATTEMPTS,
-            reason: "review_delivery_retries_exhausted",
-            workflowId: workflow?.id,
-          },
-        )
       } catch (error) {
         attachWaitRecovery(error, workflow, input.waitMode)
         return toolError(error)

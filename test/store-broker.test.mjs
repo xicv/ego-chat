@@ -152,7 +152,7 @@ function createConvergenceEgoAdapter(reviewFactory) {
         assert.equal(input.modelPolicy.modelSelection, "strongest_available")
         assert.equal(input.modelPolicy.thinkingEffort, "maximum_available")
         const review = reviewFactory(parseConvergenceIdentity(input.prompt), exchanges)
-        const responseText = `${JSON.stringify(review)}\n${input.expectedTerminalMarker}`
+        const responseText = `${typeof review === "string" ? review : JSON.stringify(review)}\n${input.expectedTerminalMarker}`
         return {
           canonicalUrl: input.binding.canonicalUrl,
           durationMs: 20,
@@ -1856,6 +1856,98 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(appServer.closed, true)
   assert.equal(broker.getConversationBinding({ bindingKey: "ego-chat-main" }).revision, 3)
   assert.equal(broker.getModelPolicy().revision, 2)
+})
+
+test("broker repairs an invalid delivered review inside the same implementation cycle", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter((identity, exchanges) => {
+    if (exchanges === 1) {
+      return "not-json"
+    }
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The immutable identity is exact.", id: "AC-1", status: "pass" },
+        { evidence: "The candidate is independently settled.", id: "AC-2", status: "pass" },
+      ],
+      decision: "settled",
+      findings: [],
+      summary: "The same candidate is settled after protocol repair.",
+    }
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-protocol-repair",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: [
+      "Every turn binds the immutable target identity.",
+      "The exact candidate is independently settled.",
+    ],
+    bindingKey: "ego-chat-main",
+    codexSandbox: "read-only",
+    cwd: process.cwd(),
+    maxCycles: 1,
+    target: "Repair malformed review protocol without another implementation cycle.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 1)
+  assert.equal(completed.result.protocolRepairCount, 1)
+  assert.equal(appServer.turns, 1)
+  assert.equal(ego.exchanges, 2)
+})
+
+test("broker reports repeated invalid review state as a non-human failure", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter(() => "not-json")
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-protocol-stagnation",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: [
+      "Every turn binds the immutable target identity.",
+      "The exact candidate is independently settled.",
+    ],
+    bindingKey: "ego-chat-main",
+    codexSandbox: "read-only",
+    cwd: process.cwd(),
+    maxCycles: 1,
+    target: "Stop only after the same unusable protocol state repeats.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "failed")
+  assert.equal(completed.error.code, "review_protocol_stagnated")
+  assert.equal(completed.humanRequired, undefined)
+  assert.equal(appServer.turns, 1)
+  assert.equal(ego.exchanges, 2)
 })
 
 test("broker-owned convergence has no implicit cycle ceiling", async (t) => {
