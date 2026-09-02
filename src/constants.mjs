@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto"
 
 export const APP_NAME = "ego-chat"
-export const APP_VERSION = "0.2.13"
-export const BROWSER_CONTRACT_REVISION = 11
+export const APP_VERSION = "0.2.16"
+export const BROWSER_CONTRACT_REVISION = 13
 export const IPC_VERSION = 1
 
 const RUNTIME_CONTRACT = {
   appVersion: APP_VERSION,
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
-  mcpSchemaRevision: 8,
-  runtimeGeneration: "2026-09-02.3",
+  mcpSchemaRevision: 10,
+  runtimeGeneration: "2026-09-02.7",
   storeSchemaRevision: 4,
 }
 
@@ -29,7 +29,9 @@ export const DEFAULT_MODEL_POLICY = Object.freeze({
 })
 
 export const MAX_IPC_LINE_BYTES = 1024 * 1024
-export const MAX_PROMPT_BYTES = 64 * 1024
+export const MAX_DRIVER_INPUT_BYTES = 512 * 1024
+export const MAX_PROMPT_BYTES = 192 * 1024
+export const MAX_REVIEW_PACKET_BYTES = 512 * 1024
 export const MAX_RESULT_BYTES = 256 * 1024
 export const DEFAULT_CHATGPT_GENERATION_MS = 2 * 60 * 60 * 1000
 export const DEFAULT_BROWSER_CAPTURE_SLICE_MS = 15 * 1000

@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto"
 import { z } from "zod/v4"
 
-import { MAX_PROMPT_BYTES } from "./constants.mjs"
+import {
+  MAX_PROMPT_BYTES,
+  MAX_REVIEW_PACKET_BYTES,
+} from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const CriterionResultSchema = z.object({
@@ -17,10 +20,15 @@ const FindingSchema = z.object({
   title: z.string().trim().min(1).max(500),
 }).strict()
 
+const ReviewPacketSchema = z.string().trim().min(1).max(MAX_REVIEW_PACKET_BYTES).refine(
+  (value) => Buffer.byteLength(value, "utf8") <= MAX_REVIEW_PACKET_BYTES,
+  `Review packet must be at most ${MAX_REVIEW_PACKET_BYTES} UTF-8 bytes`,
+)
+
 const AgentCandidateSchema = z.object({
   blockers: z.array(z.string().trim().min(1).max(2_000)).max(8),
   criteria: z.array(CriterionResultSchema).min(1).max(8),
-  reviewPacket: z.string().trim().min(1).max(MAX_PROMPT_BYTES),
+  reviewPacket: ReviewPacketSchema,
   status: z.enum(["candidate", "blocked"]),
   summary: z.string().trim().min(1).max(4_000),
 }).strict()
@@ -67,7 +75,7 @@ export const CODEX_CANDIDATE_OUTPUT_SCHEMA = Object.freeze({
       minItems: 1,
       type: "array",
     },
-    reviewPacket: { maxLength: MAX_PROMPT_BYTES, minLength: 1, type: "string" },
+    reviewPacket: { maxLength: MAX_REVIEW_PACKET_BYTES, minLength: 1, type: "string" },
     status: { enum: ["candidate", "blocked"], type: "string" },
     summary: { maxLength: 4_000, minLength: 1, type: "string" },
   },
@@ -81,6 +89,17 @@ const SECRET_SIGNATURES = Object.freeze([
   ["github_token", /\bgh[pousr]_[A-Za-z0-9]{20,}\b/],
   ["openai_api_key", /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/],
   ["slack_token", /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/],
+])
+
+const SECRET_REDACTIONS = Object.freeze([
+  [
+    "private_key",
+    /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----|$)/gi,
+  ],
+  ["aws_access_key", /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g],
+  ["github_token", /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g],
+  ["openai_api_key", /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/g],
+  ["slack_token", /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g],
 ])
 
 export function digestJson(value) {
@@ -188,9 +207,246 @@ export function scanForSecrets(value) {
     .map(([code]) => code)
 }
 
+export function redactSecrets(value) {
+  let sanitized = value
+  const signatures = []
+  for (const [code, expression] of SECRET_REDACTIONS) {
+    expression.lastIndex = 0
+    if (!expression.test(sanitized)) {
+      continue
+    }
+    signatures.push(code)
+    expression.lastIndex = 0
+    sanitized = sanitized.replace(expression, `[EGO_CHAT_REDACTED_${code.toUpperCase()}]`)
+  }
+  return {
+    redacted: signatures.length > 0,
+    signatures,
+    value: sanitized,
+  }
+}
+
 function stripOptionalJsonFence(value) {
   const match = value.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i)
   return match ? match[1].trim() : value
+}
+
+const REPAIRABLE_REVIEW_TEXT_PROPERTY = /(?:^|[,{])\s*"(?:summary|evidence|title|action)"\s*:\s*"/g
+const MAX_REVIEW_JSON_DEPTH = 64
+const MAX_REVIEW_JSON_NODES = 10_000
+const MAX_REVIEW_TEXT_QUOTE_ESCAPES = 128
+
+function skipJsonWhitespace(value, start) {
+  let index = start
+  while (index < value.length && /\s/u.test(value[index])) {
+    index += 1
+  }
+  return index
+}
+
+function findStrictJsonStringEnd(value, start) {
+  let escaped = false
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (character === "\\") {
+      escaped = true
+      continue
+    }
+    if (character === "\"") {
+      return index
+    }
+  }
+  return null
+}
+
+function isReviewTextClosingQuote(value, quoteIndex) {
+  const delimiterIndex = skipJsonWhitespace(value, quoteIndex + 1)
+  const delimiter = value[delimiterIndex]
+  if (delimiter === ",") {
+    const keyStart = skipJsonWhitespace(value, delimiterIndex + 1)
+    if (value[keyStart] !== "\"") {
+      return false
+    }
+    const keyEnd = findStrictJsonStringEnd(value, keyStart)
+    return Number.isInteger(keyEnd)
+      && value[skipJsonWhitespace(value, keyEnd + 1)] === ":"
+  }
+  if (delimiter !== "}") {
+    return false
+  }
+  const parentDelimiter = value[skipJsonWhitespace(value, delimiterIndex + 1)]
+  return parentDelimiter === undefined
+    || parentDelimiter === ","
+    || parentDelimiter === "]"
+    || parentDelimiter === "}"
+}
+
+function escapeReviewTextQuotes(value) {
+  let cursor = 0
+  let normalized = ""
+  let quoteEscapes = 0
+
+  while (true) {
+    REPAIRABLE_REVIEW_TEXT_PROPERTY.lastIndex = cursor
+    const property = REPAIRABLE_REVIEW_TEXT_PROPERTY.exec(value)
+    if (!property) {
+      normalized += value.slice(cursor)
+      break
+    }
+
+    const valueStart = REPAIRABLE_REVIEW_TEXT_PROPERTY.lastIndex - 1
+    normalized += value.slice(cursor, valueStart + 1)
+    let segmentStart = valueStart + 1
+    let closed = false
+
+    for (let index = segmentStart; index < value.length; index += 1) {
+      if (value[index] === "\\") {
+        index += 1
+        continue
+      }
+      if (value[index] !== "\"") {
+        continue
+      }
+      if (isReviewTextClosingQuote(value, index)) {
+        normalized += value.slice(segmentStart, index + 1)
+        cursor = index + 1
+        closed = true
+        break
+      }
+      normalized += `${value.slice(segmentStart, index)}\\\"`
+      segmentStart = index + 1
+      quoteEscapes += 1
+      if (quoteEscapes > MAX_REVIEW_TEXT_QUOTE_ESCAPES) {
+        return { normalizations: [], value }
+      }
+    }
+
+    if (!closed) {
+      return { normalizations: [], value }
+    }
+  }
+
+  return {
+    normalizations: quoteEscapes > 0
+      ? [{ count: quoteEscapes, rule: "json_string_quote_escape" }]
+      : [],
+    value: normalized,
+  }
+}
+
+function hasUniqueJsonObjectKeys(value) {
+  let index = 0
+  let nodes = 0
+
+  const parseString = () => {
+    if (value[index] !== "\"") {
+      throw new Error("expected JSON string")
+    }
+    const start = index
+    index += 1
+    while (index < value.length) {
+      if (value[index] === "\\") {
+        index += 2
+        continue
+      }
+      if (value[index] === "\"") {
+        index += 1
+        return JSON.parse(value.slice(start, index))
+      }
+      index += 1
+    }
+    throw new Error("unterminated JSON string")
+  }
+
+  const parseValue = (depth) => {
+    if (depth > MAX_REVIEW_JSON_DEPTH || nodes >= MAX_REVIEW_JSON_NODES) {
+      throw new Error("JSON structure exceeds review bounds")
+    }
+    nodes += 1
+    index = skipJsonWhitespace(value, index)
+    if (value[index] === "{") {
+      index += 1
+      index = skipJsonWhitespace(value, index)
+      const keys = new Set()
+      if (value[index] === "}") {
+        index += 1
+        return
+      }
+      while (index < value.length) {
+        const key = parseString()
+        if (keys.has(key)) {
+          throw new Error("duplicate JSON object key")
+        }
+        keys.add(key)
+        index = skipJsonWhitespace(value, index)
+        if (value[index] !== ":") {
+          throw new Error("expected JSON property separator")
+        }
+        index += 1
+        parseValue(depth + 1)
+        index = skipJsonWhitespace(value, index)
+        if (value[index] === "}") {
+          index += 1
+          return
+        }
+        if (value[index] !== ",") {
+          throw new Error("expected JSON object delimiter")
+        }
+        index += 1
+        index = skipJsonWhitespace(value, index)
+      }
+      throw new Error("unterminated JSON object")
+    }
+    if (value[index] === "[") {
+      index += 1
+      index = skipJsonWhitespace(value, index)
+      if (value[index] === "]") {
+        index += 1
+        return
+      }
+      while (index < value.length) {
+        parseValue(depth + 1)
+        index = skipJsonWhitespace(value, index)
+        if (value[index] === "]") {
+          index += 1
+          return
+        }
+        if (value[index] !== ",") {
+          throw new Error("expected JSON array delimiter")
+        }
+        index += 1
+      }
+      throw new Error("unterminated JSON array")
+    }
+    if (value[index] === "\"") {
+      parseString()
+      return
+    }
+    const scalar = value.slice(index).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/u)?.[0]
+    if (!scalar) {
+      throw new Error("invalid JSON scalar")
+    }
+    index += scalar.length
+  }
+
+  try {
+    parseValue(0)
+    return skipJsonWhitespace(value, index) === value.length
+  } catch (_error) {
+    return false
+  }
+}
+
+function parseJsonWithUniqueObjectKeys(value) {
+  const decoded = JSON.parse(value)
+  if (!hasUniqueJsonObjectKeys(value)) {
+    throw new SyntaxError("The review JSON contains duplicate or ambiguous object keys.")
+  }
+  return decoded
 }
 
 function escapeJsonStringControls(value) {
@@ -339,16 +595,35 @@ export function parseChatGptReviewEnvelope(responseText, expected) {
     )
   }
   const envelopeText = responseText.slice(0, responseText.lastIndexOf(expected.terminalMarker)).trim()
-  const normalizedText = normalizeJsonSyntax(stripOptionalJsonFence(envelopeText))
+  const unfencedText = stripOptionalJsonFence(envelopeText)
+  let normalizedText = normalizeJsonSyntax(unfencedText)
   let decoded
   try {
-    decoded = JSON.parse(normalizedText.value)
-  } catch (_error) {
-    throw new EgoChatError(
-      "human_required",
-      "ChatGPT returned a settlement marker without a strict JSON review envelope.",
-      { reason: "convergence_protocol_invalid" },
-    )
+    decoded = parseJsonWithUniqueObjectKeys(normalizedText.value)
+  } catch (_initialError) {
+    const quoteNormalized = escapeReviewTextQuotes(unfencedText)
+    if (quoteNormalized.normalizations.length > 0) {
+      const syntaxNormalized = normalizeJsonSyntax(quoteNormalized.value)
+      normalizedText = {
+        normalizations: [
+          ...quoteNormalized.normalizations,
+          ...syntaxNormalized.normalizations,
+        ],
+        value: syntaxNormalized.value,
+      }
+      try {
+        decoded = parseJsonWithUniqueObjectKeys(normalizedText.value)
+      } catch (_repairError) {
+        decoded = undefined
+      }
+    }
+    if (decoded === undefined) {
+      throw new EgoChatError(
+        "human_required",
+        "ChatGPT returned a settlement marker without a strict JSON review envelope.",
+        { reason: "convergence_protocol_invalid" },
+      )
+    }
   }
   const normalized = normalizeChatGptReviewEnvelope(decoded)
   const review = parseWithSchema(ChatGptReviewSchema, normalized.value, "ChatGPT")
@@ -377,32 +652,126 @@ export function parseChatGptReview(responseText, expected) {
   return parseChatGptReviewEnvelope(responseText, expected).review
 }
 
+const MAX_NATURAL_LANGUAGE_REVIEW_BYTES = 128 * 1024
+
+function boundedReviewText(value, maximumBytes = MAX_NATURAL_LANGUAGE_REVIEW_BYTES) {
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .trim()
+  if (normalized.length === 0) {
+    return "ChatGPT returned review feedback without a machine-readable verdict."
+  }
+  return compactUtf8(normalized, maximumBytes, "review feedback").value
+}
+
+function utf8Prefix(value, maximumBytes) {
+  let low = 0
+  let high = value.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    const end = /[\uD800-\uDBFF]/.test(value[middle - 1] ?? "") ? middle - 1 : middle
+    if (Buffer.byteLength(value.slice(0, end), "utf8") <= maximumBytes) {
+      low = middle
+    } else {
+      high = middle - 1
+    }
+  }
+  const end = /[\uD800-\uDBFF]/.test(value[low - 1] ?? "") ? low - 1 : low
+  return value.slice(0, end)
+}
+
+function compactUtf8(value, maximumBytes, label) {
+  const originalBytes = Buffer.byteLength(value, "utf8")
+  if (originalBytes <= maximumBytes) {
+    return { originalBytes, truncated: false, value }
+  }
+  const notice = `\n[${label} compacted for transport; original sha256 ${digestJson(value)}]`
+  const noticeBytes = Buffer.byteLength(notice, "utf8")
+  const prefix = utf8Prefix(value, Math.max(0, maximumBytes - noticeBytes)).trimEnd()
+  return {
+    originalBytes,
+    truncated: true,
+    value: `${prefix}${notice}`,
+  }
+}
+
+function consumeNaturalLanguageReview(responseText, expected) {
+  const markerCount = responseText.split(expected.terminalMarker).length - 1
+  const lines = responseText.replace(/\r\n?/g, "\n").trimEnd().split("\n")
+  const hasTerminalMarker = markerCount === 1 && lines.at(-1)?.trim() === expected.terminalMarker
+  if (hasTerminalMarker) {
+    lines.pop()
+  }
+  while (lines.length > 0 && lines.at(-1).trim() === "") {
+    lines.pop()
+  }
+  const verdictMatch = lines.at(-1)?.trim().match(/^EGO_CHAT_DECISION:\s*(SETTLED|CONTINUE|BLOCKED)$/i)
+  if (verdictMatch) {
+    lines.pop()
+  }
+  const substantiveText = boundedReviewText(lines.join("\n"))
+  const explicitlySettled = hasTerminalMarker && verdictMatch?.[1].toUpperCase() === "SETTLED"
+  const explicitBlocked = verdictMatch?.[1].toUpperCase() === "BLOCKED"
+  const criteria = expected.criteria.map(({ id }) => ({
+    evidence: explicitlySettled
+      ? `ChatGPT explicitly settled ${id} in the attributable review response.`
+      : `ChatGPT has not explicitly settled ${id}; the complete natural-language review is retained in the summary.`,
+    id,
+    status: explicitlySettled ? "pass" : "unknown",
+  }))
+  const findings = explicitlySettled
+    ? []
+    : [{
+        action: boundedReviewText(substantiveText, 4_000),
+        id: explicitBlocked ? "B-REVIEWER_BLOCKED" : "B-REVIEW_FEEDBACK",
+        severity: "blocking",
+        title: explicitBlocked
+          ? "Reviewer reported a substantive blocker"
+          : "Apply the natural-language review",
+      }]
+  return {
+    protocolNormalization: {
+      applied: true,
+      rules: [{ count: 1, rule: "natural_language_review" }],
+    },
+    review: {
+      candidateDigest: expected.candidateDigest,
+      criteria,
+      cycle: expected.cycle,
+      decision: explicitlySettled ? "settled" : "continue",
+      findings,
+      summary: substantiveText,
+      targetDigest: expected.targetDigest,
+    },
+  }
+}
+
+export function consumeChatGptReview(responseText, expected) {
+  try {
+    return parseChatGptReviewEnvelope(responseText, expected)
+  } catch (error) {
+    if (
+      !(error instanceof EgoChatError)
+      || error.code !== "human_required"
+    ) {
+      throw error
+    }
+    return consumeNaturalLanguageReview(responseText, expected)
+  }
+}
+
 export function evaluateReview(review) {
   const blockingFindings = review.findings.filter((finding) => finding.severity === "blocking")
   const incompleteCriteria = review.criteria.filter((criterion) => criterion.status !== "pass")
   if (review.decision === "settled") {
     if (blockingFindings.length > 0 || incompleteCriteria.length > 0) {
-      throw new EgoChatError(
-        "human_required",
-        "ChatGPT claimed settlement while retaining blocking findings or unproven criteria.",
-        { reason: "invalid_settlement_claim" },
-      )
+      return { settled: false }
     }
     return { settled: true }
   }
   if (review.decision === "blocked") {
-    throw new EgoChatError(
-      "human_required",
-      "ChatGPT reported that the convergence target cannot proceed automatically.",
-      { reason: "chatgpt_reported_blocked" },
-    )
-  }
-  if (blockingFindings.length === 0 && incompleteCriteria.length === 0) {
-    throw new EgoChatError(
-      "human_required",
-      "ChatGPT requested another cycle without an actionable blocking finding or incomplete criterion.",
-      { reason: "review_not_actionable" },
-    )
+    return { settled: false }
   }
   return { settled: false }
 }
@@ -445,7 +814,26 @@ export function buildCodexInspectionCorrectionPrompt({ contract, cycle }) {
   ].join("\n\n")
 }
 
-export function buildChatGptPrompt({ candidate, candidateDigest, contract, cycle, terminalMarker, turnMarker }) {
+export function buildCodexCandidateCorrectionPrompt({ contract, cycle, reason }) {
+  return [
+    "Your preceding convergence result could not be consumed as a candidate, but this is an internal correction turn and does not stop the workflow.",
+    `Remain on cycle ${cycle} and immutable target digest ${contract.targetDigest}.`,
+    `Validation reason: ${reason}.`,
+    "Re-inspect any evidence needed to correct the result. Preserve valid implementation work and do not repeat an internally inconsistent envelope.",
+    "Report every acceptance criterion exactly once and in contract order. A candidate must have no blockers; when a real blocker remains, use blocked and explain it concretely.",
+    "All original authority limits remain in force. Return a fresh JSON object constrained by the provided output schema.",
+  ].join("\n\n")
+}
+
+export function buildChatGptPrompt({
+  candidate,
+  candidateDigest,
+  contract,
+  cycle,
+  terminalMarker,
+  transportNotice = undefined,
+  turnMarker,
+}) {
   const criteria = contract.criteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n")
   return [
     turnMarker,
@@ -460,16 +848,142 @@ export function buildChatGptPrompt({ candidate, candidateDigest, contract, cycle
     criteria,
     "Implementing-agent candidate summary:",
     candidate.summary,
+    `Implementing-agent status: ${candidate.status}`,
+    "Implementing-agent reported blockers:",
+    candidate.blockers.length > 0 ? candidate.blockers.join("\n") : "None reported.",
     "Implementing-agent per-criterion evidence:",
     JSON.stringify(candidate.criteria),
+    ...(transportNotice ? ["Transport note:", transportNotice] : []),
     "Implementing-agent review packet:",
     candidate.reviewPacket,
-    "Return exactly one JSON object with these fields: targetDigest, candidateDigest, cycle, decision, summary, criteria, findings.",
-    "decision must be settled, continue, or blocked. Settlement is permitted only when every criterion is pass and there are no blocking findings. Continue must contain at least one blocking finding or a fail/unknown criterion. Use blocked only when the substantive target cannot proceed safely because authority or essential external input is missing; never use blocked for a formatting or review-protocol problem. Each criteria item must contain exactly id, status, and evidence; status must be pass, fail, or unknown, and evidence must be a non-empty string. Do not rename evidence to assessment, rationale, or another field. Each finding must contain exactly id, severity, title, and action; severity must be blocking or advisory. Every finding id must start with B- and match B-[A-Z0-9_-]{1,40}. Report every acceptance criterion exactly once and in contract order using the supplied AC-N ids.",
-    "Use valid JSON escaping. Inside JSON strings, encode line breaks as \\n, tabs as \\t, quotes as \\\", and backslashes as \\\\. Do not emit literal control characters inside a quoted JSON string and do not use trailing commas.",
-    "After the JSON object, output the following terminal marker on its own final line. Do not use Markdown prose and do not repeat the outbound turn marker.",
+    "Write the review as ordinary Markdown. Be concrete: state what you checked, list any blocking corrections with actionable detail, and distinguish blockers from optional advice. Do not emit JSON and do not repeat the outbound turn marker.",
+    "On the line immediately before the terminal marker, output exactly one verdict: EGO_CHAT_DECISION: SETTLED when every acceptance criterion is satisfied and no blocking correction remains; otherwise output EGO_CHAT_DECISION: CONTINUE. A missing or malformed verdict is treated as continuation feedback, never as a reason to stop or resend the review.",
+    "Output the following terminal marker exactly once on its own final line:",
     terminalMarker,
   ].join("\n\n")
+}
+
+export function prepareChatGptReviewPrompt({
+  candidate,
+  candidateDigest,
+  contract,
+  cycle,
+  terminalMarker,
+  turnMarker,
+}) {
+  const rawPrompt = buildChatGptPrompt({
+    candidate,
+    candidateDigest,
+    contract,
+    cycle,
+    terminalMarker,
+    turnMarker,
+  })
+  const initialRedaction = redactSecrets(rawPrompt)
+  const originalBytes = Buffer.byteLength(initialRedaction.value, "utf8")
+  if (originalBytes <= MAX_PROMPT_BYTES) {
+    return {
+      prompt: initialRedaction.value,
+      redactedSecretSignatures: initialRedaction.signatures,
+      transportCompaction: {
+        applied: false,
+        originalBytes,
+        transmittedBytes: originalBytes,
+      },
+    }
+  }
+
+  const compactedFields = []
+  const compact = (value, maximumBytes, label) => {
+    const result = compactUtf8(value, maximumBytes, label)
+    if (result.truncated) {
+      compactedFields.push(label)
+    }
+    return result.value
+  }
+  const compactContract = {
+    ...contract,
+    criteria: contract.criteria.map((criterion) => ({
+      ...criterion,
+      text: compact(criterion.text, 1_024, `acceptance criterion ${criterion.id}`),
+    })),
+    target: compact(contract.target, 8 * 1_024, "target"),
+  }
+  const compactCandidate = {
+    ...candidate,
+    blockers: candidate.blockers.map((blocker, index) => (
+      compact(blocker, 512, `blocker ${index + 1}`)
+    )),
+    criteria: candidate.criteria.map((criterion) => ({
+      ...criterion,
+      evidence: compact(criterion.evidence, 1_024, `candidate evidence ${criterion.id}`),
+    })),
+    reviewPacket: "[review packet budget pending]",
+    summary: compact(candidate.summary, 4 * 1_024, "candidate summary"),
+  }
+  const transportNotice = [
+    "The original prompt exceeded the browser transport budget and was deterministically compacted.",
+    "Treat missing evidence as a reason to continue, never as settlement. Ask the implementing agent for a smaller packet or exact accessible revision references in the next cycle.",
+  ].join(" ")
+  const shellPrompt = redactSecrets(buildChatGptPrompt({
+    candidate: compactCandidate,
+    candidateDigest,
+    contract: compactContract,
+    cycle,
+    terminalMarker,
+    transportNotice,
+    turnMarker,
+  })).value
+  const placeholderBytes = Buffer.byteLength(compactCandidate.reviewPacket, "utf8")
+  let packetBudget = Math.max(
+    512,
+    MAX_PROMPT_BYTES - Buffer.byteLength(shellPrompt, "utf8") + placeholderBytes,
+  )
+  let finalRedaction
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    compactCandidate.reviewPacket = compact(
+      redactSecrets(candidate.reviewPacket).value,
+      packetBudget,
+      "review packet",
+    )
+    finalRedaction = redactSecrets(buildChatGptPrompt({
+      candidate: compactCandidate,
+      candidateDigest,
+      contract: compactContract,
+      cycle,
+      terminalMarker,
+      transportNotice,
+      turnMarker,
+    }))
+    const actualBytes = Buffer.byteLength(finalRedaction.value, "utf8")
+    if (actualBytes <= MAX_PROMPT_BYTES) {
+      break
+    }
+    packetBudget = Math.max(256, packetBudget - (actualBytes - MAX_PROMPT_BYTES) - 64)
+  }
+  assertReviewPromptWithinBudget(
+    finalRedaction.value,
+    compactCandidate.reviewPacket,
+    {
+      code: "prompt_compaction_failed",
+      message: "The deterministic review prompt compactor could not satisfy the browser transport budget.",
+      reason: "prompt_compaction_failed",
+    },
+  )
+  const transmittedBytes = Buffer.byteLength(finalRedaction.value, "utf8")
+  return {
+    prompt: finalRedaction.value,
+    redactedSecretSignatures: [...new Set([
+      ...initialRedaction.signatures,
+      ...finalRedaction.signatures,
+    ])],
+    transportCompaction: {
+      applied: true,
+      compactedFields: [...new Set(compactedFields)],
+      originalBytes,
+      transmittedBytes,
+    },
+  }
 }
 
 export function buildChatGptProtocolRepairPrompt({
@@ -520,13 +1034,6 @@ export function prepareAgentReview({
   }
   const contract = createContract(target, acceptanceCriteria)
   const validatedCandidate = validateAgentCandidate(candidate, contract.criteria)
-  if (validatedCandidate.status === "blocked") {
-    throw new EgoChatError(
-      "human_required",
-      "The implementing agent reported that the target requires missing authority or cannot proceed safely.",
-      { reason: "agent_candidate_blocked" },
-    )
-  }
   const candidateDigest = digestJson(validatedCandidate)
   const resolvedOperationId = operationId ?? `review-${digestJson({
     bindingKey: bindingKey ?? null,
@@ -542,24 +1049,14 @@ export function prepareAgentReview({
   const resolvedMarkerToken = markerToken ?? digestJson(markerIdentity).slice(0, 32).toUpperCase()
   const turnMarker = `EGO_CHAT_AGENT_REVIEW_${resolvedMarkerToken}_C${cycle}`
   const terminalMarker = `EGO_CHAT_REVIEW_DONE_${resolvedMarkerToken}`
-  const prompt = buildChatGptPrompt({
+  const preparedPrompt = prepareChatGptReviewPrompt({
     candidate: validatedCandidate,
     candidateDigest,
     contract,
     cycle,
-    operationId: resolvedOperationId,
     terminalMarker,
     turnMarker,
   })
-  const signatures = scanForSecrets(prompt)
-  if (signatures.length > 0) {
-    throw new EgoChatError(
-      "human_required",
-      "The exact outbound review prompt contains a high-confidence secret signature.",
-      { reason: "review_packet_secret_detected", signatures },
-    )
-  }
-  assertReviewPromptWithinBudget(prompt, validatedCandidate.reviewPacket)
   return {
     ...(bindingKey ? { bindingKey } : {}),
     candidate: validatedCandidate,
@@ -568,8 +1065,10 @@ export function prepareAgentReview({
     cycle,
     deliveryAttempt,
     operationId: resolvedOperationId,
-    prompt,
+    prompt: preparedPrompt.prompt,
+    redactedSecretSignatures: preparedPrompt.redactedSecretSignatures,
     terminalMarker,
+    transportCompaction: preparedPrompt.transportCompaction,
     turnMarker,
   }
 }
@@ -646,7 +1145,7 @@ export function prepareAgentReviewProtocolRepair(
   }).slice(0, 32).toUpperCase()
   const turnMarker = `EGO_CHAT_AGENT_REVIEW_${markerToken}_C${initialPrepared.cycle}_R${protocolRepairAttempt}`
   const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}_R${protocolRepairAttempt}`
-  const prompt = buildChatGptProtocolRepairPrompt({
+  const rawPrompt = buildChatGptProtocolRepairPrompt({
     candidateDigest: initialPrepared.candidateDigest,
     contract: initialPrepared.contract,
     cycle: initialPrepared.cycle,
@@ -655,20 +1154,27 @@ export function prepareAgentReviewProtocolRepair(
     terminalMarker,
     turnMarker,
   })
-  const signatures = scanForSecrets(prompt)
-  if (signatures.length > 0) {
+  const redaction = redactSecrets(rawPrompt)
+  if (scanForSecrets(redaction.value).length > 0) {
     throw new EgoChatError(
-      "human_required",
-      "The exact outbound protocol-repair prompt contains a high-confidence secret signature.",
-      { reason: "review_packet_secret_detected", signatures },
+      "secret_redaction_failed",
+      "The protocol-repair prompt could not be sanitized without exposing a high-confidence secret signature.",
+      { userActionRequired: false },
     )
   }
+  const prompt = redaction.value
   assertReviewPromptWithinBudget(prompt, "")
   return {
     ...initialPrepared,
     deliveryAttempt,
     previousResponseDigest,
     prompt,
+    redactedSecretSignatures: [
+      ...new Set([
+        ...(initialPrepared.redactedSecretSignatures ?? []),
+        ...redaction.signatures,
+      ]),
+    ],
     protocolFailureReason: failureReason,
     protocolRepairAttempt,
     terminalMarker,
@@ -677,14 +1183,54 @@ export function prepareAgentReviewProtocolRepair(
 }
 
 export function completeAgentReview(prepared, responseText) {
-  const { protocolNormalization, review } = parseChatGptReviewEnvelope(responseText, {
+  const { protocolNormalization, review: consumedReview } = consumeChatGptReview(responseText, {
     candidateDigest: prepared.candidateDigest,
     criteria: prepared.contract.criteria,
     cycle: prepared.cycle,
     targetDigest: prepared.contract.targetDigest,
     terminalMarker: prepared.terminalMarker,
   })
-  return { protocolNormalization, review, ...evaluateReview(review) }
+  let review = consumedReview
+  let evaluation = evaluateReview(review)
+  if (prepared.transportCompaction?.applied && evaluation.settled) {
+    review = {
+      ...review,
+      criteria: review.criteria.map((criterion) => ({
+        ...criterion,
+        evidence: "The candidate evidence was compacted for browser transport; request a smaller packet or exact accessible revision references before settlement.",
+        status: "unknown",
+      })),
+      decision: "continue",
+      findings: [{
+        action: "Provide a smaller self-contained review packet or exact accessible revision references, then resubmit the candidate.",
+        id: "B-TRANSPORT-COMPACTED",
+        severity: "blocking",
+        title: "Review evidence was compacted for transport",
+      }],
+    }
+    evaluation = { settled: false }
+  }
+  if (prepared.candidate.status === "blocked" && evaluation.settled) {
+    const blockerText = (prepared.candidate.blockers.join("\n") || prepared.candidate.summary)
+      .slice(0, 4_000)
+    review = {
+      ...review,
+      criteria: review.criteria.map((criterion) => ({
+        ...criterion,
+        evidence: `The implementing agent still reports a blocker: ${blockerText}`.slice(0, 4_000),
+        status: "unknown",
+      })),
+      decision: "continue",
+      findings: [{
+        action: blockerText,
+        id: "B-IMPLEMENTER-BLOCKED",
+        severity: "blocking",
+        title: "Resolve the implementing agent blocker",
+      }],
+    }
+    evaluation = { settled: false }
+  }
+  return { protocolNormalization, review, ...evaluation }
 }
 
 export function reviewSignature(review) {

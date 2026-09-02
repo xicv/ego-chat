@@ -9,17 +9,22 @@ import {
   createContract,
   digestJson,
   completeAgentReview,
+  consumeChatGptReview,
   evaluateReview,
   parseChatGptReview,
   parseChatGptReviewEnvelope,
   prepareAgentReview,
   prepareAgentReviewProtocolRepair,
+  redactSecrets,
   reviewProtocolFailureSignature,
   scanForSecrets,
   validateAgentCandidate,
   validateCodexCandidate,
 } from "../src/convergence.mjs"
-import { MAX_PROMPT_BYTES } from "../src/constants.mjs"
+import {
+  MAX_PROMPT_BYTES,
+  MAX_REVIEW_PACKET_BYTES,
+} from "../src/constants.mjs"
 
 const OPENAI_LIKE_TEST_TOKEN = `sk-proj-${"A".repeat(26)}123456`
 const PRIVATE_KEY_TEST_HEADER = ["-----BEGIN", "PRIVATE KEY-----"].join(" ")
@@ -76,6 +81,114 @@ test("settlement binds exact target, candidate, cycle, and complete criterion ev
   })
 
   assert.deepEqual(evaluateReview(parsed), { settled: true })
+})
+
+test("natural-language review is a first-class continuation instead of a protocol failure", () => {
+  const contract = createContract("Keep working until the review is settled.", [
+    "The candidate handles the reported edge case.",
+    "The relevant verification passes.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_NATURAL1234"
+  const response = [
+    "The direction is sound, but the restart path still loses its pending response.",
+    "Please preserve the message identity across restart and add a regression test.",
+    "EGO_CHAT_DECISION: CONTINUE",
+    terminalMarker,
+  ].join("\n")
+
+  const consumed = consumeChatGptReview(response, {
+    candidateDigest,
+    criteria: contract.criteria,
+    cycle: 1,
+    targetDigest: contract.targetDigest,
+    terminalMarker,
+  })
+
+  assert.equal(consumed.review.decision, "continue")
+  assert.equal(consumed.review.findings.length, 1)
+  assert.match(consumed.review.findings[0].action, /preserve the message identity/i)
+  assert.equal(consumed.review.criteria.every(({ status }) => status === "unknown"), true)
+  assert.deepEqual(consumed.protocolNormalization, {
+    applied: true,
+    rules: [{ count: 1, rule: "natural_language_review" }],
+  })
+  assert.deepEqual(evaluateReview(consumed.review), { settled: false })
+})
+
+test("long natural-language review remains available to the next convergence cycle", () => {
+  const contract = createContract("Carry the complete substantive review forward.", [
+    "The next implementing turn receives the detailed review.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_LONGNATURAL1234"
+  const detailedReview = `Preserve this detailed review context. ${"evidence ".repeat(2_000)}`
+  const consumed = consumeChatGptReview([
+    detailedReview,
+    "EGO_CHAT_DECISION: CONTINUE",
+    terminalMarker,
+  ].join("\n"), {
+    candidateDigest,
+    criteria: contract.criteria,
+    cycle: 1,
+    targetDigest: contract.targetDigest,
+    terminalMarker,
+  })
+
+  assert.equal(consumed.review.summary, detailedReview.trim())
+  assert.ok(Buffer.byteLength(consumed.review.summary, "utf8") > 4_000)
+  assert.ok(Buffer.byteLength(consumed.review.findings[0].action, "utf8") <= 4_000)
+})
+
+test("a simple explicit verdict can settle without a fragile JSON envelope", () => {
+  const target = "Settle a candidate without making prose conform to a control schema."
+  const acceptanceCriteria = [
+    "The exact candidate is independently reviewed.",
+    "No blocking finding remains.",
+  ]
+  const contract = createContract(target, acceptanceCriteria)
+  const prepared = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract),
+    cycle: 3,
+    markerToken: "NATURALSETTLED1234",
+    target,
+  })
+  const response = [
+    "I reviewed the supplied candidate and validation evidence against both acceptance criteria.",
+    "No correctness, security, or verification blocker remains.",
+    "EGO_CHAT_DECISION: SETTLED",
+    prepared.terminalMarker,
+  ].join("\n")
+
+  const completed = completeAgentReview(prepared, response)
+
+  assert.equal(completed.settled, true)
+  assert.equal(completed.review.decision, "settled")
+  assert.equal(completed.review.criteria.every(({ status }) => status === "pass"), true)
+})
+
+test("missing reviewer formatting remains actionable and never requests a resend", () => {
+  const contract = createContract("Continue through imperfect reviewer output.", [
+    "The reviewer feedback reaches the implementing agent.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_FORMATLESS1234"
+
+  const consumed = consumeChatGptReview(
+    `Please add a restart regression before settling.\n${terminalMarker}`,
+    {
+      candidateDigest,
+      criteria: contract.criteria,
+      cycle: 1,
+      targetDigest: contract.targetDigest,
+      terminalMarker,
+    },
+  )
+
+  assert.equal(consumed.review.decision, "continue")
+  assert.match(consumed.review.summary, /restart regression/i)
+  assert.equal(consumed.review.findings[0].severity, "blocking")
 })
 
 test("an unambiguous ChatGPT assessment alias is normalized without another browser send", () => {
@@ -162,6 +275,43 @@ test("unescaped JSON string controls are normalized without another browser send
   })
 })
 
+test("unescaped quotes inside review prose are normalized without another browser send", () => {
+  const contract = createContract("Consume the already-delivered review safely.", [
+    "The review remains bound to the exact candidate.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_RAWQUOTE1234"
+  const review = reviewFor(contract, candidateDigest, {
+    decision: "continue",
+    findings: [{
+      action: "Replace the split call with an exact frontmatter parser.",
+      id: "B-STRICT_FRONTMATTER",
+      severity: "blocking",
+      title: "The parser accepts a preamble",
+    }],
+    summary: "The parser uses split(\"---\", 2), which accepts a preamble.",
+  })
+  const malformed = JSON.stringify(review).replace(
+    String.raw`split(\"---\", 2)`,
+    `split("---", 2)`,
+  )
+
+  const parsed = parseChatGptReviewEnvelope(`${malformed}\n${terminalMarker}`, {
+    candidateDigest,
+    criteria: contract.criteria,
+    cycle: 1,
+    targetDigest: contract.targetDigest,
+    terminalMarker,
+  })
+
+  assert.equal(parsed.review.summary, review.summary)
+  assert.deepEqual(parsed.protocolNormalization, {
+    applied: true,
+    rules: [{ count: 2, rule: "json_string_quote_escape" }],
+  })
+  assert.deepEqual(evaluateReview(parsed.review), { settled: false })
+})
+
 test("unambiguous trailing JSON commas are normalized without another browser send", () => {
   const contract = createContract("Consume one trailing-comma review safely.", [
     "The exact candidate remains independently verified.",
@@ -189,7 +339,7 @@ test("unambiguous trailing JSON commas are normalized without another browser se
   assert.equal(parsed.review.criteria[0].evidence, "Literal ,} remains evidence.")
 })
 
-test("forged identities and incomplete settlement claims fail closed", () => {
+test("forged identities fail closed while inconsistent settlement remains a continuation", () => {
   const contract = createContract("Settle safely.", ["One criterion passes."])
   const candidateDigest = digestJson(candidateFor(contract))
   const terminalMarker = "EGO_CHAT_REVIEW_DONE_TEST5678"
@@ -209,9 +359,29 @@ test("forged identities and incomplete settlement claims fail closed", () => {
   const incomplete = reviewFor(contract, candidateDigest, {
     criteria: [{ evidence: "Evidence is still unknown.", id: "AC-1", status: "unknown" }],
   })
+  assert.deepEqual(evaluateReview(incomplete), { settled: false })
+})
+
+test("duplicate structural review fields remain invalid during text repair", () => {
+  const contract = createContract("Settle only one unambiguous review.", [
+    "The review identity remains unique.",
+  ])
+  const candidateDigest = digestJson(candidateFor(contract))
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_DUPLICATE1234"
+  const review = JSON.stringify(reviewFor(contract, candidateDigest)).replace(
+    `"targetDigest":"${contract.targetDigest}"`,
+    `"targetDigest":"${"0".repeat(64)}","targetDigest":"${contract.targetDigest}"`,
+  )
+
   assert.throws(
-    () => evaluateReview(incomplete),
-    (error) => error.details?.reason === "invalid_settlement_claim",
+    () => parseChatGptReview(`${review}\n${terminalMarker}`, {
+      candidateDigest,
+      criteria: contract.criteria,
+      cycle: 1,
+      targetDigest: contract.targetDigest,
+      terminalMarker,
+    }),
+    (error) => error.details?.reason === "convergence_protocol_invalid",
   )
 })
 
@@ -230,9 +400,9 @@ test("continuation must be actionable and browser feedback stays explicitly untr
   })
   assert.deepEqual(evaluateReview(actionable), { settled: false })
 
-  assert.throws(
-    () => evaluateReview(reviewFor(contract, candidateDigest, { decision: "continue" })),
-    (error) => error.details?.reason === "review_not_actionable",
+  assert.deepEqual(
+    evaluateReview(reviewFor(contract, candidateDigest, { decision: "continue" })),
+    { settled: false },
   )
   assert.match(buildCodexPrompt({
     contract,
@@ -249,8 +419,9 @@ test("continuation must be actionable and browser feedback stays explicitly untr
     terminalMarker: "EGO_CHAT_REVIEW_DONE_SCHEMA123",
     turnMarker: "EGO_CHAT_CONVERGENCE_SCHEMA123_C1",
   })
-  assert.match(reviewPrompt, /Each criteria item must contain exactly id, status, and evidence/)
-  assert.match(reviewPrompt, /Do not emit literal control characters inside a quoted JSON string/)
+  assert.match(reviewPrompt, /ordinary Markdown/i)
+  assert.match(reviewPrompt, /EGO_CHAT_DECISION: SETTLED/)
+  assert.doesNotMatch(reviewPrompt, /Return exactly one JSON object/)
 })
 
 test("Codex convergence prompts require workspace inspection before final-only JSON", () => {
@@ -282,6 +453,11 @@ test("high-confidence secret signatures block the exact outbound packet", () => 
     scanForSecrets(`${PRIVATE_KEY_TEST_HEADER}\nredacted`),
     ["private_key"],
   )
+  const sanitized = redactSecrets(`token ${OPENAI_LIKE_TEST_TOKEN}`)
+  assert.equal(sanitized.redacted, true)
+  assert.deepEqual(sanitized.signatures, ["openai_api_key"])
+  assert.deepEqual(scanForSecrets(sanitized.value), [])
+  assert.doesNotMatch(sanitized.value, new RegExp(OPENAI_LIKE_TEST_TOKEN))
 })
 
 test("a host-owned candidate receives the same identity-bound strict review", () => {
@@ -335,7 +511,7 @@ test("a host-owned review can continue beyond six cycles", () => {
   assert.equal(completed.review.cycle, 7)
 })
 
-test("review packet admission defers to the exact UTF-8 prompt byte budget", () => {
+test("review packet admission compacts oversized UTF-8 prompts without stopping", () => {
   const target = "Review a large but transport-safe candidate packet."
   const acceptanceCriteria = ["The review packet obeys the exact outbound byte budget."]
   const contract = createContract(target, acceptanceCriteria)
@@ -350,43 +526,53 @@ test("review packet admission defers to the exact UTF-8 prompt byte budget", () 
 
   assert.equal(
     CODEX_CANDIDATE_OUTPUT_SCHEMA.properties.reviewPacket.maxLength,
-    MAX_PROMPT_BYTES,
+    MAX_REVIEW_PACKET_BYTES,
   )
   assert.ok(Buffer.byteLength(prepared.prompt, "utf8") < MAX_PROMPT_BYTES)
 
-  const oversizedPacket = "界".repeat(22_000)
-  assert.throws(
-    () => prepareAgentReview({
-      acceptanceCriteria,
-      candidate: candidateFor(contract, { reviewPacket: oversizedPacket }),
-      cycle: 1,
-      markerToken: "MULTIBYTETESTPACKET1234",
-      target,
-    }),
-    (error) => {
-      assert.equal(error.code, "invalid_input")
-      assert.equal(error.details?.reason, "review_prompt_too_large")
-      assert.equal(error.details?.maxBytes, MAX_PROMPT_BYTES)
-      assert.equal(
-        error.details?.reviewPacketBytes,
-        Buffer.byteLength(oversizedPacket, "utf8"),
-      )
-      assert.ok(error.details?.actualBytes > error.details?.maxBytes)
-      assert.equal(
-        error.details?.overageBytes,
-        error.details?.actualBytes - error.details?.maxBytes,
-      )
-      assert.equal(
-        error.details?.promptOverheadBytes,
-        error.details?.actualBytes - error.details?.reviewPacketBytes,
-      )
-      return true
-    },
+  const oversizedPacket = "界".repeat(70_000)
+  const compacted = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract, { reviewPacket: oversizedPacket }),
+    cycle: 1,
+    markerToken: "MULTIBYTETESTPACKET1234",
+    target,
+  })
+  assert.equal(compacted.transportCompaction.applied, true)
+  assert.ok(compacted.transportCompaction.originalBytes > MAX_PROMPT_BYTES)
+  assert.ok(compacted.transportCompaction.transmittedBytes <= MAX_PROMPT_BYTES)
+  assert.match(compacted.prompt, /deterministically compacted/)
+  const claimedSettlement = reviewFor(contract, compacted.candidateDigest)
+  const continued = completeAgentReview(
+    compacted,
+    `${JSON.stringify(claimedSettlement)}\n${compacted.terminalMarker}`,
   )
+  assert.equal(continued.settled, false)
+  assert.equal(continued.review.findings[0].id, "B-TRANSPORT-COMPACTED")
+
+  const oversizedAsciiPacket = "x".repeat(MAX_PROMPT_BYTES * 2)
+  const compactedAscii = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract, { reviewPacket: oversizedAsciiPacket }),
+    cycle: 1,
+    markerToken: "OVERSIZEDASCIIPACKET12",
+    target,
+  })
+  assert.equal(compactedAscii.transportCompaction.applied, true)
+  assert.ok(compactedAscii.transportCompaction.transmittedBytes <= MAX_PROMPT_BYTES)
 
   assert.throws(
     () => validateAgentCandidate(
-      candidateFor(contract, { reviewPacket: "x".repeat(MAX_PROMPT_BYTES + 1) }),
+      candidateFor(contract, { reviewPacket: "x".repeat(MAX_REVIEW_PACKET_BYTES + 1) }),
+      contract.criteria,
+    ),
+    (error) => error.details?.reason === "convergence_protocol_invalid",
+  )
+  assert.throws(
+    () => validateAgentCandidate(
+      candidateFor(contract, {
+        reviewPacket: "界".repeat(Math.floor(MAX_REVIEW_PACKET_BYTES / 3) + 1),
+      }),
       contract.criteria,
     ),
     (error) => error.details?.reason === "convergence_protocol_invalid",
@@ -481,34 +667,40 @@ test("protocol failure signatures ignore fresh terminal-marker identity but reta
   assert.notEqual(changed, first)
 })
 
-test("a blocked or secret-bearing host candidate stops before browser submission", () => {
-  const target = "Stop unsafe review packets."
-  const acceptanceCriteria = ["No unresolved blocker or secret is sent."]
+test("blocked candidates continue to review and secret signatures are redacted", () => {
+  const target = "Continue safely without leaking review-packet secrets."
+  const acceptanceCriteria = ["Unresolved blockers remain reviewable without exposing secrets."]
   const contract = createContract(target, acceptanceCriteria)
 
-  assert.throws(
-    () => prepareAgentReview({
-      acceptanceCriteria,
-      candidate: candidateFor(contract, {
-        blockers: ["Missing authority."],
-        status: "blocked",
-      }),
-      cycle: 1,
-      markerToken: "BLOCKEDREVIEW1234",
-      target,
+  const blocked = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract, {
+      blockers: ["Missing authority."],
+      status: "blocked",
     }),
-    (error) => error.details?.reason === "agent_candidate_blocked",
+    cycle: 1,
+    markerToken: "BLOCKEDREVIEW1234",
+    target,
+  })
+  const claimedSettlement = reviewFor(contract, blocked.candidateDigest)
+  const completed = completeAgentReview(
+    blocked,
+    `${JSON.stringify(claimedSettlement)}\n${blocked.terminalMarker}`,
   )
-  assert.throws(
-    () => prepareAgentReview({
-      acceptanceCriteria,
-      candidate: candidateFor(contract, {
-        reviewPacket: `Unsafe ${OPENAI_LIKE_TEST_TOKEN}`,
-      }),
-      cycle: 1,
-      markerToken: "SECRETREVIEW12345",
-      target,
+  assert.equal(completed.settled, false)
+  assert.equal(completed.review.decision, "continue")
+  assert.match(completed.review.findings[0].action, /Missing authority/)
+
+  const sanitized = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract, {
+      reviewPacket: `Unsafe ${OPENAI_LIKE_TEST_TOKEN}`,
     }),
-    (error) => error.details?.reason === "review_packet_secret_detected",
-  )
+    cycle: 1,
+    markerToken: "SECRETREVIEW12345",
+    target,
+  })
+  assert.deepEqual(sanitized.redactedSecretSignatures, ["openai_api_key"])
+  assert.deepEqual(scanForSecrets(sanitized.prompt), [])
+  assert.doesNotMatch(sanitized.prompt, new RegExp(OPENAI_LIKE_TEST_TOKEN))
 })
