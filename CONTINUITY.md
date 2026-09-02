@@ -93,6 +93,6 @@ Qualification itself exposed and fixed additional real-browser boundaries before
 
 ## Gate decision and remaining scope
 
-The honest Gate 0 claim is now: “live bounded Codex-first continuous conversation proven on the installed stack.” It is ready for supervised use with immutable targets, explicit acceptance criteria, bounded cycles, and the existing fail-closed rules.
+The recorded Gate 0 claim was: “live bounded Codex-first continuous conversation proven on the installed stack.” That two-cycle qualification remains the evidence baseline. The current runtime no longer imposes an implicit cycle ceiling: it continues until objective settlement or an evidence-based safety or wall-clock stop, while an explicitly supplied `maxCycles` budget remains authoritative.
 
 Later work is still required for ChatGPT-first initiation, automatic GitHub or attachment context transfer, browser/daemon crash continuation, CAPTCHA/logout/rate-limit recovery, multi-owner fencing, and broader interruption qualification. Those are production-hardening and later-phase features; they do not invalidate this completed two-cycle continuity gate.

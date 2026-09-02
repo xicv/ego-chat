@@ -67,7 +67,7 @@ const CONVERGENCE_INPUT_SCHEMA = {
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),
   codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   cwd: z.string().min(1).max(1_024),
-  maxCycles: z.number().int().min(1).max(6).default(4),
+  maxCycles: z.number().int().min(1).optional().describe("Optional caller-selected cycle budget. Omit it to continue until objective settlement or another evidence-based safety or wall-clock stop."),
   target: z.string().trim().min(1).max(8_000),
   wallClockTimeoutMs: z.number().int().min(120_000).max(MAX_WAIT_MS).default(MAX_WAIT_MS),
 }
@@ -89,7 +89,7 @@ const AGENT_REVIEW_INPUT_SCHEMA = {
     status: z.enum(["candidate", "blocked"]),
     summary: z.string().trim().min(1).max(4_000),
   }).strict(),
-  cycle: z.number().int().min(1).max(6),
+  cycle: z.number().int().min(1),
   operationId: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{7,119}$/).optional(),
   target: z.string().trim().min(1).max(8_000),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
@@ -107,10 +107,12 @@ const RECOVERABLE_AGENT_REVIEW_CODES = new Set([
 
 const MCP_INSTRUCTIONS = [
   "Use binding ego-chat-main unless the user explicitly names another binding.",
+  "Codex and ZCode share one authoritative broker and do not automatically receive separate bindings or task spaces. Ego Chat serializes its own browser operations across bindings and yields long confirmed-send capture in bounded read-only slices. Never evade conversation_busy with another binding; use distinct bindings only for genuinely independent user-authorized conversations and spaces.",
   "When the user supplies a private canonical ChatGPT /c/ URL to continue, adopt it with ego_adopt_conversation_and_wait and omit bindingKey unless the user names one; use ego_start_conversation_adoption only when detachment is required.",
   "For one free-form ChatGPT review returned to the current agent turn, use ego_exchange_and_wait.",
   "When the current Codex or ZCode task remains the implementer, use ego_review_candidate_and_wait once per candidate and continue in that same host task until settled; do not spawn a nested broker-owned Codex task just to review work the current task already owns.",
   "A successful strict review with settled false is a machine continuation, not a stopping condition. Read its complete review, address the in-scope blocking findings, and immediately submit nextCycle in the same host task without asking the user to relay or approve the review. A protocolNormalization result records a bounded local schema normalization and does not require another browser send.",
+  "Do not invent a cycle ceiling for an until-settled loop. Current-host reviews have no fixed cycle limit. Detached convergence also continues without a cycle limit when maxCycles is omitted; set maxCycles only when the user explicitly requests that budget.",
   `Finalize and UTF-8 byte-check a strict review packet before creating its operationId. The complete generated review prompt, including protocol overhead, must not exceed ${MAX_PROMPT_BYTES} bytes; prefer an accessible PR URL plus exact revisions, changed-file inventory, critical excerpts, tests, and unresolved risks over an entire diff. Never split one candidate across multiple sends automatically.`,
   "Give every exact strict candidate review one stable operationId; reuse it only with byte-identical arguments to recover a lost tool result, and generate a new ID for any changed candidate or cycle.",
   "A strict review may retry internally with a deterministic fresh marker only after durable reconciliation proves the prior prompt was never delivered and the exact prior conversation head remains unchanged; it never retries an interleaved, ambiguous, or possibly accepted send.",
@@ -763,7 +765,6 @@ export function createMcpServer(config = loadConfig()) {
           }
           const responseText = await resolveResponseText(config, workflow.id, exchangeResult)
           const { protocolNormalization, review, settled } = completeAgentReview(prepared, responseText)
-          const canContinue = !settled && input.cycle < 6
           return waitedToolResult({
             bindingKey: input.bindingKey,
             candidateDigest: prepared.candidateDigest,
@@ -772,12 +773,8 @@ export function createMcpServer(config = loadConfig()) {
             deliveryAttemptCount: deliveryAttempt,
             exchangeWorkflowId: workflow.id,
             modelPolicy: exchangeResult.modelPolicy,
-            nextAction: settled
-              ? "settled"
-              : (canContinue
-                  ? "address_review_and_submit_next_cycle"
-                  : "cycle_limit_reached"),
-            ...(canContinue ? { nextCycle: input.cycle + 1 } : {}),
+            nextAction: settled ? "settled" : "address_review_and_submit_next_cycle",
+            ...(!settled ? { nextCycle: input.cycle + 1 } : {}),
             operationId: prepared.operationId,
             protocolNormalization,
             recoveredLateResponse,
@@ -848,7 +845,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_start_convergence",
     {
-      description: "Start a detached broker-owned Codex implementation and ChatGPT review loop against an immutable target and explicit acceptance criteria. Use this only when the current host task is not the implementation owner. Each fresh review performs its own live checks; do not call ego_verify_conversation first. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send.",
+      description: "Start a detached broker-owned Codex implementation and ChatGPT review loop against an immutable target and explicit acceptance criteria. Use this only when the current host task is not the implementation owner. Each fresh review performs its own live checks; do not call ego_verify_conversation first. It reserves one canonical conversation, enforces strongest-available ChatGPT plus maximum thinking on every review, and returns a durable workflow ID immediately. Omit maxCycles to continue until objective settlement or another evidence-based safety or wall-clock stop; set it only for a caller-selected cycle budget. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send.",
       inputSchema: CONVERGENCE_INPUT_SCHEMA,
     },
     async (input) => {
@@ -863,7 +860,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_converge_until_settled",
     {
-      description: "Run a detached broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is independently settled or a fail-closed stop requires human reconciliation. When the current Codex or ZCode task owns the candidate, use ego_review_candidate_and_wait instead. Each fresh review performs its own live checks; do not call ego_verify_conversation first. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
+      description: "Run a detached broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is independently settled or an evidence-based fail-closed stop requires reconciliation. When the current Codex or ZCode task owns the candidate, use ego_review_candidate_and_wait instead. Each fresh review performs its own live checks; do not call ego_verify_conversation first. Omit maxCycles for no arbitrary cycle ceiling; set it only for a caller-selected cycle budget. Set allowTaskSpaceReclaim only after explicit user authorization to recover the exact binding-owned space before each fresh review Send. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
       inputSchema: {
         ...CONVERGENCE_INPUT_SCHEMA,
         waitMode: waitModeSchema(),

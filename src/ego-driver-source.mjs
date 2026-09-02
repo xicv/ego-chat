@@ -1810,6 +1810,67 @@ async function egoDriverMain(inputPathOverride = undefined) {
         )`)
       }
       if (generationRunning) {
+        if (input.captureContinuationAllowed === true) {
+          const pendingInfo = await pageInfo()
+          const pendingEntries = await readConversationEntries()
+          const pendingAnchorIndexes = input.expectedPreviousMessageId
+            ? pendingEntries
+                .map((entry, index) => entry.messageId === input.expectedPreviousMessageId ? index : -1)
+                .filter((index) => index >= 0)
+            : []
+          const pendingAnchorIndex = pendingAnchorIndexes[0] ?? -1
+          const pendingAnchor = pendingAnchorIndex >= 0 ? pendingEntries[pendingAnchorIndex] : null
+          const pendingCommitted = pendingAnchorIndex >= 0
+            ? pendingEntries.slice(pendingAnchorIndex + 1)
+            : pendingEntries
+          const pendingPrompt = pendingCommitted[0]
+          const pendingAssistant = pendingCommitted[1]
+          const pendingRenderedMarkerCount = pendingEntries.reduce(
+            (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
+            0,
+          )
+          const pendingIdentityMatches = (
+            normalizeUrl(pendingInfo.url) === normalizeUrl(expectedCanonicalUrl)
+            && (input.expectedPreviousMessageId
+              ? pendingAnchorIndexes.length === 1
+              : pendingAnchorIndexes.length === 0)
+            && (!input.expectedPreviousContentDigest
+              || pendingAnchor?.contentDigest === input.expectedPreviousContentDigest)
+            && (!input.binding.headRole || pendingAnchor?.role === input.binding.headRole)
+            && pendingCommitted.length >= 1
+            && pendingCommitted.length <= 2
+            && pendingPrompt?.messageId === input.promptMessageId
+            && pendingPrompt?.role === "user"
+            && pendingPrompt.text.split(input.turnMarker).length - 1 === 1
+            && pendingRenderedMarkerCount === 1
+            && (!pendingAssistant || pendingAssistant.role === "assistant")
+          )
+          if (!pendingIdentityMatches) {
+            humanRequired("capture_pending_identity_mismatch", "The generating response no longer follows the exact confirmed prompt and prior head.", {
+              anchorCount: pendingAnchorIndexes.length,
+              committedCount: pendingCommitted.length,
+              promptMessageIdMatches: pendingPrompt?.messageId === input.promptMessageId,
+              renderedMarkerCount: pendingRenderedMarkerCount,
+              targetId: selected.targetId,
+              taskSpaceId: selected.task.id,
+            })
+            return
+          }
+          emit({
+            ok: true,
+            result: {
+              canonicalUrl: normalizeUrl(pendingInfo.url),
+              captureReason: "generation_running",
+              captureState: "pending",
+              generationRunning: true,
+              promptMessageId: pendingPrompt.messageId,
+              targetId: selected.targetId,
+              taskSpaceId: selected.task.id,
+              turnMarker: input.turnMarker,
+            },
+          })
+          return
+        }
         humanRequired("completion_timeout_after_confirmed_send", "The confirmed prompt is still generating after the broker-owned generation deadline.", {
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
@@ -1840,6 +1901,8 @@ async function egoDriverMain(inputPathOverride = undefined) {
       || anchor?.contentDigest === input.expectedPreviousContentDigest
     const anchorRoleMatches = !input.binding.headRole || anchor?.role === input.binding.headRole
     const promptDigestMatches = prompt?.contentDigest === input.inputDigest
+    const promptMessageIdMatches = !input.promptMessageId
+      || prompt?.messageId === input.promptMessageId
     const promptMarkerCount = prompt?.text.split(input.turnMarker).length - 1
     const renderedMarkerCount = entries.reduce(
       (count, entry) => count + entry.text.split(input.turnMarker).length - 1,
@@ -1847,6 +1910,60 @@ async function egoDriverMain(inputPathOverride = undefined) {
     )
     const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
     const responseEndsWithTerminal = response?.text.trimEnd().endsWith(input.expectedTerminalMarker) ?? false
+    const terminalPairReady = (
+      committed.length === 2
+      && prompt?.role === "user"
+      && response?.role === "assistant"
+      && Boolean(prompt?.messageId)
+      && Boolean(response?.messageId)
+      && promptMessageIdMatches
+      && prompt.messageId !== response.messageId
+      && terminalCount === 1
+      && responseEndsWithTerminal
+    )
+    const incompleteCaptureCanContinue = (
+      input.mode === "capture_exchange"
+      && input.captureContinuationAllowed === true
+      && (input.expectedPreviousMessageId ? anchorIndexes.length === 1 : anchorIndexes.length === 0)
+      && anchorDigestMatches
+      && anchorRoleMatches
+      && committed.length >= 1
+      && committed.length <= 2
+      && prompt?.messageId === input.promptMessageId
+      && prompt?.role === "user"
+      && promptMarkerCount === 1
+      && renderedMarkerCount === 1
+      && (!response || (
+        response.role === "assistant"
+        && (!response.messageId || response.messageId !== prompt.messageId)
+        && (!Number.isInteger(terminalCount) || terminalCount <= 1)
+      ))
+      && !terminalPairReady
+    )
+    if (incompleteCaptureCanContinue) {
+      const pendingInfo = await pageInfo()
+      if (normalizeUrl(pendingInfo.url) !== normalizeUrl(expectedCanonicalUrl)) {
+        humanRequired("reconciliation_url_mismatch", "The incomplete response moved away from the bound canonical conversation.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      emit({
+        ok: true,
+        result: {
+          canonicalUrl: normalizeUrl(pendingInfo.url),
+          captureReason: "response_not_terminal",
+          captureState: "pending",
+          generationRunning: false,
+          promptMessageId: prompt.messageId,
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+          turnMarker: input.turnMarker,
+        },
+      })
+      return
+    }
     const deliveryAbsentCandidate = (
       input.allowDeliveryAbsent === true
       && anchorIndexes.length === 1
@@ -1911,6 +2028,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
       && response?.role === "assistant"
       && Boolean(prompt?.messageId)
       && Boolean(response?.messageId)
+      && promptMessageIdMatches
       && prompt.messageId !== response.messageId
       && promptMarkerCount === 1
       && renderedMarkerCount === 1
@@ -1924,6 +2042,7 @@ async function egoDriverMain(inputPathOverride = undefined) {
         anchorRoleMatches,
         committedCount: committed.length,
         promptDigestMatches,
+        promptMessageIdMatches,
         promptMarkerCount: Number.isInteger(promptMarkerCount) ? promptMarkerCount : null,
         promptRole: prompt?.role ?? null,
         renderedMarkerCount,

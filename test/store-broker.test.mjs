@@ -438,6 +438,104 @@ test("fresh-send task-space reclaim authority is durable for Send but stripped f
   assert.equal(captures, 1)
 })
 
+test("confirmed exchanges resume after a bounded pending capture without another Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/capture-slice"
+  const terminalMarker = "EGO_CHAT_CAPTURE_SLICE_DONE"
+  const turnMarker = "EGO_CHAT_CAPTURE_SLICE_TEST"
+  const promptMessageId = "capture-slice-user"
+  let captures = 0
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "capture-slice-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "capture-slice-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "capture-slice-tab",
+      taskSpaceId: 18,
+    }),
+    captureExchange: async () => {
+      captures += 1
+      if (captures === 1) {
+        return {
+          canonicalUrl,
+          captureReason: "response_not_terminal",
+          captureState: "pending",
+          generationRunning: false,
+          promptMessageId,
+          targetId: "capture-slice-tab",
+          taskSpaceId: 18,
+          turnMarker,
+        }
+      }
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "capture-slice-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "capture-slice-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "capture-slice-tab",
+        taskSpaceId: 18,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => {
+      sends += 1
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId,
+        sentAt: new Date().toISOString(),
+        targetId: "capture-slice-tab",
+        taskSpaceId: 18,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "capture-slice",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 18,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "capture-slice",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nWait for the bounded capture to resume.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 4_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.ok(
+    Date.parse(completed.deadlineAt) - Date.parse(completed.createdAt)
+      >= 2 * 60 * 60 * 1_000 + 25,
+  )
+  assert.equal(sends, 1)
+  assert.equal(captures, 2)
+})
+
 test("event checkpoints bound the active ledger and result blobs are digest verified", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -1758,6 +1856,122 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(appServer.closed, true)
   assert.equal(broker.getConversationBinding({ bindingKey: "ego-chat-main" }).revision, 3)
   assert.equal(broker.getModelPolicy().revision, 2)
+})
+
+test("broker-owned convergence has no implicit cycle ceiling", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter((identity) => {
+    const settled = identity.cycle === 7
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The immutable target identity is exact.", id: "AC-1", status: "pass" },
+        {
+          evidence: settled
+            ? "The seventh cycle settled the target."
+            : `Cycle ${identity.cycle} still requires one more revision.`,
+          id: "AC-2",
+          status: settled ? "pass" : "fail",
+        },
+      ],
+      decision: settled ? "settled" : "continue",
+      findings: settled
+        ? []
+        : [{
+            action: `Prepare candidate cycle ${identity.cycle + 1}.`,
+            id: `B-CYCLE-${identity.cycle}`,
+            severity: "blocking",
+            title: `Cycle ${identity.cycle} remains unsettled`,
+          }],
+      summary: settled
+        ? "The target is settled after seven cycles."
+        : `Continue from cycle ${identity.cycle}.`,
+    }
+  })
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-no-implicit-cycle-ceiling",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: [
+      "Every cycle binds the immutable target identity.",
+      "The target is independently settled.",
+    ],
+    bindingKey: "ego-chat-main",
+    codexSandbox: "read-only",
+    cwd: process.cwd(),
+    target: "Continue the broker-owned loop until objective settlement.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 7)
+  assert.equal(appServer.turns, 7)
+  assert.equal(ego.exchanges, 7)
+})
+
+test("an explicit convergence cycle budget remains authoritative", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const appServer = new FakeConvergenceAppServer()
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The immutable target identity is exact.", id: "AC-1", status: "pass" },
+      {
+        evidence: `Cycle ${identity.cycle} remains unsettled.`,
+        id: "AC-2",
+        status: "fail",
+      },
+    ],
+    decision: "continue",
+    findings: [{
+      action: "Continue only if the explicit budget permits it.",
+      id: `B-BUDGET-${identity.cycle}`,
+      severity: "blocking",
+      title: `Cycle ${identity.cycle} remains unsettled`,
+    }],
+    summary: `Cycle ${identity.cycle} requires another candidate.`,
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-explicit-cycle-budget",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The target is settled."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    maxCycles: 2,
+    target: "Respect the caller's explicit two-cycle budget.",
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "convergence_cycle_limit_reached")
+  assert.equal(appServer.turns, 2)
+  assert.equal(ego.exchanges, 2)
 })
 
 test("convergence corrects one schema-only Codex turn before sending to ChatGPT", async (t) => {

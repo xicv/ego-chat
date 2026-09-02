@@ -159,6 +159,15 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
     reviewTool.inputSchema.properties.candidate.properties.reviewPacket.maxLength,
     MAX_PROMPT_BYTES,
   )
+  assert.equal(reviewTool.inputSchema.properties.cycle.maximum, Number.MAX_SAFE_INTEGER)
+  for (const toolName of ["ego_start_convergence", "ego_converge_until_settled"]) {
+    const convergenceTool = tools.tools.find((tool) => tool.name === toolName)
+    assert.equal(convergenceTool.inputSchema.required.includes("maxCycles"), false)
+    assert.equal(
+      convergenceTool.inputSchema.properties.maxCycles.maximum,
+      Number.MAX_SAFE_INTEGER,
+    )
+  }
   const abandonmentTool = tools.tools.find((tool) => tool.name === "abandon_workflow_recovery")
   assert.ok(abandonmentTool)
   assert.equal(
@@ -1019,4 +1028,14 @@ test("strict candidate review crosses MCP, validates settlement, and reconciles 
   assert.equal(compactContinuation.nextCycle, 2)
   assert.deepEqual(compactContinuation.review, aliasedContinuation.structuredContent.review)
   assert.equal(exchanges, 11)
+
+  const seventhCycle = await client.callTool({
+    arguments: { ...reviewInput("cycle-seven"), cycle: 7 },
+    name: "ego_review_candidate_and_wait",
+  })
+  assert.equal(seventhCycle.isError, undefined)
+  assert.equal(seventhCycle.structuredContent.settled, true)
+  assert.equal(seventhCycle.structuredContent.cycle, 7)
+  assert.equal(seventhCycle.structuredContent.nextAction, "settled")
+  assert.equal(exchanges, 12)
 })

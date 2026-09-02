@@ -197,7 +197,7 @@ export const StartConvergenceSchema = z.object({
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),
   codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
   cwd: z.string().trim().min(1).max(1_024).refine(path.isAbsolute, "Working directory must be absolute"),
-  maxCycles: z.number().int().min(1).max(6).default(4),
+  maxCycles: z.number().int().min(1).optional(),
   target: ConvergenceTextSchema(8_000),
   wallClockTimeoutMs: z.number().int().min(120_000).max(MAX_WAIT_MS).default(MAX_WAIT_MS),
 }).superRefine((value, context) => {

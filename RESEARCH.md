@@ -5,9 +5,11 @@ Scope: research and design only; no product implementation or configuration chan
 
 ## Implementation update
 
-The post-research implementation now includes the smallest bounded Codex-first convergence slice described later in this record. A single broker-owned workflow starts one dedicated Codex App Server thread, posts each candidate to one reserved canonical ChatGPT conversation through Ego, injects the strict ChatGPT review into the next Codex turn as untrusted context, and stops only at validated settlement or a bounded fail-closed condition.
+The post-research implementation now includes the smallest durable Codex-first convergence slice described later in this record. A single broker-owned workflow starts one dedicated Codex App Server thread, posts each candidate to one reserved canonical ChatGPT conversation through Ego, injects the strict ChatGPT review into the next Codex turn as untrusted context, and stops only at validated settlement or an evidence-based fail-closed condition.
 
-This closes the normal-process A/B/A continuation gap without claiming unsafe crash replay. MCP facade disconnects are recoverable because the daemon owns the workflow. For a browser turn that completed after capture, one evidence-only reconciliation may recover the exact prior-head-anchored user/assistant pair without sending again. A daemon restart, unattributable browser state, authentication interruption, invalid envelope, secret match, stagnation, missing authority, deadline, or cycle exhaustion still requires a fail-closed stop. ChatGPT-first initiation and a full content-addressed local context capsule remain later work.
+The 2 September 2026 stability iteration adds one broker-wide FIFO browser lane because Ego Lite's task-space browsing contexts are isolated but its current CDP automation channel is still global ([upstream issue #213](https://github.com/citrolabs/ego-lite/issues/213)). All Ego Chat browser children are therefore serialized across Codex and ZCode. Long confirmed-send captures run as short read-only slices, prove the durable prompt identity before yielding, and requeue without another Send. This preserves distinct conversation state while preventing Ego Chat's own hosts from racing the shared CDP channel; unrelated automation outside the broker remains an upstream boundary.
+
+This closes the normal-process A/B/A continuation gap without claiming unsafe crash replay. MCP facade disconnects are recoverable because the daemon owns the workflow. For a browser turn that completed after capture, one evidence-only reconciliation may recover the exact prior-head-anchored user/assistant pair without sending again. A daemon restart, unattributable browser state, authentication interruption, invalid envelope, secret match, stagnation, missing authority, deadline, or exhaustion of an explicitly caller-selected cycle budget still requires a fail-closed stop. ChatGPT-first initiation and a full content-addressed local context capsule remain later work.
 
 The portable wrapper now also targets ZCode's documented native user surfaces: `~/.zcode/cli/config.json` with `mcp.servers` for local STDIO MCP services, and `~/.zcode/skills/<name>/SKILL.md` for user skills. ZCode's current [MCP Services](https://zcode.z.ai/en/docs/mcp-services), [Skills](https://zcode.z.ai/en/docs/skill), and [Goal](https://zcode.z.ai/en/docs/goal) documentation supports an in-client loop in which the current ZCode task remains side A and invokes Ego Chat for each strict side-B review.
 
@@ -240,7 +242,7 @@ Rules:
 - If the click may have occurred but confirmation is missing, enter `B_SEND_UNKNOWN`; allow only read-only observation and reconciliation.
 - Never switch conversations or transports after possible submission.
 - A correction is a new marked turn created only after a terminal response was captured and rejected; it is not a retry of an ambiguous send.
-- Every loop has a maximum cycle count, wall-clock deadline, and explicit completion criteria. There is no unbounded “keep asking until happy” mode.
+- Every loop has a wall-clock deadline and explicit completion criteria. There is no implicit cycle ceiling; a positive maximum cycle count is enforced only when the caller explicitly supplies one. Repeated state and fail-closed evidence boundaries still stop non-productive or ambiguous loops.
 
 ## Reliable ChatGPT completion detection
 
@@ -404,7 +406,7 @@ The essential problem is solved only when a recorded end-to-end test demonstrate
 6. Killing and restarting the broker at every send boundary never duplicates a message.
 7. Authentication or CAPTCHA produces a clear human-required stop.
 8. No unselected source, credential, automatic push, or expanded authority is involved.
-9. The loop ends under explicit completion criteria and a bounded cycle/time budget.
+9. The loop ends under explicit completion criteria, evidence-based safety stops, and a wall-clock deadline; an explicit caller-selected cycle budget remains optional and authoritative.
 
 Until that evidence exists, a successful prompt or a stable browser session is only a component proof, not proof of the automated conversation loop.
 

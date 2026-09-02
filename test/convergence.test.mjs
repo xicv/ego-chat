@@ -248,6 +248,28 @@ test("a host-owned candidate receives the same identity-bound strict review", ()
   assert.deepEqual(completed.protocolNormalization, { applied: false, rules: [] })
 })
 
+test("a host-owned review can continue beyond six cycles", () => {
+  const target = "Keep reviewing until the immutable target is settled."
+  const acceptanceCriteria = ["The seventh candidate is independently settled."]
+  const contract = createContract(target, acceptanceCriteria)
+  const prepared = prepareAgentReview({
+    acceptanceCriteria,
+    candidate: candidateFor(contract),
+    cycle: 7,
+    markerToken: "HOSTOWNEDCYCLESEVEN1234",
+    target,
+  })
+  const review = reviewFor(contract, prepared.candidateDigest, { cycle: 7 })
+
+  const completed = completeAgentReview(
+    prepared,
+    `${JSON.stringify(review)}\n${prepared.terminalMarker}`,
+  )
+
+  assert.equal(completed.settled, true)
+  assert.equal(completed.review.cycle, 7)
+})
+
 test("review packet admission defers to the exact UTF-8 prompt byte budget", () => {
   const target = "Review a large but transport-safe candidate packet."
   const acceptanceCriteria = ["The review packet obeys the exact outbound byte budget."]
