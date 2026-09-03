@@ -7039,6 +7039,114 @@ test("broker restart preserves the same-cycle no-inspection liveness threshold",
   assert.equal(ego.exchanges, 2)
 })
 
+test("broker restart repairs a missing no-inspection thread rotation", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  await seedRestartBinding(
+    dataDir,
+    "https://chatgpt.com/c/convergence-restart-missing-inspection-rotation",
+  )
+  const contract = createContract(
+    "Repair a legacy no-inspection continuation that reused its exhausted thread.",
+    ["Identity is bound.", "The continuation uses a fresh Codex thread."],
+  )
+  const candidate = {
+    ...convergenceCandidate(1),
+    blockers: ["The exhausted thread produced no workspace evidence."],
+    status: "blocked",
+  }
+  const candidateDigest = digestJson(candidate)
+  const review = {
+    candidateDigest,
+    criteria: [
+      { evidence: "The target identity remains exact.", id: "AC-1", status: "pass" },
+      { evidence: "Continue in a fresh Codex thread.", id: "AC-2", status: "fail" },
+    ],
+    cycle: 1,
+    decision: "continue",
+    findings: [{
+      action: "Rotate before the next Codex turn.",
+      id: "B-ROTATE-AFTER-INSPECTION-LIVENESS",
+      severity: "blocking",
+      title: "Fresh Codex thread required",
+    }],
+    summary: "Continue after repairing the missing rotation.",
+    targetDigest: contract.targetDigest,
+  }
+  const workflow = convergenceRestartWorkflow({
+    candidate,
+    contract,
+    cycle: 1,
+    id: "d4a5532d-d4bc-4bf8-8db4-c65e9f85b534",
+    phase: "codex_running",
+    review,
+  })
+  workflow.cycle = 2
+  workflow.codexInspectionLivenessCheckpointCount = 1
+  workflow.codexInspectionRetryCount = 3
+  workflow.codexThreadGeneration = 1
+  workflow.codexThreadRotationCount = 0
+  workflow.activeCodexTurn = {
+    continuation: { cycle: 2, kind: "cycle" },
+    cycle: 2,
+    turnId: "codex-wrongly-reused-thread-turn",
+  }
+  workflow.private.cycles[0].livenessCheckpoint = {
+    kind: "inspection",
+    retryCount: 3,
+    sourceTurnId: "codex-no-inspection-source-turn",
+  }
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("workflow.started", workflow)
+
+  const replacementClient = new FakeConvergenceAppServer(() => convergenceCandidate(2))
+  replacementClient.resumeThread = async () => {
+    throw new Error("the exhausted Codex thread must not be resumed")
+  }
+  replacementClient.startThread = async () => ({
+    id: "codex-repaired-inspection-thread",
+    sessionId: "codex-repaired-inspection-thread",
+  })
+  replacementClient.unsubscribeThread = async (threadId) => {
+    assert.equal(threadId, "codex-repaired-inspection-thread")
+  }
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target identity remained exact.", id: "AC-1", status: "pass" },
+      { evidence: "The repaired continuation used a fresh thread.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The repaired fresh-thread continuation is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => replacementClient,
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({
+    timeoutMs: 5_000,
+    workflowId: workflow.id,
+  })
+
+  assert.equal(
+    completed.status,
+    "succeeded",
+    JSON.stringify(completed.error ?? completed.humanRequired ?? completed),
+  )
+  assert.equal(completed.codexThreadGeneration, 2)
+  assert.equal(completed.codexThreadRotationCount, 1)
+  assert.equal(completed.lastCodexThreadRotation.abandonedThreadId, "codex-convergence-thread")
+  assert.equal(completed.lastCodexThreadRotation.threadId, "codex-repaired-inspection-thread")
+  assert.equal(replacementClient.turns, 1)
+  assert.equal(ego.exchanges, 1)
+})
+
 test("running convergence resumes a captured Codex candidate after broker restart", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

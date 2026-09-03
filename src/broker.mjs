@@ -2837,6 +2837,7 @@ export class Broker {
 
     try {
       let current = this.#requireRunningConvergence(workflowId, controller.signal)
+      current = await this.#repairMissingConvergenceThreadRotation(current)
       const { request } = current.private
       let setupRecoveryCount = 0
       const durableThreadRotationPending = Boolean(current.codexThreadRotationPending)
@@ -3968,6 +3969,90 @@ export class Broker {
       },
     })
     return { candidateDigest }
+  }
+
+  async #repairMissingConvergenceThreadRotation(current) {
+    if (current.codexThreadRotationPending) {
+      return current
+    }
+    const livenessCheckpointCount = (
+      (current.codexInspectionLivenessCheckpointCount ?? 0)
+      + (current.codexAppServerLivenessCheckpointCount ?? 0)
+    )
+    const threadRotationCount = current.codexThreadRotationCount ?? 0
+    if (livenessCheckpointCount === threadRotationCount) {
+      return current
+    }
+    const latestCycle = current.private?.cycles?.at(-1)
+    const checkpoint = latestCycle?.livenessCheckpoint
+    if (
+      livenessCheckpointCount !== threadRotationCount + 1
+      || !Number.isSafeInteger(latestCycle?.cycle)
+      || !checkpoint
+      || !["inspection", "app_server"].includes(checkpoint.kind)
+      || typeof checkpoint.sourceTurnId !== "string"
+      || checkpoint.sourceTurnId.length === 0
+      || typeof current.codexThreadId !== "string"
+      || current.codexThreadId.length === 0
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The durable liveness checkpoint count cannot be reconciled with its Codex thread rotations.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const pending = {
+      afterCycle: latestCycle.cycle,
+      abandonedThreadId: current.codexThreadId,
+      createdAt: new Date().toISOString(),
+      nextGeneration: (current.codexThreadGeneration ?? 1) + 1,
+      sourceTurnId: checkpoint.sourceTurnId,
+    }
+    const capturedCheckpointState = (
+      current.cycle === latestCycle.cycle
+      && ["codex_captured", "chatgpt_running", "review_captured"].includes(current.phase)
+      && !current.activeCodexTurn
+    )
+    if (capturedCheckpointState) {
+      await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+        codexThreadRotationPending: pending,
+        phase: current.phase,
+        private: current.private,
+      })
+      return this.#requireRunningConvergence(current.id)
+    }
+    const reusedThreadState = (
+      current.cycle === latestCycle.cycle + 1
+      && ["codex_ready", "codex_running", "codex_recovering"].includes(current.phase)
+    )
+    if (!reusedThreadState) {
+      throw new EgoChatError(
+        "human_required",
+        "The missing Codex thread rotation is not in a safely repairable convergence phase.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const continuation = current.activeCodexTurn?.continuation
+      ?? current.pendingCodexContinuation
+      ?? { cycle: current.cycle, kind: "cycle" }
+    if (continuation.cycle !== current.cycle) {
+      throw new EgoChatError(
+        "human_required",
+        "The reused Codex turn continuation does not match the repair cycle.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+      activeCodexInspectionRetryCount: undefined,
+      activeCodexTurn: undefined,
+      activeCodexWorkspaceActivity: undefined,
+      codexThreadRotationPending: pending,
+      consecutiveAppServerExitCount: 0,
+      pendingCodexContinuation: continuation,
+      phase: "codex_ready",
+      private: withoutPendingCodexResult(current.private),
+    })
+    return this.#requireRunningConvergence(current.id)
   }
 
   async #rotateConvergenceThread({ client, controller, current, request }) {
