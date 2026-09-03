@@ -1151,6 +1151,95 @@ test("confirmed response capture retries beyond three transient transport failur
   assert.equal(captures, 5)
 })
 
+test("an image-only response protocol gap stops capture without retrying", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/image-only-response"
+  const terminalMarker = "EGO_CHAT_IMAGE_ONLY_RESPONSE_DONE"
+  const turnMarker = "EGO_CHAT_IMAGE_ONLY_RESPONSE_TEST"
+  let captures = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "image-only-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "image-only-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "image-only-tab",
+      taskSpaceId: 24,
+    }),
+    captureExchange: async () => {
+      captures += 1
+      if (captures > 1) {
+        throw new EgoChatError("human_required", "Unexpected retry.", {
+          reason: "authentication_required",
+        })
+      }
+      throw new EgoChatError(
+        "human_required",
+        "The confirmed prompt produced an image-only assistant turn.",
+        {
+          evidence: {
+            attachmentCount: 1,
+            promptMessageIdMatches: true,
+            responseMessageIdPresent: true,
+            responseText: "must not enter durable terminal evidence",
+          },
+          reason: "image_only_response_without_terminal_marker",
+        },
+      )
+    },
+    sendExchange: async () => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "image-only-user",
+      sentAt: new Date().toISOString(),
+      targetId: "image-only-tab",
+      taskSpaceId: 24,
+      turnMarker,
+    }),
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "image-only-response",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: 24,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "image-only-response",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nGenerate one image.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(
+    stopped.humanRequired.code,
+    "image_only_response_without_terminal_marker",
+  )
+  assert.deepEqual(stopped.humanRequired.evidence, {
+    attachmentCount: 1,
+    promptMessageIdMatches: true,
+    responseMessageIdPresent: true,
+  })
+  assert.equal(captures, 1)
+})
+
 test("event checkpoints bound the active ledger and result blobs are digest verified", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

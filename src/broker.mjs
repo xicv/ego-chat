@@ -189,10 +189,12 @@ const BROWSER_RECOVERY_BOOLEAN_EVIDENCE = [
   "anchorRoleMatches",
   "promptDigestMatches",
   "promptMessageIdMatches",
+  "responseMessageIdPresent",
   "responseEndsWithTerminal",
 ]
 const BROWSER_RECOVERY_COUNT_EVIDENCE = [
   "anchorCount",
+  "attachmentCount",
   "committedCount",
   "promptMarkerCount",
   "renderedMarkerCount",
@@ -376,6 +378,7 @@ const HUMAN_ONLY_BROWSER_REASONS = new Set([
   "browser_contract_mismatch",
   "broker_fence_lost",
   "broker_fence_missing",
+  "image_only_response_without_terminal_marker",
   "model_policy_unsupported",
   "verification_challenge",
 ])
@@ -2649,6 +2652,9 @@ export class Broker {
       }
 
       const isHumanRequired = error instanceof EgoChatError && error.code === "human_required"
+      const humanRequiredEvidence = isHumanRequired
+        ? boundedBrowserRecoveryEvidence(error)
+        : undefined
       const headChange = current.phase === "browser_owned"
         && error.details?.reason === "conversation_head_changed"
         ? safeHeadChangeEvidence(error)
@@ -2741,6 +2747,7 @@ export class Broker {
                 code: browserInterrupted
                   ? "browser_operation_interrupted_before_send_confirmation"
                   : (error.details?.reason ?? "browser_intervention_required"),
+                ...(humanRequiredEvidence ? { evidence: humanRequiredEvidence } : {}),
                 ...(browserInterruption ? { diagnostic: browserInterruption } : {}),
                 ...(headChange ? { headChange } : {}),
                 ...(reanchorableHeadChange
