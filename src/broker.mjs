@@ -3936,7 +3936,7 @@ export class Broker {
             },
           }
         : {}
-    const threadRotationPatch = livenessCheckpoint?.kind === "app_server"
+    const threadRotationPatch = livenessCheckpoint
       ? {
           codexThreadRotationPending: {
             afterCycle: cycle,

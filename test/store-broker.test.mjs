@@ -3473,6 +3473,107 @@ test("convergence asks ChatGPT for recovery guidance instead of retrying side A 
   assert.equal(ego.exchanges, 2)
 })
 
+test("no-inspection liveness guidance rotates to a fresh Codex thread", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const sourceClient = new FakeConvergenceAppServer()
+  sourceClient.runStructuredTurn = async (input) => {
+    sourceClient.turns += 1
+    if (sourceClient.turns > 3) {
+      throw new Error("the abandoned no-inspection thread must not run the next cycle")
+    }
+    const turnId = `codex-no-inspection-source-${sourceClient.turns}`
+    await input.onStarted?.({ turnId })
+    return {
+      durationMs: 10,
+      responseDigest: String(sourceClient.turns).repeat(64),
+      turnId,
+      value: convergenceCandidate(1),
+      workspaceActivity: { count: 0, types: [] },
+    }
+  }
+  const replacementClient = new FakeConvergenceAppServer(() => convergenceCandidate(2))
+  replacementClient.startThread = async () => ({
+    id: "codex-no-inspection-fresh-thread",
+    sessionId: "codex-no-inspection-fresh-thread",
+  })
+  replacementClient.unsubscribeThread = async (threadId) => {
+    assert.equal(threadId, "codex-no-inspection-fresh-thread")
+  }
+  const clients = [sourceClient, replacementClient]
+  let appServerFactoryCalls = 0
+  const ego = createConvergenceEgoAdapter((identity, exchange) => {
+    if (exchange === 1) {
+      return {
+        ...identity,
+        criteria: [
+          { evidence: "The first cycle has no workspace evidence.", id: "AC-1", status: "unknown" },
+          { evidence: "A fresh thread must inspect the workspace.", id: "AC-2", status: "unknown" },
+        ],
+        decision: "continue",
+        findings: [{
+          action: "Continue in a fresh Codex thread with observable inspection.",
+          id: "B-NO-INSPECTION-THREAD",
+          severity: "blocking",
+          title: "Rotate the exhausted Codex thread",
+        }],
+        summary: "Continue after the no-inspection liveness checkpoint.",
+      }
+    }
+    assert.equal(exchange, 2)
+    return {
+      ...identity,
+      criteria: [
+        { evidence: "The target identity remained exact.", id: "AC-1", status: "pass" },
+        { evidence: "The fresh thread inspected the workspace.", id: "AC-2", status: "pass" },
+      ],
+      decision: "settled",
+      findings: [],
+      summary: "The fresh-thread continuation is settled.",
+    }
+  })
+  const broker = new Broker({
+    appServerFactory: () => {
+      appServerFactoryCalls += 1
+      return clients.shift()
+    },
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-inspection-liveness-thread-rotation",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Identity is bound.", "The fresh thread inspects the workspace."],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Rotate after a no-inspection liveness checkpoint.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(
+    completed.status,
+    "succeeded",
+    JSON.stringify(completed.error ?? completed.humanRequired ?? completed),
+  )
+  assert.equal(completed.codexInspectionLivenessCheckpointCount, 1)
+  assert.equal(completed.codexThreadGeneration, 2)
+  assert.equal(completed.codexThreadRotationCount, 1)
+  assert.equal(completed.lastCodexThreadRotation.abandonedThreadId, "codex-convergence-thread")
+  assert.equal(completed.lastCodexThreadRotation.threadId, "codex-no-inspection-fresh-thread")
+  assert.equal(sourceClient.turns, 3)
+  assert.equal(replacementClient.turns, 1)
+  assert.equal(appServerFactoryCalls, 2)
+  assert.equal(ego.exchanges, 2)
+})
+
 test("no-inspection liveness candidate capture is atomic across broker restart", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
