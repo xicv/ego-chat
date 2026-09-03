@@ -1678,6 +1678,20 @@ mod tests {
     }
 
     #[test]
+    fn release_version_surfaces_match_the_cargo_package() {
+        let version = env!("CARGO_PKG_VERSION");
+        let javascript_constants = include_str!("../src/constants.mjs");
+        let package_json = include_str!("../package.json");
+        let package_lock = include_str!("../package-lock.json");
+        let javascript_version = format!("export const APP_VERSION = \"{version}\"");
+        let npm_version = format!("\"version\": \"{version}\"");
+
+        assert!(javascript_constants.contains(&javascript_version));
+        assert!(package_json.contains(&npm_version));
+        assert_eq!(package_lock.matches(&npm_version).count(), 2);
+    }
+
+    #[test]
     fn codex_configuration_is_scoped_and_preserves_other_entries() {
         let directory = TestDirectory::new();
         let config = directory.0.join("config.toml");
