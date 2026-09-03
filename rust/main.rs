@@ -17,8 +17,11 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const MINIMUM_NODE_MAJOR: u64 = 24;
 const RUNTIME_MARKER: &str = ".ego-chat-runtime-version";
 const MCP_SERVER_NAME: &str = "ego_chat";
-const MCP_TOOL_TIMEOUT_SECONDS: i64 = 21_900;
-const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = 21_900_000;
+const MAX_CONVERGENCE_ATTACHMENT_SECONDS: i64 = 8 * 60 * 60;
+const MCP_TOOL_TIMEOUT_GRACE_SECONDS: i64 = 5 * 60;
+const MCP_TOOL_TIMEOUT_SECONDS: i64 =
+    MAX_CONVERGENCE_ATTACHMENT_SECONDS + MCP_TOOL_TIMEOUT_GRACE_SECONDS;
+const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = MCP_TOOL_TIMEOUT_SECONDS as u64 * 1_000;
 const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
 
 struct EmbeddedFile {
@@ -828,6 +831,33 @@ fn server_matches(item: &Item, executable: &str) -> bool {
     command_matches && args_match
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostConfigStatus {
+    Ready,
+    Missing,
+    IdentityMismatch,
+    TimeoutMissingOrInvalid,
+    TimeoutTooShort,
+}
+
+fn codex_server_value_status(item: &Item, executable: &str) -> HostConfigStatus {
+    if !server_matches(item, executable) {
+        return HostConfigStatus::IdentityMismatch;
+    }
+    let Some(timeout) = item
+        .as_table()
+        .and_then(|table| table.get("tool_timeout_sec"))
+        .and_then(Item::as_integer)
+    else {
+        return HostConfigStatus::TimeoutMissingOrInvalid;
+    };
+    if timeout < MCP_TOOL_TIMEOUT_SECONDS {
+        HostConfigStatus::TimeoutTooShort
+    } else {
+        HostConfigStatus::Ready
+    }
+}
+
 fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result<(), String> {
     let original = match fs::read_to_string(config_path) {
         Ok(value) => value,
@@ -879,10 +909,16 @@ fn configure_zcode(config_path: &Path, executable: &Path, force: bool) -> Result
     for codex_only_key in ["required", "startup_timeout_sec", "tool_timeout_sec"] {
         server.remove(codex_only_key);
     }
-    server.insert(
-        "timeoutMs".to_string(),
-        JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
-    );
+    let existing_timeout = server
+        .get("timeoutMs")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if existing_timeout < MCP_TOOL_TIMEOUT_MILLISECONDS {
+        server.insert(
+            "timeoutMs".to_string(),
+            JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
+        );
+    }
     let mut configured = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("could not serialize {}: {error}", config_path.display()))?;
     configured.push('\n');
@@ -916,9 +952,40 @@ fn zcode_server_identity_matches(value: &JsonValue, executable: &str) -> bool {
     command_matches && args_match
 }
 
-fn zcode_server_value_matches(value: &JsonValue, executable: &str) -> bool {
-    zcode_server_identity_matches(value, executable)
-        && value.get("timeoutMs").and_then(JsonValue::as_u64) == Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
+fn zcode_server_value_status(value: &JsonValue, executable: &str) -> HostConfigStatus {
+    if !zcode_server_identity_matches(value, executable) {
+        return HostConfigStatus::IdentityMismatch;
+    }
+    let Some(timeout) = value.get("timeoutMs").and_then(JsonValue::as_u64) else {
+        return HostConfigStatus::TimeoutMissingOrInvalid;
+    };
+    if timeout < MCP_TOOL_TIMEOUT_MILLISECONDS {
+        HostConfigStatus::TimeoutTooShort
+    } else {
+        HostConfigStatus::Ready
+    }
+}
+
+fn host_config_problem(
+    host: &str,
+    timeout_field: &str,
+    minimum: u64,
+    unit: &str,
+    status: HostConfigStatus,
+) -> String {
+    match status {
+        HostConfigStatus::Ready => format!("{host} MCP server {MCP_SERVER_NAME} is ready"),
+        HostConfigStatus::Missing => format!("{host} MCP server {MCP_SERVER_NAME} is missing"),
+        HostConfigStatus::IdentityMismatch => {
+            format!("{host} MCP server {MCP_SERVER_NAME} command or args are mismatched")
+        }
+        HostConfigStatus::TimeoutMissingOrInvalid => format!(
+            "{host} MCP server {MCP_SERVER_NAME} has a missing or invalid {timeout_field}; expected at least {minimum} {unit}"
+        ),
+        HostConfigStatus::TimeoutTooShort => format!(
+            "{host} MCP server {MCP_SERVER_NAME} has a too-short {timeout_field}; expected at least {minimum} {unit}"
+        ),
+    }
 }
 
 fn doctor() -> Result<(), String> {
@@ -975,10 +1042,19 @@ fn doctor() -> Result<(), String> {
     }
     let executable = env::current_exe()
         .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
-    if codex_server_matches(&paths.codex_config, &executable)? {
-        println!("[ok] Codex MCP server {MCP_SERVER_NAME} points to this executable");
+    let server_status = codex_server_status(&paths.codex_config, &executable)?;
+    if server_status == HostConfigStatus::Ready {
+        println!(
+            "[ok] Codex MCP server {MCP_SERVER_NAME} points to this executable with the required tool timeout"
+        );
     } else {
-        let message = format!("Codex MCP server {MCP_SERVER_NAME} is missing or points elsewhere");
+        let message = host_config_problem(
+            "Codex",
+            "tool_timeout_sec",
+            MCP_TOOL_TIMEOUT_SECONDS as u64,
+            "seconds",
+            server_status,
+        );
         println!("[fail] {message}");
         failures.push(message);
     }
@@ -1056,10 +1132,19 @@ fn doctor_zcode() -> Result<(), String> {
     }
     let executable = env::current_exe()
         .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
-    if zcode_server_matches(&paths.zcode_config, &executable)? {
-        println!("[ok] ZCode MCP server {MCP_SERVER_NAME} points to this executable");
+    let server_status = zcode_server_status(&paths.zcode_config, &executable)?;
+    if server_status == HostConfigStatus::Ready {
+        println!(
+            "[ok] ZCode MCP server {MCP_SERVER_NAME} points to this executable with the required tool timeout"
+        );
     } else {
-        let message = format!("ZCode MCP server {MCP_SERVER_NAME} is missing or points elsewhere");
+        let message = host_config_problem(
+            "ZCode",
+            "timeoutMs",
+            MCP_TOOL_TIMEOUT_MILLISECONDS,
+            "milliseconds",
+            server_status,
+        );
         println!("[fail] {message}");
         failures.push(message);
     }
@@ -1098,10 +1183,12 @@ fn managed_files_match(root: &Path, embedded_files: &[EmbeddedFile]) -> bool {
     })
 }
 
-fn codex_server_matches(config_path: &Path, executable: &Path) -> Result<bool, String> {
+fn codex_server_status(config_path: &Path, executable: &Path) -> Result<HostConfigStatus, String> {
     let contents = match fs::read_to_string(config_path) {
         Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HostConfigStatus::Missing);
+        }
         Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
     };
     let document = contents
@@ -1112,15 +1199,17 @@ fn codex_server_matches(config_path: &Path, executable: &Path) -> Result<bool, S
         .and_then(Item::as_table)
         .and_then(|servers| servers.get(MCP_SERVER_NAME))
     else {
-        return Ok(false);
+        return Ok(HostConfigStatus::Missing);
     };
-    Ok(server_matches(server, &path_bytes(executable)?))
+    Ok(codex_server_value_status(server, &path_bytes(executable)?))
 }
 
-fn zcode_server_matches(config_path: &Path, executable: &Path) -> Result<bool, String> {
+fn zcode_server_status(config_path: &Path, executable: &Path) -> Result<HostConfigStatus, String> {
     let contents = match fs::read_to_string(config_path) {
         Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HostConfigStatus::Missing);
+        }
         Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
     };
     let document = serde_json::from_str::<JsonValue>(&contents)
@@ -1130,9 +1219,9 @@ fn zcode_server_matches(config_path: &Path, executable: &Path) -> Result<bool, S
         .and_then(|mcp| mcp.get("servers"))
         .and_then(|servers| servers.get(MCP_SERVER_NAME))
     else {
-        return Ok(false);
+        return Ok(HostConfigStatus::Missing);
     };
-    Ok(zcode_server_value_matches(server, &path_bytes(executable)?))
+    Ok(zcode_server_value_status(server, &path_bytes(executable)?))
 }
 
 fn proxy_node(script: &str, arguments: &[OsString]) -> Result<u8, String> {
@@ -1579,6 +1668,16 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_timeout_outlives_the_eight_hour_attachment_contract() {
+        let javascript_constants = include_str!("../src/constants.mjs");
+
+        assert!(javascript_constants.contains("export const MAX_WAIT_MS = 8 * 60 * 60 * 1000"));
+        assert_eq!(MAX_CONVERGENCE_ATTACHMENT_SECONDS, 28_800);
+        assert_eq!(MCP_TOOL_TIMEOUT_SECONDS, 29_100);
+        assert_eq!(MCP_TOOL_TIMEOUT_MILLISECONDS, 29_100_000);
+    }
+
+    #[test]
     fn codex_configuration_is_scoped_and_preserves_other_entries() {
         let directory = TestDirectory::new();
         let config = directory.0.join("config.toml");
@@ -1602,6 +1701,49 @@ mod tests {
         assert_eq!(
             server["tool_timeout_sec"].as_integer(),
             Some(MCP_TOOL_TIMEOUT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn codex_configuration_raises_an_owned_legacy_tool_timeout_without_force() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("config.toml");
+        let executable = directory.0.join("bin/ego-chat");
+        fs::write(
+            &config,
+            format!(
+                "model = \"preserved\"\n\n[mcp_servers.other]\ncommand = \"other\"\n\n[mcp_servers.ego_chat]\ncommand = {:?}\nargs = [\"mcp\"]\ntool_timeout_sec = 21900\ncustom = \"preserved\"\n",
+                executable.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("seed legacy config");
+
+        assert_eq!(
+            codex_server_status(&config, &executable).expect("inspect legacy config"),
+            HostConfigStatus::TimeoutTooShort
+        );
+        configure_codex(&config, &executable, false).expect("raise owned timeout");
+        assert_eq!(
+            codex_server_status(&config, &executable).expect("inspect repaired config"),
+            HostConfigStatus::Ready
+        );
+
+        let document = fs::read_to_string(&config)
+            .expect("read repaired config")
+            .parse::<DocumentMut>()
+            .expect("parse repaired config");
+        assert_eq!(
+            document["mcp_servers"][MCP_SERVER_NAME]["tool_timeout_sec"].as_integer(),
+            Some(MCP_TOOL_TIMEOUT_SECONDS)
+        );
+        assert_eq!(document["model"].as_str(), Some("preserved"));
+        assert_eq!(
+            document["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+        assert_eq!(
+            document["mcp_servers"][MCP_SERVER_NAME]["custom"].as_str(),
+            Some("preserved")
         );
     }
 
@@ -1680,10 +1822,10 @@ mod tests {
             Some("other")
         );
         let server = &document["mcp"]["servers"][MCP_SERVER_NAME];
-        assert!(zcode_server_value_matches(
-            server,
-            executable.to_str().expect("utf8 path")
-        ));
+        assert_eq!(
+            zcode_server_value_status(server, executable.to_str().expect("utf8 path")),
+            HostConfigStatus::Ready
+        );
         assert_eq!(
             server["timeoutMs"].as_u64(),
             Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
@@ -1710,7 +1852,10 @@ mod tests {
         );
 
         configure_zcode(&config, &executable, true).expect("replace with force");
-        assert!(zcode_server_matches(&config, &executable).expect("inspect ZCode config"));
+        assert_eq!(
+            zcode_server_status(&config, &executable).expect("inspect ZCode config"),
+            HostConfigStatus::Ready
+        );
         let configured = serde_json::from_str::<JsonValue>(
             &fs::read_to_string(&config).expect("read configured ZCode config"),
         )
@@ -1721,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn zcode_configuration_normalizes_every_invalid_timeout_form() {
+    fn zcode_configuration_repairs_owned_short_timeouts_without_force() {
         let directory = TestDirectory::new();
         let executable = directory.0.join("ego-chat");
         let invalid_timeouts = [
@@ -1734,7 +1879,7 @@ mod tests {
                 )),
             ),
             ("too-small", Some(JsonValue::from(30_000_u64))),
-            ("excessive", Some(JsonValue::from(3_800_000_u64))),
+            ("legacy-short", Some(JsonValue::from(21_900_000_u64))),
         ];
 
         for (label, invalid_timeout) in invalid_timeouts {
@@ -1748,6 +1893,10 @@ mod tests {
                 "args".to_string(),
                 JsonValue::Array(vec![JsonValue::String("mcp".to_string())]),
             );
+            server.insert(
+                "custom".to_string(),
+                JsonValue::String("preserved".to_string()),
+            );
             if let Some(timeout) = invalid_timeout {
                 server.insert("timeoutMs".to_string(), timeout);
             }
@@ -1757,6 +1906,7 @@ mod tests {
             mcp.insert("servers".to_string(), JsonValue::Object(servers));
             let mut root = JsonMap::new();
             root.insert("mcp".to_string(), JsonValue::Object(mcp));
+            root.insert("unrelated".to_string(), JsonValue::Bool(true));
             let document = JsonValue::Object(root);
             fs::write(
                 &config,
@@ -1764,9 +1914,15 @@ mod tests {
             )
             .expect("seed invalid timeout");
 
-            assert!(!zcode_server_matches(&config, &executable).expect("inspect invalid config"));
+            assert_ne!(
+                zcode_server_status(&config, &executable).expect("inspect invalid config"),
+                HostConfigStatus::Ready
+            );
             configure_zcode(&config, &executable, false).expect("normalize owned timeout");
-            assert!(zcode_server_matches(&config, &executable).expect("inspect repaired config"));
+            assert_eq!(
+                zcode_server_status(&config, &executable).expect("inspect repaired config"),
+                HostConfigStatus::Ready
+            );
             let repaired = serde_json::from_str::<JsonValue>(
                 &fs::read_to_string(&config).expect("read repaired config"),
             )
@@ -1776,7 +1932,132 @@ mod tests {
                 Some(MCP_TOOL_TIMEOUT_MILLISECONDS),
                 "invalid timeout variant {label} was not normalized"
             );
+            assert_eq!(
+                repaired["mcp"]["servers"][MCP_SERVER_NAME]["custom"].as_str(),
+                Some("preserved")
+            );
+            assert_eq!(repaired["unrelated"].as_bool(), Some(true));
         }
+    }
+
+    #[test]
+    fn owned_host_configuration_preserves_longer_timeouts() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("ego-chat");
+        let longer_seconds = MCP_TOOL_TIMEOUT_SECONDS + 60;
+        let codex_config = directory.0.join("config.toml");
+        fs::write(
+            &codex_config,
+            format!(
+                "[mcp_servers.ego_chat]\ncommand = {:?}\nargs = [\"mcp\"]\ntool_timeout_sec = {longer_seconds}\ncustom = \"preserved\"\n",
+                executable.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("seed Codex config");
+        configure_codex(&codex_config, &executable, false).expect("preserve longer Codex timeout");
+        let codex_document = fs::read_to_string(&codex_config)
+            .expect("read Codex config")
+            .parse::<DocumentMut>()
+            .expect("parse Codex config");
+        assert_eq!(
+            codex_document["mcp_servers"][MCP_SERVER_NAME]["tool_timeout_sec"].as_integer(),
+            Some(longer_seconds)
+        );
+        assert_eq!(
+            codex_document["mcp_servers"][MCP_SERVER_NAME]["custom"].as_str(),
+            Some("preserved")
+        );
+
+        let longer_milliseconds = MCP_TOOL_TIMEOUT_MILLISECONDS + 60_000;
+        let zcode_config = directory.0.join("config.json");
+        fs::write(
+            &zcode_config,
+            format!(
+                r#"{{"mcp":{{"servers":{{"ego_chat":{{"command":{},"args":["mcp"],"timeoutMs":{longer_milliseconds},"custom":"preserved"}}}}}}}}"#,
+                serde_json::to_string(executable.to_str().expect("utf8 path"))
+                    .expect("encode executable")
+            ),
+        )
+        .expect("seed ZCode config");
+        configure_zcode(&zcode_config, &executable, false).expect("preserve longer ZCode timeout");
+        let zcode_document = serde_json::from_str::<JsonValue>(
+            &fs::read_to_string(&zcode_config).expect("read ZCode config"),
+        )
+        .expect("parse ZCode config");
+        let zcode_server = &zcode_document["mcp"]["servers"][MCP_SERVER_NAME];
+        assert_eq!(
+            zcode_server["timeoutMs"].as_u64(),
+            Some(longer_milliseconds)
+        );
+        assert_eq!(zcode_server["custom"].as_str(), Some("preserved"));
+    }
+
+    #[test]
+    fn doctor_status_distinguishes_missing_mismatched_and_timeout_problems() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("ego-chat");
+        let codex_config = directory.0.join("config.toml");
+        let zcode_config = directory.0.join("config.json");
+
+        assert_eq!(
+            codex_server_status(&codex_config, &executable).expect("inspect missing Codex config"),
+            HostConfigStatus::Missing
+        );
+        fs::write(
+            &codex_config,
+            "[mcp_servers.ego_chat]\ncommand = \"someone-else\"\nargs = [\"mcp\"]\ntool_timeout_sec = 29100\n",
+        )
+        .expect("seed mismatched Codex config");
+        assert_eq!(
+            codex_server_status(&codex_config, &executable)
+                .expect("inspect mismatched Codex config"),
+            HostConfigStatus::IdentityMismatch
+        );
+        fs::write(
+            &codex_config,
+            format!(
+                "[mcp_servers.ego_chat]\ncommand = {:?}\nargs = [\"mcp\"]\ntool_timeout_sec = 21900\n",
+                executable.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("seed short Codex config");
+        assert_eq!(
+            codex_server_status(&codex_config, &executable).expect("inspect short Codex config"),
+            HostConfigStatus::TimeoutTooShort
+        );
+        assert!(
+            host_config_problem(
+                "Codex",
+                "tool_timeout_sec",
+                MCP_TOOL_TIMEOUT_SECONDS as u64,
+                "seconds",
+                HostConfigStatus::TimeoutTooShort,
+            )
+            .contains("too-short tool_timeout_sec")
+        );
+
+        fs::write(
+            &zcode_config,
+            format!(
+                r#"{{"mcp":{{"servers":{{"ego_chat":{{"command":{},"args":["mcp"]}}}}}}}}"#,
+                serde_json::to_string(executable.to_str().expect("utf8 path"))
+                    .expect("encode executable")
+            ),
+        )
+        .expect("seed missing ZCode timeout");
+        let zcode_status =
+            zcode_server_status(&zcode_config, &executable).expect("inspect missing ZCode timeout");
+        assert_eq!(zcode_status, HostConfigStatus::TimeoutMissingOrInvalid);
+        assert!(
+            host_config_problem(
+                "ZCode",
+                "timeoutMs",
+                MCP_TOOL_TIMEOUT_MILLISECONDS,
+                "milliseconds",
+                zcode_status,
+            )
+            .contains("missing or invalid timeoutMs")
+        );
     }
 
     #[test]

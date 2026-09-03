@@ -138,6 +138,102 @@ test("the initial supervision read is aborted and drained when the operation fin
   assert.deepEqual(messages, [])
 })
 
+test("polling starts after the initial durable observation and heartbeats from that anchor", async () => {
+  const messages = []
+  let reads = 0
+  let finishOperation
+  let releaseInitialRead
+  let initialReadStarted
+  let intervalScheduled
+  let message = "initial durable state"
+  let tick
+  let now = 1_000
+  const operationFinished = new Promise((resolve) => {
+    finishOperation = resolve
+  })
+  const initialReadReleased = new Promise((resolve) => {
+    releaseInitialRead = resolve
+  })
+  const observedInitialRead = new Promise((resolve) => {
+    initialReadStarted = resolve
+  })
+  const observedInterval = new Promise((resolve) => {
+    intervalScheduled = resolve
+  })
+  const waiting = withProgress(
+    {
+      _meta: { progressToken: "initial-observation-heartbeat" },
+      sendNotification: async (notification) => {
+        messages.push(notification.params.message)
+      },
+    },
+    "heartbeat schedule test",
+    async () => {
+      await operationFinished
+      return "completed"
+    },
+    {
+      clearIntervalFn: (timer) => {
+        assert.equal(timer, "owned-test-interval")
+      },
+      config: {},
+      heartbeatMs: 60_000,
+      now: () => now,
+      pollMs: 10_000,
+      readWorkflow: async () => {
+        reads += 1
+        if (reads === 1) {
+          initialReadStarted()
+          await initialReadReleased
+        }
+        return { supervision: { message } }
+      },
+      setIntervalFn: (callback, delayMs) => {
+        assert.equal(delayMs, 10_000)
+        tick = callback
+        intervalScheduled()
+        return "owned-test-interval"
+      },
+      workflowId: "initial-observation-heartbeat-workflow",
+    },
+  )
+
+  await observedInitialRead
+  assert.equal(tick, undefined)
+  releaseInitialRead()
+  await observedInterval
+  assert.deepEqual(messages, ["initial durable state"])
+
+  message = "changed durable state"
+  now += 1
+  await tick()
+  assert.equal(reads, 2)
+  assert.deepEqual(messages, ["initial durable state", "changed durable state"])
+
+  now += 59_999
+  await tick()
+  assert.equal(reads, 3)
+  assert.deepEqual(messages, ["initial durable state", "changed durable state"])
+
+  now += 1
+  await tick()
+  assert.equal(reads, 4)
+  assert.deepEqual(messages, [
+    "initial durable state",
+    "changed durable state",
+    "changed durable state",
+  ])
+
+  finishOperation()
+  const result = await waiting
+  assert.equal(result, "completed")
+  assert.deepEqual(messages, [
+    "initial durable state",
+    "changed durable state",
+    "changed durable state",
+  ])
+})
+
 test("a delayed progress notification is accepted before the operation result returns", async () => {
   let notifyStarted
   let releaseNotification

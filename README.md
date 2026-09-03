@@ -50,7 +50,7 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - Detached `ego_start_exchange`, `await_workflow`, `workflow_status`, and `cancel_workflow` operations for recovery, plus an explicit acknowledged recovery-abandonment tool that preserves the at-most-once operation tombstone.
 - A staged browser lifecycle that durably records `send_confirmed`, performs response capture read-only, and resumes that capture after a facade or broker restart without resending.
 - One broker-wide FIFO browser lane across every binding and supported host. Confirmed-send response capture uses at most 15-second read-only slices, yields between slices, and revalidates the canonical conversation, prior head, prompt message ID, and unique marker before continuing; it never repeats Send.
-- A two-hour default broker-owned ChatGPT generation budget, a six-hour transport ceiling, and separate caller attachment from browser-workflow ownership.
+- A two-hour default broker-owned ChatGPT generation budget, an eight-hour caller-attachment ceiling, and host MCP caps five minutes longer than that attachment while browser-workflow ownership remains durable.
 - Compact Token-Saver text summaries plus digest-bound `ego_read_result` ranges for responses larger than 16 KiB.
 - Persistent `ego-chat-main` conversation binding with exact canonical-URL verification.
 - A durable `strongest_available` / `maximum_available` ChatGPT web policy, enforced immediately before every send.
@@ -109,7 +109,7 @@ ego-chat doctor-zcode
 - redirects only verified older managed daemon launchers to the new runtime, so a still-open older host facade cannot resurrect an obsolete broker;
 - hands off an authenticated stale broker only after closing new mutation admission and proving it is idle with no prompt mailbox entry or browser child; current brokers drain atomically, while the one-time legacy path quarantines every authenticated socket before two final identity/idle/lease checks and restores those sockets on any active or ambiguous evidence;
 - installs the bundled `ego-chat` skill under `~/.codex/skills/ego-chat`;
-- registers the installed executable as the `ego_chat` STDIO MCP server with a 21,900-second tool timeout.
+- registers the installed executable as the `ego_chat` STDIO MCP server with a timeout of at least 29,100 seconds: the eight-hour attachment plus five minutes of host transport margin.
 
 Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat setup --skip-codex-config` when configuration is managed separately. Setup refuses to replace a different skill or MCP entry unless `--force` is explicit.
 
@@ -117,7 +117,7 @@ Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat
 
 - installs `SKILL.md` under `~/.zcode/skills/ego-chat`;
 - semantically merges `mcp.servers.ego_chat` into `~/.zcode/cli/config.json` while preserving existing plugin and server entries;
-- registers the absolute installed executable with `args: ["mcp"]` and an owned, exact 21,900,000 ms timeout that `doctor-zcode` also validates;
+- registers the absolute installed executable with `args: ["mcp"]` and a timeout of at least 29,100,000 ms: the eight-hour attachment plus five minutes of host transport margin, which `doctor-zcode` also validates;
 - does not require Codex for ZCode-owned review cycles, while preserving a still-executable managed Codex path from an earlier Codex setup when Codex is temporarily absent from `PATH`.
 
 Restart ZCode.app after setup and verify `ego_chat` under MCP Services. The paths and configuration shape follow ZCode's official [MCP Services](https://zcode.z.ai/en/docs/mcp-services) and [Skills](https://zcode.z.ai/en/docs/skill) documentation. A conflicting `ego_chat` server or skill is never replaced without explicit `--force`.
@@ -352,7 +352,7 @@ The Cargo wrapper configures this automatically. For development directly from t
 command = "node"
 args = ["/absolute/path/to/ego-chat/bin/ego-chat-mcp.mjs"]
 required = true
-tool_timeout_sec = 21900
+tool_timeout_sec = 29100
 ```
 
 For development directly from this checkout, ZCode's equivalent native user configuration is:
@@ -364,12 +364,14 @@ For development directly from this checkout, ZCode's equivalent native user conf
       "ego_chat": {
         "command": "node",
         "args": ["/absolute/path/to/ego-chat/bin/ego-chat-mcp.mjs"],
-        "timeoutMs": 21900000
+        "timeoutMs": 29100000
       }
     }
   }
 }
 ```
+
+Both values are eight hours plus five minutes of host transport margin. The one-minute supervised heartbeat keeps a healthy attached call observable; these configured host caps only bound that attachment and remain longer than the broker's eight-hour attachment window. Per-review and per-Codex-turn deadlines remain recovery triggers inside the durable workflow rather than limits on the overall workflow.
 
 ## Codex and ZCode skill
 
