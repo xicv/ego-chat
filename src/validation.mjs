@@ -197,13 +197,16 @@ export const StartConvergenceSchema = z.object({
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,
-  chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+  chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
+    .describe("Per-review browser recovery deadline. This does not bound the durable workflow or its host attachment."),
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),
-  codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+  codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
+    .describe("Per-turn App Server recovery deadline. This does not bound the durable workflow or its host attachment."),
   cwd: z.string().trim().min(1).max(1_024).refine(path.isAbsolute, "Working directory must be absolute"),
   maxCycles: z.number().int().min(1).optional(),
   target: ConvergenceTextSchema(8_000),
-  wallClockTimeoutMs: z.number().int().min(120_000).max(MAX_WAIT_MS).default(MAX_WAIT_MS),
+  wallClockTimeoutMs: z.number().int().min(120_000).max(MAX_WAIT_MS).default(MAX_WAIT_MS)
+    .describe("Host attachment window, at most eight hours. Expiry detaches the waiter without terminating the durable convergence workflow."),
 }).superRefine((value, context) => {
   const contractBytes = Buffer.byteLength(JSON.stringify({
     acceptanceCriteria: value.acceptanceCriteria,

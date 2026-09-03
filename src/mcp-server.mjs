@@ -26,6 +26,7 @@ const PROGRESS_POLL_MS = 10 * 1_000
 
 function waitModeSchema(defaultMode = "progress") {
   return z.enum(WAIT_MODES).default(defaultMode)
+    .describe("progress reports semantic durable-state changes plus at most one unchanged-state heartbeat per minute; token_saver performs no supervision reads or notifications.")
 }
 
 const EGO_EXCHANGE_INPUT_SCHEMA = {
@@ -65,9 +66,11 @@ const CONVERGENCE_INPUT_SCHEMA = {
   acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true).describe("Every ChatGPT review cycle and its read-only recovery may reclaim only this binding's exact deterministic Ego task space."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
-  chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+  chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
+    .describe("Per-review browser recovery deadline. This does not bound the durable workflow or its host attachment."),
   codexSandbox: z.enum(["read-only", "workspace-write"]).default("read-only"),
-  codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000),
+  codexTurnTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
+    .describe("Per-turn App Server recovery deadline. This does not bound the durable workflow or its host attachment."),
   cwd: z.string().min(1).max(1_024),
   maxCycles: z.number().int().min(1).optional().describe("Optional caller-selected cycle budget. Omit it to continue until objective settlement."),
   target: z.string().trim().min(1).max(8_000),
@@ -293,8 +296,11 @@ export async function readSupervisedWorkflow(
 export async function withProgress(extra, description, operation, {
   config,
   heartbeatMs = PROGRESS_HEARTBEAT_MS,
+  now = Date.now,
   pollMs = PROGRESS_POLL_MS,
   readWorkflow = readSupervisedWorkflow,
+  clearIntervalFn = clearInterval,
+  setIntervalFn = setInterval,
   workflowId,
 } = {}) {
   let progress = 0
@@ -306,6 +312,7 @@ export async function withProgress(extra, description, operation, {
   let activeSend = Promise.resolve()
   let pendingNotification
   let sending = false
+  let timer
   const statusController = new AbortController()
   const flushNotification = () => {
     if (closed || sending || !pendingNotification) return
@@ -339,11 +346,11 @@ export async function withProgress(extra, description, operation, {
         }
       }
       if (closed) return
-      const now = Date.now()
-      if (!force && fingerprint === lastFingerprint && now - lastNotificationAt < heartbeatMs) return
+      const observedAt = now()
+      if (!force && fingerprint === lastFingerprint && observedAt - lastNotificationAt < heartbeatMs) return
       progress += 1
       lastFingerprint = fingerprint
-      lastNotificationAt = now
+      lastNotificationAt = observedAt
       if (closed) return
       pendingNotification = {
         method: "notifications/progress",
@@ -359,17 +366,22 @@ export async function withProgress(extra, description, operation, {
     }
   }
   const operationPromise = Promise.resolve().then(operation)
-  activePoll = notify(true).catch(() => {})
-  const timer = setInterval(() => {
-    if (closed || reading) return
-    activePoll = notify().catch(() => {})
-  }, pollMs)
+  activePoll = notify(true)
+    .catch(() => {})
+    .finally(() => {
+      if (closed) return
+      timer = setIntervalFn(() => {
+        if (closed || reading) return
+        activePoll = notify().catch(() => {})
+        return activePoll
+      }, pollMs)
+    })
 
   try {
     return await operationPromise
   } finally {
     closed = true
-    clearInterval(timer)
+    clearIntervalFn(timer)
     statusController.abort()
     await activePoll.catch(() => {})
     pendingNotification = undefined
