@@ -63,6 +63,38 @@ test("supervision distinguishes an unconfirmed delivery from a confirmed Send", 
   assert.equal(confirmed.lastTransitionAt, "2026-09-03T00:03:00.000Z")
 })
 
+test("supervision distinguishes active generation from a markerless completed response", () => {
+  const parent = convergence({
+    childWorkflowId: "child-1",
+    phase: "chatgpt_running",
+  })
+  const generating = superviseWorkflow(parent, {
+    capturePending: {
+      generationRunning: true,
+      observedAt: "2026-09-03T00:02:00.000Z",
+      reason: "generation_running",
+    },
+    phase: "send_confirmed",
+    status: "running",
+  })
+  const markerless = superviseWorkflow(parent, {
+    capturePending: {
+      generationRunning: false,
+      observedAt: "2026-09-03T00:03:00.000Z",
+      reason: "response_not_terminal",
+    },
+    phase: "send_confirmed",
+    status: "running",
+  })
+
+  assert.equal(generating.chatGpt.delivery, "sent_generating")
+  assert.equal(generating.chatGpt.pendingReason, "generation_running")
+  assert.match(generating.message, /actively generating/)
+  assert.equal(markerless.chatGpt.delivery, "sent_response_incomplete")
+  assert.equal(markerless.chatGpt.pendingReason, "response_not_terminal")
+  assert.match(markerless.message, /response is present but not terminal/)
+})
+
 test("supervision reports a captured response without inspecting private workflow data", () => {
   const supervision = superviseWorkflow(convergence({
     childWorkflowId: "child-1",

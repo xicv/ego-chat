@@ -759,7 +759,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
     }),
     captureExchange: async () => {
       captures += 1
-      if (captures === 1) {
+      if (captures <= 2) {
         return {
           canonicalUrl,
           captureReason: "response_not_terminal",
@@ -820,7 +820,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
     timeoutMs: 30_000,
     turnMarker,
   })
-  const completed = await broker.awaitWorkflow({ timeoutMs: 4_000, workflowId: started.id })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 7_000, workflowId: started.id })
 
   assert.equal(completed.status, "succeeded")
   assert.ok(
@@ -828,7 +828,18 @@ test("confirmed exchanges resume after a bounded pending capture without another
       >= 2 * 60 * 60 * 1_000 + 25,
   )
   assert.equal(sends, 1)
-  assert.equal(captures, 2)
+  assert.equal(captures, 3)
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  const pendingEvents = events.filter((event) => event.type === "exchange.response_pending")
+  assert.equal(pendingEvents.length, 1)
+  assert.deepEqual(pendingEvents[0].workflow.capturePending, {
+    generationRunning: false,
+    observedAt: pendingEvents[0].at,
+    reason: "response_not_terminal",
+  })
 })
 
 test("recoverable maximum-model UI uncertainty stays in the same exchange until Send succeeds", async (t) => {

@@ -2442,6 +2442,25 @@ export class Broker {
                 controller.signal,
               )
               if (validatePendingCapture(captured, current)) {
+                const capturePending = {
+                  generationRunning: captured.generationRunning,
+                  observedAt: new Date().toISOString(),
+                  reason: captured.captureReason,
+                }
+                if (
+                  current.capturePending?.reason !== capturePending.reason
+                  || current.capturePending?.generationRunning !== capturePending.generationRunning
+                ) {
+                  await this.#transition(current, "exchange.response_pending", {
+                    capturePending,
+                    phase: "send_confirmed",
+                    private: current.private,
+                  })
+                  current = this.#store.getWorkflow(workflow.id)
+                  if (!current || current.status !== "running") {
+                    return
+                  }
+                }
                 const requeueDelayMs = captured.captureReason === "response_not_terminal"
                   ? 2_000
                   : 250
@@ -2477,6 +2496,7 @@ export class Broker {
                 return
               }
               await this.#transition(current, "exchange.capture_failed", {
+                capturePending: undefined,
                 captureRecoveryCount: captureFailures,
                 lastCaptureRecovery: this.#recoveryRecord(error, captureFailures),
                 phase: "send_confirmed",
@@ -2533,6 +2553,7 @@ export class Broker {
           return
         }
         await this.#transition(current, "exchange.response_captured", {
+          capturePending: undefined,
           phase: "response_captured",
           private: current.private,
           result: capturedResult,
