@@ -2066,7 +2066,6 @@ async function egoDriverMain(
       && prompt?.messageId === input.promptMessageId
       && prompt?.role === "user"
       && promptMarkerCount === 1
-      && renderedMarkerCount === 1
       && (!response || (
         response.role === "assistant"
         && (!response.messageId || response.messageId !== prompt.messageId)
@@ -2165,7 +2164,6 @@ async function egoDriverMain(
       && promptMessageIdMatches
       && prompt.messageId !== response.messageId
       && promptMarkerCount === 1
-      && renderedMarkerCount === 1
       && (exactTerminalResponse || protocolRepairResponse)
     )
     if (!attributablePair) {

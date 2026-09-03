@@ -1069,6 +1069,7 @@ async function runTaskSpaceReconciliationCase({
   mode = "reconcile_bound",
   promptIdentityMatches = true,
   requestedTaskSpaceOwnership = null,
+  responseText = "Partial review",
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
@@ -1086,7 +1087,9 @@ async function runTaskSpaceReconciliationCase({
   ]
   const previousText = "Prior assistant response."
   const previousDigest = createHash("sha256").update(previousText, "utf8").digest("hex")
-  const promptText = "EGO_CHAT_RECONCILE_TEST_MARKER\nReview this candidate."
+  const turnMarker = "EGO_CHAT_RECONCILE_TEST_MARKER"
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST"
+  const promptText = `${turnMarker}\nReview this candidate.`
   const promptMessageId = "reconcile-user"
   const captureEntries = [
     { messageId: "previous-assistant", role: "assistant", text: previousText },
@@ -1095,7 +1098,7 @@ async function runTaskSpaceReconciliationCase({
       role: "user",
       text: promptText,
     },
-    { messageId: "partial-assistant", role: "assistant", text: "Partial review" },
+    { messageId: "partial-assistant", role: "assistant", text: responseText },
   ]
   const input = {
     allowDeliveryAbsent: true,
@@ -1121,12 +1124,12 @@ async function runTaskSpaceReconciliationCase({
     canonicalUrl,
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
-    expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    expectedTerminalMarker: terminalMarker,
     inputDigest: createHash("sha256").update(promptText, "utf8").digest("hex"),
     mode,
     promptMessageId,
     timeoutMs: mode === "capture_exchange" ? 1 : 1_000,
-    turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
+    turnMarker,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
   await fs.writeFile(ownerPath, JSON.stringify({
@@ -2560,6 +2563,21 @@ test("strict bounded capture commits a stable markerless review for automatic pr
   )
   assert.equal(captured.result.head.lastMessageId, "partial-assistant")
   assert.equal(captured.result.head.lastRole, "assistant")
+})
+
+test("bound capture accepts an exact assistant response that repeats the user turn marker", async () => {
+  const turnMarker = "EGO_CHAT_RECONCILE_TEST_MARKER"
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST"
+  const responseText = `Checked ${turnMarker}.\n${terminalMarker}`
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+    responseText,
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.responseText, responseText)
 })
 
 test("bounded capture fails closed when the confirmed prompt identity changes", async () => {
