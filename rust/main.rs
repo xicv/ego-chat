@@ -108,6 +108,22 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/store.mjs"),
     },
     EmbeddedFile {
+        path: "src/task-domain.mjs",
+        bytes: include_bytes!("../src/task-domain.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/task-fakes.mjs",
+        bytes: include_bytes!("../src/task-fakes.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/task-spine.mjs",
+        bytes: include_bytes!("../src/task-spine.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/task-store.mjs",
+        bytes: include_bytes!("../src/task-store.mjs"),
+    },
+    EmbeddedFile {
         path: "src/upgrade-dispatch.mjs",
         bytes: include_bytes!("../src/upgrade-dispatch.mjs"),
     },

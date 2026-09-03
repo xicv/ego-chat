@@ -3,6 +3,8 @@
 import { Broker } from "../src/broker.mjs"
 import { AppServerClient } from "../src/app-server-client.mjs"
 import { EventStore } from "../src/store.mjs"
+import { DurableTaskSpine } from "../src/task-spine.mjs"
+import { DurableTaskStore } from "../src/task-store.mjs"
 import { EgoAdapter } from "../src/ego-adapter.mjs"
 import { loadConfig } from "../src/config.mjs"
 import { loadOrCreateBrokerToken } from "../src/auth-token.mjs"
@@ -30,6 +32,7 @@ for (const legacySocketPath of config.legacySocketPaths) {
   }
 }
 const store = new EventStore(config.dataDir)
+const taskSpine = new DurableTaskSpine({ store: new DurableTaskStore(config.dataDir) })
 const brokerLease = {
   brokerId: lease.identity.brokerId,
   epoch: lease.identity.epoch,
@@ -49,6 +52,7 @@ const broker = new Broker({
   brokerLease,
   egoAdapter,
   store,
+  taskSpine,
 })
 
 try {
