@@ -7147,6 +7147,204 @@ test("broker restart repairs a missing no-inspection thread rotation", async (t)
   assert.equal(ego.exchanges, 1)
 })
 
+test("broker restart retires an old-thread review before accepting settlement", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/convergence-restart-old-thread-review"
+  await seedRestartBinding(dataDir, canonicalUrl)
+  const contract = createContract(
+    "Retire a delivered review whose candidate reused an exhausted Codex thread.",
+    ["Identity is bound.", "Only a fresh-thread candidate may settle."],
+  )
+  const workflowId = "45401d01-c88f-470e-bd70-fbb410676f61"
+  const staleCandidate = convergenceCandidate(2)
+  const staleCandidateDigest = digestJson(staleCandidate)
+  const markerToken = digestJson({
+    cycle: 2,
+    purpose: "review",
+    workflowId,
+  }).slice(0, 32).toUpperCase()
+  const turnMarker = `EGO_CHAT_CONVERGENCE_${markerToken}_C2`
+  const terminalMarker = `EGO_CHAT_REVIEW_DONE_${markerToken}`
+  const staleReview = {
+    candidateDigest: staleCandidateDigest,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      { evidence: "The stale candidate appears complete.", id: "AC-2", status: "pass" },
+    ],
+    cycle: 2,
+    decision: "settled",
+    findings: [],
+    summary: "The stale candidate would otherwise settle.",
+    targetDigest: contract.targetDigest,
+  }
+  const staleResponseText = `${JSON.stringify(staleReview)}\n${terminalMarker}`
+  let staleBrowserSends = 0
+  const firstBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      exchange: async (input) => {
+        staleBrowserSends += 1
+        return {
+          canonicalUrl,
+          durationMs: 20,
+          head: {
+            fingerprint: "old-thread-review-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(staleResponseText),
+            lastMessageId: "old-thread-review-assistant",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(staleResponseText),
+          responseText: staleResponseText,
+          targetId: "restart-tab",
+          taskSpaceId: 10,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await firstBroker.initialize()
+  const staleChild = await firstBroker.startEgoExchange({
+    allowProtocolRepairCapture: true,
+    allowTaskSpaceReclaim: true,
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: terminalMarker,
+    prompt: buildChatGptPrompt({
+      candidate: staleCandidate,
+      candidateDigest: staleCandidateDigest,
+      contract,
+      cycle: 2,
+      terminalMarker,
+      turnMarker,
+    }),
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  await firstBroker.awaitWorkflow({ timeoutMs: 5_000, workflowId: staleChild.id })
+  firstBroker.close()
+
+  const livenessCandidate = {
+    ...convergenceCandidate(1),
+    blockers: ["The exhausted thread produced no workspace evidence."],
+    status: "blocked",
+  }
+  const livenessCandidateDigest = digestJson(livenessCandidate)
+  const livenessReview = {
+    candidateDigest: livenessCandidateDigest,
+    criteria: [
+      { evidence: "The target identity remains exact.", id: "AC-1", status: "pass" },
+      { evidence: "Continue in a fresh Codex thread.", id: "AC-2", status: "fail" },
+    ],
+    cycle: 1,
+    decision: "continue",
+    findings: [{
+      action: "Rotate before the next Codex turn.",
+      id: "B-ROTATE-AFTER-INSPECTION-LIVENESS",
+      severity: "blocking",
+      title: "Fresh Codex thread required",
+    }],
+    summary: "Continue after repairing the missing rotation.",
+    targetDigest: contract.targetDigest,
+  }
+  const livenessWorkflow = convergenceRestartWorkflow({
+    candidate: livenessCandidate,
+    contract,
+    id: workflowId,
+    phase: "review_captured",
+    review: livenessReview,
+  })
+  livenessWorkflow.codexInspectionLivenessCheckpointCount = 1
+  livenessWorkflow.codexInspectionRetryCount = 3
+  livenessWorkflow.codexThreadGeneration = 1
+  livenessWorkflow.codexThreadRotationCount = 0
+  livenessWorkflow.private.cycles[0].livenessCheckpoint = {
+    kind: "inspection",
+    retryCount: 3,
+    sourceTurnId: "codex-no-inspection-source-turn",
+  }
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persist("workflow.started", livenessWorkflow)
+  const persistedLiveness = store.getWorkflow(workflowId)
+  const staleWorkflow = structuredClone(persistedLiveness)
+  staleWorkflow.candidateDigest = staleCandidateDigest
+  staleWorkflow.childWorkflowId = staleChild.id
+  staleWorkflow.cycle = 2
+  staleWorkflow.phase = "chatgpt_running"
+  staleWorkflow.private.cycles = [
+    {
+      candidateDigest: livenessCandidateDigest,
+      codex: {
+        responseDigest: "b".repeat(64),
+        turnId: "codex-no-inspection-source-turn",
+      },
+      cycle: 1,
+      reviewSignature: reviewSignature(livenessReview),
+    },
+    {
+      candidate: staleCandidate,
+      candidateDigest: staleCandidateDigest,
+      codex: {
+        appServerRecoveryCount: 0,
+        durationMs: 10,
+        inspectionRetryCount: 0,
+        responseDigest: "c".repeat(64),
+        turnId: "codex-old-thread-candidate",
+        workspaceActivity: { count: 1, types: ["commandExecution"] },
+      },
+      cycle: 2,
+    },
+  ]
+  staleWorkflow.private.priorReview = livenessReview
+  delete staleWorkflow.lastCodexLivenessCheckpoint
+  await store.persist("convergence.chatgpt_review_started", staleWorkflow, persistedLiveness)
+
+  const appServer = new FakeConvergenceAppServer(() => convergenceCandidate(3))
+  appServer.resumeThread = async () => {
+    throw new Error("the exhausted Codex thread must not be resumed")
+  }
+  appServer.startThread = async () => ({
+    id: "codex-repaired-review-thread",
+    sessionId: "codex-repaired-review-thread",
+  })
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target identity remained exact.", id: "AC-1", status: "pass" },
+      { evidence: "The fresh-thread candidate is complete.", id: "AC-2", status: "pass" },
+    ],
+    decision: "settled",
+    findings: [],
+    summary: "The fresh-thread candidate is settled.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => appServer,
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId })
+
+  assert.equal(
+    completed.status,
+    "succeeded",
+    JSON.stringify(completed.error ?? completed.humanRequired ?? completed),
+  )
+  assert.equal(completed.result.cycleCount, 3)
+  assert.equal(completed.codexThreadGeneration, 2)
+  assert.equal(completed.codexThreadRotationCount, 1)
+  assert.equal(completed.lastCodexThreadRotation.threadId, "codex-repaired-review-thread")
+  assert.equal(appServer.turns, 1)
+  assert.equal(ego.exchanges, 1)
+  assert.equal(staleBrowserSends, 1)
+})
+
 test("running convergence resumes a captured Codex candidate after broker restart", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

@@ -69,7 +69,38 @@ function compactHistoricalConvergenceCycle(record) {
         }
       : {}),
     cycle: record.cycle,
+    ...(record.livenessCheckpoint ? { livenessCheckpoint: record.livenessCheckpoint } : {}),
     ...(record.reviewSignature ? { reviewSignature: record.reviewSignature } : {}),
+  }
+}
+
+function requiresRepairedThreadRotation(workflow, cycle) {
+  return Number.isSafeInteger(workflow.codexThreadRotationPending?.afterCycle)
+    && workflow.codexThreadRotationPending.afterCycle < cycle
+}
+
+function continueAfterRepairedThreadRotation(review, cycle) {
+  if (!review || !Array.isArray(review.findings) || typeof review.summary !== "string") {
+    throw new EgoChatError(
+      "human_required",
+      "The old-thread review is incomplete and cannot be retained for fresh-thread recovery.",
+      { reason: "convergence_recovery_state_invalid" },
+    )
+  }
+  const findingId = "B-FRESH-CODEX-THREAD-REQUIRED"
+  return {
+    ...review,
+    decision: "continue",
+    findings: [
+      ...review.findings.filter((finding) => finding.id !== findingId),
+      {
+        action: `Continue after cycle ${cycle} in the fresh Codex thread required by the preceding liveness checkpoint.`,
+        id: findingId,
+        severity: "blocking",
+        title: "Fresh Codex thread required before settlement",
+      },
+    ],
+    summary: `${review.summary}\n\nBroker recovery note: this candidate reused the exhausted Codex thread after a liveness checkpoint. Its review is retained as untrusted context, but it cannot settle the workflow.`,
   }
 }
 
@@ -3151,6 +3182,7 @@ export class Broker {
         }
         if (
           capturedCycle.candidate.status !== "blocked"
+          && !requiresRepairedThreadRotation(current, current.cycle)
           && evaluateReview(capturedCycle.review).settled
         ) {
           await this.#completeConvergenceSettlement({
@@ -3774,6 +3806,10 @@ export class Broker {
           }
           evaluation = { settled: false }
         }
+        if (requiresRepairedThreadRotation(current, cycle)) {
+          review = continueAfterRepairedThreadRotation(review, cycle)
+          evaluation = { settled: false }
+        }
         const signature = reviewSignature(review)
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
@@ -3958,6 +3994,14 @@ export class Broker {
       candidateDigest,
       consecutiveAppServerExitCount: 0,
       cycle,
+      ...(livenessCheckpoint
+        ? {
+            lastCodexLivenessCheckpoint: {
+              ...livenessCheckpoint,
+              cycle,
+            },
+          }
+        : {}),
       phase: "codex_captured",
       pendingCodexContinuation: undefined,
       private: {
@@ -3975,20 +4019,36 @@ export class Broker {
     if (current.codexThreadRotationPending) {
       return current
     }
-    const livenessCheckpointCount = (
-      (current.codexInspectionLivenessCheckpointCount ?? 0)
-      + (current.codexAppServerLivenessCheckpointCount ?? 0)
-    )
-    const threadRotationCount = current.codexThreadRotationCount ?? 0
+    const checkpointCounts = [
+      current.codexInspectionLivenessCheckpointCount ?? 0,
+      current.codexAppServerLivenessCheckpointCount ?? 0,
+      current.codexThreadRotationCount ?? 0,
+    ]
+    if (checkpointCounts.some((count) => !Number.isSafeInteger(count) || count < 0)) {
+      throw new EgoChatError(
+        "human_required",
+        "The durable liveness or Codex thread-rotation count is invalid.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const livenessCheckpointCount = checkpointCounts[0] + checkpointCounts[1]
+    const threadRotationCount = checkpointCounts[2]
     if (livenessCheckpointCount === threadRotationCount) {
       return current
     }
-    const latestCycle = current.private?.cycles?.at(-1)
-    const checkpoint = latestCycle?.livenessCheckpoint
+    const recordedCheckpointCycle = current.private?.cycles?.findLast(
+      (cycle) => cycle?.livenessCheckpoint,
+    )
+    const checkpoint = recordedCheckpointCycle
+      ? {
+          ...recordedCheckpointCycle.livenessCheckpoint,
+          cycle: recordedCheckpointCycle.cycle,
+        }
+      : current.lastCodexLivenessCheckpoint
     if (
       livenessCheckpointCount !== threadRotationCount + 1
-      || !Number.isSafeInteger(latestCycle?.cycle)
       || !checkpoint
+      || !Number.isSafeInteger(checkpoint.cycle)
       || !["inspection", "app_server"].includes(checkpoint.kind)
       || typeof checkpoint.sourceTurnId !== "string"
       || checkpoint.sourceTurnId.length === 0
@@ -4002,14 +4062,14 @@ export class Broker {
       )
     }
     const pending = {
-      afterCycle: latestCycle.cycle,
+      afterCycle: checkpoint.cycle,
       abandonedThreadId: current.codexThreadId,
       createdAt: new Date().toISOString(),
       nextGeneration: (current.codexThreadGeneration ?? 1) + 1,
       sourceTurnId: checkpoint.sourceTurnId,
     }
     const capturedCheckpointState = (
-      current.cycle === latestCycle.cycle
+      current.cycle === checkpoint.cycle
       && ["codex_captured", "chatgpt_running", "review_captured"].includes(current.phase)
       && !current.activeCodexTurn
     )
@@ -4021,8 +4081,38 @@ export class Broker {
       })
       return this.#requireRunningConvergence(current.id)
     }
+    const carriedCandidateState = (
+      current.cycle === checkpoint.cycle + 1
+      && ["codex_captured", "chatgpt_running", "review_captured"].includes(current.phase)
+      && !current.activeCodexTurn
+    )
+    if (carriedCandidateState) {
+      const capturedCycle = current.private.cycles.at(-1)
+      const repairedReview = current.phase === "review_captured"
+        ? continueAfterRepairedThreadRotation(capturedCycle.review, current.cycle)
+        : undefined
+      await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+        codexThreadRotationPending: pending,
+        phase: current.phase,
+        private: repairedReview
+          ? {
+              ...current.private,
+              cycles: [
+                ...current.private.cycles.slice(0, -1),
+                {
+                  ...capturedCycle,
+                  review: repairedReview,
+                  reviewSignature: reviewSignature(repairedReview),
+                },
+              ],
+              priorReview: repairedReview,
+            }
+          : current.private,
+      })
+      return this.#requireRunningConvergence(current.id)
+    }
     const reusedThreadState = (
-      current.cycle === latestCycle.cycle + 1
+      current.cycle === checkpoint.cycle + 1
       && ["codex_ready", "codex_running", "codex_recovering"].includes(current.phase)
     )
     if (!reusedThreadState) {

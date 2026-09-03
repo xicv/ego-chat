@@ -140,7 +140,9 @@ function migrateState(value) {
   const state = clone(value)
   state.operations ??= {}
 
-  for (const workflow of Object.values(state.workflows)) {
+  for (const [workflowId, persistedWorkflow] of Object.entries(state.workflows)) {
+    const workflow = preserveConvergenceLivenessCheckpoint(persistedWorkflow)
+    state.workflows[workflowId] = workflow
     if (
       workflow.kind === "ego_exchange"
       && typeof workflow.operationKey !== "string"
@@ -175,6 +177,25 @@ function migrateState(value) {
 
   state.schemaVersion = 4
   return state
+}
+
+function preserveConvergenceLivenessCheckpoint(workflow, previousWorkflow = undefined) {
+  if (workflow?.kind !== "convergence") {
+    return workflow
+  }
+  const recordedCycle = workflow.private?.cycles?.findLast(
+    (cycle) => cycle?.livenessCheckpoint,
+  )
+  const checkpoint = recordedCycle
+    ? {
+        ...recordedCycle.livenessCheckpoint,
+        cycle: recordedCycle.cycle,
+      }
+    : workflow.lastCodexLivenessCheckpoint
+      ?? previousWorkflow?.lastCodexLivenessCheckpoint
+  return checkpoint
+    ? { ...workflow, lastCodexLivenessCheckpoint: checkpoint }
+    : workflow
 }
 
 async function listFiles(directory) {
@@ -214,7 +235,10 @@ function applyEvent(state, event) {
   }
 
   if (event.workflow && typeof event.workflow.id === "string") {
-    state.workflows[event.workflow.id] = event.workflow
+    state.workflows[event.workflow.id] = preserveConvergenceLivenessCheckpoint(
+      event.workflow,
+      state.workflows[event.workflow.id],
+    )
     if (event.operation && typeof event.operation.key === "string") {
       state.operations[event.operation.key] = event.operation
     }
