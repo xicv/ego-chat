@@ -184,6 +184,45 @@ function validatePendingCapture(value, workflow) {
   return true
 }
 
+const BROWSER_RECOVERY_BOOLEAN_EVIDENCE = [
+  "anchorDigestMatches",
+  "anchorRoleMatches",
+  "promptDigestMatches",
+  "promptMessageIdMatches",
+  "responseEndsWithTerminal",
+]
+const BROWSER_RECOVERY_COUNT_EVIDENCE = [
+  "anchorCount",
+  "committedCount",
+  "promptMarkerCount",
+  "renderedMarkerCount",
+  "terminalCount",
+]
+
+function boundedBrowserRecoveryEvidence(error) {
+  const source = error?.details?.evidence
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return undefined
+  }
+  const evidence = {}
+  for (const field of BROWSER_RECOVERY_BOOLEAN_EVIDENCE) {
+    if (typeof source[field] === "boolean") {
+      evidence[field] = source[field]
+    }
+  }
+  for (const field of BROWSER_RECOVERY_COUNT_EVIDENCE) {
+    if (Number.isSafeInteger(source[field]) && source[field] >= 0) {
+      evidence[field] = source[field]
+    }
+  }
+  for (const field of ["promptRole", "responseRole"]) {
+    if (["assistant", "user"].includes(source[field])) {
+      evidence[field] = source[field]
+    }
+  }
+  return Object.keys(evidence).length > 0 ? evidence : undefined
+}
+
 function responseExcerpt(value, maximumBytes = 4 * 1024) {
   const bytes = Buffer.from(value, "utf8")
   if (bytes.length <= maximumBytes) {
@@ -2075,6 +2114,7 @@ export class Broker {
   }
 
   #recoveryRecord(error, attempt) {
+    const evidence = boundedBrowserRecoveryEvidence(error)
     return {
       at: new Date().toISOString(),
       attempt,
@@ -2087,6 +2127,7 @@ export class Broker {
       ...(typeof error?.details?.driverStage === "string"
         ? { driverStage: error.details.driverStage }
         : {}),
+      ...(evidence ? { evidence } : {}),
     }
   }
 

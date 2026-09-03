@@ -1073,7 +1073,18 @@ test("confirmed response capture retries beyond three transient transport failur
     captureExchange: async () => {
       captures += 1
       if (captures <= 4) {
-        throw new EgoChatError("ego_driver_error", "Transient browser transport failure.")
+        throw new EgoChatError("human_required", "The browser pair is not attributable.", {
+          evidence: {
+            anchorCount: 1,
+            committedCount: 3,
+            promptMessageIdMatches: true,
+            renderedMarkerCount: 1,
+            responseEndsWithTerminal: true,
+            responseText: "must not enter durable recovery state",
+            terminalCount: 1,
+          },
+          reason: "bound_reconciliation_mismatch",
+        })
       }
       const responseText = terminalMarker
       return {
@@ -1128,6 +1139,15 @@ test("confirmed response capture retries beyond three transient transport failur
 
   assert.equal(completed.status, "succeeded")
   assert.equal(completed.captureRecoveryCount, 4)
+  assert.deepEqual(completed.lastCaptureRecovery.evidence, {
+    anchorCount: 1,
+    committedCount: 3,
+    promptMessageIdMatches: true,
+    renderedMarkerCount: 1,
+    responseEndsWithTerminal: true,
+    terminalCount: 1,
+  })
+  assert.equal(Object.hasOwn(completed.lastCaptureRecovery.evidence, "responseText"), false)
   assert.equal(captures, 5)
 })
 
