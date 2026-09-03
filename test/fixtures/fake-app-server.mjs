@@ -9,6 +9,7 @@ const multipleFinalMessages = process.argv.includes("--multiple-final-messages")
 const phaseUnknownMessages = process.argv.includes("--phase-unknown-messages")
 const interruptedTurnReads = process.argv.includes("--interrupted-turn-reads")
 const interruptedTurnWithoutItems = process.argv.includes("--interrupted-turn-without-items")
+const omitTurnCompleted = process.argv.includes("--omit-turn-completed")
 let turnNumber = 1
 let activeReadsRemaining = 0
 const completedTurns = []
@@ -110,6 +111,8 @@ lines.on("line", (line) => {
       }, 10)
       return
     }
-    send({ method: "turn/completed", params: { threadId, turn } })
+    if (!omitTurnCompleted) {
+      send({ method: "turn/completed", params: { threadId, turn } })
+    }
   }
 })

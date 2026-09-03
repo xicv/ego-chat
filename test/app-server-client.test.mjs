@@ -111,6 +111,36 @@ test("App Server recovery retains workspace activity from an interrupted turn", 
   })
 })
 
+test("App Server client detects a terminal turn when the completion notification is lost", async (t) => {
+  const client = new AppServerClient({
+    args: [fixture, "--interrupted-turn-reads", "--omit-turn-completed"],
+    command: process.execPath,
+    completionPollIntervalMs: 10,
+  })
+  await client.connect()
+  t.after(() => client.close())
+  const thread = await client.startThread({ cwd: process.cwd() })
+  let turnId
+  const startedAt = Date.now()
+
+  await assert.rejects(
+    () => client.runStructuredTurn({
+      onStarted: async (started) => {
+        turnId = started.turnId
+      },
+      outputSchema: CODEX_CANDIDATE_OUTPUT_SCHEMA,
+      prompt: "Return the structured candidate.",
+      threadId: thread.id,
+      timeoutMs: 1_000,
+    }),
+    (error) => error.code === "app_server_turn_failed"
+      && error.details.status === "interrupted"
+      && error.details.turnId === turnId,
+  )
+
+  assert.ok(Date.now() - startedAt < 500)
+})
+
 test("App Server recovery treats a partial interrupted turn without items as no activity", async (t) => {
   const client = new AppServerClient({
     args: [fixture, "--interrupted-turn-reads", "--interrupted-turn-without-items"],
