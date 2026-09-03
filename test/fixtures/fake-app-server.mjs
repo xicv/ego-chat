@@ -7,6 +7,8 @@ const exitAfterTurnStart = process.argv.includes("--exit-after-turn-start")
 const signalAfterTurnStart = process.argv.includes("--signal-after-turn-start")
 const multipleFinalMessages = process.argv.includes("--multiple-final-messages")
 const phaseUnknownMessages = process.argv.includes("--phase-unknown-messages")
+const interruptedTurnReads = process.argv.includes("--interrupted-turn-reads")
+const interruptedTurnWithoutItems = process.argv.includes("--interrupted-turn-without-items")
 let turnNumber = 1
 let activeReadsRemaining = 0
 const completedTurns = []
@@ -90,7 +92,10 @@ lines.on("line", (line) => {
           type: "agentMessage",
         },
       ],
-      status: "completed",
+      status: interruptedTurnReads ? "interrupted" : "completed",
+    }
+    if (interruptedTurnWithoutItems) {
+      delete turn.items
     }
     completedTurns.push(turn)
     activeReadsRemaining = 1

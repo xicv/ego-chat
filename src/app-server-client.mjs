@@ -63,7 +63,7 @@ function structuredTurnResult(turn) {
 }
 
 function summarizeWorkspaceActivity(turn) {
-  const types = turn.items
+  const types = (Array.isArray(turn?.items) ? turn.items : [])
     .filter((item) => WORKSPACE_ACTIVITY_ITEM_TYPES.has(item.type))
     .map((item) => item.type)
   return {
@@ -195,7 +195,11 @@ export class AppServerClient {
         return { disposition: "completed", result: structuredTurnResult(turn) }
       }
       if (turn?.status === "failed" || turn?.status === "interrupted") {
-        return { disposition: "retry", status: turn.status }
+        return {
+          disposition: "retry",
+          status: turn.status,
+          workspaceActivity: summarizeWorkspaceActivity(turn),
+        }
       }
       if (thread.status?.type === "notLoaded" || thread.status?.type === "systemError") {
         throw new EgoChatError("app_server_recovery_ambiguous", "The resumed App Server thread is not readable.", {

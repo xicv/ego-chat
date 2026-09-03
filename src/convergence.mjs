@@ -814,6 +814,52 @@ export function buildCodexInspectionCorrectionPrompt({ contract, cycle }) {
   ].join("\n\n")
 }
 
+export function buildCodexInspectionLivenessCandidate({ contract, cycle, retryCount }) {
+  const blocker = `No observable workspace activity was reported after ${retryCount} Codex turns in cycle ${cycle}.`
+  return {
+    blockers: [blocker],
+    criteria: contract.criteria.map((criterion) => ({
+      evidence: "The broker has no workspace-backed candidate evidence for this cycle yet.",
+      id: criterion.id,
+      status: "unknown",
+    })),
+    reviewPacket: [
+      "Broker liveness checkpoint: side A repeatedly returned without observable workspace activity.",
+      `Cycle: ${cycle}.`,
+      `Inspection retries: ${retryCount}.`,
+      "No implementation claim is being made. Review the immutable target and provide concrete recovery guidance for the next Codex cycle.",
+    ].join("\n"),
+    status: "blocked",
+    summary: `${blocker} The broker is consulting ChatGPT instead of continuing an invisible side-A-only retry loop.`,
+  }
+}
+
+export function buildCodexAppServerLivenessCandidate({
+  contract,
+  cycle,
+  errorCode,
+  recoveryCount,
+}) {
+  const blocker = `The Codex App Server could not recover the accepted turn after ${recoveryCount} consecutive attempts (${errorCode}).`
+  return {
+    blockers: [blocker],
+    criteria: contract.criteria.map((criterion) => ({
+      evidence: "The broker has no completed workspace-backed candidate for this cycle yet.",
+      id: criterion.id,
+      status: "unknown",
+    })),
+    reviewPacket: [
+      "Broker liveness checkpoint: side A is trapped in repeated App Server recovery before candidate capture.",
+      `Cycle: ${cycle}.`,
+      `Consecutive recovery attempts: ${recoveryCount}.`,
+      `Last recovery code: ${errorCode}.`,
+      "No implementation claim is being made. Review the immutable target and provide concrete recovery guidance for a fresh Codex cycle.",
+    ].join("\n"),
+    status: "blocked",
+    summary: `${blocker} The broker is consulting ChatGPT instead of continuing an invisible recovery-only loop.`,
+  }
+}
+
 export function buildCodexCandidateCorrectionPrompt({ contract, cycle, reason }) {
   return [
     "Your preceding convergence result could not be consumed as a candidate, but this is an internal correction turn and does not stop the workflow.",

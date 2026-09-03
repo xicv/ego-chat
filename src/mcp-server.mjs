@@ -18,8 +18,11 @@ import {
   prepareAgentReview,
 } from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
+import { superviseWorkflow } from "./workflow-supervision.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
+const PROGRESS_HEARTBEAT_MS = 60 * 1_000
+const PROGRESS_POLL_MS = 10 * 1_000
 
 function waitModeSchema(defaultMode = "progress") {
   return z.enum(WAIT_MODES).default(defaultMode)
@@ -127,7 +130,7 @@ const MCP_INSTRUCTIONS = [
   "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in, open ego-chat-main, or provide another conversation URL unless the exact broker code is authentication_required or verification_challenge.",
   "Use ego_converge_until_settled for durable multi-cycle work; supply an immutable target, observable acceptance criteria, and the absolute working directory. Use workspace-write when the user authorized local fixes and read-only for review-only targets.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
-  "For Token-Saver waiting, set waitMode to token_saver, keep the one tool call open, and do not poll workflow_status or await_workflow; this suppresses progress chatter but does not reduce required ChatGPT or implementing-agent reasoning.",
+  "Keep the default progress wait for unattended convergence so deterministic broker supervision reports phase changes, recovery counters, and whether ChatGPT delivery is not started, unconfirmed, confirmed, or captured. These local status reads do not invoke another model. Use token_saver only when the user explicitly prefers a silent wait; keep that one tool call open and do not poll workflow_status or await_workflow.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never duplicate an ambiguous send. Keep its durable workflow alive and reconcile it; retry delivery only after exact evidence proves the prior marked prompt absent.",
@@ -256,34 +259,135 @@ function toolError(error) {
   }
 }
 
-async function withProgress(extra, description, operation) {
-  let progress = 0
-  const timer = setInterval(() => {
-    progress += 1
-    if (extra._meta?.progressToken !== undefined) {
-      extra.sendNotification({
-        method: "notifications/progress",
-        params: {
-          message: `${description}; the broker-owned workflow remains attachable`,
-          progress,
-          progressToken: extra._meta.progressToken,
-        },
-      }).catch(() => {})
+export async function readSupervisedWorkflow(
+  config,
+  workflowId,
+  signal = undefined,
+  request = requestBroker,
+) {
+  const workflow = await request(
+    config,
+    "workflow.get",
+    { workflowId },
+    { signal },
+  )
+  let child
+  if (workflow.kind === "convergence" && typeof workflow.childWorkflowId === "string") {
+    try {
+      child = await request(
+        config,
+        "workflow.get",
+        { workflowId: workflow.childWorkflowId },
+        { signal },
+      )
+    } catch (_error) {
+      child = undefined
     }
-  }, 25_000)
-
-  try {
-    return await operation()
-  } finally {
-    clearInterval(timer)
+  }
+  return {
+    ...workflow,
+    supervision: superviseWorkflow(workflow, child),
   }
 }
 
-async function withWaitMode(extra, description, waitMode, operation) {
+export async function withProgress(extra, description, operation, {
+  config,
+  heartbeatMs = PROGRESS_HEARTBEAT_MS,
+  pollMs = PROGRESS_POLL_MS,
+  readWorkflow = readSupervisedWorkflow,
+  workflowId,
+} = {}) {
+  let progress = 0
+  let lastFingerprint
+  let lastNotificationAt = 0
+  let reading = false
+  let closed = false
+  let activePoll = Promise.resolve()
+  let activeSend = Promise.resolve()
+  let pendingNotification
+  let sending = false
+  const statusController = new AbortController()
+  const flushNotification = () => {
+    if (closed || sending || !pendingNotification) return
+    const notification = pendingNotification
+    pendingNotification = undefined
+    sending = true
+    activeSend = Promise.resolve()
+      .then(() => extra.sendNotification(notification))
+      .catch(() => {})
+      .finally(() => {
+        sending = false
+        flushNotification()
+      })
+  }
+  const notify = async (force = false) => {
+    if (closed || reading || extra._meta?.progressToken === undefined) return
+    reading = true
+    try {
+      let fingerprint = description
+      let message = `${description}; the broker-owned workflow remains attachable`
+      if (config && workflowId) {
+        try {
+          const workflow = await readWorkflow(config, workflowId, statusController.signal)
+          if (workflow.supervision?.message) {
+            message = workflow.supervision.message
+            fingerprint = message
+          }
+        } catch (_error) {
+          fingerprint = `${workflowId}:status_unavailable`
+          message = `Ego Chat cannot read durable status for ${workflowId}; the supervisor will retry without resending.`
+        }
+      }
+      if (closed) return
+      const now = Date.now()
+      if (!force && fingerprint === lastFingerprint && now - lastNotificationAt < heartbeatMs) return
+      progress += 1
+      lastFingerprint = fingerprint
+      lastNotificationAt = now
+      if (closed) return
+      pendingNotification = {
+        method: "notifications/progress",
+        params: {
+          message,
+          progress,
+          progressToken: extra._meta.progressToken,
+        },
+      }
+      flushNotification()
+    } finally {
+      reading = false
+    }
+  }
+  const operationPromise = Promise.resolve().then(operation)
+  activePoll = notify(true).catch(() => {})
+  const timer = setInterval(() => {
+    if (closed || reading) return
+    activePoll = notify().catch(() => {})
+  }, pollMs)
+
+  try {
+    return await operationPromise
+  } finally {
+    closed = true
+    clearInterval(timer)
+    statusController.abort()
+    await activePoll.catch(() => {})
+    pendingNotification = undefined
+    await activeSend.catch(() => {})
+  }
+}
+
+export async function withWaitMode(
+  extra,
+  description,
+  waitMode,
+  operation,
+  supervision = undefined,
+) {
   if (waitMode === "token_saver") {
     return operation()
   }
-  return withProgress(extra, description, operation)
+  return withProgress(extra, description, operation, supervision)
 }
 
 export function createMcpServer(config = loadConfig()) {
@@ -347,7 +451,7 @@ export function createMcpServer(config = loadConfig()) {
             signal: extra.signal,
             timeoutMs: Math.min(MAX_WAIT_MS, request.delayMs + 65_000),
           },
-        ))
+        ), { config, workflowId: workflow.id })
         return waitedToolResult(result, waitMode)
       } catch (error) {
         return toolError(error)
@@ -467,6 +571,7 @@ export function createMcpServer(config = loadConfig()) {
             { timeoutMs: waitMs, workflowId: workflow.id },
             { signal: extra.signal, timeoutMs: waitMs + 5_000 },
           ),
+          { config, workflowId: workflow.id },
         )
         return waitedToolResult(result, waitMode)
       } catch (error) {
@@ -578,7 +683,7 @@ export function createMcpServer(config = loadConfig()) {
           "workflow.await",
           { timeoutMs: waitMs, workflowId: workflow.id },
           { signal: extra.signal, timeoutMs: waitMs + 5_000 },
-        ))
+        ), { config, workflowId: workflow.id })
         return waitedToolResult(result, waitMode)
       } catch (error) {
         attachWaitRecovery(error, workflow, input.waitMode)
@@ -641,6 +746,7 @@ export function createMcpServer(config = loadConfig()) {
               { timeoutMs: waitMs, workflowId: workflow.id },
               { signal: extra.signal, timeoutMs: waitMs + 5_000 },
             ),
+            { config, workflowId: workflow.id },
           )
           let exchangeResult = completed.result
           let recoveredLateResponse = false
@@ -799,7 +905,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_converge_until_settled",
     {
-      description: "Run a durable broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is settled. This is the preferred path whenever the user asks for multi-cycle discussion or review until settled, even when the current host initiated the work, because broker ownership survives host detachment and restart. Recoverable browser, model-policy, protocol, task-space, App Server, and oversized-packet states remain inside the durable workflow; do not call ego_verify_conversation first. Omit maxCycles for no arbitrary cycle ceiling; set it only for an explicit caller-selected budget. wallClockTimeoutMs bounds this host attachment, not the durable workflow. Set waitMode to token_saver to suppress progress chatter while broker ownership continues.",
+      description: "Run a durable broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is settled. This is the preferred path whenever the user asks for multi-cycle discussion or review until settled, even when the current host initiated the work, because broker ownership survives host detachment and restart. Recoverable browser, model-policy, protocol, task-space, App Server, and oversized-packet states remain inside the durable workflow; do not call ego_verify_conversation first. Omit maxCycles for no arbitrary cycle ceiling; set it only for an explicit caller-selected budget. wallClockTimeoutMs bounds this host attachment, not the durable workflow. The default progress mode reports deterministic phase and delivery supervision without another model; choose token_saver only for an explicitly silent wait.",
       inputSchema: {
         ...CONVERGENCE_INPUT_SCHEMA,
         waitMode: waitModeSchema(),
@@ -821,6 +927,7 @@ export function createMcpServer(config = loadConfig()) {
             { timeoutMs: waitMs, workflowId: workflow.id },
             { signal: extra.signal, timeoutMs: waitMs + 5_000 },
           ),
+          { config, workflowId: workflow.id },
         )
         return waitedToolResult(result, waitMode)
       } catch (error) {
@@ -848,7 +955,7 @@ export function createMcpServer(config = loadConfig()) {
           "workflow.await",
           request,
           { signal: extra.signal, timeoutMs: Math.min(MAX_WAIT_MS + 5_000, request.timeoutMs + 5_000) },
-        ))
+        ), { config, workflowId: request.workflowId })
         return waitedToolResult(result, waitMode)
       } catch (error) {
         return toolError(error)
@@ -864,7 +971,7 @@ export function createMcpServer(config = loadConfig()) {
     },
     async (input) => {
       try {
-        return toolResult(await requestBroker(config, "workflow.get", input))
+        return toolResult(await readSupervisedWorkflow(config, input.workflowId))
       } catch (error) {
         return toolError(error)
       }
