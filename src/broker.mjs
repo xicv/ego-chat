@@ -3324,7 +3324,45 @@ export class Broker {
                 current = this.#requireRunningConvergence(workflowId, controller.signal)
                 const turnId = current.activeCodexTurn?.turnId
                 if (typeof turnId !== "string" || turnId.length === 0) {
-                  throw error
+                  if (!isRetryableAppServerError(error)) {
+                    throw error
+                  }
+                  let setupError = error
+                  while (true) {
+                    setupRecoveryCount += 1
+                    current = this.#requireRunningConvergence(workflowId, controller.signal)
+                    await this.#transition(current, "convergence.codex_setup_recovery_scheduled", {
+                      appServerSetupRecoveryCount: (current.appServerSetupRecoveryCount ?? 0) + 1,
+                      lastAppServerSetupRecovery: {
+                        ...appServerDiagnostic(setupError),
+                        action: "pre_turn_reconnect",
+                        at: new Date().toISOString(),
+                        code: setupError.code,
+                      },
+                      pendingCodexContinuation: codexContinuation,
+                      phase: "codex_ready",
+                      private: current.private,
+                    })
+                    await client?.close().catch(() => {})
+                    await this.#waitForRecovery(setupRecoveryCount, controller.signal)
+                    try {
+                      client = this.#createAppServerClient()
+                      this.#convergenceClients.set(workflowId, client)
+                      await client.connect()
+                      await client.resumeThread(threadId, {
+                        cwd: request.cwd,
+                        developerInstructions: CONVERGENCE_DEVELOPER_INSTRUCTIONS,
+                        sandbox: request.codexSandbox,
+                      })
+                      break
+                    } catch (nextError) {
+                      if (controller.signal.aborted || !isRetryableAppServerError(nextError)) {
+                        throw nextError
+                      }
+                      setupError = nextError
+                    }
+                  }
+                  continue
                 }
 
                 let recoveryError = error

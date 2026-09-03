@@ -2634,6 +2634,80 @@ test("broker alternates Codex and one persistent ChatGPT conversation until stri
   assert.equal(broker.getModelPolicy().revision, 2)
 })
 
+test("a live convergence reconnects an App Server that goes idle during ChatGPT review", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const firstClient = new FakeConvergenceAppServer()
+  const firstRunStructuredTurn = firstClient.runStructuredTurn.bind(firstClient)
+  let firstClientTurnAttempts = 0
+  firstClient.runStructuredTurn = async (input) => {
+    firstClientTurnAttempts += 1
+    if (firstClientTurnAttempts === 2) {
+      throw new EgoChatError("app_server_state", "Codex App Server is not connected.")
+    }
+    return firstRunStructuredTurn(input)
+  }
+  const resumedClient = new FakeConvergenceAppServer(() => convergenceCandidate(2))
+  const clients = [firstClient, resumedClient]
+  const ego = createConvergenceEgoAdapter((identity) => ({
+    ...identity,
+    criteria: [
+      { evidence: "The target digest is exact.", id: "AC-1", status: "pass" },
+      {
+        evidence: identity.cycle === 2
+          ? "The disconnected idle App Server was replaced before the next accepted turn."
+          : "Reconnect once before the next accepted turn.",
+        id: "AC-2",
+        status: identity.cycle === 2 ? "pass" : "fail",
+      },
+    ],
+    decision: identity.cycle === 2 ? "settled" : "continue",
+    findings: identity.cycle === 2
+      ? []
+      : [{
+          action: "Continue after the idle App Server disconnects.",
+          id: "B-IDLE-APP-SERVER",
+          severity: "blocking",
+          title: "Reconnect the idle App Server",
+        }],
+    summary: identity.cycle === 2
+      ? "The live reconnect path is settled."
+      : "Exercise the live reconnect path.",
+  }))
+  const broker = new Broker({
+    appServerFactory: () => clients.shift(),
+    egoAdapter: ego.adapter,
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "ego-chat-main",
+    canonicalUrl: "https://chatgpt.com/c/convergence-idle-app-server",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: [
+      "Every turn binds the immutable target identity.",
+      "An idle App Server disconnect is recovered before the next accepted turn.",
+    ],
+    bindingKey: "ego-chat-main",
+    cwd: process.cwd(),
+    target: "Keep live convergence healthy across a ChatGPT review longer than the App Server lifetime.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 2)
+  assert.equal(completed.appServerSetupRecoveryCount, 1)
+  assert.equal(firstClientTurnAttempts, 2)
+  assert.equal(resumedClient.turns, 1)
+  assert.equal(ego.exchanges, 2)
+})
+
 test("broker renews its ChatGPT child wait without ending convergence", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
