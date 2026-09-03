@@ -10,8 +10,9 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 10,
-  runtimeGeneration: "2026-09-02.7",
+  runtimeGeneration: "2026-09-03.1",
   storeSchemaRevision: 4,
+  taskStoreSchemaRevision: 1,
 }
 
 export const RUNTIME_IDENTITY = Object.freeze({

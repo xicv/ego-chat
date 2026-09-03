@@ -60,6 +60,7 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - Codex App Server spikes for broker-owned thread start/resume and desktop active-writer isolation.
 - Broker-owned `ego_start_convergence` and `ego_converge_until_settled` workflows that alternate Codex and ChatGPT without human copy/paste.
 - Immutable target and acceptance-contract digests, validated implementing-agent candidates, exact cycle identity, and objective settlement checks.
+- A bounded durable task/runner core with immutable acceptance-and-evidence settlement contracts, exact-revision artifacts and evidence, completion-bound fenced verification leases, approval invalidation, and an effect ledger exercised only through fake adapters in this slice.
 - Exclusive conversation leases across every cycle, an optional caller-selected cycle budget, caller-attachment deadlines, liveness guidance for repeated state, secret scanning of exact outbound review bytes, and terminal-state compare-and-set protection.
 - ChatGPT feedback injected into the next Codex turn as explicitly untrusted App Server context.
 - Native Rust setup, conflict-safe MCP configuration, and the same host-aware skill for both Codex and ZCode.
@@ -445,6 +446,12 @@ Each cycle is bound as follows:
 The broker has no implicit cycle ceiling. Repeated candidate/review state adds a liveness instruction and continues. Browser/model-policy/transient UI failures retry; App Server exits reconnect; stable pre-Send assistant-head advances re-anchor; potentially accepted Sends stay in read-only reconciliation; proven absences get a uniquely marked new attempt. A running ChatGPT child is reattached through renewable wait windows, restart reconciliation can itself survive another broker restart, and completed cycle bodies are compacted before the next candidate is persisted. Only conclusive authentication/CAPTCHA, explicit caller budgets, unrecoverable durable corruption, or authority genuinely required outside review need to stop useful progress. App Server diagnostics retain only bounded identity, exit, signal, status, and digest fields; raw stderr is not stored in workflow state.
 
 The original live two-cycle ChatGPT qualification remains the browser baseline. The current deterministic suite additionally covers unbounded protocol-free continuation, bounded historical cycle storage, repeated-state progress, App Server setup and accepted-turn reconnection, renewable child-review waits, exact task-space reclaim, transient model-policy recovery, repeated broker restart during reconciliation, ambiguous-delivery reconciliation, oversized-packet admission and compaction, and exact-owned unsent-draft cleanup. See [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for the contract and evidence boundary.
+
+### Durable task and runner spine
+
+The daemon now constructs a separate durable task spine beside the existing browser workflow store. The local `createDurableTaskSpine` entry point can also be used without the daemon or ChatGPT. Its pure reducer owns logical conversations, tasks, activities, exact base/head pull-request artifacts, capability-checked runner registrations and fenced leases, revision-bound approvals, adapter-bound effect reservations, bounded JSON inputs, and ordered cursor-addressed conversation events. The existing Ego Browser and Codex App Server workflow paths do not call the new task transitions; the broker exposes the spine through a narrow compatibility boundary for later slices.
+
+This first slice has fake remote, runner, and effect adapters only. It cannot write to GitHub, merge, deploy, access production, retrieve credentials, or grant real-world authority. See [`docs/durable-task-runner-spine.md`](docs/durable-task-runner-spine.md) for the invariants, effect reconciliation protocol, local API example, and explicit limitations.
 
 ## Validation
 

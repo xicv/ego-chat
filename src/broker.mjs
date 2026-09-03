@@ -400,6 +400,8 @@ export class Broker {
   #egoAdapter
   #recoveryDelaysMs
   #store
+  #taskSpine
+  #taskSpineInitializationError = null
   #timers = new Map()
   #waiters = new Map()
 
@@ -411,6 +413,7 @@ export class Broker {
     egoAdapter,
     recoveryDelaysMs = DEFAULT_RECOVERY_DELAYS_MS,
     store,
+    taskSpine = undefined,
   }) {
     if (
       !Array.isArray(recoveryDelaysMs)
@@ -435,10 +438,23 @@ export class Broker {
     this.#egoAdapter = egoAdapter
     this.#recoveryDelaysMs = [...recoveryDelaysMs]
     this.#store = store
+    this.#taskSpine = taskSpine
   }
 
   async initialize() {
     await this.#store.initialize()
+    if (this.#taskSpine) {
+      try {
+        await this.#taskSpine.initialize()
+      } catch (error) {
+        this.#taskSpineInitializationError = {
+          errorCode: typeof error?.code === "string" && error.code.length <= 100
+            ? error.code
+            : "task_spine_initialization_failed",
+          status: "unavailable",
+        }
+      }
+    }
 
     for (const workflow of this.#store.listWorkflows()) {
       if (workflow.status !== "running") {
@@ -574,8 +590,26 @@ export class Broker {
         .filter((workflow) => workflow.status === "running")
         .map((workflow) => ({ id: workflow.id, kind: workflow.kind, phase: workflow.phase ?? null })),
       store: this.#store.getMetrics(),
+      ...(this.#taskSpine
+        ? { taskSpine: this.#taskSpineInitializationError ?? this.#taskSpine.getMetrics() }
+        : {}),
       terminalWorkflowCount: workflows.filter(isTerminal).length,
     }
+  }
+
+  getTaskSpine() {
+    if (!this.#taskSpine || this.#taskSpineInitializationError) {
+      throw new EgoChatError(
+        "task_spine_unavailable",
+        this.#taskSpineInitializationError
+          ? "The optional durable task spine did not initialize; existing browser workflows remain available."
+          : "This broker was constructed without the durable task spine compatibility boundary.",
+        this.#taskSpineInitializationError
+          ? { reasonCode: this.#taskSpineInitializationError.errorCode }
+          : undefined,
+      )
+    }
+    return this.#taskSpine
   }
 
   async getRefreshedStatus() {
