@@ -190,7 +190,7 @@ globalThis.js = async (source) => {
   if (source.includes('composer.contains(active)')) {
     return { blurred: false, ok: true }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return []
   }
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) {
@@ -448,7 +448,7 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return taskSpaceOwnership === null ? [] : beforeEntries
   }
   if (source.trimStart().startsWith('Boolean(')) return false
@@ -684,7 +684,7 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     const snapshot = entrySnapshots[Math.min(entryReads, entrySnapshots.length - 1)]
     entryReads += 1
     return snapshot
@@ -941,7 +941,7 @@ globalThis.js = async (source) => {
   if (source.includes('composer.contains(active)')) {
     return { blurred: false, ok: true }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return messages()
   }
   if (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount')) {
@@ -1066,6 +1066,7 @@ async function runTaskSpaceReconciliationCase({
   composerDraft = "",
   fallbackTaskSpaceOwnership = null,
   generationRunning = false,
+  imageOnlyResponse = false,
   mode = "reconcile_bound",
   promptIdentityMatches = true,
   requestedTaskSpaceOwnership = null,
@@ -1098,7 +1099,15 @@ async function runTaskSpaceReconciliationCase({
       role: "user",
       text: promptText,
     },
-    { messageId: "partial-assistant", role: "assistant", text: responseText },
+    imageOnlyResponse
+      ? {
+          attachmentCount: 1,
+          imageOnly: true,
+          messageId: "image-only-assistant",
+          role: "assistant",
+          text: "",
+        }
+      : { messageId: "partial-assistant", role: "assistant", text: responseText },
   ]
   const input = {
     allowDeliveryAbsent: true,
@@ -1195,7 +1204,7 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return ${JSON.stringify(mode === "capture_exchange"
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
@@ -2545,6 +2554,24 @@ test("bounded capture tolerates a transient missing generation control", async (
   assert.equal(captured.result.captureState, "pending")
   assert.equal(captured.result.generationRunning, false)
   assert.equal(captured.result.promptMessageId, "reconcile-user")
+})
+
+test("bounded capture fails closed for a completed image-only assistant turn without the terminal marker", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    imageOnlyResponse: true,
+    mode: "capture_exchange",
+  })
+
+  assert.equal(captured.result, undefined)
+  assert.equal(captured.error?.code, "human_required")
+  assert.equal(
+    captured.error?.details?.reason,
+    "image_only_response_without_terminal_marker",
+  )
+  assert.equal(captured.error?.details?.evidence?.attachmentCount, 1)
+  assert.equal(captured.error?.details?.evidence?.responseMessageIdPresent, true)
 })
 
 test("strict bounded capture commits a stable markerless review for automatic protocol repair", async () => {

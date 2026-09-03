@@ -338,15 +338,40 @@ async function egoDriverMain(
 
   async function readConversationEntries() {
     const messages = await js(String.raw`(() => {
-      return [...document.querySelectorAll('[data-message-author-role]')].map((message) => {
-        const role = message.getAttribute('data-message-author-role')
-        const content = role === 'user'
+      const messageNodes = [
+        ...document.querySelectorAll('[data-message-author-role]'),
+        ...[...document.querySelectorAll('section[data-turn="assistant"][data-turn-id]')]
+          .filter((turn) => (
+            !turn.querySelector('[data-message-author-role]')
+            && turn.querySelector('[id^="image-"] img')
+          )),
+      ]
+      messageNodes.sort((left, right) => (
+        left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      ))
+      return messageNodes.map((message) => {
+        const imageOnly = !message.hasAttribute('data-message-author-role')
+        const role = imageOnly
+          ? message.getAttribute('data-turn')
+          : message.getAttribute('data-message-author-role')
+        const content = imageOnly
+          ? ''
+          : role === 'user'
           ? (message.querySelector('[data-testid="collapsible-user-message-content"]')?.textContent
               ?? message.querySelector('.whitespace-pre-wrap')?.textContent
               ?? message.innerText)
           : (message.querySelector('.markdown')?.innerText ?? message.innerText)
+        const attachmentIds = imageOnly
+          ? [...message.querySelectorAll('[id^="image-"]')]
+              .map((image) => image.id)
+              .filter(Boolean)
+          : []
         return {
-          messageId: message.getAttribute('data-message-id'),
+          attachmentCount: new Set(attachmentIds).size,
+          imageOnly,
+          messageId: imageOnly
+            ? message.getAttribute('data-turn-id')
+            : message.getAttribute('data-message-id'),
           role,
           text: String(content || ''),
         }
@@ -354,6 +379,14 @@ async function egoDriverMain(
     })()`)
     return messages.map((message) => ({
       contentDigest: sha256(message.text),
+      ...(message.imageOnly === true
+        ? {
+            attachmentCount: Number.isSafeInteger(message.attachmentCount)
+              ? message.attachmentCount
+              : 0,
+            imageOnly: true,
+          }
+        : {}),
       messageId: message.messageId,
       role: message.role,
       text: message.text,
@@ -2055,6 +2088,35 @@ async function egoDriverMain(
       && prompt.messageId !== response.messageId
       && (exactTerminalResponse || protocolRepairResponse)
     )
+    const imageOnlyResponseReady = (
+      (input.expectedPreviousMessageId ? anchorIndexes.length === 1 : anchorIndexes.length === 0)
+      && anchorDigestMatches
+      && anchorRoleMatches
+      && committed.length === 2
+      && prompt?.messageId === input.promptMessageId
+      && prompt?.role === "user"
+      && promptDigestMatches
+      && promptMarkerCount === 1
+      && response?.role === "assistant"
+      && response?.imageOnly === true
+      && Boolean(response.messageId)
+      && response.messageId !== prompt.messageId
+      && !exactTerminalResponse
+    )
+    if (imageOnlyResponseReady) {
+      humanRequired(
+        "image_only_response_without_terminal_marker",
+        "The confirmed prompt produced an image-only assistant turn without the expected terminal marker.",
+        {
+          attachmentCount: response.attachmentCount,
+          promptMessageIdMatches,
+          responseMessageIdPresent: Boolean(response.messageId),
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        },
+      )
+      return
+    }
     const incompleteCaptureCanContinue = (
       input.mode === "capture_exchange"
       && input.captureContinuationAllowed === true
