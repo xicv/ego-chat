@@ -10,7 +10,7 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 10,
-  runtimeGeneration: "2026-09-03.1",
+  runtimeGeneration: "2026-09-03.2",
   storeSchemaRevision: 4,
   taskStoreSchemaRevision: 1,
 }
@@ -36,7 +36,7 @@ export const MAX_REVIEW_PACKET_BYTES = 512 * 1024
 export const MAX_RESULT_BYTES = 256 * 1024
 export const DEFAULT_CHATGPT_GENERATION_MS = 2 * 60 * 60 * 1000
 export const DEFAULT_BROWSER_CAPTURE_SLICE_MS = 15 * 1000
-export const MAX_WAIT_MS = 6 * 60 * 60 * 1000
+export const MAX_WAIT_MS = 8 * 60 * 60 * 1000
 
 export const READ_ONLY_IPC_METHODS = new Set([
   "broker.status",

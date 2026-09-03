@@ -34,6 +34,7 @@ test("progress and Token-Saver MCP calls both stay active beyond the SDK default
   t.after(() => client.close())
 
   let progressEvents = 0
+  const progressMessages = []
   let tokenSaverProgressEvents = 0
   const startedAt = Date.now()
   const [progressResult, tokenSaverResult] = await Promise.all([
@@ -42,8 +43,9 @@ test("progress and Token-Saver MCP calls both stay active beyond the SDK default
       name: "gate0_probe_and_wait",
     }, CallToolResultSchema, {
       maxTotalTimeout: 80_000,
-      onprogress: () => {
+      onprogress: (event) => {
         progressEvents += 1
+        progressMessages.push(event.message)
       },
       resetTimeoutOnProgress: true,
       timeout: 70_000,
@@ -68,5 +70,6 @@ test("progress and Token-Saver MCP calls both stay active beyond the SDK default
   assert.equal(tokenSaverResult.structuredContent.waitMode, "token_saver")
   assert.ok(elapsedMs >= 65_000, `expected at least 65000ms, observed ${elapsedMs}ms`)
   assert.ok(progressEvents >= 2, `expected at least two progress events, observed ${progressEvents}`)
+  assert.ok(progressMessages.some((message) => /probe is running in phase/.test(message)))
   assert.equal(tokenSaverProgressEvents, 0)
 })

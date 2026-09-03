@@ -124,6 +124,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/task-store.mjs"),
     },
     EmbeddedFile {
+        path: "src/workflow-supervision.mjs",
+        bytes: include_bytes!("../src/workflow-supervision.mjs"),
+    },
+    EmbeddedFile {
         path: "src/upgrade-dispatch.mjs",
         bytes: include_bytes!("../src/upgrade-dispatch.mjs"),
     },
