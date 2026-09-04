@@ -4,7 +4,20 @@ import path from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 
-import { MAX_RESULT_BYTES } from "./constants.mjs"
+import {
+  ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
+  ATTACHMENT_PERMANENT_RESERVATION_BYTES,
+  MAX_ATTACHMENT_EVIDENCE_INTENTS,
+  MAX_ATTACHMENT_EVIDENCE_RESERVED_BYTES,
+  MAX_ATTACHMENT_PERMANENT_BINDINGS,
+  MAX_ATTACHMENT_PERMANENT_RESERVED_BYTES,
+  MAX_RESULT_BYTES,
+} from "./constants.mjs"
+import {
+  canonicalJsonBytes,
+  operationKeyDigest,
+  sha256Hex,
+} from "./attachment-execution-receipt.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const DEFAULT_MAX_BINDINGS = 256
@@ -15,11 +28,19 @@ const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024
 const RESULT_RECOVERY_KINDS = new Set(["conversation_adoption", "ego_exchange"])
 
 const EMPTY_STATE = Object.freeze({
+  attachmentCapacity: {
+    liveIntentCount: 0,
+    liveReservedBytes: 0,
+    permanentEntryCount: 0,
+    permanentReservedBytes: 0,
+  },
+  attachmentExternalBindings: {},
+  attachmentIntents: {},
   bindings: {},
   modelPolicies: {},
   nextSeq: 1,
   operations: {},
-  schemaVersion: 4,
+  schemaVersion: 5,
   workflows: {},
 })
 
@@ -129,7 +150,7 @@ function validateCheckpoint(value) {
     || !value.workflows
     || !value.bindings
     || !value.modelPolicies
-    || ![3, 4].includes(value.schemaVersion)
+    || ![3, 4, 5].includes(value.schemaVersion)
   ) {
     throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
   }
@@ -138,6 +159,9 @@ function validateCheckpoint(value) {
 function migrateState(value) {
   validateCheckpoint(value)
   const state = clone(value)
+  state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
+  state.attachmentExternalBindings ??= {}
+  state.attachmentIntents ??= {}
   state.operations ??= {}
 
   for (const [workflowId, persistedWorkflow] of Object.entries(state.workflows)) {
@@ -175,7 +199,8 @@ function migrateState(value) {
     }
   }
 
-  state.schemaVersion = 4
+  state.schemaVersion = 5
+  validateAttachmentEvidenceState(state)
   return state
 }
 
@@ -196,6 +221,61 @@ function preserveConvergenceLivenessCheckpoint(workflow, previousWorkflow = unde
   return checkpoint
     ? { ...workflow, lastCodexLivenessCheckpoint: checkpoint }
     : workflow
+}
+
+function validateAttachmentEvidenceState(state) {
+  const capacity = state.attachmentCapacity
+  const intents = state.attachmentIntents
+  const bindings = state.attachmentExternalBindings
+  if (
+    !capacity
+    || typeof capacity !== "object"
+    || Array.isArray(capacity)
+    || !intents
+    || typeof intents !== "object"
+    || Array.isArray(intents)
+    || !bindings
+    || typeof bindings !== "object"
+    || Array.isArray(bindings)
+  ) {
+    throw new EgoChatError(
+      "corrupt_attachment_evidence_state",
+      "The attachment evidence ledger has an invalid durable shape.",
+    )
+  }
+  const expectedCapacity = {
+    liveIntentCount: Object.keys(intents).length,
+    liveReservedBytes: Object.keys(intents).length * ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
+    permanentEntryCount: Object.keys(bindings).length,
+    permanentReservedBytes: (
+      Object.keys(bindings).length * ATTACHMENT_PERMANENT_RESERVATION_BYTES
+    ),
+  }
+  if (!isDeepStrictEqual(capacity, expectedCapacity)) {
+    throw new EgoChatError(
+      "corrupt_attachment_evidence_state",
+      "The attachment evidence capacity counters do not match the durable ledgers.",
+    )
+  }
+  for (const [workflowId, intent] of Object.entries(intents)) {
+    const ledgerKey = `${intent?.profile}:${intent?.external_binding_sha256}`
+    const entry = bindings[ledgerKey]
+    if (
+      intent?.source_workflow_id !== workflowId
+      || intent.schema !== "ego-chat-attachment-capture-intent/v1"
+      || intent.state !== "RESERVED"
+      || intent.live_reservation_bytes !== ATTACHMENT_EVIDENCE_RESERVATION_BYTES
+      || intent.permanent_reservation_bytes !== ATTACHMENT_PERMANENT_RESERVATION_BYTES
+      || entry?.source_workflow_id !== workflowId
+      || entry.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
+      || entry.state !== "RESERVED"
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The attachment evidence intent and permanent binding do not match.",
+      )
+    }
+  }
 }
 
 async function listFiles(directory) {
@@ -242,6 +322,19 @@ function applyEvent(state, event) {
     if (event.operation && typeof event.operation.key === "string") {
       state.operations[event.operation.key] = event.operation
     }
+    if (event.attachmentIntent && typeof event.attachmentIntent.source_workflow_id === "string") {
+      state.attachmentIntents[event.attachmentIntent.source_workflow_id] = event.attachmentIntent
+    }
+    if (
+      event.attachmentExternalBinding
+      && typeof event.attachmentExternalBinding.ledger_key === "string"
+    ) {
+      state.attachmentExternalBindings[event.attachmentExternalBinding.ledger_key]
+        = event.attachmentExternalBinding
+    }
+    if (event.attachmentCapacity) {
+      state.attachmentCapacity = event.attachmentCapacity
+    }
   } else if (event.binding && typeof event.binding.key === "string") {
     state.bindings[event.binding.key] = event.binding
   } else if (event.modelPolicy && typeof event.modelPolicy.key === "string") {
@@ -249,6 +342,7 @@ function applyEvent(state, event) {
   } else {
     throw new EgoChatError("corrupt_event_log", "The event ledger contains an invalid record.")
   }
+  validateAttachmentEvidenceState(state)
   state.nextSeq += 1
 }
 
@@ -262,6 +356,10 @@ export class EventStore {
   #eventsSinceCheckpoint = 0
   #eventsPath
   #maxBlobBytes
+  #maxAttachmentIntents
+  #maxAttachmentLiveBytes
+  #maxAttachmentPermanentBindings
+  #maxAttachmentPermanentBytes
   #maxBindings
   #maxEventBytes
   #maxEvents
@@ -283,6 +381,14 @@ export class EventStore {
     this.#checkpointManifestPath = path.join(dataDir, "checkpoint.manifest.json")
     this.#eventsPath = path.join(dataDir, "events.jsonl")
     this.#maxBlobBytes = options.maxBlobBytes ?? 256 * 1024 * 1024
+    this.#maxAttachmentIntents = options.maxAttachmentIntents
+      ?? MAX_ATTACHMENT_EVIDENCE_INTENTS
+    this.#maxAttachmentLiveBytes = options.maxAttachmentLiveBytes
+      ?? MAX_ATTACHMENT_EVIDENCE_RESERVED_BYTES
+    this.#maxAttachmentPermanentBindings = options.maxAttachmentPermanentBindings
+      ?? MAX_ATTACHMENT_PERMANENT_BINDINGS
+    this.#maxAttachmentPermanentBytes = options.maxAttachmentPermanentBytes
+      ?? MAX_ATTACHMENT_PERMANENT_RESERVED_BYTES
     this.#maxBindings = options.maxBindings ?? DEFAULT_MAX_BINDINGS
     this.#maxEventBytes = options.maxEventBytes ?? 8 * 1024 * 1024
     this.#maxEvents = options.maxEvents ?? 5_000
@@ -304,6 +410,12 @@ export class EventStore {
     const capacity = this.#recoveryCapacity()
     return {
       bindingCount: Object.keys(this.#state.bindings).length,
+      attachmentIntentCount: this.#state.attachmentCapacity.liveIntentCount,
+      attachmentReservedBytes: this.#state.attachmentCapacity.liveReservedBytes,
+      attachmentPermanentEntryCount: this.#state.attachmentCapacity.permanentEntryCount,
+      attachmentPermanentReservedBytes: (
+        this.#state.attachmentCapacity.permanentReservedBytes
+      ),
       blobBytes: this.#blobBytes,
       checkpointNextSeq: this.#state.nextSeq,
       eventBytes: this.#eventBytes,
@@ -446,6 +558,18 @@ export class EventStore {
     return operation ? clone(operation) : undefined
   }
 
+  getAttachmentIntent(workflowId) {
+    const intent = this.#state.attachmentIntents[workflowId]
+    return intent ? clone(intent) : undefined
+  }
+
+  getAttachmentExternalBinding(profile, externalBindingDigest) {
+    const entry = this.#state.attachmentExternalBindings[
+      `${profile}:${externalBindingDigest}`
+    ]
+    return entry ? clone(entry) : undefined
+  }
+
   listBindings() {
     return Object.values(this.#state.bindings).map(clone)
   }
@@ -569,7 +693,7 @@ export class EventStore {
     return this.#persistEntity(type, "workflow", workflow, expectedWorkflow)
   }
 
-  async persistStarted(type, workflow) {
+  async persistStarted(type, workflow, receiptAdmission = undefined) {
     const operation = this.#tail.then(async () => {
       const existingOperation = this.#state.operations[workflow.operationKey]
       const existing = existingOperation
@@ -595,7 +719,11 @@ export class EventStore {
 
       this.#assertNewWorkflowCapacity(workflow, { operation: true })
 
-      await this.#appendStarted(type, workflow)
+      const attachmentEvidence = receiptAdmission
+        ? this.#prepareAttachmentAdmission(workflow, receiptAdmission)
+        : undefined
+
+      await this.#appendStarted(type, workflow, attachmentEvidence)
       return { created: true, workflow: clone(workflow) }
     })
 
@@ -715,9 +843,10 @@ export class EventStore {
     }
   }
 
-  async #appendStarted(type, workflow) {
+  async #appendStarted(type, workflow, attachmentEvidence = undefined) {
     const event = {
       at: new Date().toISOString(),
+      ...(attachmentEvidence ?? {}),
       operation: {
         createdAt: workflow.createdAt,
         inputDigest: workflow.inputDigest,
@@ -730,6 +859,77 @@ export class EventStore {
       workflow: clone(workflow),
     }
     await this.#appendEvent(event)
+  }
+
+  #prepareAttachmentAdmission(workflow, receiptAdmission) {
+    const { intent, intentDigest } = receiptAdmission ?? {}
+    if (
+      !intent
+      || typeof intent !== "object"
+      || Array.isArray(intent)
+      || intent.schema !== "ego-chat-attachment-capture-intent/v1"
+      || intent.source_workflow_id !== workflow.id
+      || intent.source_operation_key_sha256 !== operationKeyDigest(workflow.operationKey)
+      || intent.live_reservation_bytes !== ATTACHMENT_EVIDENCE_RESERVATION_BYTES
+      || intent.permanent_reservation_bytes !== ATTACHMENT_PERMANENT_RESERVATION_BYTES
+      || intent.state !== "RESERVED"
+      || sha256Hex(canonicalJsonBytes(intent)) !== intentDigest
+    ) {
+      throw new EgoChatError(
+        "invalid_attachment_receipt_admission",
+        "The receipt-enabled exchange admission does not match its durable workflow.",
+      )
+    }
+    const ledgerKey = `${intent.profile}:${intent.external_binding_sha256}`
+    if (this.#state.attachmentExternalBindings[ledgerKey]) {
+      throw new EgoChatError(
+        "attachment_external_binding_consumed",
+        "That receipt external binding is already permanently consumed.",
+      )
+    }
+    const capacity = this.#state.attachmentCapacity
+    const nextCapacity = {
+      liveIntentCount: capacity.liveIntentCount + 1,
+      liveReservedBytes: capacity.liveReservedBytes + ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
+      permanentEntryCount: capacity.permanentEntryCount + 1,
+      permanentReservedBytes: (
+        capacity.permanentReservedBytes + ATTACHMENT_PERMANENT_RESERVATION_BYTES
+      ),
+    }
+    if (
+      nextCapacity.liveIntentCount > this.#maxAttachmentIntents
+      || nextCapacity.liveReservedBytes > this.#maxAttachmentLiveBytes
+    ) {
+      throw new EgoChatError(
+        "attachment_evidence_capacity_exhausted",
+        "Attachment evidence capacity is unavailable; no browser work was started.",
+      )
+    }
+    if (
+      nextCapacity.permanentEntryCount > this.#maxAttachmentPermanentBindings
+      || nextCapacity.permanentReservedBytes > this.#maxAttachmentPermanentBytes
+    ) {
+      throw new EgoChatError(
+        "attachment_permanent_ledger_capacity_exhausted",
+        "The permanent attachment-binding ledger is full; no browser work was started.",
+      )
+    }
+    return {
+      attachmentCapacity: nextCapacity,
+      attachmentExternalBinding: {
+        created_at: intent.created_at,
+        external_binding_sha256: intent.external_binding_sha256,
+        intent_sha256: intentDigest,
+        ledger_key: ledgerKey,
+        permanent_reservation_bytes: ATTACHMENT_PERMANENT_RESERVATION_BYTES,
+        profile: intent.profile,
+        schema: "ego-chat-attachment-external-binding-entry/v1",
+        source_operation_key_sha256: intent.source_operation_key_sha256,
+        source_workflow_id: workflow.id,
+        state: "RESERVED",
+      },
+      attachmentIntent: clone(intent),
+    }
   }
 
   #assertNewWorkflowCapacity(workflow, { operation = false } = {}) {

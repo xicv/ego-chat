@@ -4,6 +4,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
+import { buildAttachmentCaptureIntent } from "./attachment-execution-receipt.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
 import {
   DEFAULT_CHATGPT_GENERATION_MS,
@@ -529,6 +530,7 @@ export class Broker {
   #activeConversationUrls = new Map()
   #adoptionTaskSpaces = new Map()
   #appServerFactory
+  #attachmentReceiptAuthority
   #brokerIdentity
   #brokerLease
   #convergenceBindings = new Map()
@@ -546,6 +548,7 @@ export class Broker {
 
   constructor({
     appServerFactory,
+    attachmentReceiptAuthority = undefined,
     brokerIdentity = undefined,
     brokerLease = undefined,
     convergenceChildWaitSliceMs = DEFAULT_CONVERGENCE_CHILD_WAIT_SLICE_MS,
@@ -565,6 +568,7 @@ export class Broker {
       throw new TypeError("convergenceChildWaitSliceMs must be a positive safe integer")
     }
     this.#appServerFactory = appServerFactory
+    this.#attachmentReceiptAuthority = attachmentReceiptAuthority
     this.#brokerIdentity = brokerIdentity ?? {
       brokerId: `in-process-${process.pid}`,
       epoch: 0,
@@ -1550,6 +1554,44 @@ export class Broker {
     }
     const modelPolicy = this.#resolveModelPolicy()
     const generationTimeoutMs = Math.max(params.timeoutMs, DEFAULT_CHATGPT_GENERATION_MS)
+    const workflowId = randomUUID()
+    let receiptAdmission
+    if (params.receiptCapture) {
+      if (typeof this.#attachmentReceiptAuthority?.qualify !== "function") {
+        throw new EgoChatError(
+          "attachment_receipt_authority_unavailable",
+          "Receipt evidence authority is not enrolled; no browser work was started.",
+        )
+      }
+      const qualification = await this.#attachmentReceiptAuthority.qualify(
+        params.receiptCapture,
+      )
+      if (
+        !qualification
+        || qualification.consumerSignerAuthorizationDigest
+          !== params.receiptCapture.consumer_signer_authorization_sha256
+        || typeof qualification.signerEnrollmentDigest !== "string"
+        || !/^[a-f0-9]{64}$/.test(qualification.signerEnrollmentDigest)
+      ) {
+        throw new EgoChatError(
+          "attachment_receipt_authority_invalid",
+          "Receipt evidence authority qualification is invalid; no browser work was started.",
+        )
+      }
+      const built = buildAttachmentCaptureIntent({
+        authorizationDigest: qualification.consumerSignerAuthorizationDigest,
+        createdAt: new Date().toISOString(),
+        externalBindingDigest: params.receiptCapture.external_binding_sha256,
+        operationKey,
+        profile: params.receiptCapture.profile,
+        signerEnrollmentDigest: qualification.signerEnrollmentDigest,
+        workflowId,
+      })
+      receiptAdmission = {
+        intent: built.intent,
+        intentDigest: built.digest,
+      }
+    }
 
     this.#activeBindings.add(params.bindingKey)
     const startedAt = new Date()
@@ -1558,7 +1600,7 @@ export class Broker {
       bindingKey: params.bindingKey,
       createdAt: now,
       deadlineAt: new Date(startedAt.getTime() + generationTimeoutMs).toISOString(),
-      id: randomUUID(),
+      id: workflowId,
       inputDigest,
       kind: "ego_exchange",
       operationKey,
@@ -1589,7 +1631,11 @@ export class Broker {
     }
 
     try {
-      const persisted = await this.#store.persistStarted("workflow.started", workflow)
+      const persisted = await this.#store.persistStarted(
+        "workflow.started",
+        workflow,
+        receiptAdmission,
+      )
       if (!persisted.created) {
         this.#activeBindings.delete(params.bindingKey)
         return publicWorkflow(persisted.workflow)

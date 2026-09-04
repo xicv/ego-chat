@@ -179,6 +179,14 @@ const ConversationHeadAnchorSchema = z.object({
   role: z.enum(["assistant", "user"]).nullable(),
 }).strict()
 
+export const ReceiptEnabledExchangeRequestSchema = z.object({
+  consumer_signer_authorization_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  external_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  profile: z.literal("a3k-manual-canary-v1"),
+  receipt_capture_requested: z.literal(true),
+  schema: z.literal("ego-chat-receipt-enabled-exchange-request/v1"),
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),
@@ -186,6 +194,7 @@ export const EgoExchangeSchema = z.object({
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: SafeTextSchema,
+  receiptCapture: ReceiptEnabledExchangeRequestSchema.optional(),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS),
   turnMarker: z.string().regex(/^EGO_CHAT_[A-Z0-9_-]{8,160}$/),
 })

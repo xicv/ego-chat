@@ -478,6 +478,149 @@ test("event ledger reconstructs the latest workflow and uses private file modes"
   assert.equal((await fs.stat(path.join(dataDir, "state.json"))).mode & 0o777, 0o600)
 })
 
+test("receipt admission atomically reserves capacity and globally consumes an A3K binding", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir, { maxAttachmentIntents: 1 })
+  await store.initialize()
+  for (const [key, suffix] of [["a3k-one", "one"], ["a3k-two", "two"]]) {
+    await store.persistBinding("binding.created", {
+      canonicalUrl: `https://chatgpt.com/c/${suffix}`,
+      headContentDigest: "c".repeat(64),
+      headFingerprint: "d".repeat(64),
+      headFingerprintVersion: "tail-v1",
+      headMessageId: `assistant-${suffix}`,
+      headRole: "assistant",
+      key,
+      messageCount: 2,
+      revision: 1,
+      state: "bound",
+      targetId: `tab-${suffix}`,
+      taskSpaceId: suffix === "one" ? 1 : 2,
+    })
+  }
+  let sendCount = 0
+  const never = new Promise(() => {})
+  const broker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+        signerEnrollmentDigest: "e".repeat(64),
+      }),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureExchange: async () => never,
+      sendExchange: async () => {
+        sendCount += 1
+        return never
+      },
+    },
+    store,
+  })
+  t.after(() => broker.close())
+  const receiptCapture = {
+    consumer_signer_authorization_sha256: "b".repeat(64),
+    external_binding_sha256: "a".repeat(64),
+    profile: "a3k-manual-canary-v1",
+    receipt_capture_requested: true,
+    schema: "ego-chat-receipt-enabled-exchange-request/v1",
+  }
+  const request = (bindingKey, suffix) => ({
+    bindingKey,
+    expectedTerminalMarker: `DONE_${suffix}`,
+    prompt: `EGO_CHAT_A3K_RECEIPT_${suffix}\nprepare`,
+    receiptCapture,
+    timeoutMs: 30_000,
+    turnMarker: `EGO_CHAT_A3K_RECEIPT_${suffix}`,
+  })
+
+  const admitted = await broker.startEgoExchange(request("a3k-one", "ONE12345"))
+  await assert.rejects(
+    broker.startEgoExchange(request("a3k-two", "TWO12345")),
+    (error) => error.code === "attachment_external_binding_consumed",
+  )
+  await assert.rejects(
+    broker.startEgoExchange({
+      ...request("a3k-two", "CAP12345"),
+      receiptCapture: {
+        ...receiptCapture,
+        external_binding_sha256: "f".repeat(64),
+      },
+    }),
+    (error) => error.code === "attachment_evidence_capacity_exhausted",
+  )
+  await new Promise((resolve) => globalThis.setImmediate(resolve))
+
+  assert.equal(sendCount, 1)
+  assert.equal(store.getMetrics().attachmentIntentCount, 1)
+  assert.equal(store.getMetrics().attachmentReservedBytes, 1024 * 1024)
+  assert.equal(store.getMetrics().attachmentPermanentReservedBytes, 32 * 1024)
+  assert.equal(store.getAttachmentIntent(admitted.id).source_workflow_id, admitted.id)
+  assert.equal(
+    store.getAttachmentExternalBinding("a3k-manual-canary-v1", "a".repeat(64)).state,
+    "RESERVED",
+  )
+
+  const replayed = new EventStore(dataDir, { maxAttachmentIntents: 1 })
+  await replayed.initialize()
+  assert.equal(replayed.getMetrics().attachmentIntentCount, 1)
+  assert.equal(replayed.getAttachmentIntent(admitted.id).source_workflow_id, admitted.id)
+})
+
+test("receipt admission fails before Send when signer authority is unavailable", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/a3k-no-signer",
+    headContentDigest: "c".repeat(64),
+    headFingerprint: "d".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-no-signer",
+    messageCount: 2,
+    revision: 1,
+    state: "bound",
+    targetId: "tab-no-signer",
+    taskSpaceId: 3,
+  })
+  let sendCount = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureExchange: async () => {},
+      sendExchange: async () => {
+        sendCount += 1
+      },
+    },
+    store,
+  })
+  t.after(() => broker.close())
+
+  await assert.rejects(
+    broker.startEgoExchange({
+      bindingKey: "a3k-no-signer",
+      expectedTerminalMarker: "DONE_NO_SIGNER",
+      prompt: "EGO_CHAT_A3K_RECEIPT_NOSIGNER1\nprepare",
+      receiptCapture: {
+        consumer_signer_authorization_sha256: "b".repeat(64),
+        external_binding_sha256: "a".repeat(64),
+        profile: "a3k-manual-canary-v1",
+        receipt_capture_requested: true,
+        schema: "ego-chat-receipt-enabled-exchange-request/v1",
+      },
+      timeoutMs: 30_000,
+      turnMarker: "EGO_CHAT_A3K_RECEIPT_NOSIGNER1",
+    }),
+    (error) => error.code === "attachment_receipt_authority_unavailable",
+  )
+  assert.equal(sendCount, 0)
+  assert.equal(store.getMetrics().attachmentIntentCount, 0)
+})
+
 test("workflow status exposes exact convergence and ChatGPT delivery supervision", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
