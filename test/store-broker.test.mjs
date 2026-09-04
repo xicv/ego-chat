@@ -9440,12 +9440,13 @@ test("interrupted legacy compaction rolls forward before restart returns", async
     "a3k-legacy-attachment-provenance-v2.json",
   )))
   const entry = fixture.versions.find((candidate) => candidate.schema_version === 7)
-  const phases = ["state", "checkpoint", "manifest", "events"]
+  const phases = ["state", "checkpoint", "manifest", "events", "blobs"]
   const workflowIds = [
     "96fd0f1f-b3a7-4af4-8969-81cb4eab2f01",
     "96fd0f1f-b3a7-4af4-8969-81cb4eab2f02",
     "96fd0f1f-b3a7-4af4-8969-81cb4eab2f03",
     "96fd0f1f-b3a7-4af4-8969-81cb4eab2f04",
+    "96fd0f1f-b3a7-4af4-8969-81cb4eab2f05",
   ]
 
   for (const [index, phase] of phases.entries()) {
@@ -9550,5 +9551,101 @@ test("interrupted legacy compaction rolls forward before restart returns", async
       quarantine,
     )
     assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
+  }
+})
+
+test("interrupted compaction reconciles referenced and orphan blob inventory", async (t) => {
+  const phases = ["state", "checkpoint", "manifest", "events", "blobs"]
+  for (const [index, phase] of phases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const options = {
+      maxBlobBytes: 1_024,
+      maxEvents: 1,
+      rawRetentionMs: 30 * 24 * 60 * 60 * 1_000,
+    }
+    const seed = new EventStore(dataDir, options)
+    await seed.initialize()
+    const referencedBody = `pending attachment recovery body ${phase}`
+    const referenced = await seed.putBlob(referencedBody)
+    const now = "2026-09-04T07:30:00.000Z"
+    const workflow = {
+      createdAt: now,
+      id: `a9f39cf8-c522-4915-910d-3f778859cb0${index}`,
+      kind: "ego_exchange",
+      phase: "awaiting_attachment_capture",
+      result: {
+        responseDigest: digest(referencedBody),
+        responseRef: referenced,
+      },
+      status: "human_required",
+      updatedAt: now,
+    }
+    await seed.persist("workflow.human_required", workflow)
+
+    const orphanBody = Buffer.from(`orphaned compaction body ${phase}`)
+    const orphanDigest = digest(orphanBody)
+    const orphanDirectory = path.join(dataDir, "blobs", "sha256", orphanDigest.slice(0, 2))
+    const orphanPath = path.join(orphanDirectory, orphanDigest)
+    await fs.mkdir(orphanDirectory, { mode: 0o700, recursive: true })
+    await fs.writeFile(orphanPath, orphanBody, { mode: 0o600 })
+    assert.ok(referenced.sizeBytes + orphanBody.length < options.maxBlobBytes)
+
+    await fs.rm(path.join(dataDir, "checkpoint.manifest.json"))
+    const interrupted = new EventStore(dataDir, {
+      ...options,
+      compactionFaultInjector: async (completedPhase) => {
+        if (completedPhase === phase) {
+          throw new Error(`injected blob compaction interruption after ${phase}`)
+        }
+      },
+    })
+    await assert.rejects(
+      interrupted.initialize(),
+      new RegExp(`injected blob compaction interruption after ${phase}`),
+    )
+
+    const recovered = new EventStore(dataDir, options)
+    await recovered.initialize()
+    assert.equal(
+      (await recovered.readBlob(referenced, { maxBytes: 1_024, offset: 0 })).text,
+      referencedBody,
+    )
+    await assert.rejects(
+      fs.stat(orphanPath),
+      (error) => error.code === "ENOENT",
+    )
+    assert.equal(recovered.getWorkflow(workflow.id).status, "human_required")
+    assert.equal(recovered.getMetrics().blobBytes, referenced.sizeBytes)
+    assert.equal(recovered.getMetrics().protectedBlobBytes, referenced.sizeBytes)
+
+    const durableSnapshot = {
+      blob: await fs.readFile(path.join(
+        dataDir,
+        "blobs",
+        "sha256",
+        referenced.digest.slice(0, 2),
+        referenced.digest,
+      )),
+      checkpoint: await fs.readFile(path.join(dataDir, "checkpoint.json")),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      manifest: await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+    }
+    const restarted = new EventStore(dataDir, options)
+    await restarted.initialize()
+    assert.deepEqual({
+      blob: await fs.readFile(path.join(
+        dataDir,
+        "blobs",
+        "sha256",
+        referenced.digest.slice(0, 2),
+        referenced.digest,
+      )),
+      checkpoint: await fs.readFile(path.join(dataDir, "checkpoint.json")),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      manifest: await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+    }, durableSnapshot)
   }
 })

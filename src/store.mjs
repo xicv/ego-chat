@@ -1187,9 +1187,7 @@ export class EventStore {
     this.#state = migrateState(this.#state)
 
     this.#eventBytes = Buffer.byteLength(ledger, "utf8")
-    for (const filePath of await listFiles(this.#blobDirectory)) {
-      this.#blobBytes += (await fs.stat(filePath)).size
-    }
+    await this.#reconcileBlobInventory()
 
     if (
       durableRepairRequired
@@ -2211,6 +2209,27 @@ export class EventStore {
     }
   }
 
+  #referencedBlobDigests() {
+    return new Set(
+      Object.values(this.#state.workflows)
+        .map((workflow) => workflow.result?.responseRef?.digest)
+        .filter((digest) => typeof digest === "string"),
+    )
+  }
+
+  async #reconcileBlobInventory(retainedDigests = this.#referencedBlobDigests()) {
+    let retainedBytes = 0
+    for (const filePath of await listFiles(this.#blobDirectory)) {
+      const blobDigest = path.basename(filePath)
+      if (retainedDigests.has(blobDigest)) {
+        retainedBytes += (await fs.stat(filePath)).size
+      } else {
+        await fs.unlink(filePath)
+      }
+    }
+    this.#blobBytes = retainedBytes
+  }
+
   async #compact() {
     const { retainedDigests } = this.#applyRetention()
     await writeAtomicJson(this.#statePath, this.#state)
@@ -2227,16 +2246,8 @@ export class EventStore {
     await this.#compactionFaultInjector?.("events")
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
-    let retainedBytes = 0
-    for (const filePath of await listFiles(this.#blobDirectory)) {
-      const blobDigest = path.basename(filePath)
-      if (retainedDigests.has(blobDigest)) {
-        retainedBytes += (await fs.stat(filePath)).size
-      } else {
-        await fs.unlink(filePath)
-      }
-    }
-    this.#blobBytes = retainedBytes
+    await this.#reconcileBlobInventory(retainedDigests)
+    await this.#compactionFaultInjector?.("blobs")
   }
 
   #applyRetention() {
