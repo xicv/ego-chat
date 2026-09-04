@@ -1060,6 +1060,7 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 }
 
 async function runTaskSpaceReconciliationCase({
+  attachmentObservation = null,
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
   captureContinuationAllowed = false,
@@ -1131,6 +1132,14 @@ async function runTaskSpaceReconciliationCase({
     },
     browserContractRevision: 13,
     canonicalUrl,
+    ...(mode === "capture_attachment_execution"
+      ? {
+          captureOperationKeySha256: "a".repeat(64),
+          observationSequence: 7,
+          providerPromptMessageId: promptMessageId,
+          sourceConfirmedSendIdentitySha256: "b".repeat(64),
+        }
+      : {}),
     expectedPreviousContentDigest: previousDigest,
     expectedPreviousMessageId: "previous-assistant",
     expectedTerminalMarker: terminalMarker,
@@ -1208,6 +1217,9 @@ globalThis.js = async (source) => {
     return ${JSON.stringify(mode === "capture_exchange"
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
+  }
+  if (source.includes('ego-chat-attachment-graph-observation/v1')) {
+    return ${JSON.stringify(attachmentObservation)}
   }
   if (source.trimStart().startsWith('Boolean(')) return ${JSON.stringify(generationRunning)}
   throw new Error('Unexpected page script: ' + source.slice(0, 100))
@@ -1307,6 +1319,43 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& committed\[0\]\?\.contentDigest === sha256\(input\.prompt\)/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& prompt\?\.contentDigest === input\.inputDigest/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /finishedHead\.messageCount !== beforeHead\.messageCount/)
+
+  const attachmentCaptureStart = EGO_DRIVER_SOURCE.indexOf("async function captureAttachmentExecution()")
+  const attachmentCaptureEnd = EGO_DRIVER_SOURCE.indexOf("\n  async function ", attachmentCaptureStart + 1)
+  assert.ok(attachmentCaptureStart > 0)
+  assert.ok(attachmentCaptureEnd > attachmentCaptureStart)
+  const attachmentCaptureSource = EGO_DRIVER_SOURCE.slice(
+    attachmentCaptureStart,
+    attachmentCaptureEnd,
+  )
+  for (const forbidden of [
+    "composePrompt(",
+    "click(",
+    "fillInput(",
+    "typeText(",
+    "pressKey(",
+    "dispatchMouseEvent",
+    "insertText",
+    "captureScreenshot",
+    "browserFetch",
+    "serverFetch",
+    "navigator.clipboard",
+    "handOffTaskSpace",
+    "hover(",
+    "doubleClick(",
+    ".click(",
+    ".focus(",
+    ".dispatchEvent(",
+    "gotoUrl(",
+    "gotoAndWait(",
+    "uploadFile(",
+  ]) {
+    assert.equal(
+      attachmentCaptureSource.includes(forbidden),
+      false,
+      `attachment capture must exclude ${forbidden}`,
+    )
+  }
 
   const composed = EGO_DRIVER_SOURCE.indexOf('await composePrompt(input.prompt)')
   const reclaimFence = EGO_DRIVER_SOURCE.indexOf('assertBrokerAuthority("before_task_space_reclaim")')
@@ -2618,6 +2667,84 @@ test("bounded capture fails closed when the confirmed prompt identity changes", 
   assert.equal(captured.result, undefined)
   assert.equal(captured.error?.code, "human_required")
   assert.equal(captured.error?.details?.reason, "capture_pending_identity_mismatch")
+})
+
+test("attachment capture emits only one closed read-only observation for the confirmed prompt", async () => {
+  const attachmentObservation = {
+    artifacts: [{
+      artifact_id: "generation-image-1",
+      artifact_kind: "GENERATED_IMAGE",
+      dom_wrapper_id: "image-message-image-1",
+      file_id: "file_image_1",
+      generation_id: "generation-image-1",
+      graph_attachment_id: "message-image-1:part:0",
+      image_message_id: "message-image-1",
+    }],
+    asset_pointer_state: "PRESENT_NON_CONTROL",
+    continuation_cursor_present: false,
+    direct_branch_ids: ["response-1"],
+    direct_response_branch_count: 1,
+    generated_image_artifact_count: 1,
+    generation_terminal: true,
+    graph_complete: true,
+    graph_truncated: false,
+    hydration_pending: false,
+    non_image_artifact_count: 0,
+    normal_download_control_count: 0,
+    normal_save_control_count: 0,
+    provider_nodes: [{
+      message_id: "response-1",
+      parent_id: "reconcile-user",
+      provider_status: "COMPLETE",
+      terminal: true,
+      turn_exchange_id: "exchange-1",
+    }, {
+      message_id: "message-image-1",
+      parent_id: null,
+      provider_status: "COMPLETE",
+      terminal: true,
+      turn_exchange_id: "exchange-1",
+    }],
+    react_save_download_prop_count: 0,
+    response_message_id: "response-1",
+    save_association_id: null,
+    selected_branch_id: "response-1",
+    total_artifact_count: 1,
+    ui_action_surface_complete: true,
+    unclassified_artifact_count: 0,
+    visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
+  }
+  const captured = await runTaskSpaceReconciliationCase({
+    attachmentObservation,
+    mode: "capture_attachment_execution",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.deepEqual(captured.result, {
+    ...attachmentObservation,
+    canonical_conversation_locator_sha256: createHash("sha256")
+      .update("https://chatgpt.com/c/reconcile-driver-test", "utf8")
+      .digest("hex"),
+    capture_operation_key_sha256: "a".repeat(64),
+    observation_sequence: 7,
+    observed_at: captured.result.observed_at,
+    provider_prompt_message_id: "reconcile-user",
+    schema: "ego-chat-attachment-graph-observation/v1",
+    source_confirmed_send_identity_sha256: "b".repeat(64),
+  })
+  assert.match(captured.result.observed_at, /^2026-|^20[2-9][0-9]-/)
+  assert.deepEqual(captured.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("Ego adapter exposes the attachment capture route without Send authority", () => {
+  assert.equal(typeof EgoAdapter.prototype.captureAttachmentExecution, "function")
 })
 
 test("conversation adoption fails closed when another message interleaves", async () => {

@@ -320,6 +320,14 @@ export class EgoAdapter {
     }, timeoutMs + 60_000, signal)
   }
 
+  async captureAttachmentExecution(params, signal = undefined) {
+    return this.#run({
+      brokerLease: this.#brokerLease,
+      ...params,
+      mode: "capture_attachment_execution",
+    }, 60_000, signal)
+  }
+
   async ensureModelPolicy(params, signal = undefined) {
     return this.#run({ brokerLease: this.#brokerLease, mode: "model_policy", ...params }, 60_000, signal)
   }
