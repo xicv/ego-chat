@@ -667,6 +667,13 @@ export class Broker {
         }
       } else if (
         workflow.kind === "ego_exchange"
+        && workflow.phase === "awaiting_attachment_capture"
+        && workflow.private?.request?.receiptCapture
+        && this.#store.getConfirmedSendIdentity(workflow.id)
+      ) {
+        continue
+      } else if (
+        workflow.kind === "ego_exchange"
         && (
           workflow.phase === "response_captured"
           || (workflow.phase === "send_confirmed" && workflow.private?.send)
@@ -2485,7 +2492,9 @@ export class Broker {
               deadlineAt: new Date(
                 Date.now() + current.private.request.timeoutMs,
               ).toISOString(),
-              phase: "send_confirmed",
+              phase: current.private.request.receiptCapture
+                ? "awaiting_attachment_capture"
+                : "send_confirmed",
               private: {
                 ...current.private,
                 captureAttempts: 0,
@@ -2509,6 +2518,7 @@ export class Broker {
                 sendConfirmedPatch,
                 sent,
               )
+              return
             } else {
               await this.#transition(current, "exchange.send_confirmed", sendConfirmedPatch)
               current = this.#store.getWorkflow(workflow.id)

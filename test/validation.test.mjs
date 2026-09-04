@@ -2,7 +2,12 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { MAX_WAIT_MS } from "../src/constants.mjs"
-import { EgoExchangeSchema, StartConvergenceSchema, parse } from "../src/validation.mjs"
+import {
+  AttachmentCaptureRequestSchema,
+  EgoExchangeSchema,
+  StartConvergenceSchema,
+  parse,
+} from "../src/validation.mjs"
 
 function convergenceInput(wallClockTimeoutMs) {
   return {
@@ -51,6 +56,26 @@ test("receipt-enabled exchange input is closed and selected only before Send", (
   ]) {
     assert.throws(
       () => parse(EgoExchangeSchema, { ...input, receiptCapture }),
+      (error) => error.code === "invalid_input",
+    )
+  }
+})
+
+test("attachment capture input contains only its schema and source workflow identity", () => {
+  const input = {
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: "4559c675-14a9-4ec0-b5f9-0bb3ec3b73b5",
+  }
+  assert.deepEqual(parse(AttachmentCaptureRequestSchema, input), input)
+  for (const extra of [
+    { canonical_url: "https://chatgpt.com/c/forged" },
+    { execution_claim_sha256: "a".repeat(64) },
+    { output_path: "/tmp/asset.png" },
+    { outcome: "EXACTLY_ONE" },
+    { runtime_identity_sha256: "b".repeat(64) },
+  ]) {
+    assert.throws(
+      () => parse(AttachmentCaptureRequestSchema, { ...input, ...extra }),
       (error) => error.code === "invalid_input",
     )
   }

@@ -652,6 +652,7 @@ test("receipt Send confirmation atomically persists its immutable identity and e
     taskSpaceId: 4,
   })
   const sentAt = "2026-09-04T04:30:00.000Z"
+  let legacyCaptureCalls = 0
   const broker = new Broker({
     attachmentReceiptAuthority: {
       qualify: async (request) => ({
@@ -667,16 +668,19 @@ test("receipt Send confirmation atomically persists its immutable identity and e
     },
     egoAdapter: {
       ...unusedEgoAdapter,
-      captureExchange: async (input) => ({
-        canonicalUrl: input.canonicalUrl,
-        captureReason: "generation_running",
-        captureState: "pending",
-        generationRunning: true,
-        promptMessageId: input.promptMessageId,
-        targetId: "tab-confirmed",
-        taskSpaceId: 4,
-        turnMarker: input.turnMarker,
-      }),
+      captureExchange: async (input) => {
+        legacyCaptureCalls += 1
+        return {
+          canonicalUrl: input.canonicalUrl,
+          captureReason: "generation_running",
+          captureState: "pending",
+          generationRunning: true,
+          promptMessageId: input.promptMessageId,
+          targetId: "tab-confirmed",
+          taskSpaceId: 4,
+          turnMarker: input.turnMarker,
+        }
+      },
       sendExchange: async (input) => ({
         canonicalUrl: "https://chatgpt.com/c/a3k-confirmed-send",
         modelPolicy: modelPolicyObservation(),
@@ -708,12 +712,13 @@ test("receipt Send confirmation atomically persists its immutable identity and e
   let workflow
   for (let attempt = 0; attempt < 50; attempt += 1) {
     workflow = store.getWorkflow(started.id)
-    if (workflow?.phase === "send_confirmed") break
+    if (workflow?.phase === "awaiting_attachment_capture") break
     await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
   }
 
   const identity = store.getConfirmedSendIdentity(started.id)
-  assert.equal(workflow.phase, "send_confirmed")
+  assert.equal(workflow.phase, "awaiting_attachment_capture")
+  assert.equal(legacyCaptureCalls, 0)
   assert.equal(identity.source_workflow_id, started.id)
   assert.equal(identity.binding_key, "a3k-confirmed")
   assert.equal(identity.binding_revision, 7)
@@ -744,6 +749,14 @@ test("receipt Send confirmation atomically persists its immutable identity and e
   const replayed = new EventStore(dataDir)
   await replayed.initialize()
   assert.deepEqual(replayed.getConfirmedSendIdentity(started.id), identity)
+  const restartedBroker = new Broker({ egoAdapter: unusedEgoAdapter, store: replayed })
+  t.after(() => restartedBroker.close())
+  await restartedBroker.initialize()
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 20))
+  assert.equal(
+    replayed.getWorkflow(started.id).phase,
+    "awaiting_attachment_capture",
+  )
 })
 
 test("receipt evidence replay rejects a confirmed Send event without its immutable identity", async (t) => {

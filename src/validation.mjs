@@ -187,6 +187,11 @@ export const ReceiptEnabledExchangeRequestSchema = z.object({
   schema: z.literal("ego-chat-receipt-enabled-exchange-request/v1"),
 }).strict()
 
+export const AttachmentCaptureRequestSchema = z.object({
+  schema: z.literal("ego-chat-attachment-capture-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),
