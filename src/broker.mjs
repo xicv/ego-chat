@@ -1572,6 +1572,22 @@ export class Broker {
           !== params.receiptCapture.consumer_signer_authorization_sha256
         || typeof qualification.signerEnrollmentDigest !== "string"
         || !/^[a-f0-9]{64}$/.test(qualification.signerEnrollmentDigest)
+        || typeof qualification.signerKeyId !== "string"
+        || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(qualification.signerKeyId)
+        || !qualification.runtimeIdentity
+        || typeof qualification.runtimeIdentity !== "object"
+        || Array.isArray(qualification.runtimeIdentity)
+        || !isDeepStrictEqual(
+          Object.keys(qualification.runtimeIdentity).sort(),
+          [
+            "executable_sha256",
+            "implementation_git_sha",
+            "package_inventory_sha256",
+          ],
+        )
+        || !/^[a-f0-9]{64}$/.test(qualification.runtimeIdentity.executable_sha256)
+        || !/^[a-f0-9]{40,64}$/.test(qualification.runtimeIdentity.implementation_git_sha)
+        || !/^[a-f0-9]{64}$/.test(qualification.runtimeIdentity.package_inventory_sha256)
       ) {
         throw new EgoChatError(
           "attachment_receipt_authority_invalid",
@@ -1584,7 +1600,9 @@ export class Broker {
         externalBindingDigest: params.receiptCapture.external_binding_sha256,
         operationKey,
         profile: params.receiptCapture.profile,
+        runtimeIdentity: qualification.runtimeIdentity,
         signerEnrollmentDigest: qualification.signerEnrollmentDigest,
+        signerKeyId: qualification.signerKeyId,
         workflowId,
       })
       receiptAdmission = {
@@ -2423,7 +2441,11 @@ export class Broker {
                   controller.signal,
                 )
               } catch (error) {
-                if (controller.signal.aborted || !this.#canRetryPreSend(error)) {
+                if (
+                  controller.signal.aborted
+                  || current.private.request.receiptCapture
+                  || !this.#canRetryPreSend(error)
+                ) {
                   throw error
                 }
                 if (error.details?.reason === "conversation_head_changed") {
@@ -2459,7 +2481,7 @@ export class Broker {
             if (!current || current.status !== "running") {
               return
             }
-            await this.#transition(current, "exchange.send_confirmed", {
+            const sendConfirmedPatch = {
               deadlineAt: new Date(
                 Date.now() + current.private.request.timeoutMs,
               ).toISOString(),
@@ -2479,8 +2501,18 @@ export class Broker {
                 promptMessageId: sent.promptMessageId,
                 sentAt: sent.sentAt,
               },
-            })
-            current = this.#store.getWorkflow(workflow.id)
+            }
+            if (current.private.request.receiptCapture) {
+              current = await this.#store.persistConfirmedAttachmentSend(
+                "exchange.send_confirmed",
+                current,
+                sendConfirmedPatch,
+                sent,
+              )
+            } else {
+              await this.#transition(current, "exchange.send_confirmed", sendConfirmedPatch)
+              current = this.#store.getWorkflow(workflow.id)
+            }
           }
 
           let captureFailures = current.private.captureAttempts ?? 0

@@ -68,9 +68,15 @@ export function buildAttachmentCaptureIntent({
   externalBindingDigest,
   operationKey,
   profile,
+  runtimeIdentity,
   signerEnrollmentDigest,
+  signerKeyId,
   workflowId,
 }) {
+  const qualifiedRuntimeIdentity = {
+    ...runtimeIdentity,
+    runtime_identity_sha256: sha256Hex(canonicalJsonBytes(runtimeIdentity)),
+  }
   const intent = {
     consumer_signer_authorization_sha256: authorizationDigest,
     created_at: createdAt,
@@ -78,8 +84,10 @@ export function buildAttachmentCaptureIntent({
     live_reservation_bytes: 1024 * 1024,
     permanent_reservation_bytes: 32 * 1024,
     profile,
+    qualified_runtime_identity: qualifiedRuntimeIdentity,
     schema: "ego-chat-attachment-capture-intent/v1",
     signer_enrollment_sha256: signerEnrollmentDigest,
+    signer_key_id: signerKeyId,
     source_operation_key_sha256: operationKeyDigest(operationKey),
     source_workflow_id: workflowId,
     state: "RESERVED",
@@ -87,5 +95,62 @@ export function buildAttachmentCaptureIntent({
   return {
     digest: sha256Hex(canonicalJsonBytes(intent)),
     intent,
+  }
+}
+
+export function buildConfirmedSendIdentity({ intent, intentDigest, sequence, sent, workflow }) {
+  const canonicalUrl = new URL(sent.canonicalUrl)
+  const match = canonicalUrl.pathname.match(/(?:^|\/)c\/([^/]+)(?:\/|$)/)
+  if (!match || Buffer.byteLength(match[1], "utf8") > 200) {
+    throw new EgoChatError(
+      "invalid_confirmed_send_identity",
+      "Confirmed Send has no bounded canonical conversation identity.",
+    )
+  }
+  const eventProjection = {
+    event_type: "send_confirmed",
+    operation_key_sha256: operationKeyDigest(workflow.operationKey),
+    prompt_message_id: sent.promptMessageId,
+    schema: "ego-chat-confirmed-send-event/v1",
+    sent_at: sent.sentAt,
+    sequence,
+    workflow_id: workflow.id,
+  }
+  const beforeHead = workflow.reconciliation.beforeHead
+  const identity = {
+    before_head_content_sha256: beforeHead.contentDigest,
+    before_head_fingerprint: beforeHead.fingerprint,
+    before_head_fingerprint_version: beforeHead.fingerprintVersion,
+    before_head_message_id: beforeHead.messageId,
+    before_head_role: beforeHead.role,
+    binding_key: workflow.bindingKey,
+    binding_revision: workflow.reconciliation.bindingRevision,
+    canonical_conversation_url_sha256: sha256Hex(
+      Buffer.from(sent.canonicalUrl, "utf8"),
+    ),
+    capture_intent_sha256: intentDigest,
+    consumer_signer_authorization_sha256: intent.consumer_signer_authorization_sha256,
+    conversation_id: match[1],
+    exact_prompt_utf8_byte_length: Buffer.byteLength(workflow.private.request.prompt, "utf8"),
+    exact_prompt_utf8_sha256: workflow.inputDigest,
+    external_binding_sha256: intent.external_binding_sha256,
+    provider_prompt_message_id: sent.promptMessageId,
+    qualified_runtime_identity: intent.qualified_runtime_identity,
+    schema: "ego-chat-confirmed-send-identity/v1",
+    send_event_sequence: sequence,
+    send_event_sha256: sha256Hex(canonicalJsonBytes(eventProjection)),
+    sent_at: sent.sentAt,
+    signer_enrollment_sha256: intent.signer_enrollment_sha256,
+    signer_key_id: intent.signer_key_id,
+    source_operation_key_sha256: intent.source_operation_key_sha256,
+    source_workflow_id: workflow.id,
+    turn_marker: workflow.reconciliation.turnMarker,
+  }
+  return {
+    event: {
+      ...eventProjection,
+      confirmed_send_identity_sha256: sha256Hex(canonicalJsonBytes(identity)),
+    },
+    identity,
   }
 }

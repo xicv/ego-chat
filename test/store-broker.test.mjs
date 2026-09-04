@@ -7,6 +7,11 @@ import test from "node:test"
 
 import { Broker } from "../src/broker.mjs"
 import {
+  canonicalJsonBytes,
+  operationKeyDigest,
+  sha256Hex,
+} from "../src/attachment-execution-receipt.mjs"
+import {
   buildChatGptPrompt,
   createContract,
   digestJson,
@@ -505,7 +510,13 @@ test("receipt admission atomically reserves capacity and globally consumes an A3
     attachmentReceiptAuthority: {
       qualify: async (request) => ({
         consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "1".repeat(64),
+          implementation_git_sha: "2".repeat(40),
+          package_inventory_sha256: "3".repeat(64),
+        },
         signerEnrollmentDigest: "e".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"f".repeat(64)}`,
       }),
     },
     egoAdapter: {
@@ -619,6 +630,155 @@ test("receipt admission fails before Send when signer authority is unavailable",
   )
   assert.equal(sendCount, 0)
   assert.equal(store.getMetrics().attachmentIntentCount, 0)
+})
+
+test("receipt Send confirmation atomically persists its immutable identity and event cross-digests", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/a3k-confirmed-send",
+    headContentDigest: "c".repeat(64),
+    headFingerprint: "d".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-confirmed",
+    messageCount: 2,
+    revision: 7,
+    state: "bound",
+    targetId: "tab-confirmed",
+    taskSpaceId: 4,
+  })
+  const sentAt = "2026-09-04T04:30:00.000Z"
+  const broker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "1".repeat(64),
+          implementation_git_sha: "2".repeat(40),
+          package_inventory_sha256: "3".repeat(64),
+        },
+        signerEnrollmentDigest: "e".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"f".repeat(64)}`,
+      }),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureExchange: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        captureReason: "generation_running",
+        captureState: "pending",
+        generationRunning: true,
+        promptMessageId: input.promptMessageId,
+        targetId: "tab-confirmed",
+        taskSpaceId: 4,
+        turnMarker: input.turnMarker,
+      }),
+      sendExchange: async (input) => ({
+        canonicalUrl: "https://chatgpt.com/c/a3k-confirmed-send",
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "prompt-confirmed",
+        sentAt,
+        targetId: "tab-confirmed",
+        taskSpaceId: 4,
+        turnMarker: input.turnMarker,
+      }),
+    },
+    store,
+  })
+  t.after(() => broker.close())
+  const prompt = "EGO_CHAT_A3K_RECEIPT_CONFIRMED1\nprepare"
+  const started = await broker.startEgoExchange({
+    bindingKey: "a3k-confirmed",
+    expectedTerminalMarker: "DONE_CONFIRMED",
+    prompt,
+    receiptCapture: {
+      consumer_signer_authorization_sha256: "b".repeat(64),
+      external_binding_sha256: "a".repeat(64),
+      profile: "a3k-manual-canary-v1",
+      receipt_capture_requested: true,
+      schema: "ego-chat-receipt-enabled-exchange-request/v1",
+    },
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_A3K_RECEIPT_CONFIRMED1",
+  })
+  let workflow
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    workflow = store.getWorkflow(started.id)
+    if (workflow?.phase === "send_confirmed") break
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+  }
+
+  const identity = store.getConfirmedSendIdentity(started.id)
+  assert.equal(workflow.phase, "send_confirmed")
+  assert.equal(identity.source_workflow_id, started.id)
+  assert.equal(identity.binding_key, "a3k-confirmed")
+  assert.equal(identity.binding_revision, 7)
+  assert.equal(identity.canonical_conversation_url_sha256, sha256Hex(
+    Buffer.from("https://chatgpt.com/c/a3k-confirmed-send", "utf8"),
+  ))
+  assert.equal(identity.conversation_id, "a3k-confirmed-send")
+  assert.equal(identity.before_head_message_id, "assistant-before")
+  assert.equal(identity.exact_prompt_utf8_sha256, digest(prompt))
+  assert.equal(identity.exact_prompt_utf8_byte_length, Buffer.byteLength(prompt, "utf8"))
+  assert.equal(identity.provider_prompt_message_id, "prompt-confirmed")
+  assert.equal(identity.sent_at, sentAt)
+  const eventProjection = {
+    event_type: "send_confirmed",
+    operation_key_sha256: operationKeyDigest(workflow.operationKey),
+    prompt_message_id: "prompt-confirmed",
+    schema: "ego-chat-confirmed-send-event/v1",
+    sent_at: sentAt,
+    sequence: identity.send_event_sequence,
+    workflow_id: started.id,
+  }
+  assert.equal(identity.send_event_sha256, sha256Hex(canonicalJsonBytes(eventProjection)))
+  assert.equal(
+    workflow.private.confirmedSendIdentitySha256,
+    sha256Hex(canonicalJsonBytes(identity)),
+  )
+
+  const replayed = new EventStore(dataDir)
+  await replayed.initialize()
+  assert.deepEqual(replayed.getConfirmedSendIdentity(started.id), identity)
+})
+
+test("receipt evidence replay rejects a confirmed Send event without its immutable identity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const workflowId = "4a08ed8c-1df9-4a31-913f-632d15195289"
+  await fs.writeFile(path.join(dataDir, "events.jsonl"), `${JSON.stringify({
+    at: "2026-09-04T04:31:00.000Z",
+    confirmedSendEvent: {
+      confirmed_send_identity_sha256: "a".repeat(64),
+      event_type: "send_confirmed",
+      operation_key_sha256: "b".repeat(64),
+      prompt_message_id: "prompt-orphaned",
+      schema: "ego-chat-confirmed-send-event/v1",
+      sent_at: "2026-09-04T04:31:00.000Z",
+      sequence: 1,
+      workflow_id: workflowId,
+    },
+    schemaVersion: 1,
+    seq: 1,
+    type: "exchange.send_confirmed",
+    workflow: {
+      createdAt: "2026-09-04T04:30:00.000Z",
+      id: workflowId,
+      kind: "ego_exchange",
+      status: "running",
+      updatedAt: "2026-09-04T04:31:00.000Z",
+    },
+  })}\n`, { mode: 0o600 })
+
+  const replayed = new EventStore(dataDir)
+  await assert.rejects(
+    replayed.initialize(),
+    (error) => error.code === "corrupt_attachment_evidence_state",
+  )
 })
 
 test("workflow status exposes exact convergence and ChatGPT delivery supervision", async (t) => {

@@ -14,6 +14,7 @@ import {
   MAX_RESULT_BYTES,
 } from "./constants.mjs"
 import {
+  buildConfirmedSendIdentity,
   canonicalJsonBytes,
   operationKeyDigest,
   sha256Hex,
@@ -36,6 +37,8 @@ const EMPTY_STATE = Object.freeze({
   },
   attachmentExternalBindings: {},
   attachmentIntents: {},
+  confirmedSendEvents: {},
+  confirmedSendIdentities: {},
   bindings: {},
   modelPolicies: {},
   nextSeq: 1,
@@ -162,6 +165,8 @@ function migrateState(value) {
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
   state.attachmentExternalBindings ??= {}
   state.attachmentIntents ??= {}
+  state.confirmedSendEvents ??= {}
+  state.confirmedSendIdentities ??= {}
   state.operations ??= {}
 
   for (const [workflowId, persistedWorkflow] of Object.entries(state.workflows)) {
@@ -227,6 +232,8 @@ function validateAttachmentEvidenceState(state) {
   const capacity = state.attachmentCapacity
   const intents = state.attachmentIntents
   const bindings = state.attachmentExternalBindings
+  const confirmedEvents = state.confirmedSendEvents
+  const confirmedIdentities = state.confirmedSendIdentities
   if (
     !capacity
     || typeof capacity !== "object"
@@ -237,6 +244,12 @@ function validateAttachmentEvidenceState(state) {
     || !bindings
     || typeof bindings !== "object"
     || Array.isArray(bindings)
+    || !confirmedEvents
+    || typeof confirmedEvents !== "object"
+    || Array.isArray(confirmedEvents)
+    || !confirmedIdentities
+    || typeof confirmedIdentities !== "object"
+    || Array.isArray(confirmedIdentities)
   ) {
     throw new EgoChatError(
       "corrupt_attachment_evidence_state",
@@ -273,6 +286,40 @@ function validateAttachmentEvidenceState(state) {
       throw new EgoChatError(
         "corrupt_attachment_evidence_state",
         "The attachment evidence intent and permanent binding do not match.",
+      )
+    }
+  }
+  if (!isDeepStrictEqual(
+    Object.keys(confirmedEvents).sort(),
+    Object.keys(confirmedIdentities).sort(),
+  )) {
+    throw new EgoChatError(
+      "corrupt_attachment_evidence_state",
+      "The confirmed Send event and identity ledgers do not have the same entries.",
+    )
+  }
+  for (const [workflowId, identity] of Object.entries(confirmedIdentities)) {
+    const event = confirmedEvents[workflowId]
+    const eventProjection = event && {
+      event_type: event.event_type,
+      operation_key_sha256: event.operation_key_sha256,
+      prompt_message_id: event.prompt_message_id,
+      schema: event.schema,
+      sent_at: event.sent_at,
+      sequence: event.sequence,
+      workflow_id: event.workflow_id,
+    }
+    if (
+      identity?.source_workflow_id !== workflowId
+      || identity.schema !== "ego-chat-confirmed-send-identity/v1"
+      || identity.capture_intent_sha256 !== sha256Hex(canonicalJsonBytes(intents[workflowId]))
+      || event?.workflow_id !== workflowId
+      || event.confirmed_send_identity_sha256 !== sha256Hex(canonicalJsonBytes(identity))
+      || identity.send_event_sha256 !== sha256Hex(canonicalJsonBytes(eventProjection))
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The confirmed Send identity and event do not match.",
       )
     }
   }
@@ -334,6 +381,16 @@ function applyEvent(state, event) {
     }
     if (event.attachmentCapacity) {
       state.attachmentCapacity = event.attachmentCapacity
+    }
+    if (
+      event.confirmedSendIdentity
+      && typeof event.confirmedSendIdentity.source_workflow_id === "string"
+    ) {
+      state.confirmedSendIdentities[event.confirmedSendIdentity.source_workflow_id]
+        = event.confirmedSendIdentity
+    }
+    if (event.confirmedSendEvent && typeof event.confirmedSendEvent.workflow_id === "string") {
+      state.confirmedSendEvents[event.confirmedSendEvent.workflow_id] = event.confirmedSendEvent
     }
   } else if (event.binding && typeof event.binding.key === "string") {
     state.bindings[event.binding.key] = event.binding
@@ -570,6 +627,11 @@ export class EventStore {
     return entry ? clone(entry) : undefined
   }
 
+  getConfirmedSendIdentity(workflowId) {
+    const identity = this.#state.confirmedSendIdentities[workflowId]
+    return identity ? clone(identity) : undefined
+  }
+
   listBindings() {
     return Object.values(this.#state.bindings).map(clone)
   }
@@ -733,6 +795,65 @@ export class EventStore {
 
   async persistBinding(type, binding, expectedBinding = undefined) {
     return this.#persistEntity(type, "binding", binding, expectedBinding)
+  }
+
+  async persistConfirmedAttachmentSend(type, workflow, patch, sent) {
+    const operation = this.#tail.then(async () => {
+      const current = this.#state.workflows[workflow.id]
+      if (!isDeepStrictEqual(current, workflow)) {
+        throw new EgoChatError(
+          "workflow_transition_conflict",
+          "The workflow changed before confirmed Send could be committed.",
+        )
+      }
+      const intent = this.#state.attachmentIntents[workflow.id]
+      const entry = intent && this.#state.attachmentExternalBindings[
+        `${intent.profile}:${intent.external_binding_sha256}`
+      ]
+      if (!intent || entry?.source_workflow_id !== workflow.id) {
+        throw new EgoChatError(
+          "attachment_receipt_intent_missing",
+          "Confirmed Send has no exact reserved attachment capture intent.",
+        )
+      }
+      if (this.#state.confirmedSendIdentities[workflow.id]) {
+        throw new EgoChatError(
+          "confirmed_send_identity_conflict",
+          "Confirmed Send identity already exists and cannot be replaced.",
+        )
+      }
+      const intentDigest = sha256Hex(canonicalJsonBytes(intent))
+      const confirmed = buildConfirmedSendIdentity({
+        intent,
+        intentDigest,
+        sent,
+        sequence: this.#state.nextSeq,
+        workflow,
+      })
+      const next = {
+        ...workflow,
+        ...patch,
+        private: {
+          ...patch.private,
+          confirmedSendIdentitySha256: sha256Hex(
+            canonicalJsonBytes(confirmed.identity),
+          ),
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await this.#appendEvent({
+        at: new Date().toISOString(),
+        confirmedSendEvent: confirmed.event,
+        confirmedSendIdentity: confirmed.identity,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type,
+        workflow: next,
+      })
+      return clone(next)
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
   }
 
   async persistModelPolicy(type, modelPolicy) {
