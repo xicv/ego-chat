@@ -5,7 +5,27 @@ import { EgoChatError } from "./errors.mjs"
 
 const MAX_IJSON_INTEGER = 9_007_199_254_740_991
 
+function hasLoneSurrogate(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index)
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return true
+      index += 1
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      return true
+    }
+  }
+  return false
+}
+
 function canonicalString(value) {
+  if (hasLoneSurrogate(value)) {
+    throw new EgoChatError(
+      "invalid_canonical_json",
+      "Receipt evidence contains an unpaired Unicode surrogate.",
+    )
+  }
   return JSON.stringify(value)
 }
 
@@ -34,7 +54,23 @@ function canonicalize(value, seen) {
   seen.add(value)
   try {
     if (Array.isArray(value)) {
+      if (
+        Object.keys(value).length !== value.length
+        || Object.keys(value).some((key, index) => key !== String(index))
+      ) {
+        throw new EgoChatError(
+          "invalid_canonical_json",
+          "Receipt evidence arrays must be dense and have no named properties.",
+        )
+      }
       return `[${value.map((entry) => canonicalize(entry, seen)).join(",")}]`
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new EgoChatError(
+        "invalid_canonical_json",
+        "Receipt evidence contains a non-JSON object.",
+      )
     }
     const keys = Object.keys(value).sort((left, right) => (
       left < right ? -1 : (left > right ? 1 : 0)
