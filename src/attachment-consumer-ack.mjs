@@ -71,6 +71,17 @@ function hasExactKeys(value, keys) {
 }
 
 export function assertValidAttachmentConsumerAcknowledgement(value) {
+  const terminalOutcomes = new Map([
+    [
+      "attachment-execution-disposition",
+      new Set(["EXACTLY_ONE", "ZERO", "MULTIPLE", "UNKNOWN"]),
+    ],
+    ["ambiguous-send-disposition", new Set(["SEND_OUTCOME_UNKNOWN"])],
+    ["confirmed-send-absence", new Set(["CONFIRMED_NOT_SENT"])],
+  ])
+  const allowedOutcomes = terminalOutcomes.get(value?.terminal_evidence_kind)
+  const attachmentDisposition = value?.terminal_evidence_kind
+    === "attachment-execution-disposition"
   if (
     !hasExactKeys(value, ACKNOWLEDGEMENT_KEYS)
     || value.schema !== "a3k-attachment-disposition-consumer-acknowledgement/v1"
@@ -82,10 +93,7 @@ export function assertValidAttachmentConsumerAcknowledgement(value) {
     || value.authority_key_id !== "a3k-human-approval-root-v1"
     || value.authorized_action !== "release-attachment-evidence-reservation"
     || value.consumer_profile !== "a3k-manual-canary-v1"
-    || value.terminal_evidence_kind !== "attachment-execution-disposition"
-    || !["EXACTLY_ONE", "ZERO", "MULTIPLE", "UNKNOWN"].includes(
-      value.terminal_outcome,
-    )
+    || !allowedOutcomes?.has(value.terminal_outcome)
     || value.consumer_state !== (
       value.terminal_outcome === "EXACTLY_ONE"
         ? "WAITING_HUMAN_SOURCE_APPROVAL"
@@ -96,8 +104,10 @@ export function assertValidAttachmentConsumerAcknowledgement(value) {
       ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT,
     )
     || !ID_PATTERN.test(value.work_order_id)
+    || (attachmentDisposition
+      ? !SHA256_PATTERN.test(value.confirmed_send_identity_sha256)
+      : value.confirmed_send_identity_sha256 !== null)
     || ![
-      value.confirmed_send_identity_sha256,
       value.consumer_state_record_sha256,
       value.disposition_envelope_sha256,
       value.external_binding_sha256,

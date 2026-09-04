@@ -89,3 +89,62 @@ test("consumer acknowledgement authorizes only evidence-retention release", () =
     (error) => error.code === "invalid_attachment_consumer_acknowledgement_signature",
   )
 })
+
+test("consumer acknowledgement discriminates every terminal evidence kind", () => {
+  const keyPair = generateKeyPairSync("rsa", { modulusLength: 2048 })
+  const valid = [
+    acknowledgement(),
+    acknowledgement({
+      confirmed_send_identity_sha256: null,
+      terminal_evidence_kind: "ambiguous-send-disposition",
+      terminal_outcome: "SEND_OUTCOME_UNKNOWN",
+    }),
+    acknowledgement({
+      confirmed_send_identity_sha256: null,
+      terminal_evidence_kind: "confirmed-send-absence",
+      terminal_outcome: "CONFIRMED_NOT_SENT",
+    }),
+  ]
+  for (const payload of valid) {
+    assert.equal(
+      verifyAttachmentConsumerAcknowledgementEnvelope(
+        envelope(payload, keyPair.privateKey),
+        keyPair.publicKey,
+      ).terminal_evidence_kind,
+      payload.terminal_evidence_kind,
+    )
+  }
+
+  const outcomes = [
+    "EXACTLY_ONE",
+    "ZERO",
+    "MULTIPLE",
+    "UNKNOWN",
+    "SEND_OUTCOME_UNKNOWN",
+    "CONFIRMED_NOT_SENT",
+  ]
+  const allowed = new Map([
+    ["attachment-execution-disposition", new Set(outcomes.slice(0, 4))],
+    ["ambiguous-send-disposition", new Set(["SEND_OUTCOME_UNKNOWN"])],
+    ["confirmed-send-absence", new Set(["CONFIRMED_NOT_SENT"])],
+  ])
+  for (const [kind, allowedOutcomes] of allowed) {
+    for (const outcome of outcomes) {
+      if (allowedOutcomes.has(outcome)) continue
+      const payload = acknowledgement({
+        confirmed_send_identity_sha256: kind === "attachment-execution-disposition"
+          ? "1".repeat(64)
+          : null,
+        terminal_evidence_kind: kind,
+        terminal_outcome: outcome,
+      })
+      assert.throws(
+        () => verifyAttachmentConsumerAcknowledgementEnvelope(
+          envelope(payload, keyPair.privateKey),
+          keyPair.publicKey,
+        ),
+        (error) => error.code === "invalid_attachment_consumer_acknowledgement",
+      )
+    }
+  }
+})
