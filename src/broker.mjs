@@ -186,6 +186,31 @@ function validateTaskSpaceControlRecovery(value) {
   return structuredClone(value)
 }
 
+function validateTaskSpaceIdentity(value) {
+  if (value === undefined) {
+    return undefined
+  }
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || typeof value.name !== "string"
+    || value.name.length < 1
+    || value.name.length > 200
+    || typeof value.taskId !== "string"
+    || value.taskId.length < 1
+    || value.taskId.length > 200
+    || Object.keys(value).some((key) => !["name", "taskId"].includes(key))
+  ) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser returned invalid task-space identity evidence.",
+      { reason: "task_space_identity_invalid" },
+    )
+  }
+  return structuredClone(value)
+}
+
 function validatePendingCapture(value, workflow) {
   if (value?.captureState !== "pending") {
     return false
@@ -2485,6 +2510,7 @@ export class Broker {
       }
       const request = current.private.request
       const capture = this.#validateAdoptionCapture(current.private.capture, request)
+      const taskSpaceIdentity = validateTaskSpaceIdentity(capture.taskSpaceIdentity)
       const now = new Date().toISOString()
       const candidateBinding = {
         adoptionWorkflowId: workflowId,
@@ -2500,6 +2526,7 @@ export class Broker {
         startUrl: capture.canonicalUrl,
         state: "bound",
         targetId: capture.targetId,
+        ...(taskSpaceIdentity ? { taskSpaceIdentity } : {}),
         taskSpaceId: capture.taskSpaceId,
         updatedAt: now,
         verifiedAt: now,
@@ -2540,6 +2567,7 @@ export class Broker {
         responseRef,
         responseText: capture.responseText,
         targetId: capture.targetId,
+        ...(taskSpaceIdentity ? { taskSpaceIdentity } : {}),
         taskSpaceId: capture.taskSpaceId,
       }
       if (responseRef.sizeBytes > 16 * 1024) {

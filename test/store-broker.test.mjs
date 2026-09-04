@@ -3129,6 +3129,10 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
         responseDigest,
         responseText,
         targetId: "adopted-tab",
+        taskSpaceIdentity: {
+          name: "adoption-driver-space",
+          taskId: "adoption-driver-space",
+        },
         taskSpaceId: 10,
       }
     },
@@ -3179,6 +3183,10 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(binding.messageCount, 4)
   assert.equal(binding.mode, "existing")
   assert.equal(binding.state, "bound")
+  assert.deepEqual(binding.taskSpaceIdentity, {
+    name: "adoption-driver-space",
+    taskId: "adoption-driver-space",
+  })
   await assert.rejects(
     broker.startConversationAdoption({
       canonicalUrl,

@@ -1060,6 +1060,7 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 }
 
 async function runTaskSpaceReconciliationCase({
+  adoptedTaskSpaceOwnership = null,
   attachmentObservation = null,
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
@@ -1080,6 +1081,9 @@ async function runTaskSpaceReconciliationCase({
   const canonicalUrl = "https://chatgpt.com/c/reconcile-driver-test"
   const fallbackName = `ego-chat-bound-${createHash("sha256").update("ego-chat-main", "utf8").digest("hex").slice(0, 16)}`
   const listedTaskSpaces = [
+    ...(adoptedTaskSpaceOwnership
+      ? [{ id: 10, name: "adoption-driver-space", ownership: adoptedTaskSpaceOwnership, taskId: "adoption-driver-space" }]
+      : []),
     ...(requestedTaskSpaceOwnership
       ? [{ id: 10, name: "unrelated-agent-space", ownership: requestedTaskSpaceOwnership, taskId: "unrelated-agent-space" }]
       : []),
@@ -1122,6 +1126,14 @@ async function runTaskSpaceReconciliationCase({
       messageCount: 2,
       state: "bound",
       targetId: "stale-bound-tab",
+      ...(adoptedTaskSpaceOwnership
+        ? {
+            taskSpaceIdentity: {
+              name: "adoption-driver-space",
+              taskId: "adoption-driver-space",
+            },
+          }
+        : {}),
       taskSpaceId: 10,
     },
     brokerLease: {
@@ -2460,6 +2472,10 @@ test("conversation adoption reclaims only its explicitly selected task space", a
   })
   assert.equal(adopted.error, undefined)
   assert.equal(adopted.result.taskSpaceId, 10)
+  assert.deepEqual(adopted.result.taskSpaceIdentity, {
+    name: "adoption-driver-space",
+    taskId: "adoption-driver-space",
+  })
   assert.deepEqual(adopted.taskSpaceRequests, [10])
   assert.equal(adopted.counters.sendClick, 0)
 })
@@ -2522,6 +2538,29 @@ test("bound recovery ignores a recycled user-controlled numeric task space", asy
   assert.equal(reconciled.result.taskSpaceId, 11)
   assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
+})
+
+test("bound recovery preserves an adopted task-space identity instead of creating a fallback", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    adoptedTaskSpaceOwnership: "agent",
+  })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 10)
+  assert.deepEqual(reconciled.taskSpaceRequests, [10])
+})
+
+test("bound recovery reclaims the adopted task-space identity before reuse", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    adoptedTaskSpaceOwnership: "agentDelegatedToUser",
+    allowTaskSpaceReclaim: true,
+  })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 10)
+  assert.equal(reconciled.counters.claimTaskSpace, 0)
+  assert.equal(reconciled.counters.takeOverTaskSpace, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [10])
 })
 
 test("bound recovery stops instead of bypassing a user-controlled deterministic task space", async () => {

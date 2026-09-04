@@ -519,6 +519,38 @@ async function egoDriverMain(
     return `ego-chat-bound-${sha256(String(identity)).slice(0, 16)}`
   }
 
+  function taskSpaceIdentityMatches(taskSpace, identity) {
+    return identity
+      && typeof identity.name === "string"
+      && identity.name.length > 0
+      && typeof identity.taskId === "string"
+      && identity.taskId.length > 0
+      && taskSpace.name === identity.name
+      && taskSpace.taskId === identity.taskId
+  }
+
+  function taskSpaceIdentity(taskSpace) {
+    if (
+      typeof taskSpace?.name !== "string"
+      || taskSpace.name.length < 1
+      || taskSpace.name.length > 200
+      || typeof taskSpace?.taskId !== "string"
+      || taskSpace.taskId.length < 1
+      || taskSpace.taskId.length > 200
+    ) {
+      return null
+    }
+    return {
+      name: taskSpace.name,
+      taskId: taskSpace.taskId,
+    }
+  }
+
+  async function selectObservedTaskSpace(taskSpace) {
+    const selected = await useOrCreateTaskSpace(taskSpace.id)
+    return { ...taskSpace, ...selected }
+  }
+
   function canReclaimBoundTaskSpace(binding) {
     return input.allowTaskSpaceReclaim === true
       && (
@@ -570,7 +602,7 @@ async function egoDriverMain(
       return null
     }
 
-    const selected = await useOrCreateTaskSpace(verified.id)
+    const selected = await selectObservedTaskSpace(verified)
     if (selected.id !== verified.id) {
       humanRequired("browser_control_reclaim_failed", "Ego Chat selected a different task space after reclaiming browser control.", {
         method,
@@ -598,7 +630,36 @@ async function egoDriverMain(
         })
         return null
       }
-      return useOrCreateTaskSpace(requested?.id ?? binding.taskSpaceId)
+      return requested
+        ? selectObservedTaskSpace(requested)
+        : useOrCreateTaskSpace(binding.taskSpaceId)
+    }
+    if (binding.taskSpaceIdentity) {
+      const matches = taskSpaces.filter((taskSpace) => (
+        taskSpaceIdentityMatches(taskSpace, binding.taskSpaceIdentity)
+      ))
+      if (matches.length > 1) {
+        humanRequired("bound_task_space_identity_ambiguous", "More than one Ego task space matches the adopted binding identity.")
+        return null
+      }
+      const adopted = matches[0]
+      if (adopted) {
+        if (Object.hasOwn(adopted, "ownership") && adopted.ownership !== "agent") {
+          if (canReclaimBoundTaskSpace(binding)) {
+            return reclaimBoundTaskSpace(adopted, binding.taskSpaceIdentity.taskId)
+          }
+          humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
+            taskSpaceId: adopted.id,
+          })
+          return null
+        }
+        return selectObservedTaskSpace(adopted)
+      }
+      const recreated = await useOrCreateTaskSpace(binding.taskSpaceIdentity.name)
+      return {
+        ...binding.taskSpaceIdentity,
+        ...recreated,
+      }
     }
     const fallbackName = boundTaskSpaceName(binding)
     const fallback = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, fallbackName))
@@ -2097,6 +2158,7 @@ async function egoDriverMain(
         if (!await assertBrokerAuthority("before_head_commit")) {
           return
         }
+        const selectedTaskSpaceIdentity = taskSpaceIdentity(selected.task)
         emit({
           ok: true,
           result: {
@@ -2112,6 +2174,7 @@ async function egoDriverMain(
             responseDigest: finalResponse.contentDigest,
             responseText: finalResponse.text,
             targetId: selected.targetId,
+            ...(selectedTaskSpaceIdentity ? { taskSpaceIdentity: selectedTaskSpaceIdentity } : {}),
             taskSpaceId: selected.task.id,
           },
         })
