@@ -14,6 +14,8 @@ import {
   MAX_RESULT_BYTES,
 } from "./constants.mjs"
 import {
+  attachmentCaptureOperationKeyDigest,
+  buildAttachmentCaptureOperation,
   buildConfirmedSendIdentity,
   canonicalJsonBytes,
   operationKeyDigest,
@@ -36,6 +38,7 @@ const EMPTY_STATE = Object.freeze({
     permanentReservedBytes: 0,
   },
   attachmentExternalBindings: {},
+  attachmentCaptures: {},
   attachmentIntents: {},
   confirmedSendEvents: {},
   confirmedSendIdentities: {},
@@ -164,6 +167,7 @@ function migrateState(value) {
   const state = clone(value)
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
   state.attachmentExternalBindings ??= {}
+  state.attachmentCaptures ??= {}
   state.attachmentIntents ??= {}
   state.confirmedSendEvents ??= {}
   state.confirmedSendIdentities ??= {}
@@ -230,6 +234,7 @@ function preserveConvergenceLivenessCheckpoint(workflow, previousWorkflow = unde
 
 function validateAttachmentEvidenceState(state) {
   const capacity = state.attachmentCapacity
+  const captures = state.attachmentCaptures
   const intents = state.attachmentIntents
   const bindings = state.attachmentExternalBindings
   const confirmedEvents = state.confirmedSendEvents
@@ -241,6 +246,9 @@ function validateAttachmentEvidenceState(state) {
     || !intents
     || typeof intents !== "object"
     || Array.isArray(intents)
+    || !captures
+    || typeof captures !== "object"
+    || Array.isArray(captures)
     || !bindings
     || typeof bindings !== "object"
     || Array.isArray(bindings)
@@ -323,6 +331,32 @@ function validateAttachmentEvidenceState(state) {
       )
     }
   }
+  for (const [workflowId, capture] of Object.entries(captures)) {
+    const identity = confirmedIdentities[workflowId]
+    const identityDigest = identity && sha256Hex(canonicalJsonBytes(identity))
+    const expectedOperationKeyDigest = identityDigest
+      ? attachmentCaptureOperationKeyDigest(identityDigest)
+      : undefined
+    if (
+      capture?.source_workflow_id !== workflowId
+      || capture.schema !== "ego-chat-attachment-capture-operation/v1"
+      || capture.state !== "CAPTURING"
+      || capture.confirmed_send_identity_sha256 !== identityDigest
+      || capture.capture_operation_key_sha256
+        !== expectedOperationKeyDigest
+      || !Number.isFinite(Date.parse(capture.capture_started_at))
+      || Date.parse(capture.capture_deadline_at) - Date.parse(capture.capture_started_at)
+        !== 10 * 60 * 1_000
+      || capture.accumulated_monotonic_ms !== 0
+      || !Array.isArray(capture.attempt_journal)
+      || capture.attempt_journal.length !== 0
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The attachment capture operation does not match its confirmed Send identity.",
+      )
+    }
+  }
 }
 
 async function listFiles(directory) {
@@ -371,6 +405,13 @@ function applyEvent(state, event) {
     }
     if (event.attachmentIntent && typeof event.attachmentIntent.source_workflow_id === "string") {
       state.attachmentIntents[event.attachmentIntent.source_workflow_id] = event.attachmentIntent
+    }
+    if (
+      event.attachmentCapture
+      && typeof event.attachmentCapture.source_workflow_id === "string"
+    ) {
+      state.attachmentCaptures[event.attachmentCapture.source_workflow_id]
+        = event.attachmentCapture
     }
     if (
       event.attachmentExternalBinding
@@ -632,6 +673,11 @@ export class EventStore {
     return identity ? clone(identity) : undefined
   }
 
+  getAttachmentCapture(workflowId) {
+    const capture = this.#state.attachmentCaptures[workflowId]
+    return capture ? clone(capture) : undefined
+  }
+
   listBindings() {
     return Object.values(this.#state.bindings).map(clone)
   }
@@ -851,6 +897,60 @@ export class EventStore {
         workflow: next,
       })
       return clone(next)
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async beginAttachmentCapture(workflow, startedAt) {
+    const operation = this.#tail.then(async () => {
+      const current = this.#state.workflows[workflow.id]
+      if (!isDeepStrictEqual(current, workflow)) {
+        throw new EgoChatError(
+          "workflow_transition_conflict",
+          "The workflow changed before attachment capture could begin.",
+        )
+      }
+      const existing = this.#state.attachmentCaptures[workflow.id]
+      if (existing) {
+        return { capture: clone(existing), created: false, workflow: clone(current) }
+      }
+      const identity = this.#state.confirmedSendIdentities[workflow.id]
+      if (
+        current.phase !== "awaiting_attachment_capture"
+        || !current.private?.request?.receiptCapture
+        || !identity
+      ) {
+        throw new EgoChatError(
+          "attachment_capture_not_ready",
+          "The source workflow has no eligible confirmed attachment Send.",
+        )
+      }
+      const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+      const capture = buildAttachmentCaptureOperation({
+        confirmedSendIdentityDigest: identityDigest,
+        sourceWorkflowId: workflow.id,
+        startedAt,
+      })
+      const next = {
+        ...current,
+        deadlineAt: capture.capture_deadline_at,
+        phase: "attachment_capture_started",
+        private: {
+          ...current.private,
+          attachmentCaptureOperationKeySha256: capture.capture_operation_key_sha256,
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await this.#appendEvent({
+        at: new Date().toISOString(),
+        attachmentCapture: capture,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.capture_started",
+        workflow: next,
+      })
+      return { capture: clone(capture), created: true, workflow: clone(next) }
     })
     this.#tail = operation.catch(() => {})
     return operation

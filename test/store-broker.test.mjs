@@ -757,6 +757,43 @@ test("receipt Send confirmation atomically persists its immutable identity and e
     replayed.getWorkflow(started.id).phase,
     "awaiting_attachment_capture",
   )
+
+  const captureStarted = await restartedBroker.startAttachmentCapture({
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: started.id,
+  })
+  assert.equal(captureStarted.phase, "attachment_capture_started")
+  const capture = replayed.getAttachmentCapture(started.id)
+  assert.equal(capture.schema, "ego-chat-attachment-capture-operation/v1")
+  assert.equal(capture.source_workflow_id, started.id)
+  assert.equal(capture.state, "CAPTURING")
+  assert.equal(capture.accumulated_monotonic_ms, 0)
+  assert.deepEqual(capture.attempt_journal, [])
+  assert.equal(
+    Date.parse(capture.capture_deadline_at) - Date.parse(capture.capture_started_at),
+    10 * 60 * 1_000,
+  )
+  const replay = await restartedBroker.startAttachmentCapture({
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: started.id,
+  })
+  assert.equal(replay.phase, "attachment_capture_started")
+  assert.deepEqual(replayed.getAttachmentCapture(started.id), capture)
+
+  restartedBroker.close()
+  const captureReplayStore = new EventStore(dataDir)
+  await captureReplayStore.initialize()
+  const captureReplayBroker = new Broker({
+    egoAdapter: unusedEgoAdapter,
+    store: captureReplayStore,
+  })
+  t.after(() => captureReplayBroker.close())
+  await captureReplayBroker.initialize()
+  const captureReplayed = captureReplayStore.getWorkflow(started.id)
+  assert.equal(captureReplayed.phase, "attachment_capture_started")
+  assert.equal(captureReplayed.status, "running")
+  assert.equal(captureReplayed.humanRequired, undefined)
+  assert.deepEqual(captureReplayStore.getAttachmentCapture(started.id), capture)
 })
 
 test("receipt evidence replay rejects a confirmed Send event without its immutable identity", async (t) => {

@@ -28,6 +28,7 @@ import {
 } from "./convergence.mjs"
 import {
   AbandonWorkflowSchema,
+  AttachmentCaptureRequestSchema,
   AwaitWorkflowSchema,
   ConversationAdoptionSchema,
   ConversationBindSchema,
@@ -667,9 +668,18 @@ export class Broker {
         }
       } else if (
         workflow.kind === "ego_exchange"
-        && workflow.phase === "awaiting_attachment_capture"
         && workflow.private?.request?.receiptCapture
         && this.#store.getConfirmedSendIdentity(workflow.id)
+        && (
+          (
+            workflow.phase === "awaiting_attachment_capture"
+            && !this.#store.getAttachmentCapture(workflow.id)
+          )
+          || (
+            workflow.phase === "attachment_capture_started"
+            && this.#store.getAttachmentCapture(workflow.id)
+          )
+        )
       ) {
         continue
       } else if (
@@ -1512,6 +1522,43 @@ export class Broker {
 
   async startEgoExchange(input) {
     return this.#startEgoExchange(input)
+  }
+
+  async startAttachmentCapture(input) {
+    const params = parse(AttachmentCaptureRequestSchema, input)
+    const workflow = this.#store.getWorkflow(params.source_workflow_id)
+    if (!workflow) {
+      throw new EgoChatError("workflow_not_found", "No workflow exists with that ID.")
+    }
+    if (
+      workflow.kind !== "ego_exchange"
+      || workflow.status !== "running"
+      || !["awaiting_attachment_capture", "attachment_capture_started"].includes(
+        workflow.phase,
+      )
+      || !workflow.private?.request?.receiptCapture
+      || !this.#store.getConfirmedSendIdentity(workflow.id)
+    ) {
+      throw new EgoChatError(
+        "attachment_capture_not_ready",
+        "The source workflow has no eligible confirmed attachment Send.",
+      )
+    }
+    const existing = this.#store.getAttachmentCapture(workflow.id)
+    if (existing) {
+      if (workflow.phase !== "attachment_capture_started") {
+        throw new EgoChatError(
+          "corrupt_attachment_evidence_state",
+          "The attachment capture operation and source workflow phase do not match.",
+        )
+      }
+      return publicWorkflow(workflow)
+    }
+    const started = await this.#store.beginAttachmentCapture(
+      workflow,
+      new Date().toISOString(),
+    )
+    return publicWorkflow(started.workflow)
   }
 
   async #startEgoExchange(input, convergenceId = undefined) {

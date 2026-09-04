@@ -98,6 +98,44 @@ export function operationKeyDigest(operationKey) {
   ]))
 }
 
+export function attachmentCaptureOperationKeyDigest(confirmedSendIdentityDigest) {
+  return sha256Hex(Buffer.concat([
+    Buffer.from("EGO_CHAT_ATTACHMENT_CAPTURE_OPERATION_V1\0", "ascii"),
+    Buffer.from(confirmedSendIdentityDigest, "ascii"),
+  ]))
+}
+
+export function buildAttachmentCaptureOperation({
+  confirmedSendIdentityDigest,
+  sourceWorkflowId,
+  startedAt,
+}) {
+  const startedAtMs = Date.parse(startedAt)
+  if (
+    !/^[a-f0-9]{64}$/.test(confirmedSendIdentityDigest)
+    || !Number.isFinite(startedAtMs)
+    || new Date(startedAtMs).toISOString() !== startedAt
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_capture_operation",
+      "Attachment capture operation identity is invalid.",
+    )
+  }
+  return {
+    accumulated_monotonic_ms: 0,
+    attempt_journal: [],
+    capture_deadline_at: new Date(startedAtMs + 10 * 60 * 1_000).toISOString(),
+    capture_operation_key_sha256: attachmentCaptureOperationKeyDigest(
+      confirmedSendIdentityDigest,
+    ),
+    capture_started_at: startedAt,
+    confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+    schema: "ego-chat-attachment-capture-operation/v1",
+    source_workflow_id: sourceWorkflowId,
+    state: "CAPTURING",
+  }
+}
+
 export function buildAttachmentCaptureIntent({
   authorizationDigest,
   createdAt,
