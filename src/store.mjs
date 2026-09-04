@@ -14,8 +14,11 @@ import {
   MAX_RESULT_BYTES,
 } from "./constants.mjs"
 import {
+  assertValidAttachmentGraphObservation,
+  assertValidSignedAttachmentDispositionEnvelope,
   attachmentCaptureOperationKeyDigest,
   buildAttachmentCaptureOperation,
+  buildAttachmentExecutionDisposition,
   buildConfirmedSendIdentity,
   canonicalJsonBytes,
   operationKeyDigest,
@@ -29,6 +32,18 @@ const DEFAULT_MAX_OPERATIONS = 10_000
 const DEFAULT_MAX_RECOVERY_WORKFLOWS = 256
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024
 const RESULT_RECOVERY_KINDS = new Set(["conversation_adoption", "ego_exchange"])
+const ATTACHMENT_ATTEMPT_JOURNAL_KEYS = [
+  "attempt_number",
+  "attempted_at",
+  "candidate_generation",
+  "dom_snapshot_sha256",
+  "graph_snapshot_sha256",
+  "reason",
+  "response_snapshot_sha256",
+  "schema",
+  "state",
+].sort()
+const SHA256_PATTERN = /^[a-f0-9]{64}$/
 
 const EMPTY_STATE = Object.freeze({
   attachmentCapacity: {
@@ -39,6 +54,7 @@ const EMPTY_STATE = Object.freeze({
   },
   attachmentExternalBindings: {},
   attachmentCaptures: {},
+  attachmentDispositions: {},
   attachmentIntents: {},
   confirmedSendEvents: {},
   confirmedSendIdentities: {},
@@ -46,7 +62,7 @@ const EMPTY_STATE = Object.freeze({
   modelPolicies: {},
   nextSeq: 1,
   operations: {},
-  schemaVersion: 5,
+  schemaVersion: 6,
   workflows: {},
 })
 
@@ -56,6 +72,51 @@ function clone(value) {
 
 function digestJson(value) {
   return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex")
+}
+
+function hasExactKeys(value, expectedKeys) {
+  return value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && isDeepStrictEqual(Object.keys(value).sort(), expectedKeys)
+}
+
+function exactTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : Number.NaN
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+}
+
+function attachmentAttemptJournalEntry(observation, candidateGeneration) {
+  const entry = {
+    attempt_number: observation.observation_sequence,
+    attempted_at: observation.observed_at,
+    candidate_generation: candidateGeneration,
+    dom_snapshot_sha256: sha256Hex(canonicalJsonBytes({
+      artifacts: observation.artifacts.map((artifact) => ({
+        artifact_id: artifact.artifact_id,
+        dom_wrapper_id: artifact.dom_wrapper_id,
+      })),
+      normal_download_control_count: observation.normal_download_control_count,
+      normal_save_control_count: observation.normal_save_control_count,
+      save_association_id: observation.save_association_id,
+    })),
+    graph_snapshot_sha256: sha256Hex(canonicalJsonBytes(observation)),
+    reason: "OBSERVATION_RECORDED",
+    response_snapshot_sha256: sha256Hex(canonicalJsonBytes({
+      direct_branch_ids: observation.direct_branch_ids,
+      response_message_id: observation.response_message_id,
+      selected_branch_id: observation.selected_branch_id,
+    })),
+    schema: "ego-chat-attachment-capture-attempt/v1",
+    state: "CANDIDATE",
+  }
+  if (canonicalJsonBytes(entry).length > 768) {
+    throw new EgoChatError(
+      "attachment_capture_journal_entry_too_large",
+      "The attachment capture journal entry exceeds its fixed bound.",
+    )
+  }
+  return entry
 }
 
 function isUtf8ContinuationByte(value) {
@@ -156,7 +217,7 @@ function validateCheckpoint(value) {
     || !value.workflows
     || !value.bindings
     || !value.modelPolicies
-    || ![3, 4, 5].includes(value.schemaVersion)
+    || ![3, 4, 5, 6].includes(value.schemaVersion)
   ) {
     throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
   }
@@ -168,10 +229,17 @@ function migrateState(value) {
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
   state.attachmentExternalBindings ??= {}
   state.attachmentCaptures ??= {}
+  state.attachmentDispositions ??= {}
   state.attachmentIntents ??= {}
   state.confirmedSendEvents ??= {}
   state.confirmedSendIdentities ??= {}
   state.operations ??= {}
+  for (const capture of Object.values(state.attachmentCaptures)) {
+    capture.candidate_generation ??= 0
+    capture.candidate_observations ??= []
+    capture.terminal_disposition_sha256 ??= null
+    capture.terminal_envelope_sha256 ??= null
+  }
 
   for (const [workflowId, persistedWorkflow] of Object.entries(state.workflows)) {
     const workflow = preserveConvergenceLivenessCheckpoint(persistedWorkflow)
@@ -208,7 +276,7 @@ function migrateState(value) {
     }
   }
 
-  state.schemaVersion = 5
+  state.schemaVersion = 6
   validateAttachmentEvidenceState(state)
   return state
 }
@@ -235,6 +303,7 @@ function preserveConvergenceLivenessCheckpoint(workflow, previousWorkflow = unde
 function validateAttachmentEvidenceState(state) {
   const capacity = state.attachmentCapacity
   const captures = state.attachmentCaptures
+  const dispositions = state.attachmentDispositions
   const intents = state.attachmentIntents
   const bindings = state.attachmentExternalBindings
   const confirmedEvents = state.confirmedSendEvents
@@ -249,6 +318,9 @@ function validateAttachmentEvidenceState(state) {
     || !captures
     || typeof captures !== "object"
     || Array.isArray(captures)
+    || !dispositions
+    || typeof dispositions !== "object"
+    || Array.isArray(dispositions)
     || !bindings
     || typeof bindings !== "object"
     || Array.isArray(bindings)
@@ -337,25 +409,109 @@ function validateAttachmentEvidenceState(state) {
     const expectedOperationKeyDigest = identityDigest
       ? attachmentCaptureOperationKeyDigest(identityDigest)
       : undefined
+    const candidateObservations = capture?.candidate_observations
+    const attemptJournal = capture?.attempt_journal
+    const journalValid = Array.isArray(attemptJournal)
+      && attemptJournal.length <= 32
+      && canonicalJsonBytes(attemptJournal).length <= 32 * 1024
+      && attemptJournal.every((entry, index) => (
+        hasExactKeys(entry, ATTACHMENT_ATTEMPT_JOURNAL_KEYS)
+        && entry.schema === "ego-chat-attachment-capture-attempt/v1"
+        && entry.state === "CANDIDATE"
+        && entry.reason === "OBSERVATION_RECORDED"
+        && entry.attempt_number === index + 1
+        && Number.isSafeInteger(entry.candidate_generation)
+        && entry.candidate_generation === index + 1
+        && exactTimestamp(entry.attempted_at)
+        && SHA256_PATTERN.test(entry.dom_snapshot_sha256)
+        && SHA256_PATTERN.test(entry.graph_snapshot_sha256)
+        && SHA256_PATTERN.test(entry.response_snapshot_sha256)
+        && canonicalJsonBytes(entry).length <= 768
+      ))
+    const candidatesValid = Array.isArray(candidateObservations)
+      && Array.isArray(attemptJournal)
+      && candidateObservations.length <= 2
+      && candidateObservations.every((observation, index) => {
+        try {
+          assertValidAttachmentGraphObservation(observation)
+        } catch {
+          return false
+        }
+        return observation.source_confirmed_send_identity_sha256 === identityDigest
+          && observation.capture_operation_key_sha256 === expectedOperationKeyDigest
+          && observation.observation_sequence
+            === attemptJournal.length - candidateObservations.length + index + 1
+      })
+    const terminalEnvelope = dispositions[workflowId]
+    let terminalDispositionValid = false
+    if (terminalEnvelope) {
+      try {
+        const { disposition } = assertValidSignedAttachmentDispositionEnvelope(
+          terminalEnvelope,
+        )
+        const expectedDisposition = buildAttachmentExecutionDisposition({
+          captureOperation: capture,
+          confirmedSendIdentity: identity,
+          confirmedSendIdentityDigest: identityDigest,
+          observations: candidateObservations,
+          terminalAt: disposition.terminal_at,
+        })
+        terminalDispositionValid = isDeepStrictEqual(disposition, expectedDisposition)
+          && capture.terminal_disposition_sha256 === terminalEnvelope.payload_sha256
+          && capture.terminal_envelope_sha256
+            === sha256Hex(canonicalJsonBytes(terminalEnvelope))
+      } catch {
+        terminalDispositionValid = false
+      }
+    }
     if (
       capture?.source_workflow_id !== workflowId
       || capture.schema !== "ego-chat-attachment-capture-operation/v1"
-      || capture.state !== "CAPTURING"
+      || !["CAPTURING", "TERMINAL"].includes(capture.state)
       || capture.confirmed_send_identity_sha256 !== identityDigest
       || capture.capture_operation_key_sha256
         !== expectedOperationKeyDigest
       || !Number.isFinite(Date.parse(capture.capture_started_at))
       || Date.parse(capture.capture_deadline_at) - Date.parse(capture.capture_started_at)
         !== 10 * 60 * 1_000
-      || capture.accumulated_monotonic_ms !== 0
-      || !Array.isArray(capture.attempt_journal)
-      || capture.attempt_journal.length !== 0
+      || !Number.isSafeInteger(capture.accumulated_monotonic_ms)
+      || capture.accumulated_monotonic_ms < 0
+      || capture.accumulated_monotonic_ms > 10 * 60 * 1_000
+      || !journalValid
+      || !candidatesValid
+      || capture.candidate_generation !== attemptJournal.length
+      || (
+        capture.state === "CAPTURING"
+        && (
+          terminalEnvelope !== undefined
+          || capture.terminal_disposition_sha256 !== null
+          || capture.terminal_envelope_sha256 !== null
+        )
+      )
+      || (capture.state === "TERMINAL" && !terminalDispositionValid)
+      || (
+        capture.state === "TERMINAL"
+        && (
+          state.workflows[workflowId]?.phase !== "attachment_disposition_terminal"
+          || state.workflows[workflowId]?.status !== "succeeded"
+          || state.workflows[workflowId]?.result?.attachmentDispositionEnvelopeSha256
+            !== capture.terminal_envelope_sha256
+          || state.workflows[workflowId]?.result?.attachmentDispositionPayloadSha256
+            !== capture.terminal_disposition_sha256
+        )
+      )
     ) {
       throw new EgoChatError(
         "corrupt_attachment_evidence_state",
         "The attachment capture operation does not match its confirmed Send identity.",
       )
     }
+  }
+  if (Object.keys(dispositions).some((workflowId) => !captures[workflowId])) {
+    throw new EgoChatError(
+      "corrupt_attachment_evidence_state",
+      "A terminal attachment disposition has no capture operation.",
+    )
   }
 }
 
@@ -412,6 +568,14 @@ function applyEvent(state, event) {
     ) {
       state.attachmentCaptures[event.attachmentCapture.source_workflow_id]
         = event.attachmentCapture
+    }
+    if (
+      event.attachmentDisposition
+      && typeof event.attachmentDisposition.source_workflow_id === "string"
+      && event.attachmentDisposition.envelope
+    ) {
+      state.attachmentDispositions[event.attachmentDisposition.source_workflow_id]
+        = event.attachmentDisposition.envelope
     }
     if (
       event.attachmentExternalBinding
@@ -676,6 +840,11 @@ export class EventStore {
   getAttachmentCapture(workflowId) {
     const capture = this.#state.attachmentCaptures[workflowId]
     return capture ? clone(capture) : undefined
+  }
+
+  getAttachmentDisposition(workflowId) {
+    const envelope = this.#state.attachmentDispositions[workflowId]
+    return envelope ? clone(envelope) : undefined
   }
 
   listBindings() {
@@ -951,6 +1120,175 @@ export class EventStore {
         workflow: next,
       })
       return { capture: clone(capture), created: true, workflow: clone(next) }
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async recordAttachmentCaptureAttempt({
+    capture,
+    elapsedMonotonicMs,
+    observation,
+  }) {
+    const operation = this.#tail.then(async () => {
+      const current = this.#state.attachmentCaptures[capture?.source_workflow_id]
+      if (!current || !capture || !isDeepStrictEqual(current, capture)) {
+        throw new EgoChatError(
+          "attachment_capture_transition_conflict",
+          "The attachment capture changed before its observation could be committed.",
+        )
+      }
+      if (current.state !== "CAPTURING") {
+        throw new EgoChatError(
+          "attachment_capture_terminal",
+          "The attachment capture already has terminal evidence.",
+        )
+      }
+      assertValidAttachmentGraphObservation(observation)
+      const identity = this.#state.confirmedSendIdentities[current.source_workflow_id]
+      const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+      const observedAtMs = Date.parse(observation.observed_at)
+      if (
+        observation.source_confirmed_send_identity_sha256 !== identityDigest
+        || observation.capture_operation_key_sha256
+          !== current.capture_operation_key_sha256
+        || observation.provider_prompt_message_id !== identity.provider_prompt_message_id
+        || observation.canonical_conversation_locator_sha256
+          !== identity.canonical_conversation_url_sha256
+        || observation.observation_sequence !== current.attempt_journal.length + 1
+        || observedAtMs < Date.parse(current.capture_started_at)
+        || observedAtMs > Date.parse(current.capture_deadline_at)
+        || !Number.isSafeInteger(elapsedMonotonicMs)
+        || elapsedMonotonicMs < 0
+        || current.accumulated_monotonic_ms + elapsedMonotonicMs > 10 * 60 * 1_000
+      ) {
+        throw new EgoChatError(
+          "invalid_attachment_capture_attempt",
+          "The attachment observation does not match its fixed capture lineage or bounds.",
+        )
+      }
+      if (current.attempt_journal.length >= 32) {
+        throw new EgoChatError(
+          "attachment_capture_attempt_limit",
+          "The attachment capture attempt limit has been reached.",
+        )
+      }
+      const candidateGeneration = current.candidate_generation + 1
+      const journalEntry = attachmentAttemptJournalEntry(
+        observation,
+        candidateGeneration,
+      )
+      const next = {
+        ...current,
+        accumulated_monotonic_ms: current.accumulated_monotonic_ms + elapsedMonotonicMs,
+        attempt_journal: [...current.attempt_journal, journalEntry],
+        candidate_generation: candidateGeneration,
+        candidate_observations: [
+          ...current.candidate_observations,
+          clone(observation),
+        ].slice(-2),
+      }
+      const workflow = this.#state.workflows[current.source_workflow_id]
+      await this.#appendEvent({
+        at: observation.observed_at,
+        attachmentCapture: next,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.capture_attempt_recorded",
+        workflow,
+      })
+      return clone(next)
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async persistAttachmentDisposition({ capture, envelope }) {
+    const operation = this.#tail.then(async () => {
+      const workflowId = capture?.source_workflow_id
+      if (typeof workflowId !== "string") {
+        throw new EgoChatError(
+          "attachment_capture_transition_conflict",
+          "The attachment capture identity is missing.",
+        )
+      }
+      const existing = this.#state.attachmentDispositions[workflowId]
+      if (existing) {
+        if (!isDeepStrictEqual(existing, envelope)) {
+          throw new EgoChatError(
+            "attachment_disposition_conflict",
+            "A different terminal attachment disposition is already durable.",
+          )
+        }
+        const { disposition } = assertValidSignedAttachmentDispositionEnvelope(existing)
+        return {
+          created: false,
+          disposition: clone(disposition),
+          envelope: clone(existing),
+          workflow: clone(this.#state.workflows[workflowId]),
+        }
+      }
+      const current = this.#state.attachmentCaptures[workflowId]
+      if (!isDeepStrictEqual(current, capture) || current?.state !== "CAPTURING") {
+        throw new EgoChatError(
+          "attachment_capture_transition_conflict",
+          "The attachment capture changed before terminal evidence could be committed.",
+        )
+      }
+      const { disposition } = assertValidSignedAttachmentDispositionEnvelope(envelope)
+      const identity = this.#state.confirmedSendIdentities[workflowId]
+      const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+      const expectedDisposition = buildAttachmentExecutionDisposition({
+        captureOperation: current,
+        confirmedSendIdentity: identity,
+        confirmedSendIdentityDigest: identityDigest,
+        observations: current.candidate_observations,
+        terminalAt: disposition.terminal_at,
+      })
+      if (!isDeepStrictEqual(disposition, expectedDisposition)) {
+        throw new EgoChatError(
+          "attachment_disposition_lineage_mismatch",
+          "The terminal disposition does not match the durable capture evidence.",
+        )
+      }
+      const envelopeDigest = sha256Hex(canonicalJsonBytes(envelope))
+      const terminalCapture = {
+        ...current,
+        state: "TERMINAL",
+        terminal_disposition_sha256: envelope.payload_sha256,
+        terminal_envelope_sha256: envelopeDigest,
+      }
+      const workflow = this.#state.workflows[workflowId]
+      const nextWorkflow = {
+        ...workflow,
+        phase: "attachment_disposition_terminal",
+        result: {
+          attachmentDispositionEnvelopeSha256: envelopeDigest,
+          attachmentDispositionPayloadSha256: envelope.payload_sha256,
+          outcome: disposition.outcome,
+          reason: disposition.reason,
+        },
+        status: "succeeded",
+        updatedAt: disposition.terminal_at,
+      }
+      await this.#appendEvent({
+        at: disposition.terminal_at,
+        attachmentCapture: terminalCapture,
+        attachmentDisposition: {
+          envelope: clone(envelope),
+          source_workflow_id: workflowId,
+        },
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.disposition_persisted",
+        workflow: nextWorkflow,
+      })
+      return {
+        created: true,
+        disposition: clone(disposition),
+        envelope: clone(envelope),
+        workflow: clone(nextWorkflow),
+      }
     })
     this.#tail = operation.catch(() => {})
     return operation

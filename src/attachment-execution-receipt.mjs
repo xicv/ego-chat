@@ -62,6 +62,16 @@ const ATTACHMENT_ACTIONS = new Set([
 ])
 const PROVIDER_STATUSES = new Set(["COMPLETE", "FAILED", "IN_PROGRESS", "UNKNOWN"])
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
+const SIGNED_ATTACHMENT_ENVELOPE_KEYS = [
+  "authority_domain",
+  "media_type",
+  "payload_base64url",
+  "payload_sha256",
+  "schema",
+  "signature_base64url",
+  "signature_input_domain",
+  "signer_key_id",
+].sort()
 
 function hasLoneSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -257,28 +267,22 @@ function parseObservationTimestamp(value) {
     : null
 }
 
-function structuralAttachmentOutcome(observation) {
+export function assertValidAttachmentGraphObservation(observation) {
+  hasClosedAttachmentObservationShape(observation)
   let serializedBytes
   try {
     serializedBytes = canonicalJsonBytes(observation).length
   } catch {
-    return unknownAttachmentOutcome("UNSUPPORTED_EVIDENCE")
-  }
-  const supportedShape = {
-    artifact_shape: hasValidArtifacts(observation.artifacts),
-    branch_shape: isBoundedUniqueIdArray(observation.direct_branch_ids),
-    conversation_digest: SHA256_PATTERN.test(
-      observation.canonical_conversation_locator_sha256,
-    ),
-    node_shape: hasValidProviderNodes(observation.provider_nodes),
-    operation_digest: SHA256_PATTERN.test(observation.capture_operation_key_sha256),
-    source_digest: SHA256_PATTERN.test(observation.source_confirmed_send_identity_sha256),
+    throw new EgoChatError(
+      "invalid_attachment_observation",
+      "The attachment observation is outside the canonical evidence domain.",
+    )
   }
   if (
     serializedBytes > MAX_ATTACHMENT_OBSERVATION_BYTES
-    || !supportedShape.source_digest
-    || !supportedShape.operation_digest
-    || !supportedShape.conversation_digest
+    || !SHA256_PATTERN.test(observation.source_confirmed_send_identity_sha256)
+    || !SHA256_PATTERN.test(observation.capture_operation_key_sha256)
+    || !SHA256_PATTERN.test(observation.canonical_conversation_locator_sha256)
     || !Number.isSafeInteger(observation.observation_sequence)
     || observation.observation_sequence < 1
     || parseObservationTimestamp(observation.observed_at) === null
@@ -300,12 +304,24 @@ function structuralAttachmentOutcome(observation) {
     || !isCount(observation.normal_save_control_count)
     || !isCount(observation.normal_download_control_count)
     || !isCount(observation.react_save_download_prop_count)
-    || !supportedShape.branch_shape
-    || !supportedShape.node_shape
-    || !supportedShape.artifact_shape
+    || !isBoundedUniqueIdArray(observation.direct_branch_ids)
+    || !hasValidProviderNodes(observation.provider_nodes)
+    || !hasValidArtifacts(observation.artifacts)
     || !hasSortedUniqueAttachmentActions(observation.visible_attachment_actions)
     || !["ABSENT", "PRESENT_NON_CONTROL"].includes(observation.asset_pointer_state)
   ) {
+    throw new EgoChatError(
+      "invalid_attachment_observation",
+      "The attachment observation contains unsupported or unbounded evidence.",
+    )
+  }
+  return observation
+}
+
+function structuralAttachmentOutcome(observation) {
+  try {
+    assertValidAttachmentGraphObservation(observation)
+  } catch {
     return unknownAttachmentOutcome("UNSUPPORTED_EVIDENCE")
   }
   if (
@@ -394,7 +410,10 @@ export function classifyAttachmentExecutionObservations(observations) {
   const [first, final] = observations
   if (
     final.observation_sequence !== first.observation_sequence + 1
-    || parseObservationTimestamp(final.observed_at) <= parseObservationTimestamp(first.observed_at)
+    || parseObservationTimestamp(final.observed_at)
+      - parseObservationTimestamp(first.observed_at) < 750
+    || parseObservationTimestamp(final.observed_at)
+      - parseObservationTimestamp(first.observed_at) > 2_000
     || !canonicalJsonBytes(stableObservationProjection(first)).equals(
       canonicalJsonBytes(stableObservationProjection(final)),
     )
@@ -519,6 +538,8 @@ export function buildAttachmentCaptureOperation({
   return {
     accumulated_monotonic_ms: 0,
     attempt_journal: [],
+    candidate_generation: 0,
+    candidate_observations: [],
     capture_deadline_at: new Date(startedAtMs + 10 * 60 * 1_000).toISOString(),
     capture_operation_key_sha256: attachmentCaptureOperationKeyDigest(
       confirmedSendIdentityDigest,
@@ -528,6 +549,8 @@ export function buildAttachmentCaptureOperation({
     schema: "ego-chat-attachment-capture-operation/v1",
     source_workflow_id: sourceWorkflowId,
     state: "CAPTURING",
+    terminal_disposition_sha256: null,
+    terminal_envelope_sha256: null,
   }
 }
 
@@ -859,6 +882,74 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
     )
   }
   return disposition
+}
+
+export function assertValidSignedAttachmentDispositionEnvelope(envelope) {
+  let envelopeBytes
+  if (
+    !isDeepStrictKeySet(envelope, SIGNED_ATTACHMENT_ENVELOPE_KEYS)
+    || envelope.schema !== "ego-chat-signed-attachment-evidence-envelope/v1"
+    || typeof envelope.payload_base64url !== "string"
+    || typeof envelope.signature_base64url !== "string"
+    || !SHA256_PATTERN.test(envelope.payload_sha256)
+    || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(envelope.signer_key_id)
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed attachment disposition envelope has an invalid shape.",
+    )
+  }
+  try {
+    envelopeBytes = canonicalJsonBytes(envelope)
+  } catch {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed attachment disposition envelope is not canonical evidence.",
+    )
+  }
+  const payloadBytes = Buffer.from(envelope.payload_base64url, "base64url")
+  const signatureBytes = Buffer.from(envelope.signature_base64url, "base64url")
+  if (
+    envelopeBytes.length > 384 * 1024
+    || payloadBytes.length > 256 * 1024
+    || payloadBytes.toString("base64url") !== envelope.payload_base64url
+    || signatureBytes.length !== 64
+    || signatureBytes.toString("base64url") !== envelope.signature_base64url
+    || sha256Hex(payloadBytes) !== envelope.payload_sha256
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed attachment disposition envelope failed its encoding or size bounds.",
+    )
+  }
+  let disposition
+  try {
+    disposition = JSON.parse(payloadBytes.toString("utf8"))
+  } catch {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed attachment disposition payload is not valid JSON.",
+    )
+  }
+  if (!payloadBytes.equals(canonicalJsonBytes(disposition))) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed attachment disposition payload is not canonical JSON.",
+    )
+  }
+  assertValidAttachmentExecutionDisposition(disposition)
+  if (
+    envelope.authority_domain !== disposition.authority_domain
+    || envelope.media_type !== disposition.media_type
+    || envelope.signature_input_domain !== disposition.signature_input_domain
+    || envelope.signer_key_id !== disposition.signer_key_id
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition_envelope",
+      "The signed envelope metadata does not match its disposition payload.",
+    )
+  }
+  return { disposition, envelopeBytes, payloadBytes, signatureBytes }
 }
 
 export function buildAttachmentExecutionDisposition({

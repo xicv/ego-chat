@@ -7,6 +7,7 @@ import test from "node:test"
 
 import { Broker } from "../src/broker.mjs"
 import {
+  buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   operationKeyDigest,
   sha256Hex,
@@ -73,6 +74,74 @@ function modelPolicyObservation(overrides = {}) {
     powerLevel: 5,
     powerMax: 5,
     ...overrides,
+  }
+}
+
+function attachmentGraphObservation({
+  canonicalConversationLocatorSha256,
+  captureOperationKeySha256,
+  observedAt,
+  sequence,
+  sourceConfirmedSendIdentitySha256,
+}) {
+  return {
+    artifacts: [{
+      artifact_id: "generation-1",
+      artifact_kind: "GENERATED_IMAGE",
+      dom_wrapper_id: "image-message-1",
+      file_id: "file-1",
+      generation_id: "generation-1",
+      graph_attachment_id: "image-message-1:part:0",
+      image_message_id: "image-message-1",
+    }],
+    asset_pointer_state: "PRESENT_NON_CONTROL",
+    canonical_conversation_locator_sha256: canonicalConversationLocatorSha256,
+    capture_operation_key_sha256: captureOperationKeySha256,
+    continuation_cursor_present: false,
+    direct_branch_ids: ["response-1"],
+    direct_response_branch_count: 1,
+    generated_image_artifact_count: 1,
+    generation_terminal: true,
+    graph_complete: true,
+    graph_truncated: false,
+    hydration_pending: false,
+    non_image_artifact_count: 0,
+    normal_download_control_count: 0,
+    normal_save_control_count: 0,
+    observation_sequence: sequence,
+    observed_at: observedAt,
+    provider_nodes: [{
+      message_id: "response-1",
+      parent_id: "prompt-confirmed",
+      provider_status: "COMPLETE",
+      terminal: true,
+      turn_exchange_id: "exchange-1",
+    }],
+    provider_prompt_message_id: "prompt-confirmed",
+    react_save_download_prop_count: 0,
+    response_message_id: "response-1",
+    save_association_id: null,
+    schema: "ego-chat-attachment-graph-observation/v1",
+    selected_branch_id: "response-1",
+    source_confirmed_send_identity_sha256: sourceConfirmedSendIdentitySha256,
+    total_artifact_count: 1,
+    ui_action_surface_complete: true,
+    unclassified_artifact_count: 0,
+    visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
+  }
+}
+
+function signedAttachmentEnvelope(disposition, fill = 1) {
+  const payloadBytes = canonicalJsonBytes(disposition)
+  return {
+    authority_domain: disposition.authority_domain,
+    media_type: disposition.media_type,
+    payload_base64url: payloadBytes.toString("base64url"),
+    payload_sha256: sha256Hex(payloadBytes),
+    schema: "ego-chat-signed-attachment-evidence-envelope/v1",
+    signature_base64url: Buffer.alloc(64, fill).toString("base64url"),
+    signature_input_domain: disposition.signature_input_domain,
+    signer_key_id: disposition.signer_key_id,
   }
 }
 
@@ -794,6 +863,162 @@ test("receipt Send confirmation atomically persists its immutable identity and e
   assert.equal(captureReplayed.status, "running")
   assert.equal(captureReplayed.humanRequired, undefined)
   assert.deepEqual(captureReplayStore.getAttachmentCapture(started.id), capture)
+})
+
+test("attachment observations and terminal disposition remain create-once across restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/a3k-durable-capture",
+    headContentDigest: "1".repeat(64),
+    headFingerprint: "2".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-durable-capture",
+    messageCount: 2,
+    revision: 1,
+    state: "bound",
+    targetId: "tab-durable-capture",
+    taskSpaceId: 5,
+  })
+  const broker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "3".repeat(64),
+          implementation_git_sha: "4".repeat(40),
+          package_inventory_sha256: "5".repeat(64),
+        },
+        signerEnrollmentDigest: "6".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"7".repeat(64)}`,
+      }),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureAttachmentExecution: async () => new Promise(() => {}),
+      captureExchange: async () => new Promise(() => {}),
+      sendExchange: async (input) => ({
+        canonicalUrl: "https://chatgpt.com/c/a3k-durable-capture",
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "prompt-confirmed",
+        sentAt: "2026-09-04T05:29:59.000Z",
+        targetId: "tab-durable-capture",
+        taskSpaceId: 5,
+        turnMarker: input.turnMarker,
+      }),
+    },
+    store,
+  })
+  const started = await broker.startEgoExchange({
+    bindingKey: "a3k-durable-capture",
+    expectedTerminalMarker: "DONE_DURABLE_CAPTURE",
+    prompt: "EGO_CHAT_A3K_RECEIPT_DURABLE1\nprepare",
+    receiptCapture: {
+      consumer_signer_authorization_sha256: "8".repeat(64),
+      external_binding_sha256: "9".repeat(64),
+      profile: "a3k-manual-canary-v1",
+      receipt_capture_requested: true,
+      schema: "ego-chat-receipt-enabled-exchange-request/v1",
+    },
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_A3K_RECEIPT_DURABLE1",
+  })
+  let workflow
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    workflow = store.getWorkflow(started.id)
+    if (workflow?.phase === "awaiting_attachment_capture") break
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+  }
+  assert.equal(workflow?.phase, "awaiting_attachment_capture")
+  assert.equal(workflow?.status, "running")
+  await broker.startAttachmentCapture({
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: started.id,
+  })
+  broker.close()
+
+  const firstCapture = store.getAttachmentCapture(started.id)
+  const identity = store.getConfirmedSendIdentity(started.id)
+  const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+  const startedAtMs = Date.parse(firstCapture.capture_started_at)
+  const firstObservation = attachmentGraphObservation({
+    canonicalConversationLocatorSha256: identity.canonical_conversation_url_sha256,
+    captureOperationKeySha256: firstCapture.capture_operation_key_sha256,
+    observedAt: new Date(startedAtMs + 1_000).toISOString(),
+    sequence: 1,
+    sourceConfirmedSendIdentitySha256: identityDigest,
+  })
+  const afterFirst = await store.recordAttachmentCaptureAttempt({
+    capture: firstCapture,
+    elapsedMonotonicMs: 25,
+    observation: firstObservation,
+  })
+  assert.equal(afterFirst.attempt_journal.length, 1)
+  assert.equal(afterFirst.candidate_observations.length, 1)
+  assert.equal(afterFirst.accumulated_monotonic_ms, 25)
+
+  const restarted = new EventStore(dataDir)
+  await restarted.initialize()
+  assert.deepEqual(restarted.getAttachmentCapture(started.id), afterFirst)
+  const secondObservation = attachmentGraphObservation({
+    canonicalConversationLocatorSha256: identity.canonical_conversation_url_sha256,
+    captureOperationKeySha256: firstCapture.capture_operation_key_sha256,
+    observedAt: new Date(startedAtMs + 2_000).toISOString(),
+    sequence: 2,
+    sourceConfirmedSendIdentitySha256: identityDigest,
+  })
+  const afterSecond = await restarted.recordAttachmentCaptureAttempt({
+    capture: afterFirst,
+    elapsedMonotonicMs: 30,
+    observation: secondObservation,
+  })
+  assert.equal(afterSecond.attempt_journal.length, 2)
+  assert.equal(afterSecond.candidate_observations.length, 2)
+  assert.equal(afterSecond.accumulated_monotonic_ms, 55)
+
+  const disposition = buildAttachmentExecutionDisposition({
+    captureOperation: afterSecond,
+    confirmedSendIdentity: identity,
+    confirmedSendIdentityDigest: identityDigest,
+    observations: afterSecond.candidate_observations,
+    terminalAt: new Date(startedAtMs + 3_000).toISOString(),
+  })
+  const envelope = signedAttachmentEnvelope(disposition)
+  const terminal = await restarted.persistAttachmentDisposition({
+    capture: afterSecond,
+    envelope,
+  })
+  assert.equal(terminal.created, true)
+  assert.equal(terminal.disposition.outcome, "UNKNOWN")
+  assert.equal(terminal.disposition.reason, "UNSUPPORTED_SAVE_ASSOCIATION")
+  assert.equal(terminal.workflow.phase, "attachment_disposition_terminal")
+  assert.equal(terminal.workflow.status, "succeeded")
+  assert.deepEqual(restarted.getAttachmentDisposition(started.id), envelope)
+
+  const replay = await restarted.persistAttachmentDisposition({
+    capture: afterSecond,
+    envelope,
+  })
+  assert.equal(replay.created, false)
+  assert.deepEqual(replay.envelope, envelope)
+  await assert.rejects(
+    restarted.persistAttachmentDisposition({
+      capture: afterSecond,
+      envelope: signedAttachmentEnvelope(disposition, 2),
+    }),
+    (error) => error.code === "attachment_disposition_conflict",
+  )
+  assert.deepEqual(restarted.getAttachmentDisposition(started.id), envelope)
+
+  const terminalRestart = new EventStore(dataDir)
+  await terminalRestart.initialize()
+  assert.deepEqual(terminalRestart.getAttachmentDisposition(started.id), envelope)
+  assert.equal(terminalRestart.getAttachmentCapture(started.id).state, "TERMINAL")
+  assert.equal(terminalRestart.getMetrics().attachmentReservedBytes, 1024 * 1024)
 })
 
 test("receipt evidence replay rejects a confirmed Send event without its immutable identity", async (t) => {
