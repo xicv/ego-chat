@@ -10,6 +10,7 @@ import {
   ATTACHMENT_AUTHORIZATION_DOES_NOT_GRANT,
   AttachmentReceiptAuthority,
   RECEIPT_RELEVANT_RUNTIME_PATHS,
+  writeReceiptBuildManifest,
 } from "../src/attachment-receipt-authority.mjs"
 import {
   canonicalJsonBytes,
@@ -168,5 +169,35 @@ test("receipt canonical JSON rejects sparse arrays, lone surrogates, and non-JSO
   assert.throws(
     () => canonicalJsonBytes(new Date("2026-09-04T00:00:00.000Z")),
     (error) => error.code === "invalid_canonical_json",
+  )
+})
+
+test("receipt build manifest records the exact managed runtime and fixed executable bytes", async (t) => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "ego-receipt-install-")))
+  t.after(() => fs.rm(root, { force: false, recursive: true }))
+  await fs.chmod(root, 0o700)
+  for (const relativePath of RECEIPT_RELEVANT_RUNTIME_PATHS) {
+    await writePrivate(path.join(root, relativePath), Buffer.from(`installed:${relativePath}\n`))
+  }
+  const executablePath = path.join(root, "ego-chat")
+  const executableBytes = Buffer.from("installed executable")
+  await writePrivate(executablePath, executableBytes)
+
+  const result = await writeReceiptBuildManifest({
+    executablePath,
+    implementationGitSha: "a".repeat(40),
+    runtimeRoot: root,
+  })
+  const persisted = await fs.readFile(path.join(root, "receipt-build-manifest.json"))
+  assert.deepEqual(persisted, canonicalJsonBytes(result))
+  assert.equal(result.executable_path, executablePath)
+  assert.equal(result.executable_sha256, sha256Hex(executableBytes))
+  assert.deepEqual(
+    result.package_inventory.map((entry) => entry.path),
+    RECEIPT_RELEVANT_RUNTIME_PATHS,
+  )
+  assert.equal(
+    result.package_inventory_sha256,
+    sha256Hex(canonicalJsonBytes(result.package_inventory)),
   )
 })

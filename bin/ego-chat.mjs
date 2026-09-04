@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 
+import {
+  createInstalledAttachmentReceiptAuthority,
+  writeReceiptBuildManifest,
+} from "../src/attachment-receipt-authority.mjs"
 import { loadConfig } from "../src/config.mjs"
 import { requestBroker } from "../src/ipc-client.mjs"
 import { handoffBrokerRuntime, inspectBrokerRuntime } from "../src/runtime-handoff.mjs"
 
 const config = loadConfig()
 const [command, ...args] = process.argv.slice(2)
+const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
 function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`)
@@ -15,7 +22,7 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | reanchor <input-json-file> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | receipt-build-manifest <executable-path> <implementation-git-sha> | receipt-signer-enroll | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | reanchor <input-json-file> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
@@ -34,6 +41,24 @@ try {
       failUsage("broker-handoff does not accept arguments")
     }
     print(await handoffBrokerRuntime(config))
+  } else if (command === "receipt-build-manifest") {
+    if (args.length !== 2) {
+      failUsage("receipt-build-manifest requires an executable path and implementation Git SHA")
+    }
+    print(await writeReceiptBuildManifest({
+      executablePath: args[0],
+      implementationGitSha: args[1],
+      runtimeRoot,
+    }))
+  } else if (command === "receipt-signer-enroll") {
+    if (args.length !== 0) {
+      failUsage("receipt-signer-enroll does not accept arguments")
+    }
+    const authority = createInstalledAttachmentReceiptAuthority({
+      dataDir: config.dataDir,
+      runtimeRoot,
+    })
+    print(await authority.enroll())
   } else if (command === "probe") {
     const delayMs = Number(args[0])
     const value = args[1]

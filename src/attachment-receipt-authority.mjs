@@ -3,10 +3,12 @@ import {
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
+  randomUUID,
   verify,
 } from "node:crypto"
 import { constants as fsConstants } from "node:fs"
 import fs from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 
@@ -223,6 +225,29 @@ async function assertPrivateFile(filePath, code) {
   }
 }
 
+async function syncDirectory(directory) {
+  const handle = await fs.open(directory, fsConstants.O_RDONLY)
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function writePrivateNew(filePath, bytes) {
+  const handle = await fs.open(
+    filePath,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+    0o600,
+  )
+  try {
+    await handle.writeFile(bytes)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
 async function assertSymlinkFreeWithin(root, target, code) {
   const relative = path.relative(root, target)
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
@@ -244,6 +269,116 @@ function runtimeIdentity(manifest) {
     implementation_git_sha: manifest.implementation_git_sha,
     package_inventory_sha256: manifest.package_inventory_sha256,
   }
+}
+
+export async function writeReceiptBuildManifest({
+  executablePath,
+  implementationGitSha,
+  runtimeRoot,
+}) {
+  const [canonicalRoot, canonicalExecutable] = await Promise.all([
+    fs.realpath(runtimeRoot),
+    fs.realpath(executablePath),
+  ])
+  if (
+    canonicalRoot !== runtimeRoot
+    || canonicalExecutable !== executablePath
+    || !GIT_SHA_PATTERN.test(implementationGitSha)
+  ) {
+    fail(
+      "invalid_receipt_build_manifest_input",
+      "Receipt build manifest inputs must be canonical fixed paths and an exact Git SHA.",
+    )
+  }
+  const packageInventory = []
+  for (const relativePath of RECEIPT_RELEVANT_RUNTIME_PATHS) {
+    const filePath = path.join(canonicalRoot, relativePath)
+    await assertSymlinkFreeWithin(
+      canonicalRoot,
+      filePath,
+      "invalid_receipt_build_manifest_input",
+    )
+    const bytes = await readBoundedRegularFile(
+      filePath,
+      MAX_MANIFEST_BYTES,
+      "invalid_receipt_build_manifest_input",
+    )
+    packageInventory.push({
+      path: relativePath,
+      sha256: sha256Hex(bytes),
+      size_bytes: bytes.length,
+    })
+  }
+  const executableBytes = await readBoundedRegularFile(
+    canonicalExecutable,
+    MAX_MANIFEST_BYTES * 16,
+    "invalid_receipt_build_manifest_input",
+  )
+  const manifest = {
+    executable_path: canonicalExecutable,
+    executable_sha256: sha256Hex(executableBytes),
+    implementation_git_sha: implementationGitSha,
+    package_inventory: packageInventory,
+    package_inventory_sha256: sha256Hex(canonicalJsonBytes(packageInventory)),
+    runtime_root: canonicalRoot,
+    schema: "ego-chat-receipt-build-manifest/v1",
+  }
+  const targetPath = path.join(canonicalRoot, "receipt-build-manifest.json")
+  const temporaryPath = path.join(canonicalRoot, `.receipt-build-manifest-${randomUUID()}`)
+  const handle = await fs.open(
+    temporaryPath,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+    0o600,
+  )
+  try {
+    await handle.writeFile(canonicalJsonBytes(manifest))
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  try {
+    await fs.rename(temporaryPath, targetPath)
+    await syncDirectory(canonicalRoot)
+  } catch (error) {
+    try {
+      await fs.unlink(temporaryPath)
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") throw cleanupError
+    }
+    throw error
+  }
+  return manifest
+}
+
+export function createInstalledAttachmentReceiptAuthority({
+  dataDir,
+  homeDirectory = os.homedir(),
+  now = () => new Date(),
+  runtimeRoot,
+}) {
+  const authorityRoot = path.join(
+    homeDirectory,
+    "Library",
+    "Application Support",
+    "Across3Kingdoms",
+    "asset-decisions",
+  )
+  const authorizationPath = path.join(
+    authorityRoot,
+    "attachment-transport-signer",
+    "authorization-v1.json",
+  )
+  return new AttachmentReceiptAuthority({
+    authorizationPath,
+    dataDir,
+    humanApprovalPublicKeyPath: path.join(
+      authorityRoot,
+      "human-approval-public-key.pem",
+    ),
+    now,
+    runtimeRoot,
+    signaturePath: `${authorizationPath}.sig`,
+  })
 }
 
 export class AttachmentReceiptAuthority {
@@ -295,7 +430,8 @@ export class AttachmentReceiptAuthority {
       !hasExactKeys(manifest, MANIFEST_KEYS)
       || manifest.schema !== "ego-chat-receipt-build-manifest/v1"
       || manifest.runtime_root !== this.#runtimeRoot
-      || manifest.executable_path !== this.#executablePath
+      || (this.#executablePath !== undefined && manifest.executable_path !== this.#executablePath)
+      || !path.isAbsolute(manifest.executable_path)
       || !SHA256_PATTERN.test(manifest.executable_sha256)
       || !GIT_SHA_PATTERN.test(manifest.implementation_git_sha)
       || !SHA256_PATTERN.test(manifest.package_inventory_sha256)
@@ -303,6 +439,10 @@ export class AttachmentReceiptAuthority {
       || manifest.package_inventory.length !== RECEIPT_RELEVANT_RUNTIME_PATHS.length
     ) {
       fail("invalid_receipt_build_manifest", "The receipt build manifest has an invalid shape.")
+    }
+    this.#executablePath ??= manifest.executable_path
+    if (await fs.realpath(this.#executablePath) !== this.#executablePath) {
+      fail("invalid_receipt_build_manifest", "The fixed Ego Chat executable path is not canonical.")
     }
     const expectedPaths = [...RECEIPT_RELEVANT_RUNTIME_PATHS]
     const observedPaths = manifest.package_inventory.map((entry) => entry?.path)
@@ -403,6 +543,8 @@ export class AttachmentReceiptAuthority {
   }
 
   async enroll({ createdAt = this.#now().toISOString() } = {}) {
+    await fs.mkdir(this.#dataDir, { mode: 0o700, recursive: true })
+    await assertPrivateDirectory(this.#dataDir)
     const runtime = await this.#loadRuntimeManifest()
     try {
       return (await this.#loadEnrollment(runtime)).enrollment
@@ -419,7 +561,6 @@ export class AttachmentReceiptAuthority {
         if (statError.code !== "ENOENT") throw error
       }
     }
-    await assertPrivateDirectory(this.#dataDir)
     parseTimestamp(createdAt, "created_at")
     const keyPair = generateKeyPairSync("ed25519")
     const privateKeyDer = keyPair.privateKey.export({ format: "der", type: "pkcs8" })
@@ -443,17 +584,16 @@ export class AttachmentReceiptAuthority {
     await fs.chmod(temporaryRoot, 0o700)
     try {
       await Promise.all([
-        fs.writeFile(path.join(temporaryRoot, "private-key.pk8"), privateKeyDer, {
-          flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-          mode: 0o600,
-        }),
-        fs.writeFile(path.join(temporaryRoot, "enrollment.json"), canonicalJsonBytes(enrollment), {
-          flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-          mode: 0o600,
-        }),
+        writePrivateNew(path.join(temporaryRoot, "private-key.pk8"), privateKeyDer),
+        writePrivateNew(
+          path.join(temporaryRoot, "enrollment.json"),
+          canonicalJsonBytes(enrollment),
+        ),
       ])
+      await syncDirectory(temporaryRoot)
       try {
         await fs.rename(temporaryRoot, this.#signerRoot)
+        await syncDirectory(this.#dataDir)
       } catch (error) {
         if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error
       }
