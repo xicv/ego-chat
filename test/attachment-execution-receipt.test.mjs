@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
+import fs from "node:fs"
 import test from "node:test"
 
 import {
+  assertValidAttachmentExecutionDisposition,
   buildAttachmentEvidenceCapture,
   attachmentCaptureOperationKeyDigest,
   buildAttachmentExecutionDisposition,
@@ -9,6 +11,7 @@ import {
   classifyAttachmentExecutionObservations,
   sha256Hex,
 } from "../src/attachment-execution-receipt.mjs"
+import { buildA3kAttachmentInteroperabilityVectors } from "./fixtures/build-a3k-attachment-interoperability-v1.mjs"
 
 function imageArtifact(id = "image-1") {
   return {
@@ -91,6 +94,55 @@ function stablePair(overrides = {}) {
       observed_at: "2026-09-04T05:00:01.000Z",
     },
   ]
+}
+
+function dispositionInput(observationOverrides = {}) {
+  const observations = stablePair(observationOverrides)
+  const confirmedSendIdentityDigest = "b".repeat(64)
+  const captureOperationKeySha256 = attachmentCaptureOperationKeyDigest(
+    confirmedSendIdentityDigest,
+  )
+  for (const current of observations) {
+    current.capture_operation_key_sha256 = captureOperationKeySha256
+    current.source_confirmed_send_identity_sha256 = confirmedSendIdentityDigest
+  }
+  const runtimeIdentity = {
+    executable_sha256: "1".repeat(64),
+    implementation_git_sha: "2".repeat(40),
+    package_inventory_sha256: "3".repeat(64),
+  }
+  return {
+    captureOperation: {
+      accumulated_monotonic_ms: 1_000,
+      attempt_journal: [],
+      candidate_generation: 2,
+      candidate_observations: observations,
+      candidate_pair_count: 1,
+      capture_deadline_at: "2026-09-04T05:10:00.000Z",
+      capture_operation_key_sha256: captureOperationKeySha256,
+      capture_started_at: "2026-09-04T05:00:00.000Z",
+      confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+      schema: "ego-chat-attachment-capture-operation/v1",
+      source_workflow_id: "workflow-1",
+      state: "CAPTURING",
+      terminal_disposition_sha256: null,
+      terminal_envelope_sha256: null,
+    },
+    confirmedSendIdentity: {
+      consumer_signer_authorization_sha256: "d".repeat(64),
+      external_binding_sha256: "e".repeat(64),
+      qualified_runtime_identity: {
+        ...runtimeIdentity,
+        runtime_identity_sha256: sha256Hex(canonicalJsonBytes(runtimeIdentity)),
+      },
+      signer_enrollment_sha256: "f".repeat(64),
+      signer_key_id: `ed25519-spki-sha256:${"9".repeat(64)}`,
+      source_workflow_id: "workflow-1",
+    },
+    confirmedSendIdentityDigest,
+    observations,
+    terminalAt: "2026-09-04T05:00:02.000Z",
+  }
 }
 
 function outcome(overrides = {}) {
@@ -241,6 +293,111 @@ test("save-action conflicts are ambiguous and nullable canonical evidence is sta
     outcome: "UNKNOWN",
     reason: "AMBIGUOUS_SAVE_ASSOCIATION",
   })
+})
+
+test("public evidence retains raw Save identity independently from authoritative pointers", () => {
+  for (const observedId of [null, "save-association-wrong"]) {
+    const input = dispositionInput({ save_association_id: observedId })
+    const disposition = buildAttachmentExecutionDisposition(input)
+    assert.deepEqual(
+      { outcome: disposition.outcome, reason: disposition.reason },
+      { outcome: "UNKNOWN", reason: "AMBIGUOUS_SAVE_ASSOCIATION" },
+    )
+    const capture = buildAttachmentEvidenceCapture(
+      input.captureOperation,
+      { outcome: disposition.outcome, reason: disposition.reason },
+    )
+    for (const publicObservation of capture.candidate_observations) {
+      assert.equal(publicObservation.classification_reason, disposition.reason)
+      assert.equal(publicObservation.observed_save_association_id, observedId)
+      assert.equal(publicObservation.save_association_id, null)
+    }
+  }
+})
+
+test("forced terminal classification and public capture use the same projection", () => {
+  const input = dispositionInput()
+  const disposition = buildAttachmentExecutionDisposition({
+    ...input,
+    terminalReason: "CAPTURE_ATTEMPT_LIMIT",
+  })
+  const capture = buildAttachmentEvidenceCapture(
+    input.captureOperation,
+    { outcome: disposition.outcome, reason: disposition.reason },
+  )
+  assert.equal(capture.candidate_observations.length, 2)
+  assert.equal(
+    capture.candidate_observations[0].classification_reason,
+    "CAPTURE_ATTEMPT_LIMIT",
+  )
+  const projection = { ...capture }
+  delete projection.schema
+  delete projection.terminal_disposition_sha256
+  delete projection.terminal_envelope_sha256
+  assert.equal(
+    disposition.capture_evidence_projection_sha256,
+    sha256Hex(canonicalJsonBytes({
+      schema: "ego-chat-attachment-capture-evidence-projection/v1",
+      ...projection,
+    })),
+  )
+})
+
+test("public capture enforces the single 0..32 candidate-generation bound", () => {
+  const input = dispositionInput()
+  for (const candidateGeneration of [8, 9, 32]) {
+    assert.equal(
+      buildAttachmentEvidenceCapture({
+        ...input.captureOperation,
+        candidate_generation: candidateGeneration,
+      }).candidate_generation,
+      candidateGeneration,
+    )
+  }
+  assert.throws(
+    () => buildAttachmentEvidenceCapture({
+      ...input.captureOperation,
+      candidate_generation: 33,
+    }),
+    (error) => error.code === "invalid_attachment_capture_operation",
+  )
+})
+
+test("terminal dispositions reject retry-only observation reasons", () => {
+  for (const terminalReason of [
+    "GENERATION_ACTIVE",
+    "HYDRATION_PENDING",
+    "INCOMPLETE_GRAPH",
+    "UNSTABLE_EVIDENCE",
+  ]) {
+    assert.throws(
+      () => buildAttachmentExecutionDisposition({
+        ...dispositionInput(),
+        terminalReason,
+      }),
+      (error) => error.code === "invalid_attachment_disposition",
+    )
+  }
+})
+
+test("positive disposition validation rejects a rebound nullable download count", () => {
+  const disposition = buildAttachmentExecutionDisposition(dispositionInput())
+  assert.equal(disposition.outcome, "EXACTLY_ONE")
+  assert.throws(
+    () => assertValidAttachmentExecutionDisposition({
+      ...disposition,
+      normal_download_control_count: null,
+    }),
+    (error) => error.code === "invalid_attachment_disposition",
+  )
+})
+
+test("committed A3K interoperability vectors are exact producer output", () => {
+  const fixture = JSON.parse(fs.readFileSync(
+    new URL("./fixtures/a3k-attachment-interoperability-v1.json", import.meta.url),
+    "utf8",
+  ))
+  assert.deepEqual(fixture, buildA3kAttachmentInteroperabilityVectors())
 })
 
 test("stable-pair identity includes action, wrapper, control, and pointer evidence", () => {

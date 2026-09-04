@@ -1273,6 +1273,113 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
     }),
     (error) => error.code === "workflow_not_found",
   )
+
+  const prepatchStatePath = path.join(dataDir, "state.json")
+  const prepatchState = JSON.parse(await fs.readFile(prepatchStatePath, "utf8"))
+  prepatchState.schemaVersion = 7
+  delete prepatchState.attachmentIntents[started.id].send_resolution_deadline_at
+  for (const observation of prepatchState.attachmentCaptures[started.id]
+    .candidate_observations) {
+    delete observation.save_association_candidates
+  }
+  const legacyBindingKey = `a3k-manual-canary-v1:${"9".repeat(64)}`
+  prepatchState.attachmentExternalBindings[legacyBindingKey].intent_sha256 = sha256Hex(
+    canonicalJsonBytes(prepatchState.attachmentIntents[started.id]),
+  )
+  const prepatchRecords = {
+    attachment_consumer_acknowledgement:
+      prepatchState.attachmentConsumerAcknowledgements[started.id],
+    attachment_capture: prepatchState.attachmentCaptures[started.id],
+    attachment_disposition: prepatchState.attachmentDispositions[started.id],
+    attachment_evidence_tombstone:
+      prepatchState.attachmentEvidenceTombstones[started.id],
+    attachment_intent: prepatchState.attachmentIntents[started.id],
+    confirmed_send_event: prepatchState.confirmedSendEvents[started.id],
+    confirmed_send_identity: prepatchState.confirmedSendIdentities[started.id],
+    external_binding: prepatchState.attachmentExternalBindings[legacyBindingKey],
+  }
+  await fs.writeFile(
+    prepatchStatePath,
+    `${JSON.stringify(prepatchState, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  await fs.rm(path.join(dataDir, "checkpoint.json"), { force: true })
+  await fs.rm(path.join(dataDir, "checkpoint.manifest.json"), { force: true })
+
+  const legacyReplay = new EventStore(dataDir)
+  await legacyReplay.initialize()
+  const quarantine = legacyReplay.getLegacyAttachmentEvidence(started.id)
+  assert.equal(quarantine.reason, "LEGACY_CONTRACT_RECOVERY_ONLY")
+  assert.deepEqual(quarantine.source_records, prepatchRecords)
+  assert.equal(
+    quarantine.source_records_sha256,
+    sha256Hex(canonicalJsonBytes(prepatchRecords)),
+  )
+  assert.equal(
+    legacyReplay.getWorkflow(started.id).phase,
+    "attachment_legacy_recovery_required",
+  )
+  assert.equal(legacyReplay.getAttachmentIntent(started.id), undefined)
+  assert.equal(
+    legacyReplay.getAttachmentExternalBinding(
+      "a3k-manual-canary-v1",
+      "9".repeat(64),
+    ).state,
+    "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+  )
+
+  const freshBroker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest:
+          request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "1".repeat(64),
+          implementation_git_sha: "2".repeat(40),
+          package_inventory_sha256: "3".repeat(64),
+        },
+        signerEnrollmentDigest: "e".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"f".repeat(64)}`,
+      }),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureAttachmentExecution: async () => new Promise(() => {}),
+      captureExchange: async () => new Promise(() => {}),
+      sendExchange: async (input) => ({
+        canonicalUrl: "https://chatgpt.com/c/evidence-chain",
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "prompt-fresh-contract",
+        sentAt: "2026-09-04T06:00:00.000Z",
+        targetId: "tab-evidence",
+        taskSpaceId: 1,
+        turnMarker: input.turnMarker,
+      }),
+    },
+    store: legacyReplay,
+  })
+  t.after(() => freshBroker.close())
+  const fresh = await freshBroker.startEgoExchange({
+    bindingKey: "a3k-evidence",
+    expectedTerminalMarker: "EGO_CHAT_A3K_FRESH_RESULT",
+    prompt: "EGO_CHAT_A3K_FRESH_12345678\nprepare",
+    receiptCapture: {
+      consumer_signer_authorization_sha256: "8".repeat(64),
+      external_binding_sha256: "a".repeat(64),
+      profile: "a3k-manual-canary-v1",
+      receipt_capture_requested: true,
+      schema: "ego-chat-receipt-enabled-exchange-request/v1",
+    },
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_A3K_FRESH_12345678",
+  })
+  const freshIntent = legacyReplay.getAttachmentIntent(fresh.id)
+  assert.equal(freshIntent.schema, "ego-chat-attachment-capture-intent/v1")
+  assert.equal(
+    Date.parse(freshIntent.send_resolution_deadline_at)
+      - Date.parse(freshIntent.created_at),
+    10 * 60 * 1_000,
+  )
 })
 
 test("broker recovers a driver failure then signs one quiet terminal disposition", async (t) => {

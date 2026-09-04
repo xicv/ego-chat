@@ -45,6 +45,16 @@ const ATTACHMENT_ATTEMPT_JOURNAL_KEYS = [
   "state",
 ].sort()
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
+const LEGACY_ATTACHMENT_SOURCE_RECORD_KEYS = [
+  "attachment_capture",
+  "attachment_consumer_acknowledgement",
+  "attachment_disposition",
+  "attachment_evidence_tombstone",
+  "attachment_intent",
+  "confirmed_send_event",
+  "confirmed_send_identity",
+  "external_binding",
+].sort()
 
 const EMPTY_STATE = Object.freeze({
   attachmentCapacity: {
@@ -59,13 +69,14 @@ const EMPTY_STATE = Object.freeze({
   attachmentDispositions: {},
   attachmentIntents: {},
   attachmentEvidenceTombstones: {},
+  legacyAttachmentEvidence: {},
   confirmedSendEvents: {},
   confirmedSendIdentities: {},
   bindings: {},
   modelPolicies: {},
   nextSeq: 1,
   operations: {},
-  schemaVersion: 7,
+  schemaVersion: 8,
   workflows: {},
 })
 
@@ -257,15 +268,102 @@ function validateCheckpoint(value) {
     || !value.workflows
     || !value.bindings
     || !value.modelPolicies
-    || ![3, 4, 5, 6, 7].includes(value.schemaVersion)
+    || ![3, 4, 5, 6, 7, 8].includes(value.schemaVersion)
   ) {
     throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
   }
 }
 
+function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
+  const ledgers = [
+    "attachmentConsumerAcknowledgements",
+    "attachmentCaptures",
+    "attachmentDispositions",
+    "attachmentEvidenceTombstones",
+    "attachmentIntents",
+    "confirmedSendEvents",
+    "confirmedSendIdentities",
+  ]
+  const workflowIds = new Set(
+    ledgers.flatMap((ledger) => Object.keys(state[ledger] ?? {})),
+  )
+  for (const workflowId of workflowIds) {
+    const intent = state.attachmentIntents[workflowId]
+    const bindingKey = intent
+      ? `${intent.profile}:${intent.external_binding_sha256}`
+      : null
+    const sourceRecords = {
+      attachment_consumer_acknowledgement:
+        state.attachmentConsumerAcknowledgements[workflowId] ?? null,
+      attachment_capture: state.attachmentCaptures[workflowId] ?? null,
+      attachment_disposition: state.attachmentDispositions[workflowId] ?? null,
+      attachment_evidence_tombstone:
+        state.attachmentEvidenceTombstones[workflowId] ?? null,
+      attachment_intent: intent ?? null,
+      confirmed_send_event: state.confirmedSendEvents[workflowId] ?? null,
+      confirmed_send_identity: state.confirmedSendIdentities[workflowId] ?? null,
+      external_binding: bindingKey
+        ? state.attachmentExternalBindings[bindingKey] ?? null
+        : null,
+    }
+    state.legacyAttachmentEvidence[workflowId] = {
+      reason: "LEGACY_CONTRACT_RECOVERY_ONLY",
+      schema: "ego-chat-legacy-attachment-evidence-quarantine/v1",
+      source_records: sourceRecords,
+      source_records_sha256: sha256Hex(canonicalJsonBytes(sourceRecords)),
+      source_schema_version: sourceSchemaVersion,
+      source_workflow_id: workflowId,
+    }
+    for (const ledger of ledgers) delete state[ledger][workflowId]
+    if (bindingKey && state.attachmentExternalBindings[bindingKey]) {
+      state.attachmentExternalBindings[bindingKey] = {
+        ...state.attachmentExternalBindings[bindingKey],
+        state: "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+      }
+    }
+    const workflow = state.workflows[workflowId]
+    if (workflow) {
+      state.workflows[workflowId] = {
+        ...workflow,
+        humanRequired: true,
+        phase: "attachment_legacy_recovery_required",
+        result: {
+          reason: "LEGACY_CONTRACT_RECOVERY_ONLY",
+          sourceRecordsSha256: state.legacyAttachmentEvidence[workflowId]
+            .source_records_sha256,
+        },
+        status: "failed",
+      }
+    }
+  }
+  state.attachmentCapacity = {
+    liveIntentCount: 0,
+    liveReservedBytes: 0,
+    permanentEntryCount: Object.keys(state.attachmentExternalBindings).length,
+    permanentReservedBytes: Object.keys(state.attachmentExternalBindings).length
+      * ATTACHMENT_PERMANENT_RESERVATION_BYTES,
+  }
+}
+
+function hasLegacyAttachmentEvidenceShape(state) {
+  return Object.values(state.attachmentIntents ?? {}).some(
+    (intent) => !exactTimestamp(intent?.send_resolution_deadline_at),
+  ) || Object.values(state.attachmentCaptures ?? {}).some((capture) => (
+    !Array.isArray(capture?.attempt_journal)
+    || capture.attempt_journal.some(
+      (entry) => !hasExactKeys(entry, ATTACHMENT_ATTEMPT_JOURNAL_KEYS),
+    )
+    || !Array.isArray(capture?.candidate_observations)
+    || capture.candidate_observations.some(
+      (observation) => !Object.hasOwn(observation, "save_association_candidates"),
+    )
+  ))
+}
+
 function migrateState(value) {
   validateCheckpoint(value)
   const state = clone(value)
+  const sourceSchemaVersion = state.schemaVersion
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
   state.attachmentConsumerAcknowledgements ??= {}
   state.attachmentExternalBindings ??= {}
@@ -273,9 +371,16 @@ function migrateState(value) {
   state.attachmentDispositions ??= {}
   state.attachmentIntents ??= {}
   state.attachmentEvidenceTombstones ??= {}
+  state.legacyAttachmentEvidence ??= {}
   state.confirmedSendEvents ??= {}
   state.confirmedSendIdentities ??= {}
   state.operations ??= {}
+  if (sourceSchemaVersion < 8 || hasLegacyAttachmentEvidenceShape(state)) {
+    quarantineLegacyAttachmentEvidence(
+      state,
+      Math.min(sourceSchemaVersion, 7),
+    )
+  }
   for (const capture of Object.values(state.attachmentCaptures)) {
     capture.candidate_generation ??= 0
     capture.candidate_observations ??= []
@@ -319,7 +424,7 @@ function migrateState(value) {
     }
   }
 
-  state.schemaVersion = 7
+  state.schemaVersion = 8
   validateAttachmentEvidenceState(state)
   return state
 }
@@ -353,6 +458,7 @@ function validateAttachmentEvidenceState(state) {
   const bindings = state.attachmentExternalBindings
   const confirmedEvents = state.confirmedSendEvents
   const confirmedIdentities = state.confirmedSendIdentities
+  const legacyEvidence = state.legacyAttachmentEvidence
   if (
     !capacity
     || typeof capacity !== "object"
@@ -381,11 +487,57 @@ function validateAttachmentEvidenceState(state) {
     || !confirmedIdentities
     || typeof confirmedIdentities !== "object"
     || Array.isArray(confirmedIdentities)
+    || !legacyEvidence
+    || typeof legacyEvidence !== "object"
+    || Array.isArray(legacyEvidence)
   ) {
     throw new EgoChatError(
       "corrupt_attachment_evidence_state",
       "The attachment evidence ledger has an invalid durable shape.",
     )
+  }
+  for (const [workflowId, quarantine] of Object.entries(legacyEvidence)) {
+    const records = quarantine?.source_records
+    const intent = records?.attachment_intent
+    const bindingKey = intent
+      ? `${intent.profile}:${intent.external_binding_sha256}`
+      : null
+    const binding = bindingKey ? bindings[bindingKey] : null
+    if (
+      !hasExactKeys(quarantine, [
+        "reason",
+        "schema",
+        "source_records",
+        "source_records_sha256",
+        "source_schema_version",
+        "source_workflow_id",
+      ].sort())
+      || quarantine.schema !== "ego-chat-legacy-attachment-evidence-quarantine/v1"
+      || quarantine.reason !== "LEGACY_CONTRACT_RECOVERY_ONLY"
+      || quarantine.source_workflow_id !== workflowId
+      || !Number.isSafeInteger(quarantine.source_schema_version)
+      || quarantine.source_schema_version < 3
+      || quarantine.source_schema_version > 7
+      || !records
+      || typeof records !== "object"
+      || Array.isArray(records)
+      || !hasExactKeys(records, LEGACY_ATTACHMENT_SOURCE_RECORD_KEYS)
+      || quarantine.source_records_sha256
+        !== sha256Hex(canonicalJsonBytes(records))
+      || (intent && intent.source_workflow_id !== workflowId)
+      || (intent && binding?.source_workflow_id !== workflowId)
+      || (intent && binding?.state !== "CONSUMED_LEGACY_RECOVERY_REQUIRED")
+      || (intent && records.external_binding?.intent_sha256
+        !== sha256Hex(canonicalJsonBytes(intent)))
+      || state.workflows[workflowId]?.phase
+        !== "attachment_legacy_recovery_required"
+      || state.workflows[workflowId]?.status !== "failed"
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The legacy attachment evidence quarantine is invalid.",
+      )
+    }
   }
   const expectedCapacity = {
     liveIntentCount: Object.keys(intents).filter((workflowId) => !tombstones[workflowId]).length,
@@ -979,6 +1131,11 @@ export class EventStore {
   getAttachmentIntent(workflowId) {
     const intent = this.#state.attachmentIntents[workflowId]
     return intent ? clone(intent) : undefined
+  }
+
+  getLegacyAttachmentEvidence(workflowId) {
+    const evidence = this.#state.legacyAttachmentEvidence[workflowId]
+    return evidence ? clone(evidence) : undefined
   }
 
   getAttachmentConsumerAcknowledgement(workflowId) {

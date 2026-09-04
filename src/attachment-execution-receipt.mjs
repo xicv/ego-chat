@@ -418,8 +418,8 @@ function stableObservationProjection(observation) {
   return projection
 }
 
-function attachmentEvidenceObservation(observation, outcome) {
-  const exact = outcome === "EXACTLY_ONE"
+function attachmentEvidenceObservation(observation, classification) {
+  const exact = classification.outcome === "EXACTLY_ONE"
   const artifact = exact ? observation.artifacts[0] : null
   return {
     artifact_identities: observation.artifacts.map((candidate) => ({
@@ -437,6 +437,9 @@ function attachmentEvidenceObservation(observation, outcome) {
         : null,
     })),
     branch_id: exact ? observation.selected_branch_id : null,
+    classification_reason: classification.outcome === "UNKNOWN"
+      ? classification.reason
+      : null,
     direct_response_branch_count: observation.direct_response_branch_count,
     dom_attachment_id: exact ? artifact.dom_wrapper_id : null,
     dom_snapshot_sha256: sha256Hex(canonicalJsonBytes({
@@ -459,6 +462,7 @@ function attachmentEvidenceObservation(observation, outcome) {
     normal_download_control_count: observation.normal_download_control_count,
     normal_save_control_count: observation.normal_save_control_count,
     observed_at: observation.observed_at,
+    observed_save_association_id: observation.save_association_id,
     response_message_id: exact ? observation.response_message_id : null,
     response_snapshot_sha256: sha256Hex(canonicalJsonBytes({
       direct_branch_ids: observation.direct_branch_ids,
@@ -498,13 +502,38 @@ function attachmentEvidenceJournalEntry(entry) {
   }
 }
 
-export function buildAttachmentEvidenceCapture(captureOperation) {
+export function buildAttachmentEvidenceCapture(
+  captureOperation,
+  terminalClassification = undefined,
+) {
+  if (
+    !Number.isSafeInteger(captureOperation?.candidate_generation)
+    || captureOperation.candidate_generation < 0
+    || captureOperation.candidate_generation > 32
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_capture_operation",
+      "The capture candidate generation is outside the closed 0..32 bound.",
+    )
+  }
   const retained = captureOperation.candidate_observations.length === 2
     ? captureOperation.candidate_observations
     : []
-  const classification = retained.length === 2
+  const classification = terminalClassification ?? (retained.length === 2
     ? classifyAttachmentExecutionObservations(retained)
-    : { outcome: "UNKNOWN" }
+    : { outcome: "UNKNOWN", reason: null })
+  if (
+    !classification
+    || !["EXACTLY_ONE", "MULTIPLE", "ZERO", "UNKNOWN"].includes(classification.outcome)
+    || (classification.outcome === "UNKNOWN"
+      ? !ATTACHMENT_UNKNOWN_REASONS.has(classification.reason)
+      : typeof classification.reason !== "string")
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_capture_operation",
+      "The capture terminal classification is invalid.",
+    )
+  }
   return {
     accumulated_monotonic_ms: captureOperation.accumulated_monotonic_ms,
     attempt_journal: captureOperation.attempt_journal.map(
@@ -512,7 +541,7 @@ export function buildAttachmentEvidenceCapture(captureOperation) {
     ),
     candidate_generation: captureOperation.candidate_generation,
     candidate_observations: retained.map((observation) => (
-      attachmentEvidenceObservation(observation, classification.outcome)
+      attachmentEvidenceObservation(observation, classification)
     )),
     candidate_pair_count: captureOperation.candidate_pair_count,
     capture_deadline_at: captureOperation.capture_deadline_at,
@@ -529,8 +558,8 @@ export function buildAttachmentEvidenceCapture(captureOperation) {
   }
 }
 
-function attachmentEvidenceCaptureProjectionDigest(captureOperation) {
-  const capture = buildAttachmentEvidenceCapture(captureOperation)
+function attachmentEvidenceCaptureProjectionDigest(captureOperation, classification) {
+  const capture = buildAttachmentEvidenceCapture(captureOperation, classification)
   const projection = { ...capture }
   delete projection.schema
   delete projection.terminal_disposition_sha256
@@ -874,15 +903,15 @@ const ATTACHMENT_UNKNOWN_REASONS = new Set([
   "AMBIGUOUS_SAVE_ASSOCIATION",
   "CAPTURE_ATTEMPT_LIMIT",
   "CAPTURE_DEADLINE_EXPIRED",
-  "GENERATION_ACTIVE",
-  "HYDRATION_PENDING",
   "INCOHERENT_COUNTS",
-  "INCOMPLETE_GRAPH",
   "TRUNCATED_GRAPH",
   "UNCLASSIFIED_ARTIFACT",
-  "UNSTABLE_EVIDENCE",
   "UNSUPPORTED_EVIDENCE",
   "UNSUPPORTED_SAVE_ASSOCIATION",
+])
+const ATTACHMENT_EXHAUSTION_REASONS = new Set([
+  "CAPTURE_ATTEMPT_LIMIT",
+  "CAPTURE_DEADLINE_EXPIRED",
 ])
 
 function exactTimestamp(value) {
@@ -985,12 +1014,19 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
     )
   }
   const nonNullArtifactCounts = counts.slice(1, 5)
-  if (
+  const artifactCountMismatch = (
     nonNullArtifactCounts.every((value) => value !== null)
     && disposition.total_artifact_count
       !== disposition.generated_image_artifact_count
         + disposition.non_image_artifact_count
         + disposition.unclassified_artifact_count
+  )
+  if (
+    artifactCountMismatch
+    && !(
+      disposition.outcome === "UNKNOWN"
+      && disposition.reason === "INCOHERENT_COUNTS"
+    )
   ) {
     throw new EgoChatError(
       "invalid_attachment_disposition",
@@ -1005,6 +1041,7 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
       || disposition.generated_image_artifact_count !== 1
       || disposition.non_image_artifact_count !== 0
       || disposition.unclassified_artifact_count !== 0
+      || disposition.normal_download_control_count === null
       || disposition.normal_save_control_count !== 1
       || disposition.stable_observation_count !== 2
       || !isBoundedOpaqueId(disposition.save_association_id)
@@ -1056,16 +1093,30 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
         "The zero attachment execution disposition is inconsistent.",
       )
     }
-  } else if (
-    disposition.outcome !== "UNKNOWN"
-    || disposition.receipt !== null
-    || disposition.save_association_id !== null
-    || !ATTACHMENT_UNKNOWN_REASONS.has(disposition.reason)
-  ) {
-    throw new EgoChatError(
-      "invalid_attachment_disposition",
-      "The nonpositive attachment execution disposition is inconsistent.",
-    )
+  } else {
+    if (
+      disposition.outcome !== "UNKNOWN"
+      || disposition.receipt !== null
+      || disposition.save_association_id !== null
+      || !ATTACHMENT_UNKNOWN_REASONS.has(disposition.reason)
+      || (
+        disposition.stable_observation_count === 0
+        && !ATTACHMENT_EXHAUSTION_REASONS.has(disposition.reason)
+      )
+      || (
+        disposition.reason === "INCOHERENT_COUNTS"
+        && !artifactCountMismatch
+      )
+      || (
+        disposition.reason === "UNCLASSIFIED_ARTIFACT"
+        && disposition.unclassified_artifact_count === 0
+      )
+    ) {
+      throw new EgoChatError(
+        "invalid_attachment_disposition",
+        "The nonpositive attachment execution disposition is inconsistent.",
+      )
+    }
   }
   return disposition
 }
@@ -1147,7 +1198,7 @@ export function buildAttachmentExecutionDisposition({
   terminalAt,
 }) {
   const forcedUnknownReason = terminalReason !== undefined
-    && ATTACHMENT_UNKNOWN_REASONS.has(terminalReason)
+    && ATTACHMENT_EXHAUSTION_REASONS.has(terminalReason)
   if (terminalReason !== undefined && !forcedUnknownReason) {
     throw new EgoChatError(
       "invalid_attachment_disposition",
@@ -1215,7 +1266,7 @@ export function buildAttachmentExecutionDisposition({
   const disposition = {
     authority_domain: "attachment-observation-only",
     capture_evidence_projection_sha256:
-      attachmentEvidenceCaptureProjectionDigest(captureOperation),
+      attachmentEvidenceCaptureProjectionDigest(captureOperation, classification),
     capture_operation_key_sha256: captureOperation.capture_operation_key_sha256,
     capture_runtime_identity_sha256: runtimeIdentity.runtime_identity_sha256,
     consumer_signer_authorization_sha256:

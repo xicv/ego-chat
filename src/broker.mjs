@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
 import {
+  assertValidSignedAttachmentDispositionEnvelope,
   buildAttachmentCaptureIntent,
   buildAttachmentEvidenceCapture,
   buildAttachmentExecutionDisposition,
@@ -1633,6 +1634,9 @@ export class Broker {
     const confirmedSendIdentity = this.#store.getConfirmedSendIdentity(workflow.id)
     const capture = this.#store.getAttachmentCapture(workflow.id)
     const dispositionEnvelope = this.#store.getAttachmentDisposition(workflow.id)
+    const terminalDisposition = dispositionEnvelope
+      ? assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+      : undefined
     const externalBinding = intent && this.#store.getAttachmentExternalBinding(
       intent.profile,
       intent.external_binding_sha256,
@@ -1687,7 +1691,10 @@ export class Broker {
             evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
           }
         : {}),
-      capture: buildAttachmentEvidenceCapture(capture),
+      capture: buildAttachmentEvidenceCapture(capture, {
+        outcome: terminalDisposition.outcome,
+        reason: terminalDisposition.reason,
+      }),
       confirmed_send_event: confirmedSendEvent,
       confirmed_send_identity: confirmedSendIdentity,
       disposition_envelope: dispositionEnvelope,
