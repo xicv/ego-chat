@@ -125,6 +125,7 @@ function producerContract() {
     "src/attachment-execution-receipt.mjs",
     "src/attachment-receipt-authority.mjs",
     "src/broker.mjs",
+    "test/fixtures/build-a3k-public-boundary-v1.mjs",
   ]
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
   const files = relativePaths.map((relativePath) => ({
@@ -521,6 +522,7 @@ export function buildA3kPublicBoundaryFixture() {
       authorization_signature_base64url: authority.authorization_signature_base64url,
       enrollment: authority.enrollment,
       human_public_key_pem_base64url: authority.human_public_key_pem_base64url,
+      purpose: "TEST_ONLY_DETERMINISTIC_INTEROPERABILITY_AUTHORITY",
     },
     vectors: [
       fullAttachmentVector(authority),
@@ -532,7 +534,7 @@ export function buildA3kPublicBoundaryFixture() {
 }
 
 export function serializeFixture(value) {
-  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8")
+  return canonicalJsonBytes(value)
 }
 
 export function fixtureManifest(fixtureBytes, fixture) {

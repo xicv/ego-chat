@@ -302,7 +302,6 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
       || !workflowId
       || binding.ledger_key !== ledgerKey
       || expectedLedgerKey !== ledgerKey
-      || !state.workflows[workflowId]
       || externalBindingsByWorkflow.has(workflowId)
     ) {
       throw new EgoChatError(
@@ -580,6 +579,10 @@ function validateAttachmentEvidenceState(state) {
       ? `${intent.profile}:${intent.external_binding_sha256}`
       : null)
     const binding = bindingKey ? bindings[bindingKey] : null
+    const retainedWorkflow = state.workflows[workflowId]
+    const bindingOnly = Boolean(sourceBinding) && LEGACY_ATTACHMENT_SOURCE_RECORD_KEYS
+      .filter((key) => key !== "external_binding")
+      .every((key) => records?.[key] === null)
     if (
       !hasExactKeys(quarantine, [
         "reason",
@@ -611,10 +614,11 @@ function validateAttachmentEvidenceState(state) {
       || (intent && binding?.state !== "CONSUMED_LEGACY_RECOVERY_REQUIRED")
       || (intent && records.external_binding?.intent_sha256
         !== sha256Hex(canonicalJsonBytes(intent)))
-      || (!state.workflows[workflowId])
-      || state.workflows[workflowId]?.phase
-        !== "attachment_legacy_recovery_required"
-      || state.workflows[workflowId]?.status !== "failed"
+      || (!retainedWorkflow && !bindingOnly)
+      || (retainedWorkflow && (
+        retainedWorkflow.phase !== "attachment_legacy_recovery_required"
+        || retainedWorkflow.status !== "failed"
+      ))
     ) {
       throw new EgoChatError(
         "corrupt_attachment_evidence_state",
@@ -1182,7 +1186,8 @@ export class EventStore {
     }
 
     if (
-      this.#blobBytes > this.#maxBlobBytes
+      legacyReplay
+      || this.#blobBytes > this.#maxBlobBytes
       || Buffer.byteLength(JSON.stringify(this.#state), "utf8") > this.#maxStateBytes
     ) {
       await this.#compact()

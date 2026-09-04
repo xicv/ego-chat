@@ -13,6 +13,7 @@ import {
   assertValidSignedAttachmentConsumerAcknowledgementEnvelope,
 } from "../src/attachment-consumer-ack.mjs"
 import {
+  buildAttachmentCaptureIntent,
   buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   operationKeyDigest,
@@ -1520,11 +1521,60 @@ test("legacy attachment quarantine is stable across a stale checkpoint and ledge
     first.getAttachmentExternalBinding(profile, externalBindingDigest).state,
     "CONSUMED_LEGACY_RECOVERY_REQUIRED",
   )
+  assert.equal(
+    JSON.parse(await fs.readFile(path.join(dataDir, "checkpoint.json"), "utf8"))
+      .schemaVersion,
+    8,
+  )
+  assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
+
+  const freshWorkflowId = "55d7aa4c-423f-48ba-80ae-4a2d2d5a4036"
+  const freshOperationKey = "exchange:a3k-fresh:EGO_CHAT_A3K_FRESH_V8_12345678"
+  const freshWorkflow = {
+    bindingKey: "a3k-fresh",
+    createdAt: "2026-09-03T02:00:00.000Z",
+    id: freshWorkflowId,
+    inputDigest: "6".repeat(64),
+    kind: "ego_exchange",
+    operationKey: freshOperationKey,
+    phase: "queued",
+    status: "running",
+    updatedAt: "2026-09-03T02:00:00.000Z",
+  }
+  const freshAdmission = buildAttachmentCaptureIntent({
+    authorizationDigest: "5".repeat(64),
+    createdAt: freshWorkflow.createdAt,
+    externalBindingDigest: "4".repeat(64),
+    operationKey: freshOperationKey,
+    profile,
+    runtimeIdentity: {
+      executable_sha256: "3".repeat(64),
+      implementation_git_sha: "2".repeat(40),
+      package_inventory_sha256: "1".repeat(64),
+    },
+    signerEnrollmentDigest: "a".repeat(64),
+    signerKeyId: `ed25519-spki-sha256:${"b".repeat(64)}`,
+    workflowId: freshWorkflowId,
+  })
+  await first.persistStarted("workflow.started", freshWorkflow, {
+    intent: freshAdmission.intent,
+    intentDigest: freshAdmission.digest,
+  })
+  const freshBindingBeforeRestart = first.getAttachmentExternalBinding(
+    profile,
+    "4".repeat(64),
+  )
+  assert.notEqual(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
 
   const second = new EventStore(dataDir)
   await second.initialize()
   assert.deepEqual(second.getLegacyAttachmentEvidence(workflowId), firstQuarantine)
   assert.equal(second.getAttachmentIntent(workflowId), undefined)
+  assert.deepEqual(second.getAttachmentIntent(freshWorkflowId), freshAdmission.intent)
+  assert.deepEqual(
+    second.getAttachmentExternalBinding(profile, "4".repeat(64)),
+    freshBindingBeforeRestart,
+  )
 })
 
 test("binding-only legacy authority remains permanently consumed without mutation", async (t) => {
@@ -1534,7 +1584,6 @@ test("binding-only legacy authority remains permanently consumed without mutatio
   const profile = "a3k-manual-canary-v1"
   const externalBindingDigest = "9".repeat(64)
   const ledgerKey = `${profile}:${externalBindingDigest}`
-  const operationKey = "exchange:a3k-old:EGO_CHAT_A3K_BINDING_ONLY_12345678"
   const externalBinding = {
     external_binding_sha256: externalBindingDigest,
     ledger_key: ledgerKey,
@@ -1563,18 +1612,7 @@ test("binding-only legacy authority remains permanently consumed without mutatio
     nextSeq: 1,
     operations: {},
     schemaVersion: 7,
-    workflows: {
-      [workflowId]: {
-        bindingKey: "a3k-old",
-        createdAt: "2026-09-03T01:00:00.000Z",
-        id: workflowId,
-        inputDigest: "7".repeat(64),
-        kind: "ego_exchange",
-        operationKey,
-        status: "succeeded",
-        updatedAt: "2026-09-03T01:00:01.000Z",
-      },
-    },
+    workflows: {},
   }
   await fs.writeFile(
     path.join(dataDir, "state.json"),
@@ -1590,6 +1628,10 @@ test("binding-only legacy authority remains permanently consumed without mutatio
     store.getAttachmentExternalBinding(profile, externalBindingDigest).state,
     "CONSUMED_LEGACY_RECOVERY_REQUIRED",
   )
+  const restarted = new EventStore(dataDir)
+  await restarted.initialize()
+  assert.deepEqual(restarted.getLegacyAttachmentEvidence(workflowId), quarantine)
+  assert.deepEqual(restarted.listWorkflows(), [])
   await store.persistBinding("binding.created", {
     canonicalUrl: "https://chatgpt.com/c/a3k-binding-only",
     headContentDigest: "c".repeat(64),
@@ -9231,5 +9273,162 @@ test("committed v3-v7 store provenance remains reproducible and migratable", asy
     const migratedState = JSON.parse(await fs.readFile(path.join(dataDir, "state.json"), "utf8"))
     assert.equal(migratedState.schemaVersion, 8)
     assert.deepEqual(migratedState.legacyAttachmentEvidence, {})
+  }
+})
+
+test("historical v5-v7 producers emit nonempty migration fixtures", async (t) => {
+  const fixturePath = path.join(
+    import.meta.dirname,
+    "fixtures",
+    "a3k-legacy-attachment-provenance-v2.json",
+  )
+  const fixtureBytes = await fs.readFile(fixturePath)
+  const fixture = JSON.parse(fixtureBytes)
+  const builder = await import(
+    "./fixtures/build-a3k-legacy-attachment-provenance-v2.mjs"
+  )
+
+  assert.deepEqual(await builder.serializeA3kLegacyAttachmentProvenance(), fixtureBytes)
+  assert.equal(fixture.schema, "ego-chat-a3k-legacy-attachment-provenance/v2")
+  assert.deepEqual(fixture.versions.map((entry) => entry.schema_version), [5, 6, 7])
+
+  for (const entry of fixture.versions) {
+    for (const source of entry.producer_source_files) {
+      const sourceBytes = execFileSync(
+        "git",
+        ["show", `${entry.producer_commit}:${source.path}`],
+        { cwd: path.join(import.meta.dirname, "..") },
+      )
+      assert.equal(sha256Hex(sourceBytes), source.sha256)
+    }
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+    for (const [name, artifact] of Object.entries(entry.artifacts)) {
+      const bytes = Buffer.from(artifact.base64url, "base64url")
+      assert.equal(bytes.length, artifact.size_bytes)
+      assert.equal(sha256Hex(bytes), artifact.sha256)
+      await fs.writeFile(path.join(dataDir, name), bytes, { mode: 0o600 })
+    }
+
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const workflowId = entry.expected_source_workflow_id
+    const quarantine = store.getLegacyAttachmentEvidence(workflowId)
+    assert.ok(quarantine.source_records.attachment_intent)
+    assert.ok(quarantine.source_records.external_binding)
+    assert.equal(
+      Boolean(quarantine.source_records.confirmed_send_identity),
+      entry.schema_version >= 6,
+    )
+    assert.equal(
+      Boolean(quarantine.source_records.confirmed_send_event),
+      entry.schema_version >= 6,
+    )
+    assert.equal(
+      Boolean(quarantine.source_records.attachment_capture),
+      entry.schema_version >= 6,
+    )
+    assert.equal(
+      Boolean(quarantine.source_records.attachment_disposition),
+      entry.schema_version >= 6,
+    )
+    assert.equal(
+      Boolean(quarantine.source_records.attachment_consumer_acknowledgement),
+      entry.schema_version >= 7,
+    )
+    assert.equal(
+      Boolean(quarantine.source_records.attachment_evidence_tombstone),
+      entry.schema_version >= 7,
+    )
+    assert.equal(store.getAttachmentIntent(workflowId), undefined)
+    assert.equal(store.getConfirmedSendIdentity(workflowId), undefined)
+    assert.equal(store.getConfirmedSendEvent(workflowId), undefined)
+    assert.equal(store.getAttachmentCapture(workflowId), undefined)
+    assert.equal(store.getAttachmentDisposition(workflowId), undefined)
+    assert.equal(store.getAttachmentConsumerAcknowledgement(workflowId), undefined)
+    assert.equal(store.getAttachmentEvidenceTombstone(workflowId), undefined)
+    assert.equal(
+      store.getAttachmentExternalBinding(
+        "a3k-manual-canary-v1",
+        entry.expected_external_binding_sha256,
+      ).state,
+      "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+    )
+    assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
+    assert.equal(
+      JSON.parse(await fs.readFile(path.join(dataDir, "checkpoint.json"), "utf8"))
+        .schemaVersion,
+      8,
+    )
+
+    const migratedStateBytes = await fs.readFile(path.join(dataDir, "state.json"))
+    const migratedCheckpointBytes = await fs.readFile(path.join(dataDir, "checkpoint.json"))
+    const restarted = new EventStore(dataDir)
+    await restarted.initialize()
+    assert.deepEqual(restarted.getLegacyAttachmentEvidence(workflowId), quarantine)
+    assert.deepEqual(
+      await fs.readFile(path.join(dataDir, "state.json")),
+      migratedStateBytes,
+    )
+    assert.deepEqual(
+      await fs.readFile(path.join(dataDir, "checkpoint.json")),
+      migratedCheckpointBytes,
+    )
+
+    const freshWorkflowId = `77d7aa4c-423f-48ba-80ae-4a2d2d5a40${entry.schema_version}`
+    const freshOperationKey = `exchange:a3k-history-reuse:EGO_CHAT_A3K_HISTORY_REUSE_${entry.schema_version}`
+    const freshWorkflow = {
+      bindingKey: `history-reuse-${entry.schema_version}`,
+      createdAt: "2026-09-04T06:00:00.000Z",
+      id: freshWorkflowId,
+      inputDigest: "d".repeat(64),
+      kind: "ego_exchange",
+      operationKey: freshOperationKey,
+      phase: "queued",
+      status: "running",
+      updatedAt: "2026-09-04T06:00:00.000Z",
+    }
+    const freshAdmission = buildAttachmentCaptureIntent({
+      authorizationDigest: "c".repeat(64),
+      createdAt: freshWorkflow.createdAt,
+      externalBindingDigest: entry.expected_external_binding_sha256,
+      operationKey: freshOperationKey,
+      profile: "a3k-manual-canary-v1",
+      runtimeIdentity: {
+        executable_sha256: "b".repeat(64),
+        implementation_git_sha: "a".repeat(40),
+        package_inventory_sha256: "9".repeat(64),
+      },
+      signerEnrollmentDigest: "8".repeat(64),
+      signerKeyId: `ed25519-spki-sha256:${"7".repeat(64)}`,
+      workflowId: freshWorkflowId,
+    })
+    const beforeRejectedReuse = {
+      binding: restarted.getAttachmentExternalBinding(
+        "a3k-manual-canary-v1",
+        entry.expected_external_binding_sha256,
+      ),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      metrics: restarted.getMetrics(),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+      workflows: restarted.listWorkflows(),
+    }
+    await assert.rejects(
+      restarted.persistStarted("workflow.started", freshWorkflow, {
+        intent: freshAdmission.intent,
+        intentDigest: freshAdmission.digest,
+      }),
+      (error) => error.code === "attachment_external_binding_consumed",
+    )
+    assert.deepEqual({
+      binding: restarted.getAttachmentExternalBinding(
+        "a3k-manual-canary-v1",
+        entry.expected_external_binding_sha256,
+      ),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      metrics: restarted.getMetrics(),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+      workflows: restarted.listWorkflows(),
+    }, beforeRejectedReuse)
   }
 })
