@@ -96,6 +96,7 @@ const methods = new Map([
   ["workflow.abandon", (params) => broker.abandonWorkflow(params)],
   ["workflow.cancel", (params) => broker.cancelWorkflow(params)],
   ["workflow.get", (params) => broker.getWorkflow(params)],
+  ["workflow.reconcile_observation", (params) => broker.reconcileWorkflowObservation(params)],
   ["workflow.start_probe", (params) => broker.startProbe(params)],
 ])
 

@@ -53,6 +53,7 @@ export const READ_ONLY_IPC_METHODS = new Set([
   "result.read",
   "workflow.await",
   "workflow.get",
+  "workflow.reconcile_observation",
 ])
 
 export const TERMINAL_STATUSES = new Set([

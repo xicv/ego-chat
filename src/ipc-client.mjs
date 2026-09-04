@@ -166,7 +166,9 @@ export async function requestBroker(config, method, params = {}, options = {}) {
     }
   }
 
-  for (const legacySocketPath of config.legacySocketPaths ?? []) {
+  for (const legacySocketPath of options.legacyFallback === false
+    ? []
+    : (config.legacySocketPaths ?? [])) {
     try {
       const legacy = { ...config, socketPath: legacySocketPath }
       const ping = await requestOnce(legacy, "ping", {}, 500)
@@ -190,6 +192,7 @@ export async function requestBroker(config, method, params = {}, options = {}) {
     }
   }
 
+  await options.beforeAutostart?.()
   startDaemon(config)
   let lastError
   for (let attempt = 0; attempt < 50; attempt += 1) {

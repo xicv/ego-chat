@@ -2017,6 +2017,11 @@ test("workflow status exposes exact convergence and ChatGPT delivery supervision
   assert.equal(visible.supervision.codex.inspectionRetryCount, 7)
   assert.equal(visible.supervision.lastTransitionAt, child.updatedAt)
   assert.match(visible.supervision.message, /durably sent/)
+  assert.equal(visible.supervision.semanticCheckpoint.schema, "EagleSemanticCheckpoint.v1")
+  assert.equal(visible.supervision.semanticCheckpoint.workflowDigest.length, 64)
+  assert.equal(visible.supervision.semanticCheckpoint.delivery, "sent_waiting_response")
+  assert.equal(JSON.stringify(visible.supervision.semanticCheckpoint).includes(parent.id), false)
+  assert.equal(JSON.stringify(visible.supervision.semanticCheckpoint).includes(child.id), false)
 })
 
 test("binding persistence compare-and-swap rejects a stale re-anchor commit", async (t) => {
@@ -6715,6 +6720,14 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
   assert.equal(stopped.humanRequired.code, "canonical_conversation_missing")
 
+  await assert.rejects(
+    broker.reconcileWorkflowObservation({
+      bindingKey: "ego-chat-main",
+      workflowId: stopped.id,
+    }),
+    (error) => error.code === "workflow_not_observation_reconcilable",
+  )
+
   const reconciled = await broker.reconcileConversation({
     bindingKey: "ego-chat-main",
     workflowId: stopped.id,
@@ -6727,7 +6740,7 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "succeeded")
 })
 
-test("a bound late send reconciles only one exact tail-anchored workflow pair", async (t) => {
+test("monitor observation reconciliation leaves durable and browser effects unchanged; explicit reconciliation remains exact", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const turnMarker = "EGO_CHAT_CONVERGENCE_LATE123_C1"
@@ -6735,23 +6748,31 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
   const prompt = `${turnMarker}\nreview\n${terminalMarker}`
   const responseText = `${terminalMarker}`
   const responseDigest = digest(responseText)
+  let bindCalls = 0
+  let browserOperationCalls = 0
   let reconciliationCalls = 0
+  let sendCalls = 0
   const egoAdapter = {
     ...unusedEgoAdapter,
-    bind: async (input) => ({
-      canonicalUrl: input.canonicalUrl,
-      head: {
-        fingerprint: "old-tail",
-        fingerprintVersion: "tail-v1",
-        lastContentDigest: "a".repeat(64),
-        lastMessageId: "old-assistant",
-        lastRole: "assistant",
-        messageCount: 4,
-      },
-      targetId: "bound-tab",
-      taskSpaceId: 10,
-    }),
+    bind: async (input) => {
+      bindCalls += 1
+      return {
+        canonicalUrl: input.canonicalUrl,
+        head: {
+          fingerprint: "old-tail",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: "a".repeat(64),
+          lastMessageId: "old-assistant",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        targetId: "bound-tab",
+        taskSpaceId: 10,
+      }
+    },
     exchange: async () => {
+      browserOperationCalls += 1
+      sendCalls += 1
       throw new EgoChatError(
         "human_required",
         "The click was not confirmed.",
@@ -6763,6 +6784,9 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
     },
     reconcileBound: async (input) => {
       reconciliationCalls += 1
+      assert.equal(input.allowDeliveryAbsent, false)
+      assert.equal(input.allowTaskSpaceReclaim, true)
+      assert.equal(input.allowProtocolRepairCapture, undefined)
       assert.equal(input.expectedPreviousContentDigest, "a".repeat(64))
       assert.equal(input.expectedPreviousMessageId, "old-assistant")
       assert.equal(input.expectedTerminalMarker, terminalMarker)
@@ -6787,7 +6811,8 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
       }
     },
   }
-  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  const store = new EventStore(dataDir)
+  const broker = new Broker({ egoAdapter, store })
   await broker.initialize()
   t.after(() => broker.close())
   await broker.bindConversation({
@@ -6807,6 +6832,44 @@ test("a bound late send reconciles only one exact tail-anchored workflow pair", 
   assert.equal(stopped.humanRequired.code, "send_confirmation_ambiguous")
   assert.equal(stopped.reconciliation.beforeHead.messageId, "old-assistant")
   assert.equal(stopped.reconciliation.modelPolicyObservation.modelLabel, "GPT-5.6 Sol")
+
+  const workflowBeforeObservation = broker.getWorkflow({ workflowId: stopped.id })
+  const bindingBeforeObservation = broker.getConversationBinding({
+    bindingKey: "ego-chat-main",
+  })
+  const metricsBeforeObservation = store.getMetrics()
+  const eventLedgerBeforeObservation = await fs.readFile(
+    path.join(dataDir, "events.jsonl"),
+    "utf8",
+  )
+  const browserOperationCallsBeforeObservation = browserOperationCalls
+  const bindCallsBeforeObservation = bindCalls
+  const sendCallsBeforeObservation = sendCalls
+
+  const observed = await broker.reconcileWorkflowObservation({
+    bindingKey: "ego-chat-main",
+    workflowId: stopped.id,
+  })
+  assert.deepEqual(observed, {
+    observationOnly: true,
+    phase: stopped.phase,
+    status: "human_required",
+    workflowId: stopped.id,
+  })
+  assert.equal(reconciliationCalls, 0)
+  assert.equal(bindCalls, bindCallsBeforeObservation)
+  assert.equal(browserOperationCalls, browserOperationCallsBeforeObservation)
+  assert.equal(sendCalls, sendCallsBeforeObservation)
+  assert.deepEqual(broker.getWorkflow({ workflowId: stopped.id }), workflowBeforeObservation)
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
+    bindingBeforeObservation,
+  )
+  assert.deepEqual(store.getMetrics(), metricsBeforeObservation)
+  assert.equal(
+    await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+    eventLedgerBeforeObservation,
+  )
 
   const reconciled = await broker.reconcileConversation({
     bindingKey: "ego-chat-main",
