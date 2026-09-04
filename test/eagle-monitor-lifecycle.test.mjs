@@ -417,6 +417,9 @@ test("the public CLI emits stable JSON and never registers a real LaunchAgent in
   assert.equal(outputs.at(-1).result.session.bindingDigest.length, 64)
   assert.deepEqual(outputs.at(-1).result.monitor, { active: true, epoch: 1 })
   assert.equal(outputs.at(-1).result.policyMatches, true)
+  assert.equal(outputs.at(-1).result.semantic.schema, "EagleSemanticState.v1")
+  assert.equal(outputs.at(-1).result.semantic.classification, "suspect")
+  assert.equal(outputs.at(-1).result.semantic.reasonCode, "semantic_monitor_starting")
   assert.equal(JSON.stringify(outputs.at(-1)).includes("ego-chat-main"), false)
 
   assert.equal(await run(["incidents", "--limit", "10", "--json"]), 0)
@@ -496,6 +499,47 @@ test("status reports an active session without a monitor lease as degraded", asy
   assert.equal(exit, 2)
   assert.deepEqual(outputs.at(-1).result.monitor, { active: false, epoch: 4 })
   assert.equal(outputs.at(-1).result.session.workflowDigest.length, 64)
+})
+
+test("status reports a shadow semantic loop as attention without taking action", async (t) => {
+  const { config } = await fixture(t)
+  const outputs = []
+  const session = {
+    active: true,
+    launchAgentDigest: "a".repeat(64),
+    policyDigest: config.policy.digest,
+  }
+  const status = {
+    humanRequired: { reasonCode: "operationally_healthy", required: false },
+    semantic: { classification: "looping", reasonCode: "repeated_loop_detected" },
+    state: "healthy",
+  }
+  let writes = 0
+
+  const exit = await runEagleMonitorCli({
+    argv: ["status", "--json"],
+    config,
+    lifecycle: {
+      status: async () => ({
+        definitionMatches: true,
+        definitionPresent: true,
+        loaded: true,
+      }),
+    },
+    now: () => "2026-09-04T00:00:00.000Z",
+    observeMonitor: async () => ({ active: true, epoch: 4 }),
+    store: {
+      publicStatus: () => status,
+      readSession: async () => session,
+      readState: async () => ({}),
+      writeState: async () => { writes += 1 },
+    },
+    write: (value) => outputs.push(value),
+  })
+
+  assert.equal(exit, 2)
+  assert.equal(outputs.at(-1).result.semantic.classification, "looping")
+  assert.equal(writes, 0)
 })
 
 test("stop leaves recovery-state mutation to the fenced daemon", async () => {

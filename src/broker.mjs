@@ -4,6 +4,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
+import { projectEagleSemanticCheckpoint } from "./eagle-monitor-semantic.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
 import {
   DEFAULT_CHATGPT_GENERATION_MS,
@@ -204,9 +205,14 @@ function publicWorkflowWithSupervision(workflow, store) {
   const child = typeof workflow.childWorkflowId === "string"
     ? store.getWorkflow(workflow.childWorkflowId)
     : undefined
+  const publicChild = child ? publicWorkflow(child) : undefined
+  const supervision = superviseWorkflow(copy, publicChild)
   return {
     ...copy,
-    supervision: superviseWorkflow(copy, child ? publicWorkflow(child) : undefined),
+    supervision: {
+      ...supervision,
+      semanticCheckpoint: projectEagleSemanticCheckpoint(workflow, child, supervision),
+    },
   }
 }
 

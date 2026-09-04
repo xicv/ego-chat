@@ -1,6 +1,14 @@
 import { safeDigest } from "./eagle-monitor-config.mjs"
-import { EAGLE_MONITOR_SCHEMA_VERSION, safeEvidenceCode } from "./eagle-monitor-constants.mjs"
+import {
+  EAGLE_MONITOR_SCHEMA_VERSION,
+  safeEvidenceCode,
+} from "./eagle-monitor-constants.mjs"
 import { TERMINAL_STATUSES } from "./constants.mjs"
+import { EgoChatError } from "./errors.mjs"
+import {
+  classifyEagleSemanticLiveness,
+  projectEagleSemanticCheckpoint,
+} from "./eagle-monitor-semantic.mjs"
 import {
   assertMonitorActionAllowed,
   chooseMonitorAction,
@@ -26,6 +34,7 @@ function defaultState(nowMs) {
     reconciliation: null,
     recoveryCount: 0,
     schemaVersion: EAGLE_MONITOR_SCHEMA_VERSION,
+    semantic: null,
     state: MonitorState.STARTUP,
     updatedAt: new Date(nowMs).toISOString(),
   }
@@ -76,6 +85,39 @@ function unresolvedTerminalClassification() {
     reasonCode: "terminal_reconciliation_unresolved",
     state: MonitorState.HUMAN_REQUIRED_OTHER,
   }
+}
+
+function semanticProcessHealth(broker) {
+  if (broker.available === true) return "healthy"
+  return broker.conclusivelyDead === true ? "dead" : "unknown"
+}
+
+function semanticTransportHealth(observation) {
+  if (observation.broker?.available !== true) return "unknown"
+  if (observation.bindingMatches !== true) return "degraded"
+  const delivery = observation.workflow?.supervision?.chatGpt?.delivery
+  return [
+    "child_stopped",
+    "child_unavailable",
+    "not_confirmed",
+    "reconciling_delivery",
+    "workflow_stopped",
+  ].includes(delivery)
+    ? "degraded"
+    : "healthy"
+}
+
+const GENUINE_HUMAN_BOUNDARY_CODES = new Set([
+  "authentication_required",
+  "captcha_required",
+  "human_verification_required",
+  "verification_challenge",
+])
+
+function genuineHumanBoundary(classification, workflow) {
+  if (classification.state === MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE) return true
+  const code = workflow?.humanRequired?.code ?? workflow?.error?.code
+  return GENUINE_HUMAN_BOUNDARY_CODES.has(code)
 }
 
 export class EagleMonitorEngine {
@@ -169,6 +211,35 @@ export class EagleMonitorEngine {
     const action = chooseMonitorAction(classification, observation)
     assertMonitorActionAllowed(classification.state, action)
 
+    const semanticCheckpoint = broker.semanticCheckpoint ?? projectEagleSemanticCheckpoint({
+      createdAt: session.configuredAt,
+      id: session.workflowId,
+      ...(broker.workflow ?? {}),
+    }, null, broker.workflow?.supervision)
+    if (semanticCheckpoint.workflowDigest !== workflowDigest) {
+      throw new EgoChatError(
+        "invalid_semantic_checkpoint",
+        "The semantic checkpoint does not match the exact monitored workflow.",
+      )
+    }
+    const semantic = classifyEagleSemanticLiveness({
+      brokerEpoch: broker.epoch ?? null,
+      checkpoint: semanticCheckpoint,
+      humanRequired: genuineHumanBoundary(classification, broker.workflow),
+      nowMs,
+      previous: state.semantic,
+      processHealth: semanticProcessHealth(broker),
+      recoveryActive: broker.workflow?.phase === "codex_recovering" || (
+        session.mode === "safe"
+        && [
+          MonitorAction.RECONCILE_EXACT_WORKFLOW,
+          MonitorAction.START_BROKER,
+        ].includes(action)
+      ),
+      settled: classification.state === MonitorState.SETTLED,
+      transportHealth: semanticTransportHealth(observation),
+    })
+
     const shouldHoldAwake = session.powerPolicy === "keep-awake-on-ac"
       && power.onAc === true
       && isActiveWorkflow(classification)
@@ -180,6 +251,10 @@ export class EagleMonitorEngine {
     await this.#power.setIdleSleepAssertion(shouldHoldAwake, this.#lease)
 
     const incidents = Array.isArray(state.incidents) ? [...state.incidents] : []
+    const semanticIncidentKeys = [...new Set(incidents
+      .filter((incident) => incident.kind === "semantic")
+      .map((incident) => incident.semanticIncidentKey)
+      .filter(Boolean))]
     if (session.mode === "safe") {
       try {
         if (action === MonitorAction.START_BROKER) {
@@ -276,11 +351,28 @@ export class EagleMonitorEngine {
         monitorEpoch: this.#lease.identity.epoch,
         observation,
         recoveryCount: state.recoveryCount ?? 0,
+        semantic,
         session,
       }))
       state.lastIncidentKey = incidentKey
     } else if ([MonitorState.HEALTHY, MonitorState.SETTLED].includes(classification.state)) {
       state.lastIncidentKey = null
+    }
+    if (
+      [MonitorState.HEALTHY, MonitorState.SEND_CONFIRMED_CAPTURE].includes(classification.state)
+      && ["looping", "stagnant", "suspect"].includes(semantic.classification)
+    ) {
+      if (!semanticIncidentKeys.includes(semantic.incidentKey)) {
+        incidents.push(this.#store.createSemanticIncident({
+          classification,
+          monitorEpoch: this.#lease.identity.epoch,
+          observation,
+          recoveryCount: state.recoveryCount ?? 0,
+          semantic,
+          session,
+        }))
+        semanticIncidentKeys.push(semantic.incidentKey)
+      }
     }
 
     const backoffKey = safeDigest(JSON.stringify({
@@ -315,6 +407,7 @@ export class EagleMonitorEngine {
       phase: safeEvidenceCode(broker.workflow?.phase),
       reconciliation: state.reconciliation ?? null,
       recoveryCount: state.recoveryCount ?? 0,
+      semantic,
       state: classification.state,
       updatedAt: new Date(nowMs).toISOString(),
       workflowDigest,

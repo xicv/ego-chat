@@ -1,9 +1,19 @@
+import { createHash } from "node:crypto"
+
 import { inspectBrokerLease } from "./broker-lease.mjs"
 import { RUNTIME_IDENTITY } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 import { requestBroker } from "./ipc-client.mjs"
+import {
+  projectEagleSemanticCheckpoint,
+  validateEagleSemanticCheckpoint,
+} from "./eagle-monitor-semantic.mjs"
 
 const CONNECTION_ERRORS = new Set(["ECONNREFUSED", "ENOENT", "ipc_timeout"])
+
+function createWorkflowDigest(workflowId) {
+  return createHash("sha256").update(workflowId, "utf8").digest("hex")
+}
 
 async function assertDispatchFence(dispatchFence) {
   if (!dispatchFence || typeof dispatchFence.assertCurrent !== "function") {
@@ -82,11 +92,23 @@ export class EagleMonitorBrokerAdapter {
       if (workflow && running?.supervision) {
         workflow = { ...workflow, supervision: running.supervision }
       }
+      const semanticCheckpoint = running?.supervision?.semanticCheckpoint
+        ?? (workflow ? projectEagleSemanticCheckpoint(workflow, null, workflow.supervision) : null)
+      if (semanticCheckpoint) {
+        validateEagleSemanticCheckpoint(semanticCheckpoint)
+        if (semanticCheckpoint.workflowDigest !== createWorkflowDigest(workflowId)) {
+          throw new EgoChatError(
+            "invalid_semantic_checkpoint",
+            "The semantic checkpoint does not match the exact monitored workflow.",
+          )
+        }
+      }
       return {
         available: true,
         conclusivelyDead: false,
         epoch: status.broker.epoch,
         runtimeIdentity: status.broker.runtimeIdentity,
+        semanticCheckpoint,
         workflow,
       }
     } catch (error) {

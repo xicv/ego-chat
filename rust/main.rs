@@ -127,6 +127,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/eagle-monitor-runtime.mjs"),
     },
     EmbeddedFile {
+        path: "src/eagle-monitor-semantic.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-semantic.mjs"),
+    },
+    EmbeddedFile {
         path: "src/eagle-monitor-store.mjs",
         bytes: include_bytes!("../src/eagle-monitor-store.mjs"),
     },

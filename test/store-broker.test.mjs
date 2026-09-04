@@ -516,6 +516,11 @@ test("workflow status exposes exact convergence and ChatGPT delivery supervision
   assert.equal(visible.supervision.codex.inspectionRetryCount, 7)
   assert.equal(visible.supervision.lastTransitionAt, child.updatedAt)
   assert.match(visible.supervision.message, /durably sent/)
+  assert.equal(visible.supervision.semanticCheckpoint.schema, "EagleSemanticCheckpoint.v1")
+  assert.equal(visible.supervision.semanticCheckpoint.workflowDigest.length, 64)
+  assert.equal(visible.supervision.semanticCheckpoint.delivery, "sent_waiting_response")
+  assert.equal(JSON.stringify(visible.supervision.semanticCheckpoint).includes(parent.id), false)
+  assert.equal(JSON.stringify(visible.supervision.semanticCheckpoint).includes(child.id), false)
 })
 
 test("binding persistence compare-and-swap rejects a stale re-anchor commit", async (t) => {
