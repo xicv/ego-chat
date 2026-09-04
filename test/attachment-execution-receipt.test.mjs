@@ -4,6 +4,7 @@ import test from "node:test"
 
 import {
   assertValidAttachmentExecutionDisposition,
+  assertValidSignedAttachmentDispositionEnvelope,
   buildAttachmentEvidenceCapture,
   buildAmbiguousSendDisposition,
   attachmentCaptureOperationKeyDigest,
@@ -427,6 +428,7 @@ test("committed public-boundary fixture is exact signed producer output", () => 
 test("terminal evidence builders retain complete public lineage", () => {
   const intent = {
     consumer_signer_authorization_sha256: "a".repeat(64),
+    created_at: "2026-09-04T04:59:59.000Z",
     external_binding_sha256: "b".repeat(64),
     profile: "a3k-manual-canary-v1",
     qualified_runtime_identity: {
@@ -436,6 +438,7 @@ test("terminal evidence builders retain complete public lineage", () => {
       runtime_identity_sha256: "4".repeat(64),
     },
     signer_enrollment_sha256: "c".repeat(64),
+    send_resolution_deadline_at: "2026-09-04T05:10:00.000Z",
     signer_key_id: `ed25519-spki-sha256:${"d".repeat(64)}`,
     source_operation_key_sha256: "e".repeat(64),
     source_workflow_id: "workflow-terminal-vector",
@@ -489,6 +492,106 @@ test("terminal evidence builders retain complete public lineage", () => {
     source_operation_key: "exchange:a3k:EGO_CHAT_A3K_TERMINAL_VECTOR_12345678",
     source_workflow_id: intent.source_workflow_id,
   })
+})
+
+test("signed terminal evidence envelopes validate every advertised disposition kind", () => {
+  const runtimeProjection = {
+    executable_sha256: "1".repeat(64),
+    implementation_git_sha: "2".repeat(40),
+    package_inventory_sha256: "3".repeat(64),
+  }
+  const intent = {
+    consumer_signer_authorization_sha256: "a".repeat(64),
+    created_at: "2026-09-04T05:00:00.000Z",
+    external_binding_sha256: "b".repeat(64),
+    live_reservation_bytes: 1024 * 1024,
+    permanent_reservation_bytes: 32 * 1024,
+    profile: "a3k-manual-canary-v1",
+    qualified_runtime_identity: {
+      ...runtimeProjection,
+      runtime_identity_sha256: sha256Hex(canonicalJsonBytes(runtimeProjection)),
+    },
+    schema: "ego-chat-attachment-capture-intent/v1",
+    send_resolution_deadline_at: "2026-09-04T05:10:00.000Z",
+    signer_enrollment_sha256: "c".repeat(64),
+    signer_key_id: `ed25519-spki-sha256:${"d".repeat(64)}`,
+    source_operation_key_sha256: "e".repeat(64),
+    source_workflow_id: "workflow-terminal-envelope",
+    state: "RESERVED",
+  }
+  const dispositions = [
+    buildAmbiguousSendDisposition({
+      brokerEpoch: 7,
+      browserFencingGeneration: 11,
+      firstObservationAt: "2026-09-04T05:00:01.000Z",
+      intent,
+      lastObservationAt: "2026-09-04T05:00:02.000Z",
+      preDispatchTurnMarker: "EGO_CHAT_A3K_TERMINAL_ENVELOPE_12345678",
+      terminalAt: "2026-09-04T05:10:00.000Z",
+    }),
+    buildConfirmedSendAbsenceDisposition({
+      browserFencingGeneration: 11,
+      dispatchAttempts: [{
+        attempt_number: 1,
+        browser_fencing_generation: 11,
+        observed_at: "2026-09-04T05:00:01.000Z",
+        outcome: "ABSENT",
+      }],
+      intent,
+      observedAt: "2026-09-04T05:00:02.000Z",
+      terminalAt: "2026-09-04T05:00:03.000Z",
+    }),
+  ]
+  for (const disposition of dispositions) {
+    const payloadBytes = canonicalJsonBytes(disposition)
+    const envelope = {
+      authority_domain: disposition.authority_domain,
+      media_type: disposition.media_type,
+      payload_base64url: payloadBytes.toString("base64url"),
+      payload_sha256: sha256Hex(payloadBytes),
+      schema: "ego-chat-signed-attachment-evidence-envelope/v1",
+      signature_base64url: Buffer.alloc(64, 7).toString("base64url"),
+      signature_input_domain: disposition.signature_input_domain,
+      signer_key_id: disposition.signer_key_id,
+    }
+    assert.deepEqual(
+      assertValidSignedAttachmentDispositionEnvelope(envelope).disposition,
+      disposition,
+    )
+    const extraField = { ...disposition, unexpected: true }
+    const extraBytes = canonicalJsonBytes(extraField)
+    assert.throws(
+      () => assertValidSignedAttachmentDispositionEnvelope({
+        ...envelope,
+        payload_base64url: extraBytes.toString("base64url"),
+        payload_sha256: sha256Hex(extraBytes),
+      }),
+      (error) => error.code === "invalid_terminal_evidence_disposition",
+    )
+  }
+
+  assert.throws(
+    () => buildAmbiguousSendDisposition({
+      brokerEpoch: 7,
+      browserFencingGeneration: 11,
+      firstObservationAt: "2026-09-04T05:00:03.000Z",
+      intent,
+      lastObservationAt: "2026-09-04T05:00:02.000Z",
+      preDispatchTurnMarker: "EGO_CHAT_A3K_TERMINAL_ENVELOPE_12345678",
+      terminalAt: "2026-09-04T05:00:04.000Z",
+    }),
+    (error) => error.code === "invalid_terminal_evidence_disposition",
+  )
+  assert.throws(
+    () => buildConfirmedSendAbsenceDisposition({
+      browserFencingGeneration: 11,
+      dispatchAttempts: [],
+      intent,
+      observedAt: "2026-09-04T05:10:00.001Z",
+      terminalAt: "2026-09-04T05:10:00.001Z",
+    }),
+    (error) => error.code === "invalid_terminal_evidence_disposition",
+  )
 })
 
 test("stable-pair identity includes action, wrapper, control, and pointer evidence", () => {

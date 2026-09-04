@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
@@ -14,6 +15,7 @@ import {
 } from "../src/attachment-receipt-authority.mjs"
 import { ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT } from "../src/attachment-consumer-ack.mjs"
 import {
+  buildAmbiguousSendDisposition,
   canonicalJsonBytes,
   sha256Hex,
 } from "../src/attachment-execution-receipt.mjs"
@@ -40,18 +42,21 @@ async function createRuntimeFixture(t) {
   const executableBytes = Buffer.from("fixture ego-chat executable", "utf8")
   await writePrivate(executablePath, executableBytes)
   const packageInventory = files.map(([relativePath, bytes]) => ({
+    mode: 0o600,
     path: relativePath,
     sha256: sha256Hex(bytes),
     size_bytes: bytes.length,
   }))
   const manifest = {
+    executable_mode: 0o600,
     executable_path: executablePath,
     executable_sha256: sha256Hex(executableBytes),
     implementation_git_sha: "1".repeat(40),
     package_inventory: packageInventory,
     package_inventory_sha256: sha256Hex(canonicalJsonBytes(packageInventory)),
     runtime_root: root,
-    schema: "ego-chat-receipt-build-manifest/v1",
+    runtime_root_mode: 0o700,
+    schema: "ego-chat-receipt-build-manifest/v2",
   }
   await writePrivate(
     path.join(root, "receipt-build-manifest.json"),
@@ -132,6 +137,14 @@ test("receipt signer enrollment is create-once and qualification verifies human 
     implementation_git_sha: runtime.manifest.implementation_git_sha,
     package_inventory_sha256: runtime.manifest.package_inventory_sha256,
   })
+  assert.equal(
+    qualification.authoritySnapshotDigest,
+    sha256Hex(canonicalJsonBytes(qualification.authoritySnapshot)),
+  )
+  assert.equal(
+    qualification.authoritySnapshot.consumer_signer_authorization_sha256,
+    sha256Hex(authorizationBytes),
+  )
 
   const disposition = {
     authority_domain: "attachment-observation-only",
@@ -168,6 +181,8 @@ test("receipt signer enrollment is create-once and qualification verifies human 
     unclassified_artifact_count: 0,
   }
   const envelope = await authority.signAttachmentDisposition({
+    authoritySnapshot: qualification.authoritySnapshot,
+    authoritySnapshotDigest: qualification.authoritySnapshotDigest,
     consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
     disposition,
   })
@@ -239,6 +254,8 @@ test("receipt signer enrollment is create-once and qualification verifies human 
   )
   await assert.rejects(
     authority.signAttachmentDisposition({
+      authoritySnapshot: qualification.authoritySnapshot,
+      authoritySnapshotDigest: qualification.authoritySnapshotDigest,
       consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
       disposition: {
         ...disposition,
@@ -258,6 +275,155 @@ test("receipt signer enrollment is create-once and qualification verifies human 
     (error) => error.code === "receipt_runtime_identity_mismatch",
   )
   await fs.writeFile(runtimeFile, originalRuntimeBytes)
+  await fs.chmod(runtimeFile, 0o644)
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "invalid_receipt_build_manifest",
+  )
+  await fs.chmod(runtimeFile, 0o600)
+  const runtimeLinkTarget = `${runtimeFile}.target`
+  await fs.rename(runtimeFile, runtimeLinkTarget)
+  await fs.symlink(runtimeLinkTarget, runtimeFile)
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "invalid_receipt_build_manifest",
+  )
+  await fs.unlink(runtimeFile)
+  await fs.rename(runtimeLinkTarget, runtimeFile)
+  const publicKeyHardlink = `${publicKeyPath}.hardlink`
+  await fs.link(publicKeyPath, publicKeyHardlink)
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "attachment_receipt_authorization_unavailable",
+  )
+  await fs.unlink(publicKeyHardlink)
+  const privateKeyPath = path.join(
+    dataDir,
+    "attachment-receipt-signer",
+    "private-key.pk8",
+  )
+  const privateKeyHardlink = `${privateKeyPath}.hardlink`
+  await fs.link(privateKeyPath, privateKeyHardlink)
+  await assert.rejects(
+    authority.signAttachmentDisposition({
+      authoritySnapshot: qualification.authoritySnapshot,
+      authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+      consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+      disposition,
+    }),
+    (error) => error.code === "unsafe_attachment_signer_key",
+  )
+  await fs.unlink(privateKeyHardlink)
+  const signerRoot = path.dirname(privateKeyPath)
+  await fs.chmod(signerRoot, 0o755)
+  await assert.rejects(
+    authority.signAttachmentDisposition({
+      authoritySnapshot: qualification.authoritySnapshot,
+      authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+      consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+      disposition,
+    }),
+    (error) => error.code === "unsafe_attachment_signer_root",
+  )
+  await fs.chmod(signerRoot, 0o700)
+  const originalAuthorization = await fs.readFile(authorizationPath)
+  await fs.unlink(authorizationPath)
+  execFileSync("/usr/bin/mkfifo", [authorizationPath])
+  await fs.chmod(authorizationPath, 0o600)
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "attachment_receipt_authorization_unavailable",
+  )
+  await fs.unlink(authorizationPath)
+  await writePrivate(authorizationPath, originalAuthorization)
+  await fs.writeFile(signaturePath, Buffer.alloc(1025))
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "attachment_receipt_authorization_unavailable",
+  )
+  await fs.writeFile(signaturePath, sign(
+    "RSA-SHA256",
+    authorizationBytes,
+    humanKeyPair.privateKey,
+  ))
+  const relocatedAuthorityRoot = `${authorityRoot}.pinned`
+  await fs.rename(authorityRoot, relocatedAuthorityRoot)
+  await fs.symlink(relocatedAuthorityRoot, authorityRoot)
+  await assert.rejects(
+    authority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "attachment_receipt_authorization_unavailable",
+  )
+  await fs.unlink(authorityRoot)
+  await fs.rename(relocatedAuthorityRoot, authorityRoot)
+  const pinnedDuringReadRoot = `${authorityRoot}.during-read`
+  let replacedDuringRead = false
+  const racingAuthority = new AttachmentReceiptAuthority({
+    authorityFaultInjector: async (phase) => {
+      if (phase !== "authorization_evidence_read" || replacedDuringRead) return
+      await fs.rename(authorityRoot, pinnedDuringReadRoot)
+      await fs.mkdir(authorityRoot, { mode: 0o700 })
+      replacedDuringRead = true
+    },
+    authorizationPath,
+    dataDir,
+    executablePath: runtime.executablePath,
+    humanApprovalPublicKeyPath: publicKeyPath,
+    now: () => new Date(NOW),
+    runtimeRoot: runtime.root,
+    signaturePath,
+  })
+  await assert.rejects(
+    racingAuthority.qualify({
+      consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    }),
+    (error) => error.code === "attachment_receipt_authorization_unavailable",
+  )
+  assert.equal(replacedDuringRead, true)
+  await fs.rmdir(authorityRoot)
+  await fs.rename(pinnedDuringReadRoot, authorityRoot)
+  const originalAuthorizationPath = `${authorizationPath}.during-read`
+  let replacedAuthorizationFile = false
+  const fileRacingAuthority = new AttachmentReceiptAuthority({
+    authorityFaultInjector: async (phase) => {
+      if (phase !== "authorization_file_bytes_read" || replacedAuthorizationFile) return
+      await fs.rename(authorizationPath, originalAuthorizationPath)
+      await writePrivate(authorizationPath, authorizationBytes)
+      replacedAuthorizationFile = true
+    },
+    authorizationPath,
+    dataDir,
+    executablePath: runtime.executablePath,
+    humanApprovalPublicKeyPath: publicKeyPath,
+    now: () => new Date(NOW),
+    runtimeRoot: runtime.root,
+    signaturePath,
+  })
+  try {
+    await assert.rejects(
+      fileRacingAuthority.qualify({
+        consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+      }),
+      (error) => error.code === "attachment_receipt_authorization_unavailable",
+    )
+    assert.equal(replacedAuthorizationFile, true)
+  } finally {
+    if (replacedAuthorizationFile) {
+      await fs.unlink(authorizationPath)
+      await fs.rename(originalAuthorizationPath, authorizationPath)
+    }
+  }
   const originalSignature = await fs.readFile(signaturePath)
   const invalidSignature = Buffer.from(originalSignature)
   invalidSignature[0] ^= 0x01
@@ -267,6 +433,87 @@ test("receipt signer enrollment is create-once and qualification verifies human 
       consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
     }),
     (error) => error.code === "invalid_attachment_receipt_authorization",
+  )
+  const admittedIntent = {
+    consumer_signer_authorization_sha256: qualification.consumerSignerAuthorizationDigest,
+    created_at: NOW,
+    external_binding_sha256: "b".repeat(64),
+    live_reservation_bytes: 1024 * 1024,
+    permanent_reservation_bytes: 32 * 1024,
+    profile: "a3k-manual-canary-v1",
+    qualified_runtime_identity: {
+      ...qualification.runtimeIdentity,
+      runtime_identity_sha256: sha256Hex(canonicalJsonBytes(qualification.runtimeIdentity)),
+    },
+    schema: "ego-chat-attachment-capture-intent/v1",
+    send_resolution_deadline_at: "2026-09-04T05:10:00.000Z",
+    signer_enrollment_sha256: qualification.signerEnrollmentDigest,
+    signer_key_id: qualification.signerKeyId,
+    source_operation_key_sha256: "e".repeat(64),
+    source_workflow_id: "workflow-admitted-before-rotation",
+    state: "RESERVED",
+  }
+  const ambiguousDisposition = buildAmbiguousSendDisposition({
+    brokerEpoch: 7,
+    browserFencingGeneration: 11,
+    firstObservationAt: "2026-09-04T05:00:01.000Z",
+    intent: admittedIntent,
+    lastObservationAt: "2026-09-04T05:00:02.000Z",
+    preDispatchTurnMarker: "EGO_CHAT_A3K_ADMITTED_AUTHORITY_12345678",
+    terminalAt: "2026-09-04T05:10:00.000Z",
+  })
+  const admittedEnvelope = await authority.signAttachmentDisposition({
+    authoritySnapshot: qualification.authoritySnapshot,
+    authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+    consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+    disposition: ambiguousDisposition,
+  })
+  assert.equal(admittedEnvelope.payload_sha256, sha256Hex(canonicalJsonBytes(ambiguousDisposition)))
+  const relocatedSignerRoot = `${signerRoot}.during-sign`
+  let replacedSignerRoot = false
+  const signerRacingAuthority = new AttachmentReceiptAuthority({
+    authorityFaultInjector: async (phase) => {
+      if (phase !== "signer_private_key_read" || replacedSignerRoot) return
+      await fs.rename(signerRoot, relocatedSignerRoot)
+      await fs.mkdir(signerRoot, { mode: 0o700 })
+      replacedSignerRoot = true
+    },
+    authorizationPath,
+    dataDir,
+    executablePath: runtime.executablePath,
+    humanApprovalPublicKeyPath: publicKeyPath,
+    now: () => new Date(NOW),
+    runtimeRoot: runtime.root,
+    signaturePath,
+  })
+  try {
+    await assert.rejects(
+      signerRacingAuthority.signAttachmentDisposition({
+        authoritySnapshot: qualification.authoritySnapshot,
+        authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+        consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+        disposition: ambiguousDisposition,
+      }),
+      (error) => error.code === "unsafe_attachment_signer_root",
+    )
+    assert.equal(replacedSignerRoot, true)
+  } finally {
+    if (replacedSignerRoot) {
+      await fs.rmdir(signerRoot)
+      await fs.rename(relocatedSignerRoot, signerRoot)
+    }
+  }
+  await assert.rejects(
+    authority.signAttachmentDisposition({
+      authoritySnapshot: {
+        ...qualification.authoritySnapshot,
+        admitted_at: "2026-09-04T05:00:00.001Z",
+      },
+      authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+      consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+      disposition: ambiguousDisposition,
+    }),
+    (error) => error.code === "attachment_receipt_authority_snapshot_mismatch",
   )
 })
 

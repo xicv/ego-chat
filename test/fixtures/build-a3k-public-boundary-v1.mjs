@@ -146,6 +146,7 @@ function runtimeFixture(contract) {
   const inventory = Object.entries(files).map(([relativePath, encoded]) => {
     const bytes = Buffer.from(encoded, "base64url")
     return {
+      mode: 0o600,
       path: relativePath,
       sha256: sha256Hex(bytes),
       size_bytes: bytes.length,
@@ -153,13 +154,15 @@ function runtimeFixture(contract) {
   })
   const executableBytes = Buffer.from("ego-chat test executable", "utf8")
   const manifest = {
+    executable_mode: 0o600,
     executable_path: EXECUTABLE_PATH,
     executable_sha256: sha256Hex(executableBytes),
     implementation_git_sha: contract.sha256,
     package_inventory: inventory,
     package_inventory_sha256: sha256Hex(canonicalJsonBytes(inventory)),
     runtime_root: RUNTIME_ROOT,
-    schema: "ego-chat-receipt-build-manifest/v1",
+    runtime_root_mode: 0o700,
+    schema: "ego-chat-receipt-build-manifest/v2",
   }
   return {
     executable_base64url: executableBytes.toString("base64url"),

@@ -6,9 +6,12 @@ import { isDeepStrictEqual } from "node:util"
 import { EgoChatError } from "./errors.mjs"
 import {
   assertValidSignedAttachmentDispositionEnvelope,
+  buildAmbiguousSendDisposition,
   buildAttachmentCaptureIntent,
   buildAttachmentEvidenceCapture,
   buildAttachmentExecutionDisposition,
+  buildConfirmedSendAbsenceDisposition,
+  buildTerminalEvidenceBundle,
   canonicalJsonBytes,
   classifyAttachmentExecutionObservations,
   sha256Hex,
@@ -772,7 +775,11 @@ export class Broker {
           workflow.phase === "response_captured"
           || (workflow.phase === "send_confirmed" && workflow.private?.send)
           || (
-            ["browser_owned", "restart_reconciling"].includes(workflow.phase)
+            [
+              "browser_owned",
+              "receipt_dispatch_armed",
+              "restart_reconciling",
+            ].includes(workflow.phase)
             && workflow.reconciliation?.beforeHead?.messageId
             && workflow.reconciliation?.expectedTerminalMarker
             && workflow.reconciliation?.turnMarker
@@ -783,7 +790,9 @@ export class Broker {
         && !this.#activeBindings.has(workflow.bindingKey)
       ) {
         this.#activeBindings.add(workflow.bindingKey)
-        const resumable = workflow.phase === "browser_owned"
+        const resumable = ["browser_owned", "receipt_dispatch_armed"].includes(
+          workflow.phase,
+        )
           ? await this.#transition(workflow, "exchange.restart_reconciliation_started", {
               phase: "restart_reconciling",
               private: workflow.private,
@@ -1719,6 +1728,54 @@ export class Broker {
       workflow_id: confirmedSendEvent.workflow_id,
     }
     if (
+      [
+        "ego-chat-ambiguous-send-disposition/v1",
+        "ego-chat-confirmed-send-absence/v1",
+      ].includes(terminalDisposition?.schema)
+    ) {
+      const schema = terminalDisposition.schema === "ego-chat-ambiguous-send-disposition/v1"
+        ? "ego-chat-ambiguous-send-evidence-bundle/v1"
+        : "ego-chat-confirmed-send-absence-evidence-bundle/v1"
+      if (
+        workflow.kind !== "ego_exchange"
+        || ![
+          "attachment_disposition_terminal",
+          "attachment_evidence_released",
+        ].includes(workflow.phase)
+        || workflow.status !== "succeeded"
+        || !intent
+        || confirmedSendEvent !== undefined
+        || confirmedSendIdentity !== undefined
+        || capture !== undefined
+        || !dispositionEnvelope
+        || !externalBinding
+        || externalBinding.source_workflow_id !== workflow.id
+        || externalBinding.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
+      ) {
+        throw new EgoChatError(
+          "attachment_evidence_not_terminal",
+          "The source workflow has no complete immutable terminal Send evidence chain.",
+        )
+      }
+      return {
+        ...(this.#store.getAttachmentConsumerAcknowledgement(workflow.id)
+          ? {
+              consumer_acknowledgement_envelope:
+                this.#store.getAttachmentConsumerAcknowledgement(workflow.id),
+              evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
+            }
+          : {}),
+        ...buildTerminalEvidenceBundle({
+          dispositionEnvelope,
+          externalBinding,
+          intent,
+          schema,
+          sourceOperationKey: workflow.operationKey,
+          sourceWorkflowId: workflow.id,
+        }),
+      }
+    }
+    if (
       workflow.kind !== "ego_exchange"
       || ![
         "attachment_disposition_terminal",
@@ -1828,6 +1885,7 @@ export class Broker {
   }
 
   async #terminalizeAttachmentCapture(capture, terminalReason = undefined) {
+    const workflow = this.#store.getWorkflow(capture.source_workflow_id)
     const identity = this.#store.getConfirmedSendIdentity(capture.source_workflow_id)
     const identityDigest = sha256Hex(canonicalJsonBytes(identity))
     const finalObservedAt = capture.candidate_observations.at(-1)?.observed_at
@@ -1849,6 +1907,8 @@ export class Broker {
       terminalAt,
     })
     const envelope = await this.#attachmentReceiptAuthority.signAttachmentDisposition({
+      authoritySnapshot: workflow?.private?.receiptAuthoritySnapshot,
+      authoritySnapshotDigest: workflow?.private?.receiptAuthoritySnapshotSha256,
       consumerSignerAuthorizationDigest:
         identity.consumer_signer_authorization_sha256,
       disposition,
@@ -2090,6 +2150,14 @@ export class Broker {
       )
       if (
         !qualification
+        || !qualification.authoritySnapshot
+        || typeof qualification.authoritySnapshot !== "object"
+        || Array.isArray(qualification.authoritySnapshot)
+        || qualification.authoritySnapshot.schema
+          !== "ego-chat-attachment-receipt-authorization-snapshot/v1"
+        || !/^[a-f0-9]{64}$/.test(qualification.authoritySnapshotDigest)
+        || qualification.authoritySnapshotDigest
+          !== sha256Hex(canonicalJsonBytes(qualification.authoritySnapshot))
         || qualification.consumerSignerAuthorizationDigest
           !== params.receiptCapture.consumer_signer_authorization_sha256
         || typeof qualification.signerEnrollmentDigest !== "string"
@@ -2128,6 +2196,8 @@ export class Broker {
         workflowId,
       })
       receiptAdmission = {
+        authoritySnapshot: qualification.authoritySnapshot,
+        authoritySnapshotDigest: qualification.authoritySnapshotDigest,
         intent: built.intent,
         intentDigest: built.digest,
       }
@@ -2147,6 +2217,12 @@ export class Broker {
       phase: "browser_owned",
       private: {
         modelPolicy,
+        ...(receiptAdmission
+          ? {
+              receiptAuthoritySnapshot: receiptAdmission.authoritySnapshot,
+              receiptAuthoritySnapshotSha256: receiptAdmission.authoritySnapshotDigest,
+            }
+          : {}),
         request: {
           ...params,
           requestedTimeoutMs: params.timeoutMs,
@@ -2762,6 +2838,151 @@ export class Broker {
     }
   }
 
+  #receiptFailureIsProvenPreClick(error) {
+    const reason = error instanceof EgoChatError
+      ? (error.details?.reason ?? error.code)
+      : undefined
+    if (
+      error instanceof EgoChatError
+      && error.code === "human_required"
+      && RETRYABLE_PRE_SEND_REASONS.has(reason)
+    ) {
+      return true
+    }
+    return error?.details?.draftCleared === true
+      && PRECLICK_DRIVER_STAGES.has(error?.details?.driverStage)
+  }
+
+  async #armReceiptDispatch(workflow, binding) {
+    if (workflow.private?.receiptDispatch) {
+      return workflow
+    }
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    if (!intent) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The receipt-enabled exchange lost its immutable capture intent before dispatch.",
+      )
+    }
+    const armedAt = new Date(Math.max(
+      Date.parse(intent.created_at),
+      Math.min(Date.now(), Date.parse(intent.send_resolution_deadline_at)),
+    )).toISOString()
+    await this.#transition(workflow, "exchange.receipt_dispatch_armed", {
+      phase: "receipt_dispatch_armed",
+      private: {
+        ...workflow.private,
+        receiptDispatch: {
+          armed_at: armedAt,
+          attempt_number: 1,
+          broker_epoch: this.#brokerIdentity.epoch,
+          browser_fencing_generation: binding.revision,
+          observations: [],
+          schema: "ego-chat-receipt-dispatch-state/v1",
+          state: "ARMED",
+        },
+      },
+    })
+    return this.#store.getWorkflow(workflow.id)
+  }
+
+  async #terminalizeReceiptDispatch(workflow, {
+    error = undefined,
+    provenAbsentAfterDispatch = false,
+    provenNotDispatched = false,
+  } = {}) {
+    let current = this.#store.getWorkflow(workflow.id)
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    const dispatch = current?.private?.receiptDispatch
+    if (
+      !current
+      || current.status !== "running"
+      || !intent
+      || !dispatch
+      || dispatch.schema !== "ego-chat-receipt-dispatch-state/v1"
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The receipt dispatch cannot be terminalized without its durable admission and arming state.",
+      )
+    }
+    const deadlineMs = Date.parse(intent.send_resolution_deadline_at)
+    const terminalMs = Math.max(
+      Date.parse(intent.created_at),
+      Math.min(Date.now(), deadlineMs),
+    )
+    const terminalAt = new Date(terminalMs).toISOString()
+    const provenPreClick = !provenAbsentAfterDispatch
+      && (provenNotDispatched || this.#receiptFailureIsProvenPreClick(error))
+    const disposition = (provenPreClick || provenAbsentAfterDispatch)
+      ? buildConfirmedSendAbsenceDisposition({
+          browserFencingGeneration: dispatch.browser_fencing_generation,
+          dispatchAttempts: provenAbsentAfterDispatch
+            ? [{
+                attempt_number: 1,
+                browser_fencing_generation: dispatch.browser_fencing_generation,
+                observed_at: terminalAt,
+                outcome: "ABSENT",
+              }]
+            : [],
+          intent,
+          observedAt: terminalAt,
+          terminalAt,
+        })
+      : buildAmbiguousSendDisposition({
+          brokerEpoch: dispatch.broker_epoch,
+          browserFencingGeneration: dispatch.browser_fencing_generation,
+          firstObservationAt: dispatch.armed_at,
+          intent,
+          lastObservationAt: terminalAt,
+          preDispatchTurnMarker: current.reconciliation.turnMarker,
+          terminalAt,
+        })
+    const resolvedDispatch = {
+      ...dispatch,
+      observations: [{
+        at: terminalAt,
+        outcome: provenPreClick
+          ? "NOT_DISPATCHED"
+          : provenAbsentAfterDispatch
+            ? "ABSENT"
+            : "AMBIGUOUS",
+      }],
+      state: provenPreClick
+        ? "PROVEN_NOT_DISPATCHED"
+        : provenAbsentAfterDispatch
+          ? "PROVEN_ABSENT"
+          : "AMBIGUOUS",
+    }
+    current = await this.#transition(current, "exchange.receipt_dispatch_resolved", {
+      phase: "receipt_dispatch_resolved",
+      private: {
+        ...current.private,
+        receiptDispatch: resolvedDispatch,
+      },
+    })
+    current = this.#store.getWorkflow(workflow.id)
+    const envelope = await this.#attachmentReceiptAuthority.signAttachmentDisposition({
+      authoritySnapshot: current.private.receiptAuthoritySnapshot,
+      authoritySnapshotDigest: current.private.receiptAuthoritySnapshotSha256,
+      consumerSignerAuthorizationDigest:
+        intent.consumer_signer_authorization_sha256,
+      disposition,
+    })
+    await this.#assertBrokerAuthority("before_terminal_send_disposition_commit")
+    const persisted = await this.#store.persistTerminalEvidenceDisposition({
+      envelope,
+      workflowId: current.id,
+    })
+    this.#activeBindings.delete(current.bindingKey)
+    if (isTerminal(persisted.workflow)) {
+      for (const waiter of [...(this.#waiters.get(current.id) ?? [])]) {
+        waiter.resolve(publicWorkflow(persisted.workflow))
+      }
+    }
+    return persisted
+  }
+
   async #autoReanchorRunningExchange(workflow, error, signal) {
     const headChange = safeHeadChangeEvidence(error)
     if (headChange?.observedRole !== "assistant" || typeof this.#egoAdapter.reanchor !== "function") {
@@ -2859,6 +3080,15 @@ export class Broker {
               { reason: "delivery_absence_proof_invalid" },
             )
           }
+          if (workflow.private?.request?.receiptCapture) {
+            if (workflow.private.receiptDispatch) {
+              await this.#terminalizeReceiptDispatch(workflow, {
+                provenAbsentAfterDispatch: true,
+              })
+              return { binding, result: undefined, terminal: true }
+            }
+            return { binding, result: undefined, terminal: false }
+          }
           const current = this.#store.getWorkflow(workflow.id)
           if (current?.status === "running") {
             await this.#transition(current, "exchange.restart_delivery_absent", {
@@ -2876,6 +3106,13 @@ export class Broker {
             })
           }
           return { binding, result: undefined }
+        }
+        if (
+          workflow.private?.request?.receiptCapture
+          && workflow.private.receiptDispatch
+        ) {
+          await this.#terminalizeReceiptDispatch(workflow)
+          return { binding, result: undefined, terminal: true }
         }
         const responseText = verified.responseText
         const responseDigest = typeof responseText === "string" ? digest(responseText) : null
@@ -2905,8 +3142,22 @@ export class Broker {
           },
         }
       } catch (error) {
-        if (signal.aborted || this.#isHumanOnlyBrowserError(error)) {
+        if (signal.aborted) {
           throw error
+        }
+        if (
+          workflow.private?.request?.receiptCapture
+          && workflow.private.receiptDispatch
+          && (
+            this.#isHumanOnlyBrowserError(error)
+            || Date.now() >= Date.parse(
+              this.#store.getAttachmentIntent(workflow.id)
+                ?.send_resolution_deadline_at ?? 0,
+            )
+          )
+        ) {
+          await this.#terminalizeReceiptDispatch(workflow, { error })
+          return { binding, result: undefined, terminal: true }
         }
         const current = this.#store.getWorkflow(workflow.id)
         if (!current || current.status !== "running") {
@@ -2949,6 +3200,9 @@ export class Broker {
         )
         binding = recovered.binding
         result = recovered.result
+        if (recovered.terminal) {
+          return
+        }
         current = this.#store.getWorkflow(workflow.id)
         if (!current || current.status !== "running") {
           return
@@ -2961,6 +3215,19 @@ export class Broker {
         )
         if (stagedAdapter) {
           if (current.phase !== "send_confirmed") {
+            if (current.private.request.receiptCapture) {
+              current = await this.#armReceiptDispatch(current, binding)
+              const receiptIntent = this.#store.getAttachmentIntent(current.id)
+              if (
+                Date.now()
+                  >= Date.parse(receiptIntent.send_resolution_deadline_at)
+              ) {
+                await this.#terminalizeReceiptDispatch(current, {
+                  provenNotDispatched: true,
+                })
+                return
+              }
+            }
             let sendRecoveryCount = current.recoveryCount ?? 0
             let sent
             while (!sent) {
@@ -2974,9 +3241,12 @@ export class Broker {
                   controller.signal,
                 )
               } catch (error) {
+                if (current.private.request.receiptCapture) {
+                  await this.#terminalizeReceiptDispatch(current, { error })
+                  return
+                }
                 if (
                   controller.signal.aborted
-                  || current.private.request.receiptCapture
                   || !this.#canRetryPreSend(error)
                 ) {
                   throw error
@@ -3024,6 +3294,18 @@ export class Broker {
               private: {
                 ...current.private,
                 captureAttempts: 0,
+                ...(current.private.request.receiptCapture
+                  ? {
+                      receiptDispatch: {
+                        ...current.private.receiptDispatch,
+                        observations: [{
+                          at: new Date().toISOString(),
+                          outcome: "CONFIRMED",
+                        }],
+                        state: "CONFIRMED",
+                      },
+                    }
+                  : {}),
                 send: {
                   ...sent,
                   modelPolicy: observation,
@@ -3300,7 +3582,9 @@ export class Broker {
       await this.#assertBrokerAuthority("before_exchange_completion_commit")
       await this.#transition(current, "workflow.succeeded", {
         phase: "head_committed",
-        private: undefined,
+        private: current.private?.request?.receiptCapture
+          ? current.private
+          : undefined,
         result: {
           ...normalizedResult,
           digest: digest(JSON.stringify(normalizedResult)),

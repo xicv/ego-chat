@@ -94,6 +94,60 @@ const TERMINAL_EVIDENCE_DOES_NOT_GRANT = Object.freeze([
   "production-queue-activation",
   "shipping",
 ])
+const AMBIGUOUS_SEND_DISPOSITION_KEYS = [
+  "authority_domain",
+  "broker_epoch",
+  "browser_fencing_generation",
+  "capture_intent_sha256",
+  "consumer_signer_authorization_sha256",
+  "does_not_grant",
+  "external_binding_sha256",
+  "first_observation_at",
+  "last_observation_at",
+  "media_type",
+  "outcome",
+  "pre_dispatch_turn_marker",
+  "profile",
+  "qualified_runtime_identity",
+  "reason",
+  "schema",
+  "signature_input_domain",
+  "signer_enrollment_sha256",
+  "signer_key_id",
+  "source_operation_key_sha256",
+  "source_workflow_id",
+  "terminal_at",
+].sort()
+const CONFIRMED_SEND_ABSENCE_KEYS = [
+  "ambiguous_provider_outcome_observed",
+  "authority_domain",
+  "browser_fencing_generation",
+  "capture_intent_sha256",
+  "confirmed_provider_outcome_observed",
+  "consumer_signer_authorization_sha256",
+  "dispatch_attempts",
+  "does_not_grant",
+  "external_binding_sha256",
+  "media_type",
+  "observed_at",
+  "outcome",
+  "profile",
+  "qualified_runtime_identity",
+  "reason",
+  "schema",
+  "signature_input_domain",
+  "signer_enrollment_sha256",
+  "signer_key_id",
+  "source_operation_key_sha256",
+  "source_workflow_id",
+  "terminal_at",
+].sort()
+const SEND_ABSENCE_ATTEMPT_KEYS = [
+  "attempt_number",
+  "browser_fencing_generation",
+  "observed_at",
+  "outcome",
+].sort()
 
 function hasLoneSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -815,6 +869,9 @@ function terminalEvidenceLineage(intent) {
     || !SHA256_PATTERN.test(intent.signer_enrollment_sha256)
     || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(intent.signer_key_id)
     || !intent.qualified_runtime_identity
+    || !exactTimestamp(intent.created_at)
+    || !exactTimestamp(intent.send_resolution_deadline_at)
+    || Date.parse(intent.created_at) >= Date.parse(intent.send_resolution_deadline_at)
   ) {
     throw new EgoChatError(
       "invalid_terminal_evidence_disposition",
@@ -845,6 +902,9 @@ export function buildAmbiguousSendDisposition({
   preDispatchTurnMarker,
   terminalAt,
 }) {
+  const firstObservationAtMs = Date.parse(firstObservationAt)
+  const lastObservationAtMs = Date.parse(lastObservationAt)
+  const terminalAtMs = Date.parse(terminalAt)
   if (
     !Number.isSafeInteger(brokerEpoch)
     || brokerEpoch < 0
@@ -854,6 +914,10 @@ export function buildAmbiguousSendDisposition({
     || ![firstObservationAt, lastObservationAt, terminalAt].every(
       (value) => parseObservationTimestamp(value) !== null,
     )
+    || firstObservationAtMs < Date.parse(intent?.created_at)
+    || firstObservationAtMs > lastObservationAtMs
+    || lastObservationAtMs > terminalAtMs
+    || terminalAtMs > Date.parse(intent?.send_resolution_deadline_at)
   ) {
     throw new EgoChatError(
       "invalid_terminal_evidence_disposition",
@@ -884,6 +948,8 @@ export function buildConfirmedSendAbsenceDisposition({
   observedAt,
   terminalAt,
 }) {
+  const observedAtMs = Date.parse(observedAt)
+  const terminalAtMs = Date.parse(terminalAt)
   if (
     !Number.isSafeInteger(browserFencingGeneration)
     || browserFencingGeneration < 0
@@ -905,8 +971,15 @@ export function buildConfirmedSendAbsenceDisposition({
       || attempt.attempt_number !== index + 1
       || attempt.browser_fencing_generation !== browserFencingGeneration
       || parseObservationTimestamp(attempt.observed_at) === null
+      || Date.parse(attempt.observed_at) < Date.parse(intent?.created_at)
+      || Date.parse(attempt.observed_at) > observedAtMs
+      || (index > 0
+        && Date.parse(attempt.observed_at) < Date.parse(dispatchAttempts[index - 1].observed_at))
       || attempt.outcome !== "ABSENT"
     ))
+    || observedAtMs < Date.parse(intent?.created_at)
+    || observedAtMs > terminalAtMs
+    || terminalAtMs > Date.parse(intent?.send_resolution_deadline_at)
   ) {
     throw new EgoChatError(
       "invalid_terminal_evidence_disposition",
@@ -1144,6 +1217,103 @@ function validRuntimeIdentity(value) {
     && /^[a-f0-9]{40,64}$/.test(value.implementation_git_sha)
     && SHA256_PATTERN.test(value.package_inventory_sha256)
     && value.runtime_identity_sha256 === sha256Hex(canonicalJsonBytes(projection))
+}
+
+function validTerminalEvidenceLineage(disposition) {
+  return SHA256_PATTERN.test(disposition.capture_intent_sha256)
+    && SHA256_PATTERN.test(disposition.consumer_signer_authorization_sha256)
+    && SHA256_PATTERN.test(disposition.external_binding_sha256)
+    && SHA256_PATTERN.test(disposition.signer_enrollment_sha256)
+    && /^ed25519-spki-sha256:[a-f0-9]{64}$/.test(disposition.signer_key_id)
+    && SHA256_PATTERN.test(disposition.source_operation_key_sha256)
+    && isBoundedOpaqueId(disposition.source_workflow_id)
+    && isBoundedOpaqueId(disposition.profile)
+    && validRuntimeIdentity(disposition.qualified_runtime_identity)
+    && Array.isArray(disposition.does_not_grant)
+    && disposition.does_not_grant.length === TERMINAL_EVIDENCE_DOES_NOT_GRANT.length
+    && disposition.does_not_grant.every(
+      (value, index) => value === TERMINAL_EVIDENCE_DOES_NOT_GRANT[index],
+    )
+}
+
+export function assertValidTerminalEvidenceDisposition(disposition) {
+  if (disposition?.schema === "ego-chat-attachment-execution-disposition/v1") {
+    return assertValidAttachmentExecutionDisposition(disposition)
+  }
+  const ambiguous = disposition?.schema === "ego-chat-ambiguous-send-disposition/v1"
+  const absence = disposition?.schema === "ego-chat-confirmed-send-absence/v1"
+  const commonInvalid = !validTerminalEvidenceLineage(disposition)
+    || !exactTimestamp(disposition?.terminal_at)
+  if (ambiguous) {
+    if (
+      commonInvalid
+      || !isDeepStrictKeySet(disposition, AMBIGUOUS_SEND_DISPOSITION_KEYS)
+      || disposition.authority_domain !== "send-ambiguity-observation-only"
+      || disposition.media_type
+        !== "application/vnd.ego-chat.ambiguous-send-disposition.v1+jcs"
+      || disposition.signature_input_domain !== "EGO_CHAT_AMBIGUOUS_SEND_DISPOSITION_V1"
+      || disposition.outcome !== "SEND_OUTCOME_UNKNOWN"
+      || disposition.reason !== "SEND_CONFIRMATION_AMBIGUOUS"
+      || !Number.isSafeInteger(disposition.broker_epoch)
+      || disposition.broker_epoch < 0
+      || !Number.isSafeInteger(disposition.browser_fencing_generation)
+      || disposition.browser_fencing_generation < 0
+      || !isBoundedOpaqueId(disposition.pre_dispatch_turn_marker)
+      || !exactTimestamp(disposition.first_observation_at)
+      || !exactTimestamp(disposition.last_observation_at)
+      || Date.parse(disposition.first_observation_at) > Date.parse(disposition.last_observation_at)
+      || Date.parse(disposition.last_observation_at) > Date.parse(disposition.terminal_at)
+    ) {
+      throw new EgoChatError(
+        "invalid_terminal_evidence_disposition",
+        "The ambiguous Send disposition is outside its closed evidence schema.",
+      )
+    }
+    return disposition
+  }
+  if (absence) {
+    const attempts = disposition.dispatch_attempts
+    if (
+      commonInvalid
+      || !isDeepStrictKeySet(disposition, CONFIRMED_SEND_ABSENCE_KEYS)
+      || disposition.authority_domain !== "send-absence-observation-only"
+      || disposition.media_type
+        !== "application/vnd.ego-chat.confirmed-send-absence.v1+jcs"
+      || disposition.signature_input_domain !== "EGO_CHAT_CONFIRMED_SEND_ABSENCE_V1"
+      || disposition.outcome !== "CONFIRMED_NOT_SENT"
+      || disposition.ambiguous_provider_outcome_observed !== false
+      || disposition.confirmed_provider_outcome_observed !== false
+      || !Number.isSafeInteger(disposition.browser_fencing_generation)
+      || disposition.browser_fencing_generation < 0
+      || !exactTimestamp(disposition.observed_at)
+      || Date.parse(disposition.observed_at) > Date.parse(disposition.terminal_at)
+      || !Array.isArray(attempts)
+      || attempts.length > 32
+      || disposition.reason !== (attempts.length === 0
+        ? "NO_DISPATCH_ATTEMPT_OCCURRED"
+        : "ALL_DISPATCH_ATTEMPTS_PROVEN_ABSENT")
+      || attempts.some((attempt, index) => (
+        !isDeepStrictKeySet(attempt, SEND_ABSENCE_ATTEMPT_KEYS)
+        || attempt.attempt_number !== index + 1
+        || attempt.browser_fencing_generation !== disposition.browser_fencing_generation
+        || attempt.outcome !== "ABSENT"
+        || !exactTimestamp(attempt.observed_at)
+        || Date.parse(attempt.observed_at) > Date.parse(disposition.observed_at)
+        || (index > 0
+          && Date.parse(attempt.observed_at) < Date.parse(attempts[index - 1].observed_at))
+      ))
+    ) {
+      throw new EgoChatError(
+        "invalid_terminal_evidence_disposition",
+        "The confirmed Send absence disposition is outside its closed evidence schema.",
+      )
+    }
+    return disposition
+  }
+  throw new EgoChatError(
+    "invalid_terminal_evidence_disposition",
+    "The terminal evidence disposition kind is unsupported.",
+  )
 }
 
 function validPositiveReceipt(receipt, disposition) {
@@ -1388,7 +1558,7 @@ export function assertValidSignedAttachmentDispositionEnvelope(envelope) {
       "The signed attachment disposition payload is not canonical JSON.",
     )
   }
-  assertValidAttachmentExecutionDisposition(disposition)
+  assertValidTerminalEvidenceDisposition(disposition)
   if (
     envelope.authority_domain !== disposition.authority_domain
     || envelope.media_type !== disposition.media_type

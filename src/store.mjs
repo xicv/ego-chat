@@ -76,7 +76,7 @@ const EMPTY_STATE = Object.freeze({
   modelPolicies: {},
   nextSeq: 1,
   operations: {},
-  schemaVersion: 8,
+  schemaVersion: 9,
   workflows: {},
 })
 
@@ -98,6 +98,133 @@ function hasExactKeys(value, expectedKeys) {
 function exactTimestamp(value) {
   const timestamp = typeof value === "string" ? Date.parse(value) : Number.NaN
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+}
+
+function terminalEvidenceKind(disposition) {
+  if (disposition?.schema === "ego-chat-attachment-execution-disposition/v1") {
+    return "attachment-execution-disposition"
+  }
+  if (disposition?.schema === "ego-chat-ambiguous-send-disposition/v1") {
+    return "ambiguous-send-disposition"
+  }
+  if (disposition?.schema === "ego-chat-confirmed-send-absence/v1") {
+    return "confirmed-send-absence"
+  }
+  return undefined
+}
+
+function pendingExternalBindingState(disposition) {
+  if (disposition?.schema === "ego-chat-ambiguous-send-disposition/v1") {
+    return "CONSUMED_AMBIGUOUS_PENDING_ACK"
+  }
+  if (disposition?.schema === "ego-chat-confirmed-send-absence/v1") {
+    return "CONSUMED_NOT_SENT_PENDING_ACK"
+  }
+  return "RESERVED"
+}
+
+function dispositionMatchesIntent(disposition, intent) {
+  const runtimeIdentity = intent?.qualified_runtime_identity
+  return disposition?.capture_intent_sha256 === sha256Hex(canonicalJsonBytes(intent))
+    && disposition.consumer_signer_authorization_sha256
+      === intent.consumer_signer_authorization_sha256
+    && disposition.external_binding_sha256 === intent.external_binding_sha256
+    && disposition.profile === intent.profile
+    && isDeepStrictEqual(disposition.qualified_runtime_identity, runtimeIdentity)
+    && disposition.signer_enrollment_sha256 === intent.signer_enrollment_sha256
+    && disposition.signer_key_id === intent.signer_key_id
+    && disposition.source_operation_key_sha256 === intent.source_operation_key_sha256
+    && disposition.source_workflow_id === intent.source_workflow_id
+    && Date.parse(disposition.terminal_at) >= Date.parse(intent.created_at)
+    && Date.parse(disposition.terminal_at) <= Date.parse(intent.send_resolution_deadline_at)
+}
+
+function validReceiptDispatchState(dispatch, intent) {
+  if (
+    !hasExactKeys(dispatch, [
+      "armed_at",
+      "attempt_number",
+      "broker_epoch",
+      "browser_fencing_generation",
+      "observations",
+      "schema",
+      "state",
+    ])
+    || dispatch.schema !== "ego-chat-receipt-dispatch-state/v1"
+    || dispatch.attempt_number !== 1
+    || !Number.isSafeInteger(dispatch.broker_epoch)
+    || dispatch.broker_epoch < 0
+    || !Number.isSafeInteger(dispatch.browser_fencing_generation)
+    || dispatch.browser_fencing_generation < 0
+    || !exactTimestamp(dispatch.armed_at)
+    || Date.parse(dispatch.armed_at) < Date.parse(intent?.created_at)
+    || Date.parse(dispatch.armed_at) > Date.parse(intent?.send_resolution_deadline_at)
+    || !Array.isArray(dispatch.observations)
+    || dispatch.observations.length > 1
+    || dispatch.observations.some((observation) => (
+      !hasExactKeys(observation, ["at", "outcome"])
+      || !exactTimestamp(observation.at)
+      || Date.parse(observation.at) < Date.parse(dispatch.armed_at)
+      || Date.parse(observation.at) > Date.parse(intent.send_resolution_deadline_at)
+      || ![
+        "ABSENT",
+        "AMBIGUOUS",
+        "CONFIRMED",
+        "NOT_DISPATCHED",
+      ].includes(observation.outcome)
+    ))
+  ) {
+    return false
+  }
+  const expectedOutcome = {
+    AMBIGUOUS: "AMBIGUOUS",
+    ARMED: undefined,
+    CONFIRMED: "CONFIRMED",
+    PROVEN_ABSENT: "ABSENT",
+    PROVEN_NOT_DISPATCHED: "NOT_DISPATCHED",
+  }[dispatch.state]
+  return Object.hasOwn({
+    AMBIGUOUS: true,
+    ARMED: true,
+    CONFIRMED: true,
+    PROVEN_ABSENT: true,
+    PROVEN_NOT_DISPATCHED: true,
+  }, dispatch.state)
+    && (expectedOutcome === undefined
+      ? dispatch.observations.length === 0
+      : dispatch.observations.length === 1
+        && dispatch.observations[0].outcome === expectedOutcome)
+}
+
+function dispositionMatchesReceiptDispatch(disposition, dispatch) {
+  if (disposition.schema === "ego-chat-ambiguous-send-disposition/v1") {
+    return dispatch.state === "AMBIGUOUS"
+      && disposition.broker_epoch === dispatch.broker_epoch
+      && disposition.browser_fencing_generation
+        === dispatch.browser_fencing_generation
+      && disposition.first_observation_at === dispatch.armed_at
+      && disposition.last_observation_at === dispatch.observations[0]?.at
+  }
+  if (disposition.schema === "ego-chat-confirmed-send-absence/v1") {
+    if (
+      disposition.browser_fencing_generation
+        !== dispatch.browser_fencing_generation
+      || disposition.observed_at !== dispatch.observations[0]?.at
+    ) {
+      return false
+    }
+    if (dispatch.state === "PROVEN_NOT_DISPATCHED") {
+      return disposition.dispatch_attempts.length === 0
+    }
+    return dispatch.state === "PROVEN_ABSENT"
+      && disposition.dispatch_attempts.length === 1
+      && disposition.dispatch_attempts[0].attempt_number === dispatch.attempt_number
+      && disposition.dispatch_attempts[0].browser_fencing_generation
+        === dispatch.browser_fencing_generation
+      && disposition.dispatch_attempts[0].observed_at === dispatch.observations[0].at
+      && disposition.dispatch_attempts[0].outcome === "ABSENT"
+  }
+  return false
 }
 
 function attachmentObservationJournalEntry(
@@ -268,7 +395,7 @@ function validateCheckpoint(value) {
     || !value.workflows
     || !value.bindings
     || !value.modelPolicies
-    || ![3, 4, 5, 6, 7, 8].includes(value.schemaVersion)
+    || ![3, 4, 5, 6, 7, 8, 9].includes(value.schemaVersion)
   ) {
     throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
   }
@@ -285,7 +412,7 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
     "confirmedSendIdentities",
   ]
   const workflowIds = new Set(ledgers.flatMap((ledger) => (
-    sourceSchemaVersion < 8
+    sourceSchemaVersion < 9
       ? Object.keys(state[ledger] ?? {})
       : Object.keys(state[ledger] ?? {}).filter(
           (workflowId) => state.legacyAttachmentEvidence[workflowId],
@@ -311,7 +438,7 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
     }
     externalBindingsByWorkflow.set(workflowId, binding)
     if (
-      sourceSchemaVersion < 8
+      sourceSchemaVersion < 9
       || binding.state === "CONSUMED_LEGACY_RECOVERY_REQUIRED"
       || state.legacyAttachmentEvidence[workflowId]
     ) {
@@ -408,6 +535,18 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
 function hasLegacyAttachmentEvidenceShape(state) {
   return Object.values(state.attachmentIntents ?? {}).some(
     (intent) => !exactTimestamp(intent?.send_resolution_deadline_at),
+  ) || Object.entries(state.attachmentIntents ?? {}).some(
+    ([workflowId, intent]) => {
+      const workflow = state.workflows?.[workflowId]
+      const snapshot = workflow?.private?.receiptAuthoritySnapshot
+      const snapshotDigest = workflow?.private?.receiptAuthoritySnapshotSha256
+      return snapshot?.schema
+        !== "ego-chat-attachment-receipt-authorization-snapshot/v1"
+        || !SHA256_PATTERN.test(snapshotDigest)
+        || sha256Hex(canonicalJsonBytes(snapshot)) !== snapshotDigest
+        || snapshot.consumer_signer_authorization_sha256
+          !== intent.consumer_signer_authorization_sha256
+    },
   ) || Object.values(state.attachmentCaptures ?? {}).some((capture) => (
     !Array.isArray(capture?.attempt_journal)
     || capture.attempt_journal.some(
@@ -450,10 +589,10 @@ function normalizeStateForReplay(value) {
 function migrateState(value) {
   const state = normalizeStateForReplay(value)
   const sourceSchemaVersion = state.schemaVersion
-  if (sourceSchemaVersion < 8 || hasLegacyAttachmentEvidenceShape(state)) {
+  if (sourceSchemaVersion < 9 || hasLegacyAttachmentEvidenceShape(state)) {
     quarantineLegacyAttachmentEvidence(
       state,
-      Math.min(sourceSchemaVersion, 7),
+      Math.min(sourceSchemaVersion, 8),
     )
   }
   for (const capture of Object.values(state.attachmentCaptures)) {
@@ -499,7 +638,7 @@ function migrateState(value) {
     }
   }
 
-  state.schemaVersion = 8
+  state.schemaVersion = 9
   validateAttachmentEvidenceState(state)
   return state
 }
@@ -597,7 +736,7 @@ function validateAttachmentEvidenceState(state) {
       || quarantine.source_workflow_id !== workflowId
       || !Number.isSafeInteger(quarantine.source_schema_version)
       || quarantine.source_schema_version < 3
-      || quarantine.source_schema_version > 7
+      || quarantine.source_schema_version > 8
       || !records
       || typeof records !== "object"
       || Array.isArray(records)
@@ -645,6 +784,20 @@ function validateAttachmentEvidenceState(state) {
   for (const [workflowId, intent] of Object.entries(intents)) {
     const ledgerKey = `${intent?.profile}:${intent?.external_binding_sha256}`
     const entry = bindings[ledgerKey]
+    const workflow = state.workflows[workflowId]
+    const authoritySnapshot = workflow?.private?.receiptAuthoritySnapshot
+    const authoritySnapshotDigest = workflow?.private?.receiptAuthoritySnapshotSha256
+    const terminalEnvelope = dispositions[workflowId]
+    let expectedBindingState = tombstones[workflowId] ? "CONSUMED_RELEASED" : "RESERVED"
+    if (terminalEnvelope && !tombstones[workflowId]) {
+      try {
+        expectedBindingState = pendingExternalBindingState(
+          assertValidSignedAttachmentDispositionEnvelope(terminalEnvelope).disposition,
+        )
+      } catch {
+        expectedBindingState = undefined
+      }
+    }
     if (
       intent?.source_workflow_id !== workflowId
       || intent.schema !== "ego-chat-attachment-capture-intent/v1"
@@ -657,7 +810,28 @@ function validateAttachmentEvidenceState(state) {
         !== 10 * 60 * 1_000
       || entry?.source_workflow_id !== workflowId
       || entry.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
-      || entry.state !== (tombstones[workflowId] ? "CONSUMED_RELEASED" : "RESERVED")
+      || entry.state !== expectedBindingState
+      || authoritySnapshot?.schema
+        !== "ego-chat-attachment-receipt-authorization-snapshot/v1"
+      || !SHA256_PATTERN.test(authoritySnapshotDigest)
+      || sha256Hex(canonicalJsonBytes(authoritySnapshot)) !== authoritySnapshotDigest
+      || authoritySnapshot.consumer_signer_authorization_sha256
+        !== intent.consumer_signer_authorization_sha256
+      || authoritySnapshot.signer_enrollment_sha256 !== intent.signer_enrollment_sha256
+      || authoritySnapshot.signer_key_id !== intent.signer_key_id
+      || !isDeepStrictEqual(
+        authoritySnapshot.qualified_runtime_identity,
+        {
+          executable_sha256: intent.qualified_runtime_identity.executable_sha256,
+          implementation_git_sha: intent.qualified_runtime_identity.implementation_git_sha,
+          package_inventory_sha256: intent.qualified_runtime_identity.package_inventory_sha256,
+        },
+      )
+      || (workflow?.private?.receiptDispatch
+        && !validReceiptDispatchState(
+          workflow.private.receiptDispatch,
+          intent,
+        ))
     ) {
       throw new EgoChatError(
         "corrupt_attachment_evidence_state",
@@ -824,11 +998,57 @@ function validateAttachmentEvidenceState(state) {
       )
     }
   }
-  if (Object.keys(dispositions).some((workflowId) => !captures[workflowId])) {
-    throw new EgoChatError(
-      "corrupt_attachment_evidence_state",
-      "A terminal attachment disposition has no capture operation.",
-    )
+  for (const [workflowId, envelope] of Object.entries(dispositions)) {
+    if (captures[workflowId]) continue
+    let disposition
+    try {
+      disposition = assertValidSignedAttachmentDispositionEnvelope(envelope).disposition
+    } catch {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "A terminal Send disposition is invalid.",
+      )
+    }
+    const workflow = state.workflows[workflowId]
+    const intent = intents[workflowId]
+    const binding = intent && bindings[`${intent.profile}:${intent.external_binding_sha256}`]
+    const kind = terminalEvidenceKind(disposition)
+    if (
+      ![
+        "ambiguous-send-disposition",
+        "confirmed-send-absence",
+      ].includes(kind)
+      || !intent
+      || !dispositionMatchesIntent(disposition, intent)
+      || confirmedEvents[workflowId] !== undefined
+      || confirmedIdentities[workflowId] !== undefined
+      || binding?.state !== (tombstones[workflowId]
+        ? "CONSUMED_RELEASED"
+        : pendingExternalBindingState(disposition))
+      || ![
+        "attachment_disposition_terminal",
+        "attachment_evidence_released",
+      ].includes(workflow?.phase)
+      || workflow?.status !== "succeeded"
+      || workflow.result?.attachmentDispositionEnvelopeSha256
+        !== sha256Hex(canonicalJsonBytes(envelope))
+      || workflow.result?.attachmentDispositionPayloadSha256 !== envelope.payload_sha256
+      || workflow.result?.terminalEvidenceKind !== kind
+      || workflow.result?.outcome !== disposition.outcome
+      || workflow.result?.reason !== disposition.reason
+      || !validReceiptDispatchState(workflow?.private?.receiptDispatch, intent)
+      || !dispositionMatchesReceiptDispatch(
+        disposition,
+        workflow.private.receiptDispatch,
+      )
+      || (kind === "ambiguous-send-disposition"
+        && disposition.pre_dispatch_turn_marker !== workflow.reconciliation?.turnMarker)
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "A terminal Send disposition does not match its immutable intent lineage.",
+      )
+    }
   }
   if (!isDeepStrictEqual(
     Object.keys(acknowledgements).sort(),
@@ -855,17 +1075,20 @@ function validateAttachmentEvidenceState(state) {
     const dispositionEnvelope = dispositions[workflowId]
     const disposition = dispositionEnvelope
       && assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+    const kind = terminalEvidenceKind(disposition)
+    const expectedIdentityDigest = kind === "attachment-execution-disposition"
+      ? identity && sha256Hex(canonicalJsonBytes(identity))
+      : null
     const intent = intents[workflowId]
     const tombstone = tombstones[workflowId]
     const externalBinding = intent && bindings[`${intent.profile}:${intent.external_binding_sha256}`]
     const acknowledgementEnvelopeDigest = sha256Hex(canonicalJsonBytes(envelope))
     if (
       !intent
-      || !identity
       || !dispositionEnvelope
       || externalBinding?.state !== "CONSUMED_RELEASED"
-      || acknowledgement.confirmed_send_identity_sha256
-        !== sha256Hex(canonicalJsonBytes(identity))
+      || acknowledgement.confirmed_send_identity_sha256 !== expectedIdentityDigest
+      || acknowledgement.terminal_evidence_kind !== kind
       || acknowledgement.disposition_envelope_sha256
         !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
       || acknowledgement.terminal_evidence_digest !== dispositionEnvelope.payload_sha256
@@ -1136,7 +1359,7 @@ export class EventStore {
         throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint digest does not match its manifest.")
       }
       this.#state = normalizeStateForReplay(checkpoint)
-      legacyReplay = this.#state.schemaVersion < 8
+      legacyReplay = this.#state.schemaVersion < 9
         || hasLegacyAttachmentEvidenceShape(this.#state)
     } catch (error) {
       const checkpointMissing = error.code === "ENOENT"
@@ -1154,7 +1377,7 @@ export class EventStore {
           JSON.parse(await fs.readFile(this.#statePath, "utf8")),
         )
         durableRepairRequired = true
-        legacyReplay = this.#state.schemaVersion < 8
+        legacyReplay = this.#state.schemaVersion < 9
           || hasLegacyAttachmentEvidenceShape(this.#state)
       } catch (_recoveryError) {
         if (!checkpointMissing) {
@@ -1723,6 +1946,101 @@ export class EventStore {
     return operation
   }
 
+  async persistTerminalEvidenceDisposition({ envelope, workflowId }) {
+    const operation = this.#tail.then(async () => {
+      if (typeof workflowId !== "string") {
+        throw new EgoChatError(
+          "attachment_disposition_lineage_mismatch",
+          "The terminal Send disposition workflow identity is missing.",
+        )
+      }
+      const existing = this.#state.attachmentDispositions[workflowId]
+      if (existing) {
+        if (!isDeepStrictEqual(existing, envelope)) {
+          throw new EgoChatError(
+            "attachment_disposition_conflict",
+            "A different terminal attachment disposition is already durable.",
+          )
+        }
+        const { disposition } = assertValidSignedAttachmentDispositionEnvelope(existing)
+        return {
+          created: false,
+          disposition: clone(disposition),
+          envelope: clone(existing),
+          workflow: clone(this.#state.workflows[workflowId]),
+        }
+      }
+      const workflow = this.#state.workflows[workflowId]
+      const intent = this.#state.attachmentIntents[workflowId]
+      const externalBinding = intent && this.#state.attachmentExternalBindings[
+        `${intent.profile}:${intent.external_binding_sha256}`
+      ]
+      const { disposition } = assertValidSignedAttachmentDispositionEnvelope(envelope)
+      const kind = terminalEvidenceKind(disposition)
+      const receiptDispatch = workflow?.private?.receiptDispatch
+      if (
+        workflow?.status !== "running"
+        || !intent
+        || this.#state.attachmentCaptures[workflowId] !== undefined
+        || this.#state.confirmedSendEvents[workflowId] !== undefined
+        || this.#state.confirmedSendIdentities[workflowId] !== undefined
+        || externalBinding?.state !== "RESERVED"
+        || ![
+          "ambiguous-send-disposition",
+          "confirmed-send-absence",
+        ].includes(kind)
+        || !dispositionMatchesIntent(disposition, intent)
+        || !validReceiptDispatchState(receiptDispatch, intent)
+        || !dispositionMatchesReceiptDispatch(disposition, receiptDispatch)
+        || (kind === "ambiguous-send-disposition"
+          && disposition.pre_dispatch_turn_marker !== workflow.reconciliation?.turnMarker)
+      ) {
+        throw new EgoChatError(
+          "attachment_disposition_lineage_mismatch",
+          "The terminal Send disposition does not match its durable admitted intent.",
+        )
+      }
+      const envelopeDigest = sha256Hex(canonicalJsonBytes(envelope))
+      const nextWorkflow = {
+        ...workflow,
+        phase: "attachment_disposition_terminal",
+        result: {
+          attachmentDispositionEnvelopeSha256: envelopeDigest,
+          attachmentDispositionPayloadSha256: envelope.payload_sha256,
+          outcome: disposition.outcome,
+          reason: disposition.reason,
+          terminalEvidenceKind: kind,
+        },
+        status: "succeeded",
+        updatedAt: disposition.terminal_at,
+      }
+      const nextExternalBinding = {
+        ...externalBinding,
+        state: pendingExternalBindingState(disposition),
+      }
+      await this.#appendEvent({
+        at: disposition.terminal_at,
+        attachmentDisposition: {
+          envelope: clone(envelope),
+          source_workflow_id: workflowId,
+        },
+        attachmentExternalBinding: nextExternalBinding,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.send_disposition_persisted",
+        workflow: nextWorkflow,
+      })
+      return {
+        created: true,
+        disposition: clone(disposition),
+        envelope: clone(envelope),
+        workflow: clone(nextWorkflow),
+      }
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
   async persistAttachmentDisposition({ capture, envelope }) {
     const operation = this.#tail.then(async () => {
       const workflowId = capture?.source_workflow_id
@@ -1852,15 +2170,18 @@ export class EventStore {
       ]
       const disposition = dispositionEnvelope
         && assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+      const kind = terminalEvidenceKind(disposition)
+      const expectedIdentityDigest = kind === "attachment-execution-disposition"
+        ? identity && sha256Hex(canonicalJsonBytes(identity))
+        : null
       if (
         workflow?.phase !== "attachment_disposition_terminal"
         || workflow.status !== "succeeded"
         || !intent
-        || !identity
         || !dispositionEnvelope
-        || externalBinding?.state !== "RESERVED"
-        || acknowledgement.confirmed_send_identity_sha256
-          !== sha256Hex(canonicalJsonBytes(identity))
+        || externalBinding?.state !== pendingExternalBindingState(disposition)
+        || acknowledgement.confirmed_send_identity_sha256 !== expectedIdentityDigest
+        || acknowledgement.terminal_evidence_kind !== kind
         || acknowledgement.disposition_envelope_sha256
           !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
         || acknowledgement.terminal_evidence_digest !== dispositionEnvelope.payload_sha256
@@ -2070,9 +2391,26 @@ export class EventStore {
   }
 
   #prepareAttachmentAdmission(workflow, receiptAdmission) {
-    const { intent, intentDigest } = receiptAdmission ?? {}
+    const {
+      authoritySnapshot,
+      authoritySnapshotDigest,
+      intent,
+      intentDigest,
+    } = receiptAdmission ?? {}
     if (
-      !intent
+      !authoritySnapshot
+      || typeof authoritySnapshot !== "object"
+      || Array.isArray(authoritySnapshot)
+      || authoritySnapshot.schema
+        !== "ego-chat-attachment-receipt-authorization-snapshot/v1"
+      || !SHA256_PATTERN.test(authoritySnapshotDigest)
+      || sha256Hex(canonicalJsonBytes(authoritySnapshot)) !== authoritySnapshotDigest
+      || workflow.private?.receiptAuthoritySnapshotSha256 !== authoritySnapshotDigest
+      || !isDeepStrictEqual(
+        workflow.private?.receiptAuthoritySnapshot,
+        authoritySnapshot,
+      )
+      || !intent
       || typeof intent !== "object"
       || Array.isArray(intent)
       || intent.schema !== "ego-chat-attachment-capture-intent/v1"
@@ -2321,7 +2659,7 @@ export class EventStore {
     }
   }
 
-  async #removeSafeUnreferencedBlob(filePath) {
+  async #removeSafeUnreferencedBlob(filePath, quarantine) {
     const named = await fs.lstat(filePath)
     assertPrivateBlobFile(named)
     const handle = await fs.open(
@@ -2347,13 +2685,12 @@ export class EventStore {
       await this.#compactionFaultInjector?.("before_orphan_quarantine", {
         filePath,
       })
-      const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
-      await ensurePrivateDirectory(quarantineDirectory)
       const quarantinePath = path.join(
-        quarantineDirectory,
+        quarantine.path,
         `blob-${randomUUID()}`,
       )
       await fs.rename(filePath, quarantinePath)
+      await this.#assertPinnedBlobQuarantine(quarantine)
       const quarantined = await fs.lstat(quarantinePath)
       const openedAfterMove = await handle.stat()
       assertPrivateBlobFile(quarantined)
@@ -2373,7 +2710,7 @@ export class EventStore {
     }
   }
 
-  async #removeEmptyUnreferencedPrefix(prefixPath) {
+  async #removeEmptyUnreferencedPrefix(prefixPath, quarantine) {
     const named = await fs.lstat(prefixPath)
     assertPrivateBlobDirectory(named, "result blob prefix")
     if ((await fs.readdir(prefixPath)).length !== 0) return false
@@ -2392,13 +2729,12 @@ export class EventStore {
           "An empty result blob prefix changed identity before quarantine.",
         )
       }
-      const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
-      await ensurePrivateDirectory(quarantineDirectory)
       const quarantinePath = path.join(
-        quarantineDirectory,
+        quarantine.path,
         `prefix-${randomUUID()}`,
       )
       await fs.rename(prefixPath, quarantinePath)
+      await this.#assertPinnedBlobQuarantine(quarantine)
       const quarantined = await fs.lstat(quarantinePath)
       const openedAfterMove = await handle.stat()
       assertPrivateBlobDirectory(quarantined, "quarantined result blob prefix")
@@ -2419,23 +2755,71 @@ export class EventStore {
     }
   }
 
-  async #assertEmptyBlobQuarantine() {
-    const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
+  async #openPinnedBlobQuarantine() {
+    const quarantinePath = path.join(this.#dataDir, "blob-quarantine")
+    await ensurePrivateDirectory(quarantinePath)
+    const named = await fs.lstat(quarantinePath)
+    assertPrivateBlobDirectory(named, "result blob quarantine")
+    let handle
     try {
-      const quarantine = await fs.lstat(quarantineDirectory)
-      assertPrivateBlobDirectory(quarantine, "result blob quarantine")
-      if ((await fs.readdir(quarantineDirectory)).length !== 0) {
+      handle = await fs.open(
+        quarantinePath,
+        fsConstants.O_RDONLY
+          | fsConstants.O_NOFOLLOW
+          | (fsConstants.O_DIRECTORY ?? 0),
+      )
+      const opened = await handle.stat()
+      assertPrivateBlobDirectory(opened, "result blob quarantine")
+      if (!sameFileIdentity(named, opened)) {
         throw new EgoChatError(
           "corrupt_result_blob_inventory",
-          "The result blob quarantine contains unresolved objects.",
+          "The result blob quarantine changed identity while it was pinned.",
         )
       }
+      return { handle, identity: opened, path: quarantinePath }
     } catch (error) {
-      if (error.code !== "ENOENT") throw error
+      await handle?.close()
+      throw error
     }
   }
 
-  async #removeUnreferencedBlobInventory(references) {
+  async #assertPinnedBlobQuarantine(quarantine, { requireEmpty = false } = {}) {
+    const openedBefore = await quarantine.handle.stat()
+    const namedBefore = await fs.lstat(quarantine.path)
+    assertPrivateBlobDirectory(openedBefore, "pinned result blob quarantine")
+    assertPrivateBlobDirectory(namedBefore, "result blob quarantine")
+    if (
+      !sameFileIdentity(quarantine.identity, openedBefore)
+      || !sameFileIdentity(openedBefore, namedBefore)
+    ) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob quarantine pathname no longer names its pinned directory.",
+      )
+    }
+    const entries = await fs.readdir(quarantine.path)
+    const [openedAfter, namedAfter] = await Promise.all([
+      quarantine.handle.stat(),
+      fs.lstat(quarantine.path),
+    ])
+    if (
+      !sameFileIdentity(openedBefore, openedAfter)
+      || !sameFileIdentity(openedAfter, namedAfter)
+    ) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob quarantine changed identity during enumeration.",
+      )
+    }
+    if (requireEmpty && entries.length !== 0) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob quarantine contains unresolved objects.",
+      )
+    }
+  }
+
+  async #removeUnreferencedBlobInventory(references, quarantine) {
     let rootEntries
     let rootIdentity
     try {
@@ -2508,7 +2892,7 @@ export class EventStore {
           )
           seen.add(blobEntry.name)
         } else {
-          await this.#removeSafeUnreferencedBlob(filePath)
+          await this.#removeSafeUnreferencedBlob(filePath, quarantine)
         }
       }
       const prefixAfter = await fs.lstat(prefixPath)
@@ -2523,7 +2907,7 @@ export class EventStore {
         (digest) => digest.startsWith(prefixEntry.name),
       )
       if (!expectedInPrefix && (await fs.readdir(prefixPath)).length === 0) {
-        await this.#removeEmptyUnreferencedPrefix(prefixPath)
+        await this.#removeEmptyUnreferencedPrefix(prefixPath, quarantine)
       }
     }
     const rootAfterReconciliation = await fs.lstat(this.#blobDirectory)
@@ -2640,20 +3024,25 @@ export class EventStore {
 
   async #reconcileBlobInventory() {
     const references = this.#referencedBlobMap()
-    await this.#assertEmptyBlobQuarantine()
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      await this.#removeUnreferencedBlobInventory(references)
-      const verified = await this.#verifyExactBlobInventory(references)
-      if (verified.exact) {
-        await this.#assertEmptyBlobQuarantine()
-        this.#blobBytes = verified.retainedBytes
-        return
+    const quarantine = await this.#openPinnedBlobQuarantine()
+    try {
+      await this.#assertPinnedBlobQuarantine(quarantine, { requireEmpty: true })
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await this.#removeUnreferencedBlobInventory(references, quarantine)
+        const verified = await this.#verifyExactBlobInventory(references)
+        if (verified.exact) {
+          await this.#assertPinnedBlobQuarantine(quarantine, { requireEmpty: true })
+          this.#blobBytes = verified.retainedBytes
+          return
+        }
       }
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob inventory did not stabilize after bounded reconciliation.",
+      )
+    } finally {
+      await quarantine.handle.close()
     }
-    throw new EgoChatError(
-      "corrupt_result_blob_inventory",
-      "The result blob inventory did not stabilize after bounded reconciliation.",
-    )
   }
 
   async #compact() {
