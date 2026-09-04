@@ -9587,14 +9587,18 @@ test("interrupted compaction reconciles referenced and orphan blob inventory", a
     const orphanDigest = digest(orphanBody)
     const orphanDirectory = path.join(dataDir, "blobs", "sha256", orphanDigest.slice(0, 2))
     const orphanPath = path.join(orphanDirectory, orphanDigest)
-    await fs.mkdir(orphanDirectory, { mode: 0o700, recursive: true })
-    await fs.writeFile(orphanPath, orphanBody, { mode: 0o600 })
     assert.ok(referenced.sizeBytes + orphanBody.length < options.maxBlobBytes)
 
     await fs.rm(path.join(dataDir, "checkpoint.manifest.json"))
+    let orphanSeededAfterStartupReconciliation = false
     const interrupted = new EventStore(dataDir, {
       ...options,
       compactionFaultInjector: async (completedPhase) => {
+        if (completedPhase === "before_state") {
+          await fs.mkdir(orphanDirectory, { mode: 0o700, recursive: true })
+          await fs.writeFile(orphanPath, orphanBody, { mode: 0o600 })
+          orphanSeededAfterStartupReconciliation = true
+        }
         if (completedPhase === phase) {
           throw new Error(`injected blob compaction interruption after ${phase}`)
         }
@@ -9604,6 +9608,7 @@ test("interrupted compaction reconciles referenced and orphan blob inventory", a
       interrupted.initialize(),
       new RegExp(`injected blob compaction interruption after ${phase}`),
     )
+    assert.equal(orphanSeededAfterStartupReconciliation, true)
 
     const recovered = new EventStore(dataDir, options)
     await recovered.initialize()
@@ -9647,5 +9652,136 @@ test("interrupted compaction reconciles referenced and orphan blob inventory", a
       manifest: await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
       state: await fs.readFile(path.join(dataDir, "state.json")),
     }, durableSnapshot)
+  }
+})
+
+test("referenced blob inventory fails closed on identity, layout, and content drift", async (t) => {
+  const cases = [
+    "missing",
+    "truncated",
+    "same-size-rewrite",
+    "declared-size-mismatch",
+    "misplaced-reference",
+    "duplicate-reference",
+    "symlink",
+    "hardlink",
+    "fifo",
+    "directory",
+    "socket",
+    "root-mode",
+    "prefix-mode",
+    "inode-replacement",
+  ]
+
+  for (const [index, corruption] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+    const options = { maxBlobBytes: 1_024, maxEvents: 1 }
+    const seed = new EventStore(dataDir, options)
+    await seed.initialize()
+    const body = `protected inventory body ${corruption}`
+    const reference = await seed.putBlob(body)
+    const workflow = {
+      createdAt: "2026-09-05T01:00:00.000Z",
+      id: `c2d48761-8d55-4466-a0a2-58a21f467${String(index).padStart(3, "0")}`,
+      kind: "ego_exchange",
+      phase: "awaiting_attachment_capture",
+      result: {
+        responseDigest: reference.digest,
+        responseRef: reference,
+      },
+      status: "human_required",
+      updatedAt: "2026-09-05T01:00:00.000Z",
+    }
+    await seed.persist("workflow.human_required", workflow)
+
+    const blobRoot = path.join(dataDir, "blobs", "sha256")
+    const prefixDirectory = path.join(blobRoot, reference.digest.slice(0, 2))
+    const blobPath = path.join(prefixDirectory, reference.digest)
+    const otherPrefix = reference.digest.startsWith("ff") ? "00" : "ff"
+    const misplacedDirectory = path.join(blobRoot, otherPrefix)
+    const misplacedPath = path.join(misplacedDirectory, reference.digest)
+    let closeSocket = async () => {}
+    let replacementTriggered = corruption !== "inode-replacement"
+
+    if (corruption === "missing") {
+      await fs.rm(blobPath)
+    } else if (corruption === "truncated") {
+      await fs.writeFile(blobPath, body.slice(1), { mode: 0o600 })
+    } else if (corruption === "same-size-rewrite") {
+      await fs.writeFile(blobPath, "x".repeat(Buffer.byteLength(body)), { mode: 0o600 })
+    } else if (corruption === "declared-size-mismatch") {
+      for (const stateName of ["state.json", "checkpoint.json"]) {
+        const statePath = path.join(dataDir, stateName)
+        const state = JSON.parse(await fs.readFile(statePath, "utf8"))
+        state.workflows[workflow.id].result.responseRef.sizeBytes += 1
+        await fs.writeFile(statePath, JSON.stringify(state), { mode: 0o600 })
+      }
+      const checkpoint = JSON.parse(
+        await fs.readFile(path.join(dataDir, "checkpoint.json"), "utf8"),
+      )
+      const manifestPath = path.join(dataDir, "checkpoint.manifest.json")
+      const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"))
+      manifest.digest = digestJson(checkpoint)
+      await fs.writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 })
+    } else if (corruption === "misplaced-reference") {
+      await fs.mkdir(misplacedDirectory, { mode: 0o700 })
+      await fs.rename(blobPath, misplacedPath)
+    } else if (corruption === "duplicate-reference") {
+      await fs.mkdir(misplacedDirectory, { mode: 0o700 })
+      await fs.copyFile(blobPath, misplacedPath)
+    } else if (corruption === "symlink") {
+      const target = path.join(dataDir, "blob-symlink-target")
+      await fs.writeFile(target, body, { mode: 0o600 })
+      await fs.rm(blobPath)
+      await fs.symlink(target, blobPath)
+    } else if (corruption === "hardlink") {
+      await fs.link(blobPath, path.join(dataDir, "blob-hardlink"))
+    } else if (corruption === "fifo") {
+      await fs.rm(blobPath)
+      execFileSync("mkfifo", [blobPath])
+    } else if (corruption === "directory") {
+      await fs.rm(blobPath)
+      await fs.mkdir(blobPath, { mode: 0o700 })
+    } else if (corruption === "socket") {
+      const net = await import("node:net")
+      await fs.rm(blobPath)
+      const server = net.createServer()
+      const shortSocketPath = path.join("/tmp", `ego-blob-${process.pid}-${index}.sock`)
+      await fs.rm(shortSocketPath, { force: true })
+      await new Promise((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(shortSocketPath, resolve)
+      })
+      await fs.rename(shortSocketPath, blobPath)
+      closeSocket = async () => {
+        await new Promise((resolve) => server.close(resolve))
+        await fs.rm(shortSocketPath, { force: true })
+      }
+    } else if (corruption === "root-mode") {
+      await fs.chmod(blobRoot, 0o755)
+    } else if (corruption === "prefix-mode") {
+      await fs.chmod(prefixDirectory, 0o755)
+    }
+
+    const replayed = new EventStore(dataDir, {
+      ...options,
+      compactionFaultInjector: async (phase) => {
+        if (corruption === "inode-replacement" && phase === "blob_read") {
+          await fs.rm(blobPath)
+          await fs.writeFile(blobPath, body, { mode: 0o600 })
+          replacementTriggered = true
+        }
+      },
+    })
+    try {
+      await assert.rejects(
+        replayed.initialize(),
+        (error) => error.code === "corrupt_result_blob_inventory",
+      )
+      assert.equal(replacementTriggered, true)
+    } finally {
+      await closeSocket()
+    }
   }
 })

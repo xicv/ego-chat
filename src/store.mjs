@@ -894,26 +894,35 @@ function validateAttachmentEvidenceState(state) {
   }
 }
 
-async function listFiles(directory) {
-  let entries
-  try {
-    entries = await fs.readdir(directory, { withFileTypes: true })
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return []
-    }
-    throw error
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+function assertPrivateBlobDirectory(stat, label) {
+  if (
+    !stat.isDirectory()
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || (stat.mode & 0o777) !== 0o700
+  ) {
+    throw new EgoChatError(
+      "corrupt_result_blob_inventory",
+      `The ${label} is not a private current-owner directory.`,
+    )
   }
-  const files = []
-  for (const entry of entries) {
-    const entryPath = path.join(directory, entry.name)
-    if (entry.isDirectory()) {
-      files.push(...await listFiles(entryPath))
-    } else if (entry.isFile()) {
-      files.push(entryPath)
-    }
+}
+
+function assertPrivateBlobFile(stat) {
+  if (
+    !stat.isFile()
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || stat.nlink !== 1
+    || (stat.mode & 0o777) !== 0o600
+  ) {
+    throw new EgoChatError(
+      "corrupt_result_blob_inventory",
+      "A result blob is not a private current-owner regular single-link file.",
+    )
   }
-  return files
 }
 
 function applyEvent(state, event, { validateAttachmentEvidence = true } = {}) {
@@ -2209,29 +2218,231 @@ export class EventStore {
     }
   }
 
-  #referencedBlobDigests() {
-    return new Set(
-      Object.values(this.#state.workflows)
-        .map((workflow) => workflow.result?.responseRef?.digest)
-        .filter((digest) => typeof digest === "string"),
-    )
+  #referencedBlobMap() {
+    const references = new Map()
+    const referenceKeys = ["digest", "mediaType", "sizeBytes", "uri"]
+    for (const workflow of Object.values(this.#state.workflows)) {
+      const reference = workflow.result?.responseRef
+      if (!reference) {
+        continue
+      }
+      if (
+        !isDeepStrictEqual(Object.keys(reference).sort(), referenceKeys)
+        || typeof reference.digest !== "string"
+        || !SHA256_PATTERN.test(reference.digest)
+        || typeof reference.mediaType !== "string"
+        || reference.mediaType.length === 0
+        || reference.mediaType.length > 256
+        || !Number.isSafeInteger(reference.sizeBytes)
+        || reference.sizeBytes < 0
+        || reference.sizeBytes > this.#maxResultBytes
+        || reference.uri !== `ego-chat-result:${reference.digest}`
+        || workflow.result.responseDigest !== reference.digest
+      ) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A durable result reference is not canonical.",
+        )
+      }
+      const prior = references.get(reference.digest)
+      if (prior && !isDeepStrictEqual(prior, reference)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "Durable result references disagree about one content-addressed blob.",
+        )
+      }
+      references.set(reference.digest, reference)
+    }
+    return references
   }
 
-  async #reconcileBlobInventory(retainedDigests = this.#referencedBlobDigests()) {
-    let retainedBytes = 0
-    for (const filePath of await listFiles(this.#blobDirectory)) {
-      const blobDigest = path.basename(filePath)
-      if (retainedDigests.has(blobDigest)) {
-        retainedBytes += (await fs.stat(filePath)).size
-      } else {
-        await fs.unlink(filePath)
+  async #readVerifiedBlob(filePath, digest, reference) {
+    const namedBefore = await fs.lstat(filePath)
+    assertPrivateBlobFile(namedBefore)
+    let handle
+    try {
+      handle = await fs.open(
+        filePath,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      )
+    } catch (_error) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "A result blob could not be opened without following links.",
+      )
+    }
+    try {
+      const openedBefore = await handle.stat()
+      assertPrivateBlobFile(openedBefore)
+      if (!sameFileIdentity(namedBefore, openedBefore)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob changed identity while it was opened.",
+        )
       }
+      if (openedBefore.size !== reference.sizeBytes) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob size does not match its durable reference.",
+        )
+      }
+      const bytes = await handle.readFile()
+      await this.#compactionFaultInjector?.("blob_read", { digest, filePath })
+      const openedAfter = await handle.stat()
+      const namedAfter = await fs.lstat(filePath)
+      assertPrivateBlobFile(openedAfter)
+      assertPrivateBlobFile(namedAfter)
+      if (
+        !sameFileIdentity(openedBefore, openedAfter)
+        || !sameFileIdentity(openedAfter, namedAfter)
+        || openedAfter.size !== reference.sizeBytes
+        || bytes.length !== reference.sizeBytes
+      ) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob changed identity or size while it was verified.",
+        )
+      }
+      if (createHash("sha256").update(bytes).digest("hex") !== digest) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob content digest does not match its durable reference.",
+        )
+      }
+      return bytes.length
+    } finally {
+      await handle.close()
+    }
+  }
+
+  async #removeSafeUnreferencedBlob(filePath) {
+    const named = await fs.lstat(filePath)
+    assertPrivateBlobFile(named)
+    const handle = await fs.open(
+      filePath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    )
+    try {
+      const opened = await handle.stat()
+      assertPrivateBlobFile(opened)
+      if (!sameFileIdentity(named, opened)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "An unreferenced result blob changed identity before removal.",
+        )
+      }
+      const namedAgain = await fs.lstat(filePath)
+      if (!sameFileIdentity(opened, namedAgain)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "An unreferenced result blob changed identity before removal.",
+        )
+      }
+      await fs.unlink(filePath)
+    } finally {
+      await handle.close()
+    }
+  }
+
+  async #reconcileBlobInventory() {
+    const references = this.#referencedBlobMap()
+    let rootEntries
+    let rootIdentity
+    try {
+      const rootBefore = await fs.lstat(this.#blobDirectory)
+      assertPrivateBlobDirectory(rootBefore, "result blob root")
+      rootIdentity = rootBefore
+      rootEntries = await fs.readdir(this.#blobDirectory, { withFileTypes: true })
+      const rootAfter = await fs.lstat(this.#blobDirectory)
+      assertPrivateBlobDirectory(rootAfter, "result blob root")
+      if (!sameFileIdentity(rootBefore, rootAfter)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "The result blob root changed identity during reconciliation.",
+        )
+      }
+    } catch (error) {
+      if (error.code === "ENOENT" && references.size === 0) {
+        this.#blobBytes = 0
+        return
+      }
+      if (error.code === "ENOENT") {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "The referenced result blob root is missing.",
+        )
+      }
+      throw error
+    }
+
+    const seen = new Set()
+    let retainedBytes = 0
+    for (const prefixEntry of rootEntries) {
+      const prefixPath = path.join(this.#blobDirectory, prefixEntry.name)
+      const prefixBefore = await fs.lstat(prefixPath)
+      if (!/^[a-f0-9]{2}$/.test(prefixEntry.name)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob prefix directory is not canonical.",
+        )
+      }
+      assertPrivateBlobDirectory(prefixBefore, "result blob prefix")
+      const blobEntries = await fs.readdir(prefixPath, { withFileTypes: true })
+      for (const blobEntry of blobEntries) {
+        const filePath = path.join(prefixPath, blobEntry.name)
+        const reference = references.get(blobEntry.name)
+        if (reference && prefixEntry.name !== blobEntry.name.slice(0, 2)) {
+          throw new EgoChatError(
+            "corrupt_result_blob_inventory",
+            "A referenced result blob exists outside its canonical digest prefix.",
+          )
+        }
+        if (reference) {
+          if (seen.has(blobEntry.name)) {
+            throw new EgoChatError(
+              "corrupt_result_blob_inventory",
+              "A referenced result blob has duplicate inventory entries.",
+            )
+          }
+          retainedBytes += await this.#readVerifiedBlob(
+            filePath,
+            blobEntry.name,
+            reference,
+          )
+          seen.add(blobEntry.name)
+        } else {
+          await this.#removeSafeUnreferencedBlob(filePath)
+        }
+      }
+      const prefixAfter = await fs.lstat(prefixPath)
+      assertPrivateBlobDirectory(prefixAfter, "result blob prefix")
+      if (!sameFileIdentity(prefixBefore, prefixAfter)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob prefix changed identity during reconciliation.",
+        )
+      }
+    }
+    const rootAfterReconciliation = await fs.lstat(this.#blobDirectory)
+    assertPrivateBlobDirectory(rootAfterReconciliation, "result blob root")
+    if (!sameFileIdentity(rootIdentity, rootAfterReconciliation)) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob root changed identity during reconciliation.",
+      )
+    }
+    if (seen.size !== references.size) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "A referenced result blob is missing from canonical inventory.",
+      )
     }
     this.#blobBytes = retainedBytes
   }
 
   async #compact() {
-    const { retainedDigests } = this.#applyRetention()
+    this.#applyRetention()
+    await this.#compactionFaultInjector?.("before_state")
     await writeAtomicJson(this.#statePath, this.#state)
     await this.#compactionFaultInjector?.("state")
     await writeAtomicJson(this.#checkpointPath, this.#state)
@@ -2246,7 +2457,7 @@ export class EventStore {
     await this.#compactionFaultInjector?.("events")
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
-    await this.#reconcileBlobInventory(retainedDigests)
+    await this.#reconcileBlobInventory()
     await this.#compactionFaultInjector?.("blobs")
   }
 
