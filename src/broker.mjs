@@ -41,6 +41,7 @@ import {
   StartConvergenceSchema,
   StartProbeSchema,
   WorkflowIdInputSchema,
+  WorkflowReconcileObservationSchema,
   parse,
 } from "./validation.mjs"
 
@@ -1086,7 +1087,45 @@ export class Broker {
   }
 
   async reconcileConversation(input) {
-    const params = parse(ConversationReconcileSchema, input)
+    return this.#reconcileConversation(parse(ConversationReconcileSchema, input))
+  }
+
+  async reconcileWorkflowObservation(input) {
+    const { bindingKey, workflowId } = parse(WorkflowReconcileObservationSchema, input)
+    const binding = this.#store.getBinding(bindingKey)
+    if (!binding) {
+      throw new EgoChatError("binding_not_found", "No conversation binding exists with that key.")
+    }
+    const workflow = this.#store.getWorkflow(workflowId)
+    if (!workflow || workflow.bindingKey !== bindingKey || workflow.kind !== "ego_exchange") {
+      throw new EgoChatError("workflow_not_found", "No matching browser workflow exists for that binding.")
+    }
+    const recoveryCode = workflow.humanRequired?.code ?? workflow.error?.code
+    const observationReconciliation = binding.state === "bound" && (
+      (workflow.status === "human_required" && BOUND_RECOVERY_CODES.has(recoveryCode))
+      || (workflow.status === "failed" && LEGACY_BROWSER_RECOVERY_CODES.has(recoveryCode))
+      || (
+        ["failed", "human_required"].includes(workflow.status)
+        && workflow.phase === "response_captured"
+        && workflow.result?.reconciled === true
+      )
+      || (workflow.status === "succeeded" && workflow.result?.reconciled === true)
+    )
+    if (!observationReconciliation) {
+      throw new EgoChatError(
+        "workflow_not_observation_reconcilable",
+        "Monitor reconciliation requires an existing bound workflow with durable recovery evidence.",
+      )
+    }
+    return {
+      observationOnly: true,
+      phase: workflow.phase,
+      status: workflow.status,
+      workflowId: workflow.id,
+    }
+  }
+
+  async #reconcileConversation(params) {
     const { bindingKey, workflowId } = params
     let binding = this.#store.getBinding(bindingKey)
     if (!binding) {

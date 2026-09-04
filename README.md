@@ -455,12 +455,35 @@ The daemon now constructs a separate durable task spine beside the existing brow
 
 This first slice has fake remote, runner, and effect adapters only. It cannot write to GitHub, merge, deploy, access production, retrieve credentials, or grant real-world authority. See [`docs/durable-task-runner-spine.md`](docs/durable-task-runner-spine.md) for the invariants, effect reconciliation protocol, local API example, and explicit limitations.
 
+### Eagle Monitor
+
+The package and portable crate also expose the first Eagle Monitor slice: a deterministic, per-user macOS supervisor for one already-existing durable Ego Chat workflow. Run `ego-chat setup` once to materialize the embedded runtime before using the installed `eagle-monitor` binary. It can observe broker, workflow, power, and storage state; start the broker only after its canonical lease and IPC endpoint both prove it dead; reattach the configured workflow ID; and request the broker's observation-only exact-workflow reconciliation check. That dedicated broker capability only validates durable binding/workflow recovery evidence and returns bounded phase/status metadata: it cannot call the Ego Browser adapter, spawn a browser child, mutate broker state, retry Send, or create a workflow. The monitor has no browser driver, prompt, conversation selection, model selection, LLM, or network surface.
+
+Start in observation-only mode first:
+
+```sh
+eagle-monitor start --workflow <durable-workflow-uuid> --mode shadow --power-policy allow-sleep --json
+eagle-monitor status --json
+eagle-monitor doctor --json
+eagle-monitor incidents --limit 50 --json
+eagle-monitor stop --json
+```
+
+Safe recovery additionally requires the existing binding key. `keep-awake-on-ac` is an explicit alternative power policy; it requests only an idle-sleep assertion while the workflow is active and the Mac reports AC power. It cannot prevent lid-close, explicit, low-battery, thermal, or other forced sleep.
+
+```sh
+eagle-monitor start --workflow <durable-workflow-uuid> --binding-key <existing-binding> --mode safe --power-policy keep-awake-on-ac --json
+```
+
+`start` and `stop` manage only `gui/<uid>/com.xicv.ego-chat.eagle-monitor` through a user LaunchAgent. They never use root or a system domain. Do not run `start` in automated tests; the focused suite injects a fake launchctl runner. See [`docs/eagle-monitor.md`](docs/eagle-monitor.md) for the state/action contract, stable JSON/exit semantics, power caveats, security boundary, and runbook.
+
 ## Validation
 
 Run the focused suite. When editing, pass only the modified or newly created paths to ESLint; do not run a formatter across the project:
 
 ```sh
 npm test
+npm run test:eagle-monitor
 npm run test:long
 npx eslint <modified-files...>
 npm run audit

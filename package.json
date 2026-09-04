@@ -5,6 +5,7 @@
   "description": "Durable Codex, ZCode, and ChatGPT handoffs through Ego Browser",
   "type": "module",
   "bin": {
+    "eagle-monitor": "./bin/eagle-monitor.mjs",
     "ego-chat": "./bin/ego-chat.mjs",
     "ego-chatd": "./bin/ego-chatd.mjs",
     "ego-chat-mcp": "./bin/ego-chat-mcp.mjs"
@@ -16,6 +17,7 @@
     "gate0:ego": "node ./scripts/ego-gate.mjs",
     "lint": "eslint bin src scripts test eslint.config.mjs",
     "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "test:eagle-monitor": "node --test --test-reporter=spec test/eagle-monitor-*.test.mjs",
     "test:long": "EGO_CHAT_RUN_LONG_TESTS=1 node --test --test-reporter=spec test/mcp-long.test.mjs"
   },
   "engines": {
