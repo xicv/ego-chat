@@ -9432,3 +9432,123 @@ test("historical v5-v7 producers emit nonempty migration fixtures", async (t) =>
     }, beforeRejectedReuse)
   }
 })
+
+test("interrupted legacy compaction rolls forward before restart returns", async (t) => {
+  const fixture = JSON.parse(await fs.readFile(path.join(
+    import.meta.dirname,
+    "fixtures",
+    "a3k-legacy-attachment-provenance-v2.json",
+  )))
+  const entry = fixture.versions.find((candidate) => candidate.schema_version === 7)
+  const phases = ["state", "checkpoint", "manifest", "events"]
+  const workflowIds = [
+    "96fd0f1f-b3a7-4af4-8969-81cb4eab2f01",
+    "96fd0f1f-b3a7-4af4-8969-81cb4eab2f02",
+    "96fd0f1f-b3a7-4af4-8969-81cb4eab2f03",
+    "96fd0f1f-b3a7-4af4-8969-81cb4eab2f04",
+  ]
+
+  for (const [index, phase] of phases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+    for (const [name, artifact] of Object.entries(entry.artifacts)) {
+      await fs.writeFile(
+        path.join(dataDir, name),
+        Buffer.from(artifact.base64url, "base64url"),
+        { mode: 0o600 },
+      )
+    }
+    const interrupted = new EventStore(dataDir, {
+      compactionFaultInjector: async (completedPhase) => {
+        if (completedPhase === phase) {
+          throw new Error(`injected compaction interruption after ${phase}`)
+        }
+      },
+    })
+    await assert.rejects(
+      interrupted.initialize(),
+      new RegExp(`injected compaction interruption after ${phase}`),
+    )
+
+    const recovered = new EventStore(dataDir)
+    await recovered.initialize()
+    const state = JSON.parse(await fs.readFile(path.join(dataDir, "state.json")))
+    const checkpoint = JSON.parse(
+      await fs.readFile(path.join(dataDir, "checkpoint.json")),
+    )
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
+    )
+    const quarantine = recovered.getLegacyAttachmentEvidence(
+      entry.expected_source_workflow_id,
+    )
+    assert.equal(state.schemaVersion, 8)
+    assert.deepEqual(checkpoint, state)
+    assert.equal(manifest.digest, digestJson(checkpoint))
+    assert.equal(manifest.nextSeq, checkpoint.nextSeq)
+    assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
+    assert.ok(quarantine.source_records_sha256)
+    assert.equal(recovered.getAttachmentIntent(entry.expected_source_workflow_id), undefined)
+    assert.equal(recovered.getConfirmedSendIdentity(entry.expected_source_workflow_id), undefined)
+    assert.equal(recovered.getConfirmedSendEvent(entry.expected_source_workflow_id), undefined)
+    assert.equal(recovered.getAttachmentCapture(entry.expected_source_workflow_id), undefined)
+    assert.equal(recovered.getAttachmentDisposition(entry.expected_source_workflow_id), undefined)
+    assert.equal(
+      recovered.getAttachmentConsumerAcknowledgement(entry.expected_source_workflow_id),
+      undefined,
+    )
+    assert.equal(
+      recovered.getAttachmentEvidenceTombstone(entry.expected_source_workflow_id),
+      undefined,
+    )
+    assert.equal(
+      recovered.getAttachmentExternalBinding(
+        "a3k-manual-canary-v1",
+        entry.expected_external_binding_sha256,
+      ).state,
+      "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+    )
+
+    const freshOperationKey = `exchange:a3k-interrupted:${phase}`
+    const admission = buildAttachmentCaptureIntent({
+      authorizationDigest: "c".repeat(64),
+      createdAt: "2026-09-04T07:00:00.000Z",
+      externalBindingDigest: entry.expected_external_binding_sha256,
+      operationKey: freshOperationKey,
+      profile: "a3k-manual-canary-v1",
+      runtimeIdentity: {
+        executable_sha256: "b".repeat(64),
+        implementation_git_sha: "a".repeat(40),
+        package_inventory_sha256: "9".repeat(64),
+      },
+      signerEnrollmentDigest: "8".repeat(64),
+      signerKeyId: `ed25519-spki-sha256:${"7".repeat(64)}`,
+      workflowId: workflowIds[index],
+    })
+    await assert.rejects(
+      recovered.persistStarted("workflow.started", {
+        bindingKey: `interrupted-${phase}`,
+        createdAt: "2026-09-04T07:00:00.000Z",
+        id: workflowIds[index],
+        inputDigest: "d".repeat(64),
+        kind: "ego_exchange",
+        operationKey: freshOperationKey,
+        phase: "queued",
+        status: "running",
+        updatedAt: "2026-09-04T07:00:00.000Z",
+      }, {
+        intent: admission.intent,
+        intentDigest: admission.digest,
+      }),
+      (error) => error.code === "attachment_external_binding_consumed",
+    )
+
+    const restarted = new EventStore(dataDir)
+    await restarted.initialize()
+    assert.deepEqual(
+      restarted.getLegacyAttachmentEvidence(entry.expected_source_workflow_id),
+      quarantine,
+    )
+    assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), "")
+  }
+})

@@ -358,7 +358,12 @@ function externalBinding(intent, intentDigest, state) {
   }
 }
 
-function fullAttachmentVector(authority) {
+function fullAttachmentVector(authority, {
+  finalObservedAt = "2026-09-04T05:00:03.000Z",
+  firstObservedAt = "2026-09-04T05:00:01.000Z",
+  sentAt = "2026-09-04T05:00:00.000Z",
+  terminalAt = "2026-09-04T05:00:04.000Z",
+} = {}) {
   const { digest: intentDigest, intent } = intentFor(authority, WORKFLOW_ID, OPERATION_KEY)
   const workflow = {
     bindingKey: "adopt-21e6dcece16fa93f24608e53",
@@ -385,15 +390,15 @@ function fullAttachmentVector(authority) {
     sent: {
       canonicalUrl: "https://chatgpt.com/c/6a9621cb-1e78-83ec-a6cf-edca598cd527",
       promptMessageId: "prompt-002",
-      sentAt: "2026-09-04T05:00:00.000Z",
+      sentAt,
     },
     workflow,
   })
   const identityDigest = sha256Hex(canonicalJsonBytes(identity))
   const captureKey = attachmentCaptureOperationKeyDigest(identityDigest)
   const observations = [
-    attachmentObservation(identityDigest, captureKey, "2026-09-04T05:00:01.000Z", 1),
-    attachmentObservation(identityDigest, captureKey, "2026-09-04T05:00:03.000Z", 2),
+    attachmentObservation(identityDigest, captureKey, firstObservedAt, 1),
+    attachmentObservation(identityDigest, captureKey, finalObservedAt, 2),
   ]
   const captureOperation = {
     ...buildAttachmentCaptureOperation({
@@ -412,7 +417,7 @@ function fullAttachmentVector(authority) {
     confirmedSendIdentity: identity,
     confirmedSendIdentityDigest: identityDigest,
     observations,
-    terminalAt: "2026-09-04T05:00:04.000Z",
+    terminalAt,
   })
   const envelope = signEnvelope(disposition, authority)
   captureOperation.terminal_disposition_sha256 = envelope.payload_sha256
@@ -443,7 +448,11 @@ function fullAttachmentVector(authority) {
   }
 }
 
-function terminalVector(authority, name, kind) {
+function terminalVector(authority, name, kind, {
+  attemptObservedAt = "2026-09-04T05:00:00.500Z",
+  observedAt = "2026-09-04T05:00:01.000Z",
+  terminalAt = "2026-09-04T05:00:02.000Z",
+} = {}) {
   const sourceWorkflowId = `${WORKFLOW_ID}-${name}`
   const sourceOperationKey = `${OPERATION_KEY}-${name}`
   const { digest: intentDigest, intent } = intentFor(
@@ -461,19 +470,19 @@ function terminalVector(authority, name, kind) {
         intent,
         lastObservationAt: "2026-09-04T05:00:01.000Z",
         preDispatchTurnMarker: "EGO_CHAT_A3K_MANUAL_CANARY_EXECUTE_V1_D749A417",
-        terminalAt: "2026-09-04T05:00:02.000Z",
+        terminalAt,
       })
     : buildConfirmedSendAbsenceDisposition({
         browserFencingGeneration: 11,
         dispatchAttempts: attempted ? [{
           attempt_number: 1,
           browser_fencing_generation: 11,
-          observed_at: "2026-09-04T05:00:00.500Z",
+          observed_at: attemptObservedAt,
           outcome: "ABSENT",
         }] : [],
         intent,
-        observedAt: "2026-09-04T05:00:01.000Z",
-        terminalAt: "2026-09-04T05:00:02.000Z",
+        observedAt,
+        terminalAt,
       })
   const schema = ambiguous
     ? "ego-chat-ambiguous-send-evidence-bundle/v1"
@@ -506,6 +515,111 @@ function terminalVector(authority, name, kind) {
   }
 }
 
+function decodeDisposition(bundle) {
+  return JSON.parse(Buffer.from(
+    bundle.disposition_envelope.payload_base64url,
+    "base64url",
+  ))
+}
+
+function captureProjectionDigest(capture) {
+  const projection = { ...capture }
+  delete projection.schema
+  delete projection.terminal_disposition_sha256
+  delete projection.terminal_envelope_sha256
+  return sha256Hex(canonicalJsonBytes({
+    schema: "ego-chat-attachment-capture-evidence-projection/v1",
+    ...projection,
+  }))
+}
+
+function resignAttachmentChronologyVector(authority, mutate) {
+  const bundle = structuredClone(fullAttachmentVector(authority).bundle)
+  const disposition = decodeDisposition(bundle)
+  mutate(bundle.capture, disposition)
+  disposition.capture_evidence_projection_sha256 = captureProjectionDigest(bundle.capture)
+  const envelope = signEnvelope(disposition, authority)
+  bundle.disposition_envelope = envelope
+  bundle.capture.terminal_disposition_sha256 = envelope.payload_sha256
+  bundle.capture.terminal_envelope_sha256 = sha256Hex(canonicalJsonBytes(envelope))
+  return bundle
+}
+
+function resignTerminalChronologyVector(authority, vector, mutate) {
+  const bundle = structuredClone(vector.bundle)
+  const disposition = decodeDisposition(bundle)
+  mutate(disposition)
+  bundle.disposition_envelope = signEnvelope(disposition, authority)
+  return bundle
+}
+
+function chronologyNegativeVectors(authority) {
+  return [
+    {
+      baseline_vector: "attachment-exactly-one",
+      bundle: fullAttachmentVector(authority, {
+        sentAt: "2026-09-04T05:00:05.000Z",
+      }).bundle,
+      expected_error: "attachment evidence chronology is invalid",
+      name: "attachment-terminal-before-send",
+    },
+    {
+      baseline_vector: "attachment-exactly-one",
+      bundle: resignAttachmentChronologyVector(authority, (capture, disposition) => {
+        const first = "2026-09-04T04:59:59.500Z"
+        const final = "2026-09-04T05:00:01.500Z"
+        capture.candidate_observations[0].observed_at = first
+        capture.candidate_observations[1].observed_at = final
+        disposition.first_stable_observation_at = first
+        disposition.final_stable_observation_at = final
+        disposition.receipt.first_stable_observation_at = first
+        disposition.receipt.final_stable_observation_at = final
+      }),
+      expected_error: "attachment evidence chronology is invalid",
+      name: "attachment-observation-before-capture",
+    },
+    {
+      baseline_vector: "attachment-exactly-one",
+      bundle: resignAttachmentChronologyVector(authority, (capture, disposition) => {
+        const first = "2026-09-04T05:00:03.000Z"
+        const final = "2026-09-04T05:00:01.000Z"
+        capture.candidate_observations[0].observed_at = first
+        capture.candidate_observations[1].observed_at = final
+        disposition.first_stable_observation_at = first
+        disposition.final_stable_observation_at = final
+        disposition.receipt.first_stable_observation_at = first
+        disposition.receipt.final_stable_observation_at = final
+      }),
+      expected_error: "retained observations quiet interval is invalid",
+      name: "attachment-final-before-first",
+    },
+    {
+      baseline_vector: "attempted-confirmed-absence",
+      bundle: resignTerminalChronologyVector(
+        authority,
+        terminalVector(authority, "attempted-confirmed-absence", "absence-attempted"),
+        (disposition) => {
+          disposition.dispatch_attempts[0].observed_at = "2026-09-04T05:00:01.500Z"
+        },
+      ),
+      expected_error: "confirmed-Send absence dispatch attempt is invalid",
+      name: "attempt-after-absence-observation",
+    },
+    {
+      baseline_vector: "ambiguous-send",
+      bundle: resignTerminalChronologyVector(
+        authority,
+        terminalVector(authority, "ambiguous-send", "ambiguous"),
+        (disposition) => {
+          disposition.terminal_at = "2026-09-04T05:10:00.000Z"
+        },
+      ),
+      expected_error: "terminal evidence chronology is invalid",
+      name: "terminal-after-resolution-deadline",
+    },
+  ]
+}
+
 export function buildA3kPublicBoundaryFixture() {
   const contract = producerContract()
   const runtime = runtimeFixture(contract)
@@ -513,6 +627,7 @@ export function buildA3kPublicBoundaryFixture() {
   const claimBytes = canonicalJsonBytes(executionClaim())
   return {
     a3k_schema_files: A3K_SCHEMA_FILES,
+    chronology_negative_vectors: chronologyNegativeVectors(authority),
     execution_claim_base64url: claimBytes.toString("base64url"),
     producer_contract: contract,
     runtime_fixture: runtime,

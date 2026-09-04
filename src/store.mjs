@@ -1008,6 +1008,7 @@ export class EventStore {
   #blobBytes = 0
   #checkpointManifestPath
   #checkpointPath
+  #compactionFaultInjector
   #dataDir
   #eventBytes = 0
   #eventsSinceCheckpoint = 0
@@ -1036,6 +1037,7 @@ export class EventStore {
     this.#blobDirectory = path.join(dataDir, "blobs", "sha256")
     this.#checkpointPath = path.join(dataDir, "checkpoint.json")
     this.#checkpointManifestPath = path.join(dataDir, "checkpoint.manifest.json")
+    this.#compactionFaultInjector = options.compactionFaultInjector ?? null
     this.#eventsPath = path.join(dataDir, "events.jsonl")
     this.#maxBlobBytes = options.maxBlobBytes ?? 256 * 1024 * 1024
     this.#maxAttachmentIntents = options.maxAttachmentIntents
@@ -1102,6 +1104,7 @@ export class EventStore {
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
 
+    let durableRepairRequired = false
     let legacyReplay = false
     try {
       const [checkpointText, manifestText] = await Promise.all([
@@ -1135,6 +1138,7 @@ export class EventStore {
         this.#state = normalizeStateForReplay(
           JSON.parse(await fs.readFile(this.#statePath, "utf8")),
         )
+        durableRepairRequired = true
         legacyReplay = this.#state.schemaVersion < 8
           || hasLegacyAttachmentEvidenceShape(this.#state)
       } catch (_recoveryError) {
@@ -1154,6 +1158,7 @@ export class EventStore {
       ledger = ""
     }
 
+    let skippedEventPrefix = false
     const lines = ledger.split("\n")
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index]
@@ -1164,6 +1169,7 @@ export class EventStore {
       try {
         const event = JSON.parse(line)
         if (event.seq < this.#state.nextSeq) {
+          skippedEventPrefix = true
           continue
         }
         applyEvent(this.#state, event, {
@@ -1186,7 +1192,9 @@ export class EventStore {
     }
 
     if (
-      legacyReplay
+      durableRepairRequired
+      || legacyReplay
+      || skippedEventPrefix
       || this.#blobBytes > this.#maxBlobBytes
       || Buffer.byteLength(JSON.stringify(this.#state), "utf8") > this.#maxStateBytes
     ) {
@@ -2206,13 +2214,17 @@ export class EventStore {
   async #compact() {
     const { retainedDigests } = this.#applyRetention()
     await writeAtomicJson(this.#statePath, this.#state)
+    await this.#compactionFaultInjector?.("state")
     await writeAtomicJson(this.#checkpointPath, this.#state)
+    await this.#compactionFaultInjector?.("checkpoint")
     await writeAtomicJson(this.#checkpointManifestPath, {
       createdAt: new Date().toISOString(),
       digest: digestJson(this.#state),
       nextSeq: this.#state.nextSeq,
     })
+    await this.#compactionFaultInjector?.("manifest")
     await writeAtomicText(this.#eventsPath, "")
+    await this.#compactionFaultInjector?.("events")
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
     let retainedBytes = 0
