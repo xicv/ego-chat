@@ -10,7 +10,8 @@ async function egoDriverMain(
   expectedBrowserContractRevision = undefined,
   inputMaxBytes = undefined,
 ) {
-  const fsConstants = (await import("node:fs")).constants
+  const fsSync = await import("node:fs")
+  const fsConstants = fsSync.constants
   const fs = await import("node:fs/promises")
   const crypto = await import("node:crypto")
   const path = await import("node:path")
@@ -67,14 +68,47 @@ async function egoDriverMain(
   let compositionMethod = null
   let driverStage = "initializing"
   let observedModelPolicy = null
+  let outputEmitted = false
   let promptBytes = null
   let promptCharacters = null
   let sendClickStarted = false
+  let selectedTaskSpaceEvidence = null
+  let selectedTaskSpaceGuard = null
   let taskSpaceControlRecovery = null
   let unsentDraftMayExist = false
 
   function emit(value) {
-    const encoded = Buffer.from(JSON.stringify(value), "utf8").toString("base64url")
+    if (outputEmitted) {
+      return
+    }
+    const hasTaskSpaceResult = value?.ok === true
+      && value.result
+      && typeof value.result === "object"
+      && Object.hasOwn(value.result, "taskSpaceId")
+    const resultIdentity = hasTaskSpaceResult
+      ? value.result.taskSpaceIdentity
+      : null
+    const evidenceMismatch = hasTaskSpaceResult
+      && (
+        !selectedTaskSpaceEvidence
+        || value.result.taskSpaceId !== selectedTaskSpaceEvidence.taskSpaceId
+        || !validTaskSpaceIdentity(resultIdentity)
+        || !taskSpaceIdentityMatches(resultIdentity, selectedTaskSpaceEvidence.taskSpaceIdentity)
+      )
+    const output = evidenceMismatch
+      ? {
+          evidence: {
+            resultTaskSpaceId: value.result.taskSpaceId,
+            selectedTaskSpaceId: selectedTaskSpaceEvidence?.taskSpaceId ?? null,
+          },
+          humanRequired: true,
+          message: "The driver result no longer matches the selected task-space evidence.",
+          ok: false,
+          reason: "task_space_result_identity_mismatch",
+        }
+      : value
+    const encoded = Buffer.from(JSON.stringify(output), "utf8").toString("base64url")
+    outputEmitted = true
     cliLog(resultPrefix + encoded)
   }
 
@@ -169,6 +203,63 @@ async function egoDriverMain(
     return true
   }
 
+  function assertBrokerAuthoritySync(phase, reportFailure = true) {
+    const fail = (reason, message, evidence = {}) => {
+      if (reportFailure) {
+        humanRequired(reason, message, { ...evidence, phase })
+      }
+      return false
+    }
+    if (
+      !input.brokerLease
+      || typeof input.brokerLease.ownerPath !== "string"
+      || typeof input.brokerLease.brokerId !== "string"
+      || !Number.isSafeInteger(input.brokerLease.epoch)
+      || !Number.isSafeInteger(input.brokerLease.pid)
+      || input.brokerLease.pid < 1
+    ) {
+      return fail(
+        "broker_fence_missing",
+        "The browser mutation has no authoritative broker generation proof.",
+      )
+    }
+    let owner
+    try {
+      owner = JSON.parse(fsSync.readFileSync(input.brokerLease.ownerPath, "utf8"))
+    } catch (_error) {
+      return fail(
+        "broker_fence_lost",
+        "The authoritative broker lease disappeared at the browser mutation boundary.",
+      )
+    }
+    if (
+      owner.brokerId !== input.brokerLease.brokerId
+      || owner.epoch !== input.brokerLease.epoch
+      || owner.pid !== input.brokerLease.pid
+    ) {
+      return fail(
+        "broker_fence_lost",
+        "A newer broker generation fenced this browser mutation.",
+        {
+          observedBrokerId: owner.brokerId ?? null,
+          observedEpoch: owner.epoch ?? null,
+        },
+      )
+    }
+    try {
+      process.kill(owner.pid, 0)
+    } catch (error) {
+      if (error?.code !== "EPERM") {
+        return fail(
+          "broker_fence_lost",
+          "The authoritative broker process exited at the browser mutation boundary.",
+          { observedBrokerId: owner.brokerId, observedEpoch: owner.epoch },
+        )
+      }
+    }
+    return true
+  }
+
   async function inspectPage() {
     const info = await pageInfo()
     if (info?.dialog) {
@@ -238,23 +329,26 @@ async function egoDriverMain(
 
   async function clearUnsentComposerDraft() {
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      const cleared = await fencedJsMutation(String.raw`(() => {
+        const composer = document.querySelector('#prompt-textarea')
+        if (!composer) {
+          return false
+        }
+        if (composer.matches('input, textarea')) {
+          composer.value = ''
+        } else {
+          composer.replaceChildren()
+        }
+        composer.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'deleteContentBackward',
+        }))
+        return true
+      })()`, `before_composer_cleanup_attempt_${attempt + 1}`, false)
+      if (!cleared.performed) {
+        return false
+      }
       try {
-        await js(String.raw`(() => {
-          const composer = document.querySelector('#prompt-textarea')
-          if (!composer) {
-            return false
-          }
-          if (composer.matches('input, textarea')) {
-            composer.value = ''
-          } else {
-            composer.replaceChildren()
-          }
-          composer.dispatchEvent(new InputEvent('input', {
-            bubbles: true,
-            inputType: 'deleteContentBackward',
-          }))
-          return true
-        })()`)
         await wait(1)
         const empty = await js(String.raw`(() => {
           const composer = document.querySelector('#prompt-textarea')
@@ -279,7 +373,7 @@ async function egoDriverMain(
   }
 
   async function composePrompt(value) {
-    const ready = await js(String.raw`(() => {
+    const focused = await fencedJsMutation(String.raw`(() => {
       const composer = document.querySelector('#prompt-textarea')
       if (!composer) {
         return false
@@ -292,7 +386,11 @@ async function egoDriverMain(
       }
       composer.focus()
       return document.activeElement === composer
-    })()`)
+    })()`, "before_composer_focus")
+    if (!focused.performed) {
+      return false
+    }
+    const ready = focused.value
     if (!ready) {
       throw new Error("The verified ChatGPT composer was not empty and focusable.")
     }
@@ -305,7 +403,7 @@ async function egoDriverMain(
       .replaceAll("\u2028", "\\u2028")
       .replaceAll("\u2029", "\\u2029")
     driverStage = "inserting_prompt_content"
-    const inserted = await js(`(() => {
+    const composition = await fencedJsMutation(`(() => {
       const value = ${valueLiteral}
       const composer = document.querySelector('#prompt-textarea')
       if (!composer || composer.matches('input, textarea')) {
@@ -329,11 +427,16 @@ async function egoDriverMain(
       }))
       composer.focus()
       return document.activeElement === composer
-    })()`)
+    })()`, "before_composer_content_mutation")
+    if (!composition.performed) {
+      return false
+    }
+    const inserted = composition.value
     if (!inserted) {
       throw new Error("The ChatGPT rich-text composer rejected the exact prompt mutation.")
     }
     await wait(1)
+    return true
   }
 
   async function readConversationEntries() {
@@ -455,8 +558,13 @@ async function egoDriverMain(
     return summarizeConversationHead(await readConversationEntries(), logicalMessageCount)
   }
 
-  async function selectExactTarget(taskSpace, targetId) {
-    const task = await useOrCreateTaskSpace(taskSpace)
+  async function selectExactTarget(taskSpace, targetId, expectedIdentity = null) {
+    const task = await selectObservedTaskSpace(taskSpace, {
+      ...(expectedIdentity ? { expectedIdentity } : {}),
+    })
+    if (!task) {
+      return null
+    }
     const tabs = await listTabs()
     const tab = tabs.find((candidate) => candidate.targetId === targetId)
     if (!tab) {
@@ -466,24 +574,725 @@ async function egoDriverMain(
       })
       return null
     }
-    await switchTab(targetId)
+    if (!await fencedSwitchTab(targetId, "immediately_before_tab_switch")) {
+      return null
+    }
     return { tab, targetId: tab.targetId, task }
   }
 
-  function taskSpaceMatches(taskSpace, identifier) {
-    if (typeof identifier === "number") {
-      return taskSpace.id === identifier
+  function taskSpaceIdentity(taskSpace) {
+    if (!taskSpace || typeof taskSpace !== "object" || Array.isArray(taskSpace)) {
+      return null
     }
-    const requested = String(identifier)
-    if (taskSpace.name === requested || taskSpace.taskId === requested) {
-      return true
+    const identity = { name: taskSpace.name, taskId: taskSpace.taskId }
+    return validTaskSpaceIdentity(identity) ? identity : null
+  }
+
+  function hasTaskSpaceIdentityFields(taskSpace) {
+    return taskSpace
+      && typeof taskSpace === "object"
+      && (Object.hasOwn(taskSpace, "name") || Object.hasOwn(taskSpace, "taskId"))
+  }
+
+  function taskSpaceIdentityMatches(taskSpace, identity) {
+    return taskSpaceIdentityRelation(taskSpace, identity) === "exact"
+  }
+
+  function taskSpaceIdentityRelation(taskSpace, identity) {
+    const observed = taskSpaceIdentity(taskSpace)
+    if (!validTaskSpaceIdentity(identity)) {
+      return "unresolved"
     }
-    return /^\d+$/.test(requested) && String(taskSpace.id) === requested
+    if (!observed) {
+      const nameMatches = Object.hasOwn(taskSpace || {}, "name")
+        && taskSpace.name === identity.name
+      const taskIdMatches = Object.hasOwn(taskSpace || {}, "taskId")
+        && taskSpace.taskId === identity.taskId
+      return nameMatches || taskIdMatches ? "conflict" : "unresolved"
+    }
+    const nameMatches = observed.name === identity.name
+    const taskIdMatches = observed.taskId === identity.taskId
+    if (nameMatches && taskIdMatches) {
+      return "exact"
+    }
+    if (nameMatches || taskIdMatches) {
+      return "conflict"
+    }
+    return "distinct"
+  }
+
+  function validTaskSpaceIdentity(identity) {
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
+      return false
+    }
+    const keys = Object.keys(identity).sort()
+    return keys.length === 2
+      && keys[0] === "name"
+      && keys[1] === "taskId"
+      && keys.every((key) => (
+        typeof identity[key] === "string"
+        && identity[key].length > 0
+        && identity[key].length <= 200
+        && !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(identity[key])
+      ))
+  }
+
+  function validTaskSpaceSelector(selector) {
+    if (!selector || typeof selector !== "object" || Array.isArray(selector)) {
+      return false
+    }
+    const keys = Object.keys(selector).sort()
+    if (
+      selector.kind === "numeric_location"
+      && keys.length === 2
+      && keys[0] === "kind"
+      && keys[1] === "value"
+    ) {
+      return Number.isSafeInteger(selector.value) && selector.value > 0
+    }
+    if (
+      ["legacy_string", "name", "task_id"].includes(selector.kind)
+      && keys.length === 2
+      && keys[0] === "kind"
+      && keys[1] === "value"
+    ) {
+      return typeof selector.value === "string"
+        && selector.value.length > 0
+        && selector.value.length <= 200
+        && !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(selector.value)
+    }
+    return selector.kind === "stable_identity"
+      && keys.length === 2
+      && keys[0] === "identity"
+      && keys[1] === "kind"
+      && validTaskSpaceIdentity(selector.identity)
+  }
+
+  function selectorMatchesTaskSpace(selector, taskSpace) {
+    if (selector.kind === "numeric_location") {
+      return taskSpace.id === selector.value
+    }
+    const identity = taskSpaceIdentity(taskSpace)
+    if (!identity) {
+      return false
+    }
+    if (selector.kind === "name") {
+      return identity.name === selector.value
+    }
+    if (selector.kind === "task_id") {
+      return identity.taskId === selector.value
+    }
+    if (selector.kind === "legacy_string") {
+      return identity.name === selector.value || identity.taskId === selector.value
+    }
+    return taskSpaceIdentityMatches(identity, selector.identity)
+  }
+
+  function selectorConflictsWithTaskSpace(selector, taskSpace) {
+    if (selector.kind !== "stable_identity") {
+      return selectorMatchesTaskSpace(selector, taskSpace)
+    }
+    return taskSpaceIdentityRelation(taskSpace, selector.identity) !== "distinct"
+  }
+
+  function taskSpaceSelectorsConflict(first, second) {
+    if (first.kind === "numeric_location" || second.kind === "numeric_location") {
+      return first.kind === second.kind && first.value === second.value
+    }
+    if (first.kind === "stable_identity") {
+      return second.kind === "stable_identity"
+        ? taskSpaceIdentityRelation(first.identity, second.identity) !== "distinct"
+        : selectorMatchesTaskSpace(second, first.identity)
+    }
+    if (second.kind === "stable_identity") {
+      return selectorMatchesTaskSpace(first, second.identity)
+    }
+    return first.value === second.value
+      && (first.kind === "legacy_string" || second.kind === "legacy_string" || first.kind === second.kind)
+  }
+
+  function requireTaskSpaceGuard() {
+    if (selectedTaskSpaceGuard) {
+      return selectedTaskSpaceGuard
+    }
+    const guard = input.taskSpaceGuard
+    const keys = guard && typeof guard === "object" && !Array.isArray(guard)
+      ? Object.keys(guard).sort()
+      : []
+    const validShape = keys.length === 4
+      && keys[0] === "deniedIdentities"
+      && keys[1] === "deniedSelectors"
+      && keys[2] === "ownerSelector"
+      && keys[3] === "revision"
+      && guard.revision === 1
+      && validTaskSpaceSelector(guard.ownerSelector)
+      && Array.isArray(guard.deniedIdentities)
+      && Array.isArray(guard.deniedSelectors)
+      && guard.deniedIdentities.length <= 1_024
+      && guard.deniedSelectors.length <= 1_024
+      && guard.deniedIdentities.every(validTaskSpaceIdentity)
+      && guard.deniedSelectors.every((selector) => (
+        validTaskSpaceSelector(selector) && selector.kind !== "numeric_location"
+      ))
+    let internallyConsistent = validShape
+    if (internallyConsistent) {
+      const identityKeys = new Set()
+      for (const identity of guard.deniedIdentities) {
+        const key = JSON.stringify([identity.name, identity.taskId])
+        if (identityKeys.has(key)) {
+          internallyConsistent = false
+          break
+        }
+        identityKeys.add(key)
+      }
+      for (let first = 0; internallyConsistent && first < guard.deniedIdentities.length; first += 1) {
+        for (let second = first + 1; second < guard.deniedIdentities.length; second += 1) {
+          if (taskSpaceIdentityRelation(guard.deniedIdentities[first], guard.deniedIdentities[second]) !== "distinct") {
+            internallyConsistent = false
+            break
+          }
+        }
+      }
+      const selectorKeys = new Set()
+      for (const selector of guard.deniedSelectors) {
+        const key = JSON.stringify(selector)
+        if (selectorKeys.has(key)) {
+          internallyConsistent = false
+          break
+        }
+        selectorKeys.add(key)
+      }
+      for (let first = 0; internallyConsistent && first < guard.deniedSelectors.length; first += 1) {
+        for (let second = first + 1; second < guard.deniedSelectors.length; second += 1) {
+          if (taskSpaceSelectorsConflict(guard.deniedSelectors[first], guard.deniedSelectors[second])) {
+            internallyConsistent = false
+            break
+          }
+        }
+      }
+      for (const identity of guard.deniedIdentities) {
+        if (guard.deniedSelectors.some((selector) => selectorConflictsWithTaskSpace(selector, identity))) {
+          internallyConsistent = false
+          break
+        }
+        if (selectorConflictsWithTaskSpace(guard.ownerSelector, identity)) {
+          internallyConsistent = false
+          break
+        }
+      }
+      if (guard.deniedSelectors.some((selector) => (
+        taskSpaceSelectorsConflict(guard.ownerSelector, selector)
+      ))) {
+        internallyConsistent = false
+      }
+    }
+    if (!internallyConsistent) {
+      humanRequired(
+        "task_space_guard_invalid",
+        "The broker supplied a missing, malformed, unsupported, or internally conflicting task-space guard.",
+      )
+      return null
+    }
+    selectedTaskSpaceGuard = guard
+    return guard
+  }
+
+  function requireTaskSpaceIdentity(taskSpace, reason = "task_space_identity_invalid") {
+    const identity = taskSpaceIdentity(taskSpace)
+    if (identity) {
+      return identity
+    }
+    const failureReason = hasTaskSpaceIdentityFields(taskSpace)
+      ? reason
+      : "task_space_identity_unavailable"
+    humanRequired(failureReason, "Ego Chat could not establish one complete live task-space identity.", {
+      taskSpaceId: Number.isSafeInteger(taskSpace?.id) && taskSpace.id > 0 ? taskSpace.id : null,
+    })
+    return null
+  }
+
+  function selectedTaskSpaceResult(selected) {
+    return {
+      taskSpaceId: selected.task.id,
+      taskSpaceIdentity: {
+        name: selected.task.name,
+        taskId: selected.task.taskId,
+      },
+    }
+  }
+
+  function taskSpaceGuardIdentityAllowed(identity, taskSpaceId, phase) {
+    const guard = requireTaskSpaceGuard()
+    if (!guard) {
+      return false
+    }
+    if (!selectorMatchesTaskSpace(guard.ownerSelector, { id: taskSpaceId, ...identity })) {
+      humanRequired(
+        "task_space_selector_identity_changed",
+        "The selected task space does not match the broker-reserved typed selector.",
+        { phase, taskSpaceId },
+      )
+      return false
+    }
+    for (const deniedIdentity of guard.deniedIdentities) {
+      const relation = taskSpaceIdentityRelation(identity, deniedIdentity)
+      if (relation === "exact" || relation === "conflict") {
+        humanRequired(
+          relation === "exact"
+            ? "task_space_identity_already_bound"
+            : "task_space_identity_conflict",
+          "The selected task-space identity already belongs to another broker operation or conversation.",
+          { phase, taskSpaceId },
+        )
+        return false
+      }
+    }
+    for (const deniedSelector of guard.deniedSelectors) {
+      if (selectorConflictsWithTaskSpace(deniedSelector, { id: taskSpaceId, ...identity })) {
+        humanRequired(
+          "task_space_selector_reserved",
+          "The selected task space matches another operation's unresolved stable selector.",
+          { phase, taskSpaceId },
+        )
+        return false
+      }
+    }
+    return true
+  }
+
+  async function revalidateSelectedTaskSpace(evidence, phase, reportFailure = true) {
+    const fail = (reason, message, details = {}) => {
+      if (reportFailure) {
+        humanRequired(reason, message, { ...details, phase })
+      }
+      return false
+    }
+    if (
+      typeof globalThis.listTaskSpaces !== "function"
+      || !Number.isSafeInteger(evidence?.taskSpaceId)
+      || evidence.taskSpaceId < 1
+      || !validTaskSpaceIdentity(evidence.taskSpaceIdentity)
+    ) {
+      return fail(
+        "task_space_identity_unavailable",
+        "Ego Chat cannot re-prove the selected task-space identity before browser work.",
+        { taskSpaceId: evidence?.taskSpaceId ?? null },
+      )
+    }
+    const taskSpaces = await globalThis.listTaskSpaces()
+    const locationMatches = taskSpaces.filter((candidate) => candidate.id === evidence.taskSpaceId)
+    const identityMatches = taskSpaces.filter((candidate) => (
+      taskSpaceIdentityMatches(candidate, evidence.taskSpaceIdentity)
+    ))
+    const identityConflicts = taskSpaces.filter((candidate) => (
+      taskSpaceIdentityRelation(candidate, evidence.taskSpaceIdentity) === "conflict"
+    ))
+    if (
+      locationMatches.length !== 1
+      || !taskSpaceIdentityMatches(locationMatches[0], evidence.taskSpaceIdentity)
+      || identityMatches.length !== 1
+      || identityMatches[0].id !== evidence.taskSpaceId
+      || identityConflicts.length > 0
+    ) {
+      return fail(
+        identityMatches.length > 1
+          ? "bound_task_space_identity_ambiguous"
+          : (identityConflicts.length > 0
+              ? "bound_task_space_identity_conflict"
+              : "bound_task_space_identity_changed"),
+        "The selected task-space identity changed before a critical browser action.",
+        {
+          conflictCount: identityConflicts.length,
+          identityMatchCount: identityMatches.length,
+          matchCount: locationMatches.length,
+          taskSpaceId: evidence.taskSpaceId,
+        },
+      )
+    }
+    if (locationMatches[0].ownership !== "agent") {
+      return fail(
+        "browser_control_unavailable",
+        "The selected Ego task space is no longer under agent control.",
+        { ownership: locationMatches[0].ownership ?? null, taskSpaceId: evidence.taskSpaceId },
+      )
+    }
+    selectedTaskSpaceEvidence = {
+      taskSpaceId: evidence.taskSpaceId,
+      taskSpaceIdentity: taskSpaceIdentity(locationMatches[0]),
+    }
+    if (!taskSpaceGuardIdentityAllowed(
+      selectedTaskSpaceEvidence.taskSpaceIdentity,
+      selectedTaskSpaceEvidence.taskSpaceId,
+      phase,
+    )) {
+      return false
+    }
+    return {
+      ...selectedTaskSpaceEvidence,
+      task: locationMatches[0],
+    }
+  }
+
+  async function runSelectedMutation(phase, mutation, reportFailure = true) {
+    if (!selectedTaskSpaceEvidence) {
+      if (reportFailure) {
+        humanRequired(
+          "task_space_identity_unavailable",
+          "No stable selected task-space identity exists at the browser mutation boundary.",
+          { phase },
+        )
+      }
+      return { performed: false, value: false }
+    }
+    const live = await revalidateSelectedTaskSpace(
+      selectedTaskSpaceEvidence,
+      phase,
+      reportFailure,
+    )
+    if (!live || !assertBrokerAuthoritySync(phase, reportFailure)) {
+      return { performed: false, value: false }
+    }
+    return { performed: true, value: await mutation() }
+  }
+
+  async function runBrokerMutation(phase, mutation) {
+    if (!assertBrokerAuthoritySync(phase)) {
+      return { performed: false, value: false }
+    }
+    return { performed: true, value: await mutation() }
+  }
+
+  async function emitSelectedResult(selected, result, phase) {
+    const live = await revalidateSelectedTaskSpace({
+      taskSpaceId: selected.task.id,
+      taskSpaceIdentity: taskSpaceIdentity(selected.task),
+    }, phase)
+    if (!live || !assertBrokerAuthoritySync(phase)) {
+      return false
+    }
+    let actualCanonicalUrl = null
+    if (Object.hasOwn(result, "canonicalUrl") && result.canonicalUrl !== null) {
+      let expectedCanonicalUrl
+      try {
+        expectedCanonicalUrl = normalizeUrl(result.canonicalUrl)
+      } catch (_error) {
+        humanRequired(
+          "canonical_conversation_evidence_invalid",
+          "The driver result did not contain a valid expected canonical conversation URL.",
+          { phase },
+        )
+        return false
+      }
+      const actualInfo = await pageInfo()
+      try {
+        actualCanonicalUrl = normalizeUrl(actualInfo?.url)
+      } catch (_error) {
+        humanRequired(
+          "canonical_conversation_evidence_invalid",
+          "The browser did not report a valid canonical conversation URL for the driver result.",
+          { phase },
+        )
+        return false
+      }
+      if (
+        !isCanonicalConversationUrl(actualCanonicalUrl)
+        || actualCanonicalUrl !== expectedCanonicalUrl
+      ) {
+        humanRequired(
+          "canonical_conversation_changed",
+          "The browser's actual canonical conversation URL changed before the driver result was emitted.",
+          { phase },
+        )
+        return false
+      }
+      if (!assertBrokerAuthoritySync(phase)) {
+        return false
+      }
+    }
+    emit({
+      ok: true,
+      result: {
+        ...result,
+        ...(actualCanonicalUrl ? { canonicalUrl: actualCanonicalUrl } : {}),
+        taskSpaceId: live.taskSpaceId,
+        taskSpaceIdentity: { ...live.taskSpaceIdentity },
+      },
+    })
+    return true
+  }
+
+  async function fencedClick(target, options, phase) {
+    return (await runSelectedMutation(phase, () => click(target, options))).performed
+  }
+
+  async function fencedPressKey(key, phase) {
+    return (await runSelectedMutation(phase, () => pressKey(key))).performed
+  }
+
+  async function fencedJsMutation(source, phase, reportFailure = true) {
+    return runSelectedMutation(phase, () => js(source), reportFailure)
+  }
+
+  async function fencedCdp(method, params, phase) {
+    return (await runSelectedMutation(phase, async () => {
+      // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
+      await cdp(method, params)
+    })).performed
+  }
+
+  async function fencedSwitchTab(targetId, phase) {
+    return (await runSelectedMutation(phase, () => switchTab(targetId))).performed
+  }
+
+  async function fencedOpenOrReuseTab(url, options, phase) {
+    return runSelectedMutation(phase, () => openOrReuseTab(url, options))
+  }
+
+  async function selectObservedTaskSpace(identifier, {
+    expectedIdentity = null,
+    expectedName = null,
+  } = {}) {
+    if (typeof globalThis.listTaskSpaces !== "function") {
+      humanRequired("task_space_identity_unavailable", "Ego Browser cannot report a live task-space identity.")
+      return null
+    }
+    const guard = requireTaskSpaceGuard()
+    if (!guard) {
+      return null
+    }
+    const beforeSelection = await globalThis.listTaskSpaces()
+    const malformedSelectorMatches = beforeSelection.filter((candidate) => {
+      if (taskSpaceIdentity(candidate) || !candidate || typeof candidate !== "object") {
+        return false
+      }
+      if (["legacy_string", "name"].includes(guard.ownerSelector.kind)) {
+        return candidate.name === guard.ownerSelector.value
+          || candidate.taskId === guard.ownerSelector.value
+      }
+      if (guard.ownerSelector.kind === "task_id") {
+        return candidate.taskId === guard.ownerSelector.value
+      }
+      return guard.ownerSelector.kind === "stable_identity"
+        && taskSpaceIdentityRelation(candidate, guard.ownerSelector.identity) === "conflict"
+    })
+    if (malformedSelectorMatches.length > 0) {
+      humanRequired(
+        "task_space_identity_invalid",
+        "A live task-space record matching the requested selector has an incomplete or invalid identity.",
+        { matchCount: malformedSelectorMatches.length },
+      )
+      return null
+    }
+    const preselectionMatches = beforeSelection.filter((candidate) => (
+      selectorMatchesTaskSpace(guard.ownerSelector, candidate)
+    ))
+    if (preselectionMatches.length > 1) {
+      humanRequired(
+        expectedIdentity || expectedName
+          ? "bound_task_space_identity_ambiguous"
+          : "task_space_identity_ambiguous",
+        "More than one live task space matches the requested selector before selection.",
+        { matchCount: preselectionMatches.length },
+      )
+      return null
+    }
+    const preselection = preselectionMatches[0]
+    let selection
+    if (preselection) {
+      const preselectionIdentity = requireTaskSpaceIdentity(preselection)
+      if (!preselectionIdentity) {
+        return null
+      }
+      selectedTaskSpaceEvidence = {
+        taskSpaceId: preselection.id,
+        taskSpaceIdentity: preselectionIdentity,
+      }
+      if (expectedName && preselectionIdentity.name !== expectedName) {
+        humanRequired(
+          "bound_task_space_identity_changed",
+          "The selected task space does not match its per-conversation recovery name.",
+          { taskSpaceId: preselection.id },
+        )
+        return null
+      }
+      if (expectedIdentity && !taskSpaceIdentityMatches(preselection, expectedIdentity)) {
+        humanRequired(
+          taskSpaceIdentityRelation(preselection, expectedIdentity) === "conflict"
+            ? "bound_task_space_identity_conflict"
+            : "bound_task_space_identity_changed",
+          "The selected task space does not match the durable conversation identity.",
+          { taskSpaceId: preselection.id },
+        )
+        return null
+      }
+      selection = await runSelectedMutation(
+        "immediately_before_task_space_selection",
+        () => useOrCreateTaskSpace(preselection.id),
+      )
+      if (!selection.performed) {
+        return null
+      }
+    } else {
+      const numericSelector = guard.ownerSelector.kind === "numeric_location"
+      if (
+        guard.ownerSelector.kind === "name"
+        && beforeSelection.some((candidate) => (
+          taskSpaceIdentity(candidate)?.taskId === guard.ownerSelector.value
+        ))
+      ) {
+        humanRequired(
+          "task_space_selector_ambiguous",
+          "The requested new task-space name collides with an existing task ID.",
+        )
+        return null
+      }
+      if (
+        numericSelector
+        || guard.ownerSelector.kind === "stable_identity"
+        || guard.ownerSelector.kind === "task_id"
+        || guard.ownerSelector.kind === "legacy_string"
+        || expectedIdentity
+      ) {
+        humanRequired(
+          expectedIdentity
+            ? "bound_task_space_identity_changed"
+            : "task_space_identity_unavailable",
+          "The requested existing task space is not present before selection.",
+          { taskSpaceId: numericSelector ? Number(identifier) : null },
+        )
+        return null
+      }
+      selection = await runBrokerMutation(
+        "immediately_before_task_space_creation",
+        () => useOrCreateTaskSpace(identifier),
+      )
+      if (!selection.performed) {
+        return null
+      }
+    }
+    const selected = selection.value
+    if (!Number.isSafeInteger(selected?.id) || selected.id < 1) {
+      humanRequired("task_space_selection_invalid", "Ego Browser returned an invalid selected task-space location.")
+      return null
+    }
+    if (hasTaskSpaceIdentityFields(selected) && !requireTaskSpaceIdentity(selected)) {
+      return null
+    }
+    const taskSpaces = await globalThis.listTaskSpaces()
+    const locationMatches = taskSpaces.filter((candidate) => candidate.id === selected.id)
+    if (locationMatches.length !== 1) {
+      humanRequired(
+        locationMatches.length > 1
+          ? "task_space_identity_ambiguous"
+          : "task_space_identity_unavailable",
+        "Ego Chat could not uniquely re-observe the selected task space before browser work.",
+        { matchCount: locationMatches.length, taskSpaceId: selected.id },
+      )
+      return null
+    }
+    const observed = locationMatches[0]
+    const observedIdentity = requireTaskSpaceIdentity(observed)
+    if (!observedIdentity) {
+      return null
+    }
+    const observedIdentityMatches = taskSpaces.filter((candidate) => (
+      taskSpaceIdentityMatches(candidate, observedIdentity)
+    ))
+    if (observedIdentityMatches.length !== 1 || observedIdentityMatches[0].id !== selected.id) {
+      humanRequired(
+        expectedIdentity || expectedName
+          ? "bound_task_space_identity_ambiguous"
+          : "task_space_identity_ambiguous",
+        "The selected stable task-space identity is not unique in the live browser state.",
+        { matchCount: observedIdentityMatches.length, taskSpaceId: selected.id },
+      )
+      return null
+    }
+    const observedIdentityConflicts = taskSpaces.filter((candidate) => (
+      candidate.id !== selected.id
+      && taskSpaceIdentityRelation(candidate, observedIdentity) === "conflict"
+    ))
+    if (observedIdentityConflicts.length > 0) {
+      humanRequired(
+        expectedIdentity || expectedName
+          ? "bound_task_space_identity_conflict"
+          : "task_space_identity_conflict",
+        "Another live task space matches only part of the selected stable identity.",
+        { matchCount: observedIdentityConflicts.length, taskSpaceId: selected.id },
+      )
+      return null
+    }
+    const selectedIdentity = taskSpaceIdentity(selected)
+    if (selectedIdentity && !taskSpaceIdentityMatches(observed, selectedIdentity)) {
+      humanRequired("task_space_identity_changed", "The selected task-space identity disagrees with its live browser record.", {
+        taskSpaceId: selected.id,
+      })
+      return null
+    }
+    if (expectedIdentity) {
+      const identityConflicts = taskSpaces.filter((candidate) => (
+        taskSpaceIdentityRelation(candidate, expectedIdentity) === "conflict"
+      ))
+      if (identityConflicts.length > 0) {
+        humanRequired(
+          "bound_task_space_identity_conflict",
+          "A live task space matches only part of the durable conversation identity.",
+          { matchCount: identityConflicts.length, taskSpaceId: selected.id },
+        )
+        return null
+      }
+      const identityMatches = taskSpaces.filter((candidate) => (
+        taskSpaceIdentityMatches(candidate, expectedIdentity)
+      ))
+      if (identityMatches.length !== 1 || identityMatches[0].id !== selected.id) {
+        humanRequired(
+          identityMatches.length > 1
+            ? "bound_task_space_identity_ambiguous"
+            : "bound_task_space_identity_changed",
+          "The selected task space no longer matches the durable conversation identity.",
+          { matchCount: identityMatches.length, taskSpaceId: selected.id },
+        )
+        return null
+      }
+    }
+    if (expectedName) {
+      const nameMatches = taskSpaces.filter((candidate) => {
+        const identity = taskSpaceIdentity(candidate)
+        return identity?.name === expectedName
+      })
+      if (nameMatches.length !== 1 || nameMatches[0].id !== selected.id) {
+        humanRequired(
+          nameMatches.length > 1
+            ? "bound_task_space_identity_ambiguous"
+            : "bound_task_space_identity_changed",
+          "The selected task space no longer uniquely matches its per-conversation recovery name.",
+          { matchCount: nameMatches.length, taskSpaceId: selected.id },
+        )
+        return null
+      }
+    }
+    if (observed.ownership !== "agent") {
+      humanRequired("browser_control_unavailable", "The selected Ego task space is no longer under agent control.", {
+        ownership: observed.ownership ?? null,
+        taskSpaceId: selected.id,
+      })
+      return null
+    }
+    if (!taskSpaceGuardIdentityAllowed(observedIdentity, selected.id, "after_task_space_selection")) {
+      return null
+    }
+    selectedTaskSpaceEvidence = {
+      taskSpaceId: selected.id,
+      taskSpaceIdentity: observedIdentity,
+    }
+    return { ...selected, ...observed, ...observedIdentity, id: selected.id }
   }
 
   function boundTaskSpaceName(binding) {
-    const identity = binding.key || binding.bindingKey || binding.canonicalUrl
-    return `ego-chat-bound-${sha256(String(identity)).slice(0, 16)}`
+    const identity = binding.canonicalUrl
+      ? `canonical-conversation\0${binding.canonicalUrl}`
+      : `binding\0${binding.key || binding.bindingKey || binding.startUrl}`
+    return `ego-chat-bound-${sha256(identity).slice(0, 32)}`
   }
 
   function canReclaimBoundTaskSpace(binding) {
@@ -495,9 +1304,43 @@ async function egoDriverMain(
       && ["adopt", "capture_exchange", "exchange", "reanchor", "reconcile_bound"].includes(input.mode)
   }
 
-  async function reclaimBoundTaskSpace(taskSpace, identifier) {
+  async function reclaimBoundTaskSpace(taskSpace, expectedIdentity) {
     const method = taskSpace.ownership === "agentDelegatedToUser" ? "take_over" : "claim"
+    if (!Number.isSafeInteger(taskSpace?.id) || taskSpace.id < 1) {
+      humanRequired(
+        "task_space_identity_unavailable",
+        "Ego Chat cannot reclaim a task space without a safe positive numeric location.",
+      )
+      return null
+    }
     if (!await assertBrokerAuthority("before_task_space_reclaim")) {
+      return null
+    }
+    const beforeReclaim = await globalThis.listTaskSpaces()
+    const locationMatches = beforeReclaim.filter((candidate) => candidate.id === taskSpace.id)
+    const identityMatches = beforeReclaim.filter((candidate) => (
+      taskSpaceIdentityMatches(candidate, expectedIdentity)
+    ))
+    const identityConflicts = beforeReclaim.filter((candidate) => (
+      taskSpaceIdentityRelation(candidate, expectedIdentity) === "conflict"
+    ))
+    if (
+      locationMatches.length !== 1
+      || !taskSpaceIdentityMatches(locationMatches[0], expectedIdentity)
+      || identityMatches.length !== 1
+      || identityMatches[0].id !== taskSpace.id
+      || identityConflicts.length > 0
+      || locationMatches[0].ownership !== taskSpace.ownership
+    ) {
+      humanRequired("bound_task_space_reclaim_precondition_changed", "The exact task-space identity or ownership changed before reclaim.", {
+        conflictCount: identityConflicts.length,
+        identityMatchCount: identityMatches.length,
+        matchCount: locationMatches.length,
+        taskSpaceId: taskSpace.id,
+      })
+      return null
+    }
+    if (!assertBrokerAuthoritySync("immediately_before_task_space_reclaim")) {
       return null
     }
     try {
@@ -519,9 +1362,18 @@ async function egoDriverMain(
     let verified = null
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const taskSpaces = await globalThis.listTaskSpaces()
-      verified = taskSpaces.find((candidate) => (
-        candidate.id === taskSpace.id && taskSpaceMatches(candidate, identifier)
+      const matches = taskSpaces.filter((candidate) => (
+        candidate.id === taskSpace.id
+        && taskSpaceIdentityMatches(candidate, expectedIdentity)
       ))
+      if (matches.length > 1) {
+        humanRequired("bound_task_space_identity_ambiguous", "More than one live task-space record matches the reclaimed identity.", {
+          matchCount: matches.length,
+          taskSpaceId: taskSpace.id,
+        })
+        return null
+      }
+      verified = matches.length === 1 ? matches[0] : null
       if (verified?.ownership === "agent") {
         break
       }
@@ -537,12 +1389,8 @@ async function egoDriverMain(
       return null
     }
 
-    const selected = await useOrCreateTaskSpace(verified.id)
-    if (selected.id !== verified.id) {
-      humanRequired("browser_control_reclaim_failed", "Ego Chat selected a different task space after reclaiming browser control.", {
-        method,
-        taskSpaceId: taskSpace.id,
-      })
+    const selected = await selectObservedTaskSpace(verified.id, { expectedIdentity })
+    if (!selected) {
       return null
     }
     taskSpaceControlRecovery = {
@@ -553,36 +1401,123 @@ async function egoDriverMain(
   }
 
   async function useBoundTaskSpace(binding) {
+    const guard = requireTaskSpaceGuard()
+    if (!guard) {
+      return null
+    }
     const taskSpaces = await globalThis.listTaskSpaces()
-    const requested = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, binding.taskSpaceId))
     if (!binding.key) {
+      const expectedSelectorName = guard.ownerSelector.kind === "name"
+        ? guard.ownerSelector.value
+        : null
+      const requestedMatches = taskSpaces.filter((taskSpace) => (
+        selectorMatchesTaskSpace(guard.ownerSelector, taskSpace)
+      ))
+      if (requestedMatches.length > 1) {
+        humanRequired("task_space_identity_ambiguous", "More than one Ego task space matches the requested location.", {
+          matchCount: requestedMatches.length,
+        })
+        return null
+      }
+      const requested = requestedMatches[0]
+      const requestedIdentity = requested ? requireTaskSpaceIdentity(requested) : null
+      if (requested && !requestedIdentity) {
+        return null
+      }
       if (requested?.ownership && requested.ownership !== "agent") {
         if (canReclaimBoundTaskSpace(binding)) {
-          return reclaimBoundTaskSpace(requested, binding.taskSpaceId)
+          return reclaimBoundTaskSpace(requested, requestedIdentity)
         }
         humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
           taskSpaceId: requested.id,
         })
         return null
       }
-      return useOrCreateTaskSpace(requested?.id ?? binding.taskSpaceId)
+      return selectObservedTaskSpace(requested?.id ?? binding.taskSpaceId, {
+        ...(requestedIdentity ? { expectedIdentity: requestedIdentity } : {}),
+        ...(expectedSelectorName ? { expectedName: expectedSelectorName } : {}),
+      })
     }
+
+    if (Object.hasOwn(binding, "taskSpaceIdentity") && !validTaskSpaceIdentity(binding.taskSpaceIdentity)) {
+      humanRequired("bound_task_space_identity_invalid", "The durable binding has an invalid task-space identity.", {
+        taskSpaceId: binding.taskSpaceId,
+      })
+      return null
+    }
+
+    if (binding.taskSpaceIdentity) {
+      const conflictingMatches = taskSpaces.filter((taskSpace) => (
+        taskSpaceIdentityRelation(taskSpace, binding.taskSpaceIdentity) === "conflict"
+      ))
+      if (conflictingMatches.length > 0) {
+        humanRequired("bound_task_space_identity_conflict", "A live task space matches only part of the durable conversation identity.", {
+          matchCount: conflictingMatches.length,
+        })
+        return null
+      }
+      const exactMatches = taskSpaces.filter((taskSpace) => (
+        taskSpaceIdentityMatches(taskSpace, binding.taskSpaceIdentity)
+      ))
+      if (exactMatches.length > 1) {
+        humanRequired("bound_task_space_identity_ambiguous", "More than one Ego task space matches the durable conversation identity.", {
+          matchCount: exactMatches.length,
+        })
+        return null
+      }
+      const exact = exactMatches[0]
+      if (exact) {
+        if (exact.ownership && exact.ownership !== "agent") {
+          if (canReclaimBoundTaskSpace(binding)) {
+            return reclaimBoundTaskSpace(exact, binding.taskSpaceIdentity)
+          }
+          humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
+            taskSpaceId: exact.id,
+          })
+          return null
+        }
+        return selectObservedTaskSpace(exact.id, { expectedIdentity: binding.taskSpaceIdentity })
+      }
+      humanRequired("bound_task_space_identity_changed", "The durable task-space identity is no longer present in the live browser state.", {
+        matchCount: 0,
+        taskSpaceId: binding.taskSpaceId,
+      })
+      return null
+    }
+
     const fallbackName = boundTaskSpaceName(binding)
-    const fallback = taskSpaces.find((taskSpace) => taskSpaceMatches(taskSpace, fallbackName))
+    const fallbackMatches = taskSpaces.filter((taskSpace) => {
+      const identity = taskSpaceIdentity(taskSpace)
+      return identity?.name === fallbackName
+    })
+    if (fallbackMatches.length > 1) {
+      humanRequired("bound_task_space_identity_ambiguous", "More than one Ego task space matches the per-conversation recovery name.", {
+        matchCount: fallbackMatches.length,
+      })
+      return null
+    }
+    const fallback = fallbackMatches[0]
+    const fallbackIdentity = fallback ? requireTaskSpaceIdentity(fallback) : null
+    if (fallback && !fallbackIdentity) {
+      return null
+    }
     if (
       fallback
       && Object.hasOwn(fallback, "ownership")
       && fallback.ownership !== "agent"
     ) {
       if (canReclaimBoundTaskSpace(binding)) {
-        return reclaimBoundTaskSpace(fallback, fallbackName)
+        return reclaimBoundTaskSpace(fallback, fallbackIdentity)
       }
       humanRequired("browser_control_unavailable", "The bound Ego task space is under user control or inactive.", {
         taskSpaceId: fallback.id,
       })
       return null
     }
-    return useOrCreateTaskSpace(fallback?.id ?? fallbackName)
+    return selectObservedTaskSpace(fallback?.id ?? fallbackName, {
+      ...(fallbackIdentity ? { expectedIdentity: fallbackIdentity } : {}),
+      expectedName: fallbackName,
+    })
   }
 
   function isExactOwnedUnsentDraft(inspection) {
@@ -699,7 +1634,7 @@ async function egoDriverMain(
   }
 
   async function focusModelPolicyTrigger() {
-    return js(String.raw`(() => {
+    const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
       const composer = document.querySelector('#prompt-textarea')
@@ -719,11 +1654,12 @@ async function egoDriverMain(
       }
       pills[0].focus()
       return document.activeElement === pills[0]
-    })()`)
+    })()`, "before_policy_trigger_focus")
+    return focused.performed && focused.value
   }
 
   async function settleComposerFocusForPolicyMenu() {
-    const settled = await js(String.raw`(() => {
+    const mutation = await fencedJsMutation(String.raw`(() => {
       const composer = document.querySelector('#prompt-textarea')
       if (!composer) {
         return { blurred: false, ok: false }
@@ -737,7 +1673,11 @@ async function egoDriverMain(
         blurred: true,
         ok: document.activeElement !== composer && !composer.contains(document.activeElement),
       }
-    })()`)
+    })()`, "before_policy_composer_blur")
+    if (!mutation.performed) {
+      return false
+    }
+    const settled = mutation.value
     if (settled.blurred) {
       await wait(1)
     }
@@ -980,20 +1920,24 @@ async function egoDriverMain(
       }
       if (state.count === 1 && state.expanded === "true") {
         if (state.selectorKind === "composer_pill") {
-          await click('button.__composer-pill[aria-haspopup="menu"]', { label: "close ChatGPT policy menu" })
+          if (!await fencedClick(
+            'button.__composer-pill[aria-haspopup="menu"]',
+            { label: "close ChatGPT policy menu" },
+            "before_policy_menu_close_click",
+          )) return false
         } else {
           const focused = await focusModelPolicyTrigger()
           if (!focused) {
             await wait(1)
             continue
           }
-          await pressKey("ENTER")
+          if (!await fencedPressKey("ENTER", "before_policy_menu_close_key")) return false
         }
         await wait(1)
         continue
       }
       if (state.policyMenuCount > 0 || state.visibleModelChoiceCount > 0) {
-        await pressKey("ESCAPE")
+        if (!await fencedPressKey("ESCAPE", "before_policy_menu_escape")) return false
         await wait(1)
         continue
       }
@@ -1001,7 +1945,11 @@ async function egoDriverMain(
         await wait(1)
         continue
       }
-      await click('#prompt-textarea', { label: "dismiss ChatGPT policy menu" })
+      if (!await fencedClick(
+        '#prompt-textarea',
+        { label: "dismiss ChatGPT policy menu" },
+        "before_policy_menu_composer_dismissal",
+      )) return false
       composerDismissalAttempted = true
       await wait(1)
     }
@@ -1010,7 +1958,7 @@ async function egoDriverMain(
 
   async function focusPolicyMenuItem(ariaLabel) {
     const labelLiteral = JSON.stringify(ariaLabel)
-    return js(String.raw`(() => {
+    const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const items = [...document.querySelectorAll('[role="menuitem"]')]
         .filter(visible)
@@ -1020,7 +1968,8 @@ async function egoDriverMain(
       }
       items[0].focus()
       return document.activeElement === items[0]
-    })()`)
+    })()`, "before_policy_menu_item_focus")
+    return focused.performed && focused.value
   }
 
   async function focusModelChoice(index) {
@@ -1028,7 +1977,7 @@ async function egoDriverMain(
       return false
     }
     const indexLiteral = JSON.stringify(index)
-    return js(String.raw`(() => {
+    const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const choices = [...document.querySelectorAll('[role="menuitemradio"]')]
         .filter(visible)
@@ -1039,7 +1988,8 @@ async function egoDriverMain(
       }
       choices[choiceIndex].focus()
       return document.activeElement === choices[choiceIndex]
-    })()`)
+    })()`, "before_policy_model_choice_focus")
+    return focused.performed && focused.value
   }
 
   async function openModelPolicyState(requireModelChoices = true) {
@@ -1056,13 +2006,19 @@ async function egoDriverMain(
         return { ok: false, reason: "policy_trigger_changed", trigger }
       }
       if (trigger.selectorKind === "composer_pill") {
-        await click('button.__composer-pill[aria-haspopup="menu"]', { label: "open ChatGPT policy menu" })
+        if (!await fencedClick(
+          'button.__composer-pill[aria-haspopup="menu"]',
+          { label: "open ChatGPT policy menu" },
+          "before_policy_menu_open_click",
+        )) return { ok: false, reason: "task_space_fence" }
       } else {
         const focused = await focusModelPolicyTrigger()
         if (!focused) {
           return { ok: false, reason: "policy_trigger_focus", trigger }
         }
-        await pressKey("ENTER")
+        if (!await fencedPressKey("ENTER", "before_policy_menu_open_key")) {
+          return { ok: false, reason: "task_space_fence" }
+        }
       }
       await wait(1)
       const postActivationTrigger = await inspectModelPolicyTrigger()
@@ -1071,7 +2027,11 @@ async function egoDriverMain(
         && postActivationTrigger.count === 1
         && !postActivationTrigger.expanded
       ) {
-        await click('button.__composer-pill[aria-haspopup="menu"]', { label: "retry ChatGPT policy menu" })
+        if (!await fencedClick(
+          'button.__composer-pill[aria-haspopup="menu"]',
+          { label: "retry ChatGPT policy menu" },
+          "before_policy_menu_retry_click",
+        )) return { ok: false, reason: "task_space_fence" }
         await wait(1)
       }
     }
@@ -1085,7 +2045,9 @@ async function egoDriverMain(
       if (!focused) {
         return { ok: false, reason: "policy_model_trigger_focus", state, trigger }
       }
-      await pressKey("ENTER")
+      if (!await fencedPressKey("ENTER", "before_policy_model_choices_key")) {
+        return { ok: false, reason: "task_space_fence" }
+      }
       await wait(1)
       state = await waitForModelPolicyMenu(true)
       if (!state.ok || !state.modelChoicesOpen) {
@@ -1148,7 +2110,9 @@ async function egoDriverMain(
         })
         return null
       }
-      await pressKey("ENTER")
+      if (!await fencedPressKey("ENTER", "before_policy_model_selection_key")) {
+        return null
+      }
       adjusted = true
       await wait(1)
       if (!await closeModelPolicyMenu()) {
@@ -1182,7 +2146,9 @@ async function egoDriverMain(
         return null
       }
       for (let step = currentState.current; step < currentState.maximum; step += 1) {
-        await pressKey("ARROWRIGHT")
+        if (!await fencedPressKey("ARROWRIGHT", "before_policy_power_step")) {
+          return null
+        }
       }
       adjusted = true
       await wait(1)
@@ -1326,7 +2292,17 @@ async function egoDriverMain(
 
   async function selectConversation(binding) {
     if (binding.state === "unbound") {
-      const selected = await selectExactTarget(binding.taskSpaceId, binding.targetId)
+      if (!validTaskSpaceIdentity(binding.taskSpaceIdentity)) {
+        humanRequired("task_space_identity_missing", "The create-once binding has no complete stable task-space identity for continuation.", {
+          taskSpaceId: binding.taskSpaceId,
+        })
+        return null
+      }
+      const selected = await selectExactTarget(
+        binding.taskSpaceId,
+        binding.targetId,
+        binding.taskSpaceIdentity,
+      )
       if (!selected) {
         return null
       }
@@ -1359,7 +2335,9 @@ async function egoDriverMain(
     const tabs = await listTabs()
     const boundTab = tabs.find((candidate) => candidate.targetId === binding.targetId)
     if (boundTab) {
-      await switchTab(boundTab.targetId)
+      if (!await fencedSwitchTab(boundTab.targetId, "immediately_before_tab_switch")) {
+        return null
+      }
       const currentInfo = await pageInfo()
       if (normalizeUrl(currentInfo.url) === expectedUrl) {
         const inspection = await waitForReadyInspection()
@@ -1378,7 +2356,15 @@ async function egoDriverMain(
       }
     }
 
-    const opened = await openOrReuseTab(expectedUrl, { timeout: 30, wait: true })
+    const navigation = await fencedOpenOrReuseTab(
+      expectedUrl,
+      { timeout: 30, wait: true },
+      "immediately_before_navigation",
+    )
+    if (!navigation.performed) {
+      return null
+    }
+    const opened = navigation.value
     const refreshedTabs = await listTabs()
     const activeTab = refreshedTabs.find((candidate) => candidate.targetId === opened?.targetId)
       || refreshedTabs.find((candidate) => candidate.active)
@@ -1389,7 +2375,9 @@ async function egoDriverMain(
       })
       return null
     }
-    await switchTab(activeTab.targetId)
+    if (!await fencedSwitchTab(activeTab.targetId, "immediately_before_tab_switch")) {
+      return null
+    }
     const inspection = await waitForReadyInspection()
     const selected = { inspection, tab: activeTab, targetId: activeTab.targetId, task }
     if (!assertReady(inspection, selected)) {
@@ -1406,14 +2394,23 @@ async function egoDriverMain(
   }
 
   async function preflight() {
-    const task = await useOrCreateTaskSpace(input.taskSpace)
-    const opened = await openOrReuseTab("https://chatgpt.com/", { timeout: 30, wait: true })
+    const task = await selectObservedTaskSpace(input.taskSpace)
+    if (!task) {
+      return
+    }
+    const navigation = await fencedOpenOrReuseTab(
+      "https://chatgpt.com/",
+      { timeout: 30, wait: true },
+      "immediately_before_navigation",
+    )
+    if (!navigation.performed) {
+      return
+    }
+    const opened = navigation.value
     const tabs = await listTabs()
     const activeTab = tabs.find((tab) => tab.active) || opened
     const inspection = await inspectPage()
-    emit({
-      ok: true,
-      result: {
+    await emitSelectedResult({ targetId: activeTab.targetId, task }, {
         accountState: inspection.accountState,
         browserContract: {
           composerCount: inspection.composerCount,
@@ -1428,11 +2425,9 @@ async function egoDriverMain(
         hasComposer: inspection.hasComposer,
         snapshotDigest: inspection.snapshotDigest,
         targetId: activeTab.targetId,
-        taskSpaceId: task.id,
         unexpectedDraft: inspection.unexpectedDraft,
         url: inspection.info.url,
-      },
-    })
+    }, "before_preflight_result")
   }
 
   async function bind() {
@@ -1448,7 +2443,7 @@ async function egoDriverMain(
       if (normalizeUrl(inspection.info.url) !== normalizeUrl(input.startUrl)) {
         humanRequired("create_once_start_url_mismatch", "The exact create-once tab does not match the requested ChatGPT starting URL.", {
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
         })
         return
       }
@@ -1459,16 +2454,12 @@ async function egoDriverMain(
         })
         return
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl: null,
           head: await readConversationHead(),
           snapshotDigest: inspection.snapshotDigest,
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
-        },
-      })
+      }, "before_create_once_binding_result")
       return
     }
 
@@ -1490,23 +2481,19 @@ async function egoDriverMain(
     if (generationRunning) {
       humanRequired("conversation_generation_in_progress", "The canonical conversation is still generating a response.", {
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
+        ...selectedTaskSpaceResult(selected),
       })
       return
     }
     if (!await assertBrokerAuthority("before_head_commit")) {
       return
     }
-    emit({
-      ok: true,
-      result: {
+    await emitSelectedResult(selected, {
         canonicalUrl: normalizeUrl(selected.inspection.info.url),
         head,
         snapshotDigest: selected.inspection.snapshotDigest,
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
-      },
-    })
+    }, "before_existing_binding_result")
   }
 
   async function adopt() {
@@ -1689,7 +2676,7 @@ async function egoDriverMain(
         if (normalizeUrl(finalInspection.info.url) !== canonicalUrl) {
           humanRequired("adoption_url_changed", "The ChatGPT conversation URL changed before adoption completed.", {
             targetId: selected.targetId,
-            taskSpaceId: selected.task.id,
+            ...selectedTaskSpaceResult(selected),
           })
           return
         }
@@ -1738,9 +2725,7 @@ async function egoDriverMain(
         if (!await assertBrokerAuthority("before_head_commit")) {
           return
         }
-        emit({
-          ok: true,
-          result: {
+        await emitSelectedResult(selected, {
             adoptedWhileGenerating,
             anchor: {
               contentDigest: anchor.contentDigest,
@@ -1753,9 +2738,7 @@ async function egoDriverMain(
             responseDigest: finalResponse.contentDigest,
             responseText: finalResponse.text,
             targetId: selected.targetId,
-            taskSpaceId: selected.task.id,
-          },
-        })
+        }, "before_adoption_result")
         return
       }
       await wait(generationRunning ? 5 : 1)
@@ -1772,7 +2755,17 @@ async function egoDriverMain(
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
-    const selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
+    if (!validTaskSpaceIdentity(input.binding.taskSpaceIdentity)) {
+      humanRequired("task_space_identity_missing", "The create-once reconciliation has no complete stable task-space identity.", {
+        taskSpaceId: input.binding.taskSpaceId,
+      })
+      return
+    }
+    const selected = await selectExactTarget(
+      input.binding.taskSpaceId,
+      input.binding.targetId,
+      input.binding.taskSpaceIdentity,
+    )
     if (!selected) {
       return
     }
@@ -1783,7 +2776,7 @@ async function egoDriverMain(
     if (!isCanonicalConversationUrl(inspection.info.url)) {
       humanRequired("reconciliation_url_not_canonical", "The confirmed send still has no canonical ChatGPT conversation URL.", {
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
+        ...selectedTaskSpaceResult(selected),
       })
       return
     }
@@ -1860,18 +2853,14 @@ async function egoDriverMain(
     if (!await assertBrokerAuthority("before_head_commit")) {
       return
     }
-    emit({
-      ok: true,
-      result: {
+    await emitSelectedResult(selected, {
         canonicalUrl: normalizeUrl(inspection.info.url),
         head: stableHead,
         responseDigest: stableResponse.contentDigest,
         responseText: stableResponse.text,
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
         turnMarker: input.turnMarker,
-      },
-    })
+    }, "before_create_once_reconciliation_result")
   }
 
   async function reconcileBound() {
@@ -1980,28 +2969,24 @@ async function egoDriverMain(
               promptMessageIdMatches: pendingPrompt?.messageId === input.promptMessageId,
               renderedMarkerCount: pendingRenderedMarkerCount,
               targetId: selected.targetId,
-              taskSpaceId: selected.task.id,
+              ...selectedTaskSpaceResult(selected),
             })
             return
           }
-          emit({
-            ok: true,
-            result: {
+          await emitSelectedResult(selected, {
               canonicalUrl: normalizeUrl(pendingInfo.url),
               captureReason: "generation_running",
               captureState: "pending",
               generationRunning: true,
               promptMessageId: pendingPrompt.messageId,
               targetId: selected.targetId,
-              taskSpaceId: selected.task.id,
               turnMarker: input.turnMarker,
-            },
-          })
+          }, "before_pending_generation_result")
           return
         }
         humanRequired("completion_timeout_after_confirmed_send", "The confirmed prompt is still generating after the broker-owned generation deadline.", {
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
           turnMarker: input.turnMarker,
         })
         return
@@ -2079,23 +3064,19 @@ async function egoDriverMain(
       if (normalizeUrl(pendingInfo.url) !== normalizeUrl(expectedCanonicalUrl)) {
         humanRequired("reconciliation_url_mismatch", "The incomplete response moved away from the bound canonical conversation.", {
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
         })
         return
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl: normalizeUrl(pendingInfo.url),
           captureReason: "response_not_terminal",
           captureState: "pending",
           generationRunning: false,
           promptMessageId: prompt.messageId,
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
           turnMarker: input.turnMarker,
-        },
-      })
+      }, "before_pending_terminal_result")
       return
     }
     const deliveryAbsentCandidate = (
@@ -2140,17 +3121,13 @@ async function egoDriverMain(
       if (!await assertBrokerAuthority("before_absent_delivery_reconciliation")) {
         return
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl: normalizeUrl(inspection.info.url),
           deliveryState: "absent",
           head: stableHead,
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
           turnMarker: input.turnMarker,
-        },
-      })
+      }, "before_delivery_absence_result")
       return
     }
     const attributablePair = (
@@ -2182,7 +3159,7 @@ async function egoDriverMain(
         responseEndsWithTerminal,
         responseRole: response?.role ?? null,
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
+        ...selectedTaskSpaceResult(selected),
         terminalCount: Number.isInteger(terminalCount) ? terminalCount : null,
       })
       return
@@ -2222,18 +3199,14 @@ async function egoDriverMain(
     if (!await assertBrokerAuthority("before_head_commit")) {
       return
     }
-    emit({
-      ok: true,
-      result: {
+    await emitSelectedResult(selected, {
         canonicalUrl: normalizeUrl(inspection.info.url),
         head: stableHead,
         responseDigest: response.contentDigest,
         responseText: response.text,
         targetId: selected.targetId,
-        taskSpaceId: selected.task.id,
         turnMarker: input.turnMarker,
-      },
-    })
+    }, "before_bound_reconciliation_result")
   }
 
   async function exchange() {
@@ -2273,7 +3246,7 @@ async function egoDriverMain(
       if (!input.binding.headFingerprint) {
         humanRequired("head_checkpoint_required", "The bound conversation needs an explicit head checkpoint before sending.", {
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
         })
         return
       }
@@ -2284,7 +3257,7 @@ async function egoDriverMain(
         if (stabilized.state === "unstable") {
           humanRequired("conversation_head_unstable", "The bound conversation head did not stabilize after navigation.", {
             targetId: selected.targetId,
-            taskSpaceId: selected.task.id,
+            ...selectedTaskSpaceResult(selected),
           })
           return
         }
@@ -2335,7 +3308,7 @@ async function egoDriverMain(
       if (stabilized.state === "unstable") {
         humanRequired("conversation_head_unstable", "The bound conversation head changed unstably while the ChatGPT model policy was being verified.", {
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
         })
         return
       }
@@ -2343,7 +3316,7 @@ async function egoDriverMain(
         humanRequired("conversation_head_changed", "The bound conversation head changed while the ChatGPT model policy was being verified.", {
           headChange: headChangeEvidence(input.binding, preComposeHead),
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
+          ...selectedTaskSpaceResult(selected),
         })
         return
       }
@@ -2432,7 +3405,12 @@ async function egoDriverMain(
     }
 
     driverStage = "composing_prompt"
-    await composePrompt(input.prompt)
+    if (!await revalidateSelectedTaskSpace(selectedTaskSpaceEvidence, "before_composition")) {
+      return
+    }
+    if (!await composePrompt(input.prompt)) {
+      return
+    }
     driverStage = "verifying_composed_prompt"
     const composedPrompt = await inspectComposedPrompt()
     if (!composedPromptIsExact(composedPrompt)) {
@@ -2514,26 +3492,28 @@ async function egoDriverMain(
       await clearUnsentComposerDraft()
       return
     }
+    if (!await revalidateSelectedTaskSpace(selectedTaskSpaceEvidence, "before_send_click")) {
+      await clearUnsentComposerDraft()
+      return
+    }
 
     driverStage = "dispatching_send_click"
     sendClickStarted = true
     const sentAt = Date.now()
-    // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
-    await cdp("Input.dispatchMouseEvent", {
+    if (!await fencedCdp("Input.dispatchMouseEvent", {
       button: "left",
       clickCount: 1,
       type: "mousePressed",
       x: sendTarget.x,
       y: sendTarget.y,
-    })
-    // eslint-disable-next-line no-undef -- cdp is injected by the ego-browser runtime.
-    await cdp("Input.dispatchMouseEvent", {
+    }, "before_send_mouse_press")) return
+    if (!await fencedCdp("Input.dispatchMouseEvent", {
       button: "left",
       clickCount: 1,
       type: "mouseReleased",
       x: sendTarget.x,
       y: sendTarget.y,
-    })
+    }, "before_send_mouse_release")) return
     driverStage = "confirming_send"
     let sendConfirmation = null
     const sendConfirmationDeadline = Date.now() + 30_000
@@ -2626,19 +3606,15 @@ async function egoDriverMain(
         })
         return
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl,
           modelPolicy,
           promptMessageId: markedUsers[0].messageId,
           sentAt: new Date(sentAt).toISOString(),
           targetId: selected.targetId,
           ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
-          taskSpaceId: selected.task.id,
           turnMarker: input.turnMarker,
-        },
-      })
+      }, "before_send_confirmation_result")
       return
     }
 
@@ -2771,9 +3747,7 @@ async function egoDriverMain(
           })
           return
         }
-        emit({
-          ok: true,
-          result: {
+        await emitSelectedResult(selected, {
             canonicalUrl: normalizeUrl(finishedInfo.url),
             durationMs: Date.now() - sentAt,
             head: finishedHead,
@@ -2782,10 +3756,8 @@ async function egoDriverMain(
             responseText: stableText,
             targetId: selected.targetId,
             ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
-            taskSpaceId: selected.task.id,
             turnMarker: input.turnMarker,
-          },
-        })
+        }, "before_exchange_capture_result")
         return
       }
       await wait(5)
@@ -2827,7 +3799,13 @@ async function egoDriverMain(
         return
       }
       const modelPolicy = await ensureMaximumModelPolicy(selected)
-      if (modelPolicy) {
+      const finalTaskSpace = modelPolicy
+        ? await revalidateSelectedTaskSpace({
+            taskSpaceId: selected.task.id,
+            taskSpaceIdentity: taskSpaceIdentity(selected.task),
+          }, "before_model_policy_result")
+        : null
+      if (modelPolicy && finalTaskSpace && assertBrokerAuthoritySync("before_model_policy_result")) {
         emit({ ok: true, result: modelPolicy })
       }
     } else if (input.mode === "reconcile") {
@@ -2925,16 +3903,12 @@ async function egoDriverMain(
       if (!await assertBrokerAuthority("before_reanchor_capture")) {
         return
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl: normalizeUrl(finalInspection.info.url),
           head: finalHead,
           headChange: headChangeEvidence(input.binding, finalHead),
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
-        },
-      })
+      }, "before_reanchor_result")
     } else if (input.mode === "verify") {
       const selected = await selectConversation(input.binding)
       if (!selected) {
@@ -2972,15 +3946,11 @@ async function egoDriverMain(
           return
         }
       }
-      emit({
-        ok: true,
-        result: {
+      await emitSelectedResult(selected, {
           canonicalUrl: normalizeUrl(selected.inspection.info.url),
           head,
           targetId: selected.targetId,
-          taskSpaceId: selected.task.id,
-        },
-      })
+      }, "before_verify_result")
     } else {
       throw new Error("Unsupported driver mode")
     }
