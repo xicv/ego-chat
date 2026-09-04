@@ -1633,9 +1633,14 @@ async function egoDriverMain(
           } else if (/^save(?: this)? image$/i.test(label) || /^save$/i.test(label)) {
             visibleActions.add('SAVE_IMAGE')
             normalSaveControlCount += 1
-            saveAssociations.push(
-              control.id || artifact.dom_wrapper_id + ':save:' + saveAssociations.length,
-            )
+            const controlId = control.id
+              || artifact.dom_wrapper_id + ':save-control:' + saveAssociations.length
+            saveAssociations.push({
+              association_id: controlId,
+              control_id: controlId,
+              dom_attachment_id: artifact.dom_wrapper_id,
+              graph_attachment_id: artifact.graph_attachment_id,
+            })
           } else if (/^download(?: this)? image$/i.test(label) || /^download$/i.test(label)) {
             visibleActions.add('DOWNLOAD_IMAGE')
             normalDownloadControlCount += 1
@@ -1761,7 +1766,7 @@ async function egoDriverMain(
         && generatedImageCount === 1
         && normalSaveControlCount === 1
         && saveAssociations.length === 1
-      ) ? saveAssociations[0] : null
+      ) ? saveAssociations[0].association_id : null
       return {
         artifacts: artifacts.slice(0, maximumItems),
         asset_pointer_state: pointerPresent ? 'PRESENT_NON_CONTROL' : 'ABSENT',
@@ -1790,6 +1795,7 @@ async function egoDriverMain(
           ? null
           : reactSaveDownloadPropCount,
         response_message_id: selectedTurn?.turn?.id || null,
+        save_association_candidates: saveAssociations.slice(0, maximumItems),
         save_association_id: saveAssociationId,
         selected_branch_id: selectedTurn?.turn?.id || null,
         total_artifact_count: artifacts.length <= maximumItems ? artifacts.length : null,

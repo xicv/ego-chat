@@ -105,7 +105,7 @@ function attachmentObservationJournalEntry(
       })),
       normal_download_control_count: observation.normal_download_control_count,
       normal_save_control_count: observation.normal_save_control_count,
-      save_association_id: observation.save_association_id,
+      save_association_candidates: observation.save_association_candidates,
     })),
     graph_snapshot_sha256: sha256Hex(canonicalJsonBytes(observation)),
     reason: "OBSERVATION_RECORDED",
@@ -412,6 +412,10 @@ function validateAttachmentEvidenceState(state) {
       || intent.state !== "RESERVED"
       || intent.live_reservation_bytes !== ATTACHMENT_EVIDENCE_RESERVATION_BYTES
       || intent.permanent_reservation_bytes !== ATTACHMENT_PERMANENT_RESERVATION_BYTES
+      || !exactTimestamp(intent.created_at)
+      || !exactTimestamp(intent.send_resolution_deadline_at)
+      || Date.parse(intent.send_resolution_deadline_at) - Date.parse(intent.created_at)
+        !== 10 * 60 * 1_000
       || entry?.source_workflow_id !== workflowId
       || entry.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
       || entry.state !== (tombstones[workflowId] ? "CONSUMED_RELEASED" : "RESERVED")
@@ -1801,6 +1805,10 @@ export class EventStore {
       || intent.source_operation_key_sha256 !== operationKeyDigest(workflow.operationKey)
       || intent.live_reservation_bytes !== ATTACHMENT_EVIDENCE_RESERVATION_BYTES
       || intent.permanent_reservation_bytes !== ATTACHMENT_PERMANENT_RESERVATION_BYTES
+      || !exactTimestamp(intent.created_at)
+      || !exactTimestamp(intent.send_resolution_deadline_at)
+      || Date.parse(intent.send_resolution_deadline_at) - Date.parse(intent.created_at)
+        !== 10 * 60 * 1_000
       || intent.state !== "RESERVED"
       || sha256Hex(canonicalJsonBytes(intent)) !== intentDigest
     ) {

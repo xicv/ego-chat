@@ -2746,6 +2746,7 @@ test("attachment capture emits only one closed read-only observation for the con
     }],
     react_save_download_prop_count: 0,
     response_message_id: "response-1",
+    save_association_candidates: [],
     save_association_id: null,
     selected_branch_id: "response-1",
     total_artifact_count: 1,

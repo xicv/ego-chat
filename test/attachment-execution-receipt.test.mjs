@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  buildAttachmentEvidenceCapture,
   attachmentCaptureOperationKeyDigest,
   buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
@@ -62,6 +63,12 @@ function observation(overrides = {}) {
     provider_prompt_message_id: "prompt-1",
     react_save_download_prop_count: 0,
     response_message_id: "response-1",
+    save_association_candidates: [{
+      association_id: "save-association-1",
+      control_id: "save-control-1",
+      dom_attachment_id: "dom-image-1",
+      graph_attachment_id: "graph-image-1",
+    }],
     save_association_id: "save-association-1",
     schema: "ego-chat-attachment-graph-observation/v1",
     selected_branch_id: "branch-1",
@@ -98,6 +105,7 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
   assert.deepEqual(outcome({
     asset_pointer_state: "PRESENT_NON_CONTROL",
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
   }), {
@@ -106,6 +114,20 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
   })
   assert.deepEqual(outcome({
     normal_save_control_count: 2,
+    save_association_candidates: [
+      {
+        association_id: "save-association-1",
+        control_id: "save-control-1",
+        dom_attachment_id: "dom-image-1",
+        graph_attachment_id: "graph-image-1",
+      },
+      {
+        association_id: "save-association-2",
+        control_id: "save-control-2",
+        dom_attachment_id: "dom-image-1",
+        graph_attachment_id: "graph-image-1",
+      },
+    ],
     save_association_id: null,
   }), {
     outcome: "UNKNOWN",
@@ -115,6 +137,7 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
     direct_branch_ids: ["branch-1", "branch-2"],
     direct_response_branch_count: 2,
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
   }), {
@@ -125,6 +148,7 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
     artifacts: [imageArtifact("image-1"), imageArtifact("image-2")],
     generated_image_artifact_count: 2,
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     total_artifact_count: 2,
     visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
@@ -144,6 +168,7 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
     artifacts: [],
     generated_image_artifact_count: 0,
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     total_artifact_count: 0,
     visible_attachment_actions: [],
@@ -156,6 +181,7 @@ test("stable attachment evidence classifies exact, unsupported-Save, multiple, a
     generated_image_artifact_count: 0,
     non_image_artifact_count: 1,
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     visible_attachment_actions: [],
   }), {
@@ -204,13 +230,28 @@ test("save-action conflicts are ambiguous and nullable canonical evidence is sta
     canonicalJsonBytes({ enabled: true, missing: null }).toString("utf8"),
     '{"enabled":true,"missing":null}',
   )
+  assert.deepEqual(outcome({
+    save_association_candidates: [{
+      association_id: "save-association-1",
+      control_id: "save-control-1",
+      dom_attachment_id: "dom-wrong",
+      graph_attachment_id: "graph-image-1",
+    }],
+  }), {
+    outcome: "UNKNOWN",
+    reason: "AMBIGUOUS_SAVE_ASSOCIATION",
+  })
 })
 
 test("stable-pair identity includes action, wrapper, control, and pointer evidence", () => {
   for (const finalPatch of [
     { visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"] },
     { asset_pointer_state: "PRESENT_NON_CONTROL" },
-    { normal_save_control_count: 0, save_association_id: null },
+    {
+      normal_save_control_count: 0,
+      save_association_candidates: [],
+      save_association_id: null,
+    },
     { artifacts: [{ ...imageArtifact(), dom_wrapper_id: "dom-drift" }] },
   ]) {
     const observations = stablePair()
@@ -246,6 +287,7 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
   const observations = stablePair({
     asset_pointer_state: "PRESENT_NON_CONTROL",
     normal_save_control_count: 0,
+    save_association_candidates: [],
     save_association_id: null,
     visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
   })
@@ -263,10 +305,20 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
     current.source_confirmed_send_identity_sha256 = confirmedSendIdentityDigest
   }
   const captureOperation = {
+    accumulated_monotonic_ms: 1_000,
+    attempt_journal: [],
+    candidate_generation: 2,
+    candidate_observations: observations,
+    candidate_pair_count: 1,
+    capture_deadline_at: "2026-09-04T05:10:00.000Z",
     capture_operation_key_sha256: captureOperationKeySha256,
     capture_started_at: "2026-09-04T05:00:00.000Z",
     confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+    schema: "ego-chat-attachment-capture-operation/v1",
     source_workflow_id: "workflow-1",
+    state: "CAPTURING",
+    terminal_disposition_sha256: null,
+    terminal_envelope_sha256: null,
   }
   const confirmedSendIdentity = {
       consumer_signer_authorization_sha256: "d".repeat(64),
@@ -295,10 +347,31 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
   assert.equal(disposition.first_stable_observation_at, observations[0].observed_at)
   assert.equal(disposition.final_stable_observation_at, observations[1].observed_at)
   assert.equal(disposition.capture_operation_key_sha256, captureOperationKeySha256)
+  assert.match(disposition.capture_evidence_projection_sha256, /^[a-f0-9]{64}$/)
   assert.match(disposition.stable_observation_sha256, /^[a-f0-9]{64}$/)
 
+  const publicCapture = buildAttachmentEvidenceCapture({
+    ...captureOperation,
+    state: "TERMINAL",
+    terminal_disposition_sha256: "4".repeat(64),
+    terminal_envelope_sha256: "5".repeat(64),
+  })
+  assert.equal(publicCapture.state, "TERMINAL")
+  assert.equal(publicCapture.candidate_observations.length, 2)
+  assert.deepEqual(
+    publicCapture.candidate_observations[0].save_association_candidates,
+    observations[0].save_association_candidates,
+  )
+
+  const exhaustedCapture = {
+    ...captureOperation,
+    candidate_generation: 0,
+    candidate_observations: [],
+    candidate_pair_count: 0,
+  }
+
   const exhausted = buildAttachmentExecutionDisposition({
-    captureOperation,
+    captureOperation: exhaustedCapture,
     confirmedSendIdentity,
     confirmedSendIdentityDigest,
     observations: [],

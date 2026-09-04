@@ -135,6 +135,7 @@ test("receipt signer enrollment is create-once and qualification verifies human 
 
   const disposition = {
     authority_domain: "attachment-observation-only",
+    capture_evidence_projection_sha256: "e".repeat(64),
     capture_operation_key_sha256: "a".repeat(64),
     capture_runtime_identity_sha256: sha256Hex(canonicalJsonBytes(qualification.runtimeIdentity)),
     consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),

@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util"
 import { EgoChatError } from "./errors.mjs"
 import {
   buildAttachmentCaptureIntent,
+  buildAttachmentEvidenceCapture,
   buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   classifyAttachmentExecutionObservations,
@@ -1686,7 +1687,7 @@ export class Broker {
             evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
           }
         : {}),
-      capture,
+      capture: buildAttachmentEvidenceCapture(capture),
       confirmed_send_event: confirmedSendEvent,
       confirmed_send_identity: confirmedSendIdentity,
       disposition_envelope: dispositionEnvelope,
@@ -1757,10 +1758,15 @@ export class Broker {
     const identity = this.#store.getConfirmedSendIdentity(capture.source_workflow_id)
     const identityDigest = sha256Hex(canonicalJsonBytes(identity))
     const finalObservedAt = capture.candidate_observations.at(-1)?.observed_at
-    const terminalAt = new Date(Math.max(
+    const observedTerminalMs = Math.max(
       Date.now(),
       finalObservedAt ? Date.parse(finalObservedAt) : Date.parse(capture.capture_started_at),
-    )).toISOString()
+    )
+    const terminalAt = new Date(
+      terminalReason === "CAPTURE_DEADLINE_EXPIRED"
+        ? Math.min(Date.parse(capture.capture_deadline_at), observedTerminalMs)
+        : observedTerminalMs,
+    ).toISOString()
     const disposition = buildAttachmentExecutionDisposition({
       captureOperation: capture,
       confirmedSendIdentity: identity,

@@ -124,6 +124,7 @@ function attachmentGraphObservation({
     provider_prompt_message_id: "prompt-confirmed",
     react_save_download_prop_count: 0,
     response_message_id: "response-1",
+    save_association_candidates: [],
     save_association_id: null,
     schema: "ego-chat-attachment-graph-observation/v1",
     selected_branch_id: "response-1",
