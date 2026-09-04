@@ -470,6 +470,7 @@ export function classifyAttachmentExecutionObservations(observations) {
 }
 
 function isDeepStrictKeySet(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const keys = Object.keys(value).sort()
   return keys.length === expectedKeys.length
     && keys.every((key, index) => key === expectedKeys[index])
@@ -487,9 +488,15 @@ export function operationKeyDigest(operationKey) {
 }
 
 export function attachmentCaptureOperationKeyDigest(confirmedSendIdentityDigest) {
+  if (!SHA256_PATTERN.test(confirmedSendIdentityDigest)) {
+    throw new EgoChatError(
+      "invalid_attachment_capture_operation",
+      "Confirmed Send identity digest is invalid.",
+    )
+  }
   return sha256Hex(Buffer.concat([
-    Buffer.from("EGO_CHAT_ATTACHMENT_CAPTURE_OPERATION_V1\0", "ascii"),
-    Buffer.from(confirmedSendIdentityDigest, "ascii"),
+    Buffer.from("EGO_CHAT_ATTACHMENT_CAPTURE_V1\0", "ascii"),
+    Buffer.from(confirmedSendIdentityDigest, "hex"),
   ]))
 }
 
@@ -615,4 +622,327 @@ export function buildConfirmedSendIdentity({ intent, intentDigest, sequence, sen
     },
     identity,
   }
+}
+
+const ATTACHMENT_DISPOSITION_KEYS = [
+  "authority_domain",
+  "capture_operation_key_sha256",
+  "capture_runtime_identity_sha256",
+  "consumer_signer_authorization_sha256",
+  "direct_response_branch_count",
+  "external_binding_sha256",
+  "final_stable_observation_at",
+  "first_stable_observation_at",
+  "generated_image_artifact_count",
+  "media_type",
+  "non_image_artifact_count",
+  "normal_download_control_count",
+  "normal_save_control_count",
+  "outcome",
+  "qualified_runtime_identity",
+  "reason",
+  "receipt",
+  "save_association_id",
+  "schema",
+  "signature_input_domain",
+  "signer_enrollment_sha256",
+  "signer_key_id",
+  "source_confirmed_send_identity_sha256",
+  "stable_observation_count",
+  "stable_observation_sha256",
+  "terminal_at",
+  "total_artifact_count",
+  "unclassified_artifact_count",
+].sort()
+const ATTACHMENT_RECEIPT_KEYS = [
+  "attachment_kind",
+  "branch_id",
+  "canonical_conversation_locator_sha256",
+  "capture_operation_key_sha256",
+  "capture_runtime_identity_sha256",
+  "dom_attachment_id",
+  "external_binding_sha256",
+  "final_stable_observation_at",
+  "first_stable_observation_at",
+  "graph_attachment_id",
+  "normalized_complete_graph_sha256",
+  "response_message_id",
+  "save_association_id",
+  "schema",
+  "source_confirmed_send_identity_sha256",
+  "stable_observation_count",
+].sort()
+const RUNTIME_IDENTITY_KEYS = [
+  "executable_sha256",
+  "implementation_git_sha",
+  "package_inventory_sha256",
+  "runtime_identity_sha256",
+].sort()
+const ATTACHMENT_UNKNOWN_REASONS = new Set([
+  "AMBIGUOUS_SAVE_ASSOCIATION",
+  "CAPTURE_ATTEMPT_LIMIT",
+  "CAPTURE_DEADLINE_EXPIRED",
+  "GENERATION_ACTIVE",
+  "HYDRATION_PENDING",
+  "INCOHERENT_COUNTS",
+  "INCOMPLETE_GRAPH",
+  "TRUNCATED_GRAPH",
+  "UNCLASSIFIED_ARTIFACT",
+  "UNSTABLE_EVIDENCE",
+  "UNSUPPORTED_EVIDENCE",
+  "UNSUPPORTED_SAVE_ASSOCIATION",
+])
+
+function exactTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : Number.NaN
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+}
+
+function validRuntimeIdentity(value) {
+  if (!isDeepStrictKeySet(value, RUNTIME_IDENTITY_KEYS)) return false
+  const projection = {
+    executable_sha256: value.executable_sha256,
+    implementation_git_sha: value.implementation_git_sha,
+    package_inventory_sha256: value.package_inventory_sha256,
+  }
+  return SHA256_PATTERN.test(value.executable_sha256)
+    && /^[a-f0-9]{40,64}$/.test(value.implementation_git_sha)
+    && SHA256_PATTERN.test(value.package_inventory_sha256)
+    && value.runtime_identity_sha256 === sha256Hex(canonicalJsonBytes(projection))
+}
+
+function validPositiveReceipt(receipt, disposition) {
+  if (!isDeepStrictKeySet(receipt, ATTACHMENT_RECEIPT_KEYS)) return false
+  return receipt.schema === "ego-chat-attachment-execution-receipt/v1"
+    && receipt.attachment_kind === "GENERATED_IMAGE"
+    && isBoundedOpaqueId(receipt.branch_id)
+    && isBoundedOpaqueId(receipt.response_message_id)
+    && isBoundedOpaqueId(receipt.graph_attachment_id)
+    && isBoundedOpaqueId(receipt.dom_attachment_id)
+    && isBoundedOpaqueId(receipt.save_association_id)
+    && SHA256_PATTERN.test(receipt.canonical_conversation_locator_sha256)
+    && SHA256_PATTERN.test(receipt.normalized_complete_graph_sha256)
+    && receipt.capture_operation_key_sha256 === disposition.capture_operation_key_sha256
+    && receipt.capture_runtime_identity_sha256 === disposition.capture_runtime_identity_sha256
+    && receipt.external_binding_sha256 === disposition.external_binding_sha256
+    && receipt.first_stable_observation_at === disposition.first_stable_observation_at
+    && receipt.final_stable_observation_at === disposition.final_stable_observation_at
+    && receipt.save_association_id === disposition.save_association_id
+    && receipt.normalized_complete_graph_sha256 === disposition.stable_observation_sha256
+    && receipt.source_confirmed_send_identity_sha256
+      === disposition.source_confirmed_send_identity_sha256
+    && receipt.stable_observation_count === 2
+}
+
+export function assertValidAttachmentExecutionDisposition(disposition) {
+  const counts = [
+    disposition?.direct_response_branch_count,
+    disposition?.total_artifact_count,
+    disposition?.generated_image_artifact_count,
+    disposition?.non_image_artifact_count,
+    disposition?.unclassified_artifact_count,
+    disposition?.normal_save_control_count,
+    disposition?.normal_download_control_count,
+  ]
+  if (
+    !isDeepStrictKeySet(disposition, ATTACHMENT_DISPOSITION_KEYS)
+    || disposition.schema !== "ego-chat-attachment-execution-disposition/v1"
+    || disposition.media_type
+      !== "application/vnd.ego-chat.attachment-execution-disposition.v1+jcs"
+    || disposition.signature_input_domain !== "EGO_CHAT_ATTACHMENT_EXECUTION_DISPOSITION_V1"
+    || disposition.authority_domain !== "attachment-observation-only"
+    || !SHA256_PATTERN.test(disposition.capture_operation_key_sha256)
+    || !SHA256_PATTERN.test(disposition.capture_runtime_identity_sha256)
+    || !SHA256_PATTERN.test(disposition.consumer_signer_authorization_sha256)
+    || !SHA256_PATTERN.test(disposition.signer_enrollment_sha256)
+    || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(disposition.signer_key_id)
+    || !SHA256_PATTERN.test(disposition.source_confirmed_send_identity_sha256)
+    || !SHA256_PATTERN.test(disposition.stable_observation_sha256)
+    || !(disposition.external_binding_sha256 === null
+      || SHA256_PATTERN.test(disposition.external_binding_sha256))
+    || !validRuntimeIdentity(disposition.qualified_runtime_identity)
+    || disposition.capture_runtime_identity_sha256
+      !== disposition.qualified_runtime_identity.runtime_identity_sha256
+    || !exactTimestamp(disposition.first_stable_observation_at)
+    || !exactTimestamp(disposition.final_stable_observation_at)
+    || !exactTimestamp(disposition.terminal_at)
+    || Date.parse(disposition.first_stable_observation_at)
+      > Date.parse(disposition.final_stable_observation_at)
+    || Date.parse(disposition.final_stable_observation_at) > Date.parse(disposition.terminal_at)
+    || disposition.stable_observation_count !== 2
+    || !isNullableOpaqueId(disposition.save_association_id)
+    || counts.some((value) => !isCount(value))
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "The attachment execution disposition is outside its closed evidence schema.",
+    )
+  }
+  const nonNullArtifactCounts = counts.slice(1, 5)
+  if (
+    nonNullArtifactCounts.every((value) => value !== null)
+    && disposition.total_artifact_count
+      !== disposition.generated_image_artifact_count
+        + disposition.non_image_artifact_count
+        + disposition.unclassified_artifact_count
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "The attachment execution disposition has incoherent artifact counts.",
+    )
+  }
+  if (disposition.outcome === "EXACTLY_ONE") {
+    if (
+      disposition.reason !== "EXACTLY_ONE_SUPPORTED"
+      || disposition.direct_response_branch_count !== 1
+      || disposition.total_artifact_count !== 1
+      || disposition.generated_image_artifact_count !== 1
+      || disposition.non_image_artifact_count !== 0
+      || disposition.unclassified_artifact_count !== 0
+      || disposition.normal_save_control_count !== 1
+      || !isBoundedOpaqueId(disposition.save_association_id)
+      || !validPositiveReceipt(disposition.receipt, disposition)
+    ) {
+      throw new EgoChatError(
+        "invalid_attachment_disposition",
+        "The positive attachment execution disposition is incomplete.",
+      )
+    }
+  } else if (disposition.outcome === "MULTIPLE") {
+    const reasonMatchesCounts = (
+      disposition.reason === "MULTIPLE_RESPONSE_BRANCHES"
+        ? disposition.direct_response_branch_count > 1
+        : disposition.reason === "MULTIPLE_GENERATED_IMAGES"
+          ? disposition.generated_image_artifact_count > 1
+          : disposition.reason === "MULTIPLE_TOTAL_ARTIFACTS"
+            ? disposition.generated_image_artifact_count === 1
+              && disposition.total_artifact_count > 1
+            : false
+    )
+    if (
+      !reasonMatchesCounts
+      || counts.slice(0, 5).includes(null)
+      || disposition.receipt !== null
+      || disposition.save_association_id !== null
+    ) {
+      throw new EgoChatError(
+        "invalid_attachment_disposition",
+        "The multiple attachment execution disposition is inconsistent.",
+      )
+    }
+  } else if (disposition.outcome === "ZERO") {
+    if (
+      disposition.reason !== "ZERO_GENERATED_IMAGES"
+      || disposition.direct_response_branch_count === null
+      || disposition.direct_response_branch_count > 1
+      || counts.slice(1, 5).includes(null)
+      || disposition.generated_image_artifact_count !== 0
+      || disposition.unclassified_artifact_count !== 0
+      || disposition.normal_save_control_count !== 0
+      || disposition.receipt !== null
+      || disposition.save_association_id !== null
+    ) {
+      throw new EgoChatError(
+        "invalid_attachment_disposition",
+        "The zero attachment execution disposition is inconsistent.",
+      )
+    }
+  } else if (
+    disposition.outcome !== "UNKNOWN"
+    || disposition.receipt !== null
+    || disposition.save_association_id !== null
+    || !ATTACHMENT_UNKNOWN_REASONS.has(disposition.reason)
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "The nonpositive attachment execution disposition is inconsistent.",
+    )
+  }
+  return disposition
+}
+
+export function buildAttachmentExecutionDisposition({
+  captureOperation,
+  confirmedSendIdentity,
+  confirmedSendIdentityDigest,
+  observations,
+  terminalAt,
+}) {
+  if (
+    captureOperation?.source_workflow_id !== confirmedSendIdentity?.source_workflow_id
+    || captureOperation?.confirmed_send_identity_sha256 !== confirmedSendIdentityDigest
+    || captureOperation?.capture_operation_key_sha256
+      !== attachmentCaptureOperationKeyDigest(confirmedSendIdentityDigest)
+    || observations?.some((observation) => (
+      observation.source_confirmed_send_identity_sha256 !== confirmedSendIdentityDigest
+      || observation.capture_operation_key_sha256
+        !== captureOperation.capture_operation_key_sha256
+    ))
+  ) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "The disposition lineage does not match its confirmed Send.",
+    )
+  }
+  const classification = classifyAttachmentExecutionObservations(observations)
+  const [first, final] = observations
+  const stableProjection = stableObservationProjection(final)
+  const graphDigest = sha256Hex(canonicalJsonBytes(stableProjection))
+  const runtimeIdentity = confirmedSendIdentity.qualified_runtime_identity
+  const artifact = classification.outcome === "EXACTLY_ONE" ? final.artifacts[0] : null
+  const receipt = artifact
+    ? {
+        attachment_kind: "GENERATED_IMAGE",
+        branch_id: final.selected_branch_id,
+        canonical_conversation_locator_sha256:
+          final.canonical_conversation_locator_sha256,
+        capture_operation_key_sha256: captureOperation.capture_operation_key_sha256,
+        capture_runtime_identity_sha256: runtimeIdentity.runtime_identity_sha256,
+        dom_attachment_id: artifact.dom_wrapper_id,
+        external_binding_sha256: confirmedSendIdentity.external_binding_sha256 ?? null,
+        final_stable_observation_at: final.observed_at,
+        first_stable_observation_at: first.observed_at,
+        graph_attachment_id: artifact.graph_attachment_id,
+        normalized_complete_graph_sha256: graphDigest,
+        response_message_id: final.response_message_id,
+        save_association_id: final.save_association_id,
+        schema: "ego-chat-attachment-execution-receipt/v1",
+        source_confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+        stable_observation_count: 2,
+      }
+    : null
+  const disposition = {
+    authority_domain: "attachment-observation-only",
+    capture_operation_key_sha256: captureOperation.capture_operation_key_sha256,
+    capture_runtime_identity_sha256: runtimeIdentity.runtime_identity_sha256,
+    consumer_signer_authorization_sha256:
+      confirmedSendIdentity.consumer_signer_authorization_sha256,
+    direct_response_branch_count: final.direct_response_branch_count,
+    external_binding_sha256: confirmedSendIdentity.external_binding_sha256 ?? null,
+    final_stable_observation_at: final.observed_at,
+    first_stable_observation_at: first.observed_at,
+    generated_image_artifact_count: final.generated_image_artifact_count,
+    media_type: "application/vnd.ego-chat.attachment-execution-disposition.v1+jcs",
+    non_image_artifact_count: final.non_image_artifact_count,
+    normal_download_control_count: final.normal_download_control_count,
+    normal_save_control_count: final.normal_save_control_count,
+    outcome: classification.outcome,
+    qualified_runtime_identity: runtimeIdentity,
+    reason: classification.reason,
+    receipt,
+    save_association_id: classification.outcome === "EXACTLY_ONE"
+      ? final.save_association_id
+      : null,
+    schema: "ego-chat-attachment-execution-disposition/v1",
+    signature_input_domain: "EGO_CHAT_ATTACHMENT_EXECUTION_DISPOSITION_V1",
+    signer_enrollment_sha256: confirmedSendIdentity.signer_enrollment_sha256,
+    signer_key_id: confirmedSendIdentity.signer_key_id,
+    source_confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+    stable_observation_count: 2,
+    stable_observation_sha256: graphDigest,
+    terminal_at: terminalAt,
+    total_artifact_count: final.total_artifact_count,
+    unclassified_artifact_count: final.unclassified_artifact_count,
+  }
+  return assertValidAttachmentExecutionDisposition(disposition)
 }

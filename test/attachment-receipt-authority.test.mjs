@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { generateKeyPairSync, sign } from "node:crypto"
+import { createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -131,6 +131,77 @@ test("receipt signer enrollment is create-once and qualification verifies human 
     implementation_git_sha: runtime.manifest.implementation_git_sha,
     package_inventory_sha256: runtime.manifest.package_inventory_sha256,
   })
+
+  const disposition = {
+    authority_domain: "attachment-observation-only",
+    capture_operation_key_sha256: "a".repeat(64),
+    capture_runtime_identity_sha256: sha256Hex(canonicalJsonBytes(qualification.runtimeIdentity)),
+    consumer_signer_authorization_sha256: sha256Hex(authorizationBytes),
+    direct_response_branch_count: 1,
+    external_binding_sha256: "b".repeat(64),
+    final_stable_observation_at: "2026-09-04T04:59:59.000Z",
+    first_stable_observation_at: "2026-09-04T04:59:58.000Z",
+    generated_image_artifact_count: 1,
+    media_type: "application/vnd.ego-chat.attachment-execution-disposition.v1+jcs",
+    non_image_artifact_count: 0,
+    normal_download_control_count: 0,
+    normal_save_control_count: 0,
+    outcome: "UNKNOWN",
+    qualified_runtime_identity: {
+      ...qualification.runtimeIdentity,
+      runtime_identity_sha256: sha256Hex(canonicalJsonBytes(qualification.runtimeIdentity)),
+    },
+    reason: "UNSUPPORTED_SAVE_ASSOCIATION",
+    receipt: null,
+    save_association_id: null,
+    schema: "ego-chat-attachment-execution-disposition/v1",
+    signature_input_domain: "EGO_CHAT_ATTACHMENT_EXECUTION_DISPOSITION_V1",
+    signer_enrollment_sha256: qualification.signerEnrollmentDigest,
+    signer_key_id: qualification.signerKeyId,
+    source_confirmed_send_identity_sha256: "c".repeat(64),
+    stable_observation_count: 2,
+    stable_observation_sha256: "d".repeat(64),
+    terminal_at: NOW,
+    total_artifact_count: 1,
+    unclassified_artifact_count: 0,
+  }
+  const envelope = await authority.signAttachmentDisposition({
+    consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+    disposition,
+  })
+  const payloadBytes = Buffer.from(envelope.payload_base64url, "base64url")
+  assert.ok(payloadBytes.equals(canonicalJsonBytes(disposition)))
+  assert.equal(envelope.payload_sha256, sha256Hex(payloadBytes))
+  assert.equal(envelope.signer_key_id, firstEnrollment.signer_key_id)
+  assert.equal(envelope.authority_domain, "attachment-observation-only")
+  assert.equal(envelope.signature_input_domain, "EGO_CHAT_ATTACHMENT_EXECUTION_DISPOSITION_V1")
+  assert.equal(envelope.media_type, disposition.media_type)
+  assert.equal(
+    verify(
+      null,
+      Buffer.concat([
+        Buffer.from("EGO_CHAT_ATTACHMENT_EXECUTION_DISPOSITION_V1\0", "ascii"),
+        payloadBytes,
+      ]),
+      createPublicKey({
+        format: "der",
+        key: Buffer.from(firstEnrollment.spki_der_base64url, "base64url"),
+        type: "spki",
+      }),
+      Buffer.from(envelope.signature_base64url, "base64url"),
+    ),
+    true,
+  )
+  await assert.rejects(
+    authority.signAttachmentDisposition({
+      consumerSignerAuthorizationDigest: sha256Hex(authorizationBytes),
+      disposition: {
+        ...disposition,
+        signer_key_id: `ed25519-spki-sha256:${"0".repeat(64)}`,
+      },
+    }),
+    (error) => error.code === "attachment_disposition_authority_mismatch",
+  )
 
   const runtimeFile = path.join(runtime.root, RECEIPT_RELEVANT_RUNTIME_PATHS[0])
   const originalRuntimeBytes = await fs.readFile(runtimeFile)

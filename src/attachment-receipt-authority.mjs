@@ -4,6 +4,7 @@ import {
   createPublicKey,
   generateKeyPairSync,
   randomUUID,
+  sign,
   verify,
 } from "node:crypto"
 import { constants as fsConstants } from "node:fs"
@@ -13,6 +14,7 @@ import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 
 import {
+  assertValidAttachmentExecutionDisposition,
   canonicalJsonBytes,
   sha256Hex,
 } from "./attachment-execution-receipt.mjs"
@@ -71,6 +73,7 @@ const ISO_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const MAX_MANIFEST_BYTES = 1024 * 1024
 const MAX_AUTHORIZATION_BYTES = 256 * 1024
 const MAX_SIGNATURE_BYTES = 1024
+const MAX_DISPOSITION_BYTES = 256 * 1024
 
 export const ALLOWED_ATTACHMENT_EVIDENCE_TYPES = Object.freeze([
   Object.freeze({
@@ -674,6 +677,76 @@ export class AttachmentReceiptAuthority {
       runtimeIdentity: runtimeIdentity(runtime.manifest),
       signerEnrollmentDigest: sha256Hex(enrollmentBytes),
       signerKeyId: enrollment.signer_key_id,
+    }
+  }
+
+  async signAttachmentDisposition({
+    consumerSignerAuthorizationDigest,
+    disposition,
+  }) {
+    const qualification = await this.qualify({
+      consumer_signer_authorization_sha256: consumerSignerAuthorizationDigest,
+    })
+    try {
+      assertValidAttachmentExecutionDisposition(disposition)
+    } catch (error) {
+      if (error instanceof EgoChatError) throw error
+      fail(
+        "invalid_attachment_disposition",
+        "The attachment execution disposition is invalid.",
+      )
+    }
+    const qualifiedRuntimeIdentity = {
+      ...qualification.runtimeIdentity,
+      runtime_identity_sha256: sha256Hex(canonicalJsonBytes(qualification.runtimeIdentity)),
+    }
+    if (
+      disposition.consumer_signer_authorization_sha256
+        !== qualification.consumerSignerAuthorizationDigest
+      || disposition.signer_enrollment_sha256 !== qualification.signerEnrollmentDigest
+      || disposition.signer_key_id !== qualification.signerKeyId
+      || !isDeepStrictEqual(disposition.qualified_runtime_identity, qualifiedRuntimeIdentity)
+      || disposition.capture_runtime_identity_sha256
+        !== qualifiedRuntimeIdentity.runtime_identity_sha256
+    ) {
+      fail(
+        "attachment_disposition_authority_mismatch",
+        "The disposition does not match the currently qualified receipt authority.",
+      )
+    }
+    const payloadBytes = canonicalJsonBytes(disposition)
+    if (payloadBytes.length > MAX_DISPOSITION_BYTES) {
+      fail("attachment_disposition_too_large", "The disposition exceeds its size bound.")
+    }
+    await assertPrivateFile(this.#privateKeyPath, "unsafe_attachment_signer_key")
+    const privateKeyBytes = await fs.readFile(this.#privateKeyPath)
+    let privateKey
+    try {
+      privateKey = createPrivateKey({
+        format: "der",
+        key: privateKeyBytes,
+        type: "pkcs8",
+      })
+    } catch {
+      fail("invalid_attachment_signer_enrollment", "The attachment signer key is invalid.")
+    }
+    const signatureInput = Buffer.concat([
+      Buffer.from(`${disposition.signature_input_domain}\0`, "ascii"),
+      payloadBytes,
+    ])
+    const signature = sign(null, signatureInput, privateKey)
+    if (signature.length !== 64) {
+      fail("invalid_attachment_signature", "The Ed25519 signature has an invalid length.")
+    }
+    return {
+      authority_domain: disposition.authority_domain,
+      media_type: disposition.media_type,
+      payload_base64url: payloadBytes.toString("base64url"),
+      payload_sha256: sha256Hex(payloadBytes),
+      schema: "ego-chat-signed-attachment-evidence-envelope/v1",
+      signature_base64url: signature.toString("base64url"),
+      signature_input_domain: disposition.signature_input_domain,
+      signer_key_id: disposition.signer_key_id,
     }
   }
 }

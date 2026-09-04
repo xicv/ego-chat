@@ -2,8 +2,11 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  attachmentCaptureOperationKeyDigest,
+  buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   classifyAttachmentExecutionObservations,
+  sha256Hex,
 } from "../src/attachment-execution-receipt.mjs"
 
 function imageArtifact(id = "image-1") {
@@ -230,4 +233,64 @@ test("closed observation evidence rejects pointer values and caller-selected fie
       (error) => error.code === "invalid_attachment_observation",
     )
   }
+})
+
+test("capture operation identity decodes the confirmed-Send digest under its fixed domain", () => {
+  assert.equal(
+    attachmentCaptureOperationKeyDigest("ab".repeat(32)),
+    "97aa6ccf9c8cc9564e32b470c1a137a93362fb5a2920df9c63a146d7c59ac9ee",
+  )
+})
+
+test("terminal disposition binds a stable unsupported-Save observation pair", () => {
+  const observations = stablePair({
+    asset_pointer_state: "PRESENT_NON_CONTROL",
+    normal_save_control_count: 0,
+    save_association_id: null,
+    visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
+  })
+  const confirmedSendIdentityDigest = "b".repeat(64)
+  const captureOperationKeySha256 = attachmentCaptureOperationKeyDigest(
+    confirmedSendIdentityDigest,
+  )
+  const runtimeIdentity = {
+    executable_sha256: "1".repeat(64),
+    implementation_git_sha: "2".repeat(40),
+    package_inventory_sha256: "3".repeat(64),
+  }
+  for (const current of observations) {
+    current.capture_operation_key_sha256 = captureOperationKeySha256
+    current.source_confirmed_send_identity_sha256 = confirmedSendIdentityDigest
+  }
+  const disposition = buildAttachmentExecutionDisposition({
+    captureOperation: {
+      capture_operation_key_sha256: captureOperationKeySha256,
+      confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+      source_workflow_id: "workflow-1",
+    },
+    confirmedSendIdentity: {
+      consumer_signer_authorization_sha256: "d".repeat(64),
+      external_binding_sha256: "e".repeat(64),
+      qualified_runtime_identity: {
+        ...runtimeIdentity,
+        runtime_identity_sha256: sha256Hex(canonicalJsonBytes(runtimeIdentity)),
+      },
+      signer_enrollment_sha256: "f".repeat(64),
+      signer_key_id: `ed25519-spki-sha256:${"9".repeat(64)}`,
+      source_workflow_id: "workflow-1",
+    },
+    confirmedSendIdentityDigest,
+    observations,
+    terminalAt: "2026-09-04T05:00:02.000Z",
+  })
+
+  assert.equal(disposition.outcome, "UNKNOWN")
+  assert.equal(disposition.reason, "UNSUPPORTED_SAVE_ASSOCIATION")
+  assert.equal(disposition.receipt, null)
+  assert.equal(disposition.save_association_id, null)
+  assert.equal(disposition.stable_observation_count, 2)
+  assert.equal(disposition.first_stable_observation_at, observations[0].observed_at)
+  assert.equal(disposition.final_stable_observation_at, observations[1].observed_at)
+  assert.equal(disposition.capture_operation_key_sha256, captureOperationKeySha256)
+  assert.match(disposition.stable_observation_sha256, /^[a-f0-9]{64}$/)
 })
