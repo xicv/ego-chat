@@ -34,6 +34,7 @@ import {
   ConversationKeyInputSchema,
   ConversationReanchorSchema,
   ConversationReconcileSchema,
+  CanonicalConversationUrlSchema,
   EgoExchangeSchema,
   EgoPreflightSchema,
   HeadChangeEvidenceSchema,
@@ -147,16 +148,346 @@ function validateTaskSpaceControlRecovery(value) {
   return structuredClone(value)
 }
 
+function validateTaskSpaceIdentity(value) {
+  if (value === undefined) {
+    return undefined
+  }
+  const keys = value && typeof value === "object" && !Array.isArray(value)
+    ? Object.keys(value)
+    : []
+  if (
+    keys.length !== 2
+    || !keys.includes("name")
+    || !keys.includes("taskId")
+    || keys.some((key) => (
+      typeof value[key] !== "string"
+      || value[key].length < 1
+      || value[key].length > 200
+      || TASK_SPACE_FORBIDDEN_CHARACTERS.test(value[key])
+    ))
+  ) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser returned an invalid task-space identity.",
+      { reason: "task_space_identity_invalid" },
+    )
+  }
+  return structuredClone(value)
+}
+
+const TASK_SPACE_FORBIDDEN_CHARACTERS = /[\p{Cc}\p{Cf}\u2028\u2029]/u
+
+function taskSpaceSelector(value, kind = undefined) {
+  const effectiveKind = kind ?? (
+    typeof value === "number"
+      ? "numeric_location"
+      : (typeof value === "string" ? "legacy_string" : null)
+  )
+  if (effectiveKind === "numeric_location") {
+    if (Number.isSafeInteger(value) && value > 0) {
+      return { kind: effectiveKind, value }
+    }
+  } else if (
+    ["legacy_string", "name", "task_id"].includes(effectiveKind)
+    && typeof value === "string"
+    && value.length > 0
+    && value.length <= 200
+    && !TASK_SPACE_FORBIDDEN_CHARACTERS.test(value)
+  ) {
+    return { kind: effectiveKind, value }
+  }
+  throw new EgoChatError(
+    "human_required",
+    "The broker could not establish a typed task-space selector.",
+    { reason: "task_space_selector_invalid" },
+  )
+}
+
+function publicTaskSpaceSelector(value) {
+  return taskSpaceSelector(value, typeof value === "string" ? "name" : undefined)
+}
+
+function taskSpaceSelectorKey(selector) {
+  return JSON.stringify(validateTaskSpaceSelector(selector))
+}
+
+function taskSpaceIdentitySelector(identity) {
+  const validated = validateTaskSpaceIdentity(identity)
+  if (!validated) {
+    throw new EgoChatError(
+      "human_required",
+      "The broker could not establish a typed task-space selector.",
+      { reason: "task_space_selector_invalid" },
+    )
+  }
+  return { identity: validated, kind: "stable_identity" }
+}
+
+function validateTaskSpaceSelector(selector) {
+  const keys = selector && typeof selector === "object" && !Array.isArray(selector)
+    ? Object.keys(selector).sort()
+    : []
+  if (
+    selector?.kind === "numeric_location"
+    && keys.length === 2
+    && keys[0] === "kind"
+    && keys[1] === "value"
+    && Number.isSafeInteger(selector.value)
+    && selector.value > 0
+  ) {
+    return structuredClone(selector)
+  }
+  if (
+    ["legacy_string", "name", "task_id"].includes(selector?.kind)
+    && keys.length === 2
+    && keys[0] === "kind"
+    && keys[1] === "value"
+    && typeof selector.value === "string"
+    && selector.value.length > 0
+    && selector.value.length <= 200
+    && !TASK_SPACE_FORBIDDEN_CHARACTERS.test(selector.value)
+  ) {
+    return structuredClone(selector)
+  }
+  if (
+    selector?.kind === "stable_identity"
+    && keys.length === 2
+    && keys[0] === "identity"
+    && keys[1] === "kind"
+  ) {
+    return taskSpaceIdentitySelector(selector.identity)
+  }
+  throw new EgoChatError(
+    "human_required",
+    "The broker could not establish a typed task-space selector.",
+    { reason: "task_space_selector_invalid" },
+  )
+}
+
+function taskSpaceSelectorMatchesIdentity(selectorValue, identityValue) {
+  const selector = validateTaskSpaceSelector(selectorValue)
+  const identity = validateTaskSpaceIdentity(identityValue)
+  if (!identity || selector.kind === "numeric_location") {
+    return false
+  }
+  if (selector.kind === "name") {
+    return identity.name === selector.value
+  }
+  if (selector.kind === "task_id") {
+    return identity.taskId === selector.value
+  }
+  if (selector.kind === "legacy_string") {
+    return identity.name === selector.value || identity.taskId === selector.value
+  }
+  return taskSpaceIdentityRelation(selector.identity, identity) === "exact"
+}
+
+function taskSpaceSelectorConflictsWithIdentity(selectorValue, identityValue) {
+  const selector = validateTaskSpaceSelector(selectorValue)
+  const identity = validateTaskSpaceIdentity(identityValue)
+  if (!identity) {
+    return false
+  }
+  return selector.kind === "stable_identity"
+    ? taskSpaceIdentityRelation(selector.identity, identity) !== "distinct"
+    : taskSpaceSelectorMatchesIdentity(selector, identity)
+}
+
+function unresolvedSelectorsConflict(firstValue, secondValue) {
+  const first = validateTaskSpaceSelector(firstValue)
+  const second = validateTaskSpaceSelector(secondValue)
+  if (first.kind === "numeric_location" || second.kind === "numeric_location") {
+    return false
+  }
+  if (first.kind === "stable_identity") {
+    return taskSpaceSelectorConflictsWithIdentity(second, first.identity)
+  }
+  if (second.kind === "stable_identity") {
+    return taskSpaceSelectorConflictsWithIdentity(first, second.identity)
+  }
+  if (first.value !== second.value) {
+    return false
+  }
+  return first.kind === "legacy_string"
+    || second.kind === "legacy_string"
+    || first.kind === second.kind
+}
+
+function deterministicBindingTaskSpaceName(binding) {
+  const identity = binding.canonicalUrl
+    ? `canonical-conversation\0${binding.canonicalUrl}`
+    : `binding\0${binding.key || binding.bindingKey || binding.startUrl}`
+  return `ego-chat-bound-${digest(identity).slice(0, 32)}`
+}
+
+function taskSpaceSelectorForBinding(binding) {
+  const identity = validateTaskSpaceIdentity(binding?.taskSpaceIdentity)
+  if (identity) {
+    return taskSpaceIdentitySelector(identity)
+  }
+  if (binding?.key && binding.canonicalUrl) {
+    // A deterministic recovery name may replace only a well-formed legacy
+    // selector. Missing or malformed persisted values must not be converted
+    // into a synthetic selector during restart recovery.
+    taskSpaceSelector(binding.taskSpaceId)
+    return taskSpaceSelector(deterministicBindingTaskSpaceName(binding), "name")
+  }
+  return taskSpaceSelector(binding?.taskSpaceId)
+}
+
+function canonicalWorkflowEvidenceUrl(value) {
+  const parsed = CanonicalConversationUrlSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new EgoChatError(
+      "human_required",
+      "Durable workflow evidence does not contain a valid canonical conversation URL.",
+      { reason: "canonical_conversation_evidence_invalid" },
+    )
+  }
+  return parsed.data
+}
+
+function effectiveWorkflowBinding(binding, workflow) {
+  const evidence = [
+    ["send", workflow?.private?.send],
+    ["confirmedTaskSpace", workflow?.reconciliation?.confirmedTaskSpace],
+    ["result", workflow?.result],
+  ].filter(([, value]) => value !== undefined && value !== null)
+  if (evidence.length === 0) {
+    return binding
+  }
+  const authoritative = evidence.map(([source, value]) => {
+    const identity = validateTaskSpaceIdentity(value?.taskSpaceIdentity)
+    if (!identity) {
+      throw new EgoChatError(
+        "human_required",
+        "Post-Send workflow evidence is missing its complete task-space identity.",
+        { reason: "confirmed_task_space_identity_missing", source },
+      )
+    }
+    return {
+      canonicalUrl: canonicalWorkflowEvidenceUrl(value?.canonicalUrl),
+      identity,
+      source,
+      taskSpaceId: value?.taskSpaceId,
+    }
+  })
+  const bindingIdentity = validateTaskSpaceIdentity(binding?.taskSpaceIdentity)
+  const identities = [
+    ...(bindingIdentity ? [bindingIdentity] : []),
+    ...authoritative.map((value) => value.identity),
+  ]
+  for (let index = 1; index < identities.length; index += 1) {
+    if (!isDeepStrictEqual(identities[0], identities[index])) {
+      throw new EgoChatError(
+        "human_required",
+        "The confirmed-Send task-space identity conflicts with durable workflow evidence.",
+        { reason: "task_space_identity_changed" },
+      )
+    }
+  }
+  const canonicalUrls = [
+    ...(binding?.canonicalUrl ? [canonicalWorkflowEvidenceUrl(binding.canonicalUrl)] : []),
+    ...authoritative.map((value) => value.canonicalUrl),
+  ]
+  for (let index = 1; index < canonicalUrls.length; index += 1) {
+    if (canonicalUrls[0] !== canonicalUrls[index]) {
+      throw new EgoChatError(
+        "human_required",
+        "The confirmed-Send canonical conversation conflicts with the durable binding.",
+        { reason: "canonical_conversation_changed" },
+      )
+    }
+  }
+  const observed = authoritative.at(-1)
+  return {
+    ...binding,
+    canonicalUrl: canonicalUrls[0],
+    taskSpaceId: observed.taskSpaceId ?? binding.taskSpaceId,
+    taskSpaceIdentity: observed.identity,
+  }
+}
+
+function taskSpaceIdentityCommitPatch(value, previousBinding = undefined) {
+  const identity = validateTaskSpaceIdentity(value?.taskSpaceIdentity)
+  if (!identity) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser result did not include its complete selected task-space identity.",
+      { reason: "task_space_identity_missing" },
+    )
+  }
+  const previousIdentity = validateTaskSpaceIdentity(previousBinding?.taskSpaceIdentity)
+  if (previousIdentity && !isDeepStrictEqual(identity, previousIdentity)) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser result changed the durable task-space identity.",
+      { reason: "task_space_identity_changed" },
+    )
+  }
+  return { taskSpaceIdentity: identity }
+}
+
+function validTaskSpaceLocation(value) {
+  return (
+    typeof value === "string"
+    && value.length > 0
+    && value.length <= 200
+    && !TASK_SPACE_FORBIDDEN_CHARACTERS.test(value)
+  ) || (Number.isSafeInteger(value) && value > 0)
+}
+
+function taskSpaceIdentityRelation(first, second) {
+  const firstIdentity = validateTaskSpaceIdentity(first)
+  const secondIdentity = validateTaskSpaceIdentity(second)
+  if (!firstIdentity || !secondIdentity) {
+    return "unresolved"
+  }
+  const nameMatches = firstIdentity.name === secondIdentity.name
+  const taskIdMatches = firstIdentity.taskId === secondIdentity.taskId
+  if (nameMatches && taskIdMatches) {
+    return "exact"
+  }
+  if (nameMatches || taskIdMatches) {
+    return "conflict"
+  }
+  return "distinct"
+}
+
+function bindingsShareTaskSpace(first, second) {
+  if (!first || !second) {
+    return false
+  }
+  const firstIdentity = validateTaskSpaceIdentity(first.taskSpaceIdentity)
+  const secondIdentity = validateTaskSpaceIdentity(second.taskSpaceIdentity)
+  if (
+    typeof first.canonicalUrl === "string"
+    && first.canonicalUrl.length > 0
+    && first.canonicalUrl === second.canonicalUrl
+  ) {
+    return true
+  }
+  if (firstIdentity && secondIdentity) {
+    const relation = taskSpaceIdentityRelation(firstIdentity, secondIdentity)
+    if (relation === "conflict") {
+      throw new EgoChatError(
+        "human_required",
+        "The durable task-space identities contain conflicting stable fields.",
+        { reason: "task_space_identity_conflict" },
+      )
+    }
+    return relation === "exact"
+  }
+  return false
+}
+
 function validatePendingCapture(value, workflow) {
   if (value?.captureState !== "pending") {
     return false
   }
   const sent = workflow.private?.send
-  const validTaskSpace = (
-    typeof value.taskSpaceId === "string"
-    && value.taskSpaceId.length > 0
-    && value.taskSpaceId.length <= 200
-  ) || (Number.isSafeInteger(value.taskSpaceId) && value.taskSpaceId > 0)
+  taskSpaceIdentityCommitPatch(value, sent)
+  const validTaskSpace = validTaskSpaceLocation(value.taskSpaceId)
   const validPendingReason = (
     value.captureReason === "generation_running"
     && value.generationRunning === true
@@ -294,11 +625,7 @@ function validateReanchorCapture(capture, binding, params, expectedHeadChange) {
     && head.messageCount >= 1
     && Number.isInteger(head.renderedMessageCount)
     && head.renderedMessageCount === head.messageCount
-  const validTaskSpace = (
-    typeof capture?.taskSpaceId === "string"
-    && capture.taskSpaceId.length > 0
-    && capture.taskSpaceId.length <= 200
-  ) || (Number.isInteger(capture?.taskSpaceId) && capture.taskSpaceId > 0)
+  const validTaskSpace = validTaskSpaceLocation(capture?.taskSpaceId)
   const validIdentity = capture?.canonicalUrl === binding.canonicalUrl
     && typeof capture?.targetId === "string"
     && capture.targetId.length > 0
@@ -341,10 +668,34 @@ const DEFAULT_RECOVERY_DELAYS_MS = Object.freeze([
 ])
 const HUMAN_ONLY_BROWSER_REASONS = new Set([
   "authentication_required",
+  "bound_task_space_identity_ambiguous",
+  "bound_task_space_identity_changed",
+  "bound_task_space_identity_conflict",
+  "bound_task_space_identity_invalid",
+  "bound_task_space_reclaim_precondition_changed",
   "browser_contract_mismatch",
   "broker_fence_lost",
   "broker_fence_missing",
+  "binding_key_reserved",
+  "canonical_conversation_already_bound",
+  "canonical_conversation_changed",
+  "canonical_conversation_evidence_invalid",
+  "canonical_conversation_missing",
   "model_policy_unsupported",
+  "task_space_identity_ambiguous",
+  "task_space_identity_changed",
+  "task_space_identity_conflict",
+  "task_space_identity_invalid",
+  "task_space_identity_already_bound",
+  "task_space_identity_missing",
+  "task_space_identity_unavailable",
+  "task_space_guard_invalid",
+  "task_space_guard_missing",
+  "task_space_result_identity_mismatch",
+  "task_space_selector_identity_changed",
+  "task_space_selector_ambiguous",
+  "task_space_selector_invalid",
+  "task_space_selector_reserved",
   "verification_challenge",
 ])
 const RETRYABLE_PRE_SEND_REASONS = new Set([
@@ -475,6 +826,8 @@ export class Broker {
   #store
   #taskSpine
   #taskSpineInitializationError = null
+  #taskSpaceAdmissionReservations = new Map()
+  #taskSpaceIdentityReservations = new Map()
   #timers = new Map()
   #waiters = new Map()
 
@@ -516,6 +869,7 @@ export class Broker {
 
   async initialize() {
     await this.#store.initialize()
+    this.#synchronizeDurableClaimUrls()
     if (this.#taskSpine) {
       try {
         await this.#taskSpine.initialize()
@@ -552,14 +906,41 @@ export class Broker {
           })
           continue
         }
-        const taskSpaceOwner = this.#adoptionTaskSpaces.get(String(request.taskSpace))
-        const canonicalUrlDigest = digest(request.canonicalUrl)
+        let canonicalUrl
+        let restoredSelector
+        let taskSpaceKey
+        try {
+          canonicalUrl = canonicalWorkflowEvidenceUrl(request.canonicalUrl)
+          restoredSelector = request.taskSpaceSelector
+            ?? taskSpaceSelector(
+              request.taskSpace,
+              request.taskSpace === `ego-chat-adopt-${digest(`canonical-adoption\0${canonicalUrl}`).slice(0, 32)}`
+                ? "name"
+                : undefined,
+            )
+          taskSpaceKey = taskSpaceSelectorKey(restoredSelector)
+        } catch (error) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: error instanceof EgoChatError
+                ? (error.details?.reason ?? error.code)
+                : "task_space_selector_invalid",
+              message: error instanceof Error
+                ? error.message
+                : "The restored task-space selector is invalid.",
+            },
+            status: "human_required",
+          })
+          continue
+        }
+        const taskSpaceOwner = this.#adoptionTaskSpaces.get(taskSpaceKey)
+        const canonicalUrlDigest = digest(canonicalUrl)
         const urlOwner = this.#activeConversationUrls.get(canonicalUrlDigest)
         if (
           workflow.canonicalUrlDigest !== canonicalUrlDigest
           || this.#activeBindings.has(workflow.bindingKey)
           || taskSpaceOwner
-          || urlOwner
+          || (urlOwner && urlOwner !== workflow.id)
         ) {
           await this.#transition(workflow, "workflow.human_required", {
             humanRequired: {
@@ -572,7 +953,31 @@ export class Broker {
         }
         this.#activeBindings.add(workflow.bindingKey)
         this.#activeConversationUrls.set(canonicalUrlDigest, workflow.id)
-        this.#adoptionTaskSpaces.set(String(request.taskSpace), workflow.id)
+        this.#adoptionTaskSpaces.set(taskSpaceKey, workflow.id)
+        try {
+          this.#reserveTaskSpaceAdmission(workflow.id, {
+            canonicalUrl,
+            key: workflow.bindingKey,
+            selector: restoredSelector,
+            taskSpaceIdentity: workflow.private?.capture?.taskSpaceIdentity,
+          })
+        } catch (error) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: error instanceof EgoChatError
+                ? (error.details?.reason ?? error.code)
+                : "task_space_selector_invalid",
+              message: error instanceof Error
+                ? error.message
+                : "The restored task-space selector is invalid.",
+            },
+            status: "human_required",
+          })
+          this.#activeBindings.delete(workflow.bindingKey)
+          this.#activeConversationUrls.delete(canonicalUrlDigest)
+          this.#adoptionTaskSpaces.delete(taskSpaceKey)
+          continue
+        }
         this.#runConversationAdoption(workflow.id).catch((error) => {
           console.error("Conversation adoption runner failed:", error)
         })
@@ -612,6 +1017,49 @@ export class Broker {
         && !this.#activeBindings.has(workflow.bindingKey)
       ) {
         this.#activeBindings.add(workflow.bindingKey)
+        const binding = this.#store.getBinding(workflow.bindingKey)
+        if (!binding) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: "exchange_recovery_binding_missing",
+              message: "The broker cannot restore a task-space admission without its binding.",
+            },
+            status: "human_required",
+          })
+          this.#activeBindings.delete(workflow.bindingKey)
+          continue
+        }
+        let recoveredBinding
+        try {
+          recoveredBinding = effectiveWorkflowBinding(binding, workflow)
+        } catch (error) {
+          await this.#transition(workflow, "workflow.human_required", {
+            humanRequired: {
+              code: error instanceof EgoChatError ? error.code : "exchange_recovery_identity_invalid",
+              message: error instanceof Error
+                ? error.message
+                : "The broker cannot restore incomplete post-Send identity evidence.",
+              ...(error instanceof EgoChatError && error.details ? { details: error.details } : {}),
+            },
+            status: "human_required",
+          })
+          this.#activeBindings.delete(workflow.bindingKey)
+          continue
+        }
+        this.#reserveTaskSpaceAdmission(workflow.id, {
+          canonicalUrl: recoveredBinding.canonicalUrl,
+          key: workflow.bindingKey,
+          selector: taskSpaceSelectorForBinding(recoveredBinding),
+          taskSpaceIdentity: recoveredBinding.taskSpaceIdentity,
+        })
+        if (recoveredBinding.taskSpaceIdentity) {
+          this.#reserveBrowserTaskSpaceIdentity({
+            expectedCanonicalUrl: recoveredBinding.canonicalUrl,
+            key: workflow.bindingKey,
+            owner: workflow.id,
+            result: recoveredBinding,
+          })
+        }
         const resumable = workflow.phase === "browser_owned"
           ? await this.#transition(workflow, "exchange.restart_reconciliation_started", {
               phase: "restart_reconciling",
@@ -723,8 +1171,20 @@ export class Broker {
 
   async egoPreflight(input) {
     const params = parse(EgoPreflightSchema, input)
-    this.#assertTaskSpaceAvailable(params.taskSpace)
-    return this.#egoAdapter.preflight(params)
+    const owner = `preflight-${randomUUID()}`
+    this.#reserveTaskSpaceAdmission(owner, {
+      key: owner,
+      selector: publicTaskSpaceSelector(params.taskSpace),
+    })
+    try {
+      return await this.#egoAdapter.preflight(
+        params,
+        undefined,
+        () => ({ taskSpaceGuard: this.#taskSpaceGuard(owner) }),
+      )
+    } finally {
+      this.#releaseTaskSpaceAdmission(owner)
+    }
   }
 
   getModelPolicy() {
@@ -737,26 +1197,34 @@ export class Broker {
     if (!binding) {
       throw new EgoChatError("binding_not_found", "Bind a ChatGPT conversation before ensuring its model policy.")
     }
+    taskSpaceIdentityCommitPatch(binding, binding)
     this.#assertBindingAvailable(bindingKey)
     if (this.#activeBindings.has(bindingKey)) {
       throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
     }
 
+    const admissionOwner = `model-policy-${randomUUID()}`
+    this.#reserveTaskSpaceAdmission(admissionOwner, {
+      canonicalUrl: binding.canonicalUrl,
+      key: binding.key,
+      selector: taskSpaceSelectorForBinding(binding),
+      taskSpaceIdentity: binding.taskSpaceIdentity,
+    })
     this.#activeBindings.add(bindingKey)
     try {
       const observation = await this.#egoAdapter.ensureModelPolicy({
         binding,
         modelPolicy: this.#resolveModelPolicy(),
-      })
+      }, undefined, undefined, () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }))
       return await this.#recordModelPolicyObservation(observation, bindingKey)
     } finally {
       this.#activeBindings.delete(bindingKey)
+      this.#releaseTaskSpaceAdmission(admissionOwner)
     }
   }
 
   async bindConversation(input) {
     const params = parse(ConversationBindSchema, input)
-    this.#assertTaskSpaceAvailable(params.taskSpace)
     if (this.#store.getBinding(params.bindingKey)) {
       throw new EgoChatError(
         "binding_exists",
@@ -785,14 +1253,37 @@ export class Broker {
         )
       }
     }
-
-    this.#activeBindings.add(params.bindingKey)
     const urlOwner = canonicalUrlDigest ? `bind-${randomUUID()}` : null
+    const taskSpaceOwner = urlOwner ?? `bind-${randomUUID()}`
+    this.#reserveTaskSpaceAdmission(taskSpaceOwner, {
+      canonicalUrl: params.canonicalUrl ?? null,
+      key: params.bindingKey,
+      selector: publicTaskSpaceSelector(params.taskSpace),
+    })
+    this.#activeBindings.add(params.bindingKey)
     if (canonicalUrlDigest) {
       this.#activeConversationUrls.set(canonicalUrlDigest, urlOwner)
     }
     try {
-      const verified = await this.#egoAdapter.bind(params)
+      const verified = await this.#egoAdapter.bind(
+        params,
+        undefined,
+        (result) => this.#reserveBrowserTaskSpaceIdentity({
+          expectedCanonicalUrl: params.canonicalUrl ?? null,
+          key: params.bindingKey,
+          owner: taskSpaceOwner,
+          result,
+          allowMissingCanonicalUrl: params.mode === "create_once",
+        }),
+        () => ({ taskSpaceGuard: this.#taskSpaceGuard(taskSpaceOwner) }),
+      )
+      this.#reserveBrowserTaskSpaceIdentity({
+        expectedCanonicalUrl: params.canonicalUrl ?? null,
+        key: params.bindingKey,
+        owner: taskSpaceOwner,
+        result: verified,
+        allowMissingCanonicalUrl: params.mode === "create_once",
+      })
       const now = new Date().toISOString()
       const canonicalUrl = verified.canonicalUrl ?? null
       const binding = {
@@ -816,29 +1307,34 @@ export class Broker {
         startUrl: params.mode === "create_once" ? params.startUrl : params.canonicalUrl,
         state: canonicalUrl ? "bound" : "unbound",
         targetId: verified.targetId,
+        ...taskSpaceIdentityCommitPatch(verified),
         taskSpaceId: verified.taskSpaceId,
         updatedAt: now,
         verifiedAt: now,
       }
-      await this.#store.persistBinding("binding.created", binding)
+      await this.#persistIsolatedBinding("binding.created", binding, undefined, taskSpaceOwner)
       return publicBinding(binding)
     } finally {
       this.#activeBindings.delete(params.bindingKey)
       if (canonicalUrlDigest && this.#activeConversationUrls.get(canonicalUrlDigest) === urlOwner) {
         this.#activeConversationUrls.delete(canonicalUrlDigest)
       }
+      this.#taskSpaceIdentityReservations.delete(taskSpaceOwner)
+      this.#releaseTaskSpaceAdmission(taskSpaceOwner)
     }
   }
 
   async startConversationAdoption(input) {
     const params = parse(ConversationAdoptionSchema, input)
     const bindingKey = params.bindingKey ?? `adopt-${digest(params.canonicalUrl).slice(0, 24)}`
-    const taskSpace = params.taskSpace === "ego-chat-adoptions"
-      ? `ego-chat-adopt-${digest(params.canonicalUrl).slice(0, 16)}`
+    const defaultTaskSpace = params.taskSpace === "ego-chat-adoptions"
+    const taskSpace = defaultTaskSpace
+      ? `ego-chat-adopt-${digest(`canonical-adoption\0${params.canonicalUrl}`).slice(0, 32)}`
       : params.taskSpace
-    const request = { ...params, bindingKey, taskSpace }
+    const selector = publicTaskSpaceSelector(taskSpace)
+    const taskSpaceKey = taskSpaceSelectorKey(selector)
+    const request = { ...params, bindingKey, taskSpace, taskSpaceSelector: selector }
     const canonicalUrlDigest = digest(params.canonicalUrl)
-    this.#assertTaskSpaceAvailable(taskSpace)
     if (this.#store.getBinding(bindingKey)) {
       throw new EgoChatError(
         "binding_exists",
@@ -864,6 +1360,7 @@ export class Broker {
         { operationId: urlOwner },
       )
     }
+    this.#assertCanonicalTaskSpaceSelectorAvailable(selector)
 
     const startedAt = new Date()
     const now = startedAt.toISOString()
@@ -883,15 +1380,21 @@ export class Broker {
       updatedAt: now,
     }
 
+    this.#reserveTaskSpaceAdmission(workflow.id, {
+      canonicalUrl: params.canonicalUrl,
+      key: bindingKey,
+      selector,
+    })
     this.#activeBindings.add(bindingKey)
     this.#activeConversationUrls.set(canonicalUrlDigest, workflow.id)
-    this.#adoptionTaskSpaces.set(String(taskSpace), workflow.id)
+    this.#adoptionTaskSpaces.set(taskSpaceKey, workflow.id)
     try {
       await this.#store.persist("workflow.started", workflow)
     } catch (error) {
       this.#activeBindings.delete(bindingKey)
       this.#activeConversationUrls.delete(canonicalUrlDigest)
-      this.#adoptionTaskSpaces.delete(String(taskSpace))
+      this.#adoptionTaskSpaces.delete(taskSpaceKey)
+      this.#releaseTaskSpaceAdmission(workflow.id)
       throw error
     }
     this.#runConversationAdoption(workflow.id).catch((error) => {
@@ -923,9 +1426,32 @@ export class Broker {
       throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
     }
 
+    const admissionOwner = `verify-${randomUUID()}`
+    this.#reserveTaskSpaceAdmission(admissionOwner, {
+      canonicalUrl: binding.canonicalUrl,
+      key: binding.key,
+      selector: taskSpaceSelectorForBinding(binding),
+      taskSpaceIdentity: binding.taskSpaceIdentity,
+    })
     this.#activeBindings.add(bindingKey)
     try {
-      const verified = await this.#egoAdapter.verify({ binding })
+      const verified = await this.#egoAdapter.verify(
+        { binding },
+        undefined,
+        (result) => this.#reserveBrowserTaskSpaceIdentity({
+          expectedCanonicalUrl: binding.canonicalUrl,
+          key: binding.key,
+          owner: admissionOwner,
+          result,
+        }),
+        () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
+      )
+      this.#reserveBrowserTaskSpaceIdentity({
+        expectedCanonicalUrl: binding.canonicalUrl,
+        key: binding.key,
+        owner: admissionOwner,
+        result: verified,
+      })
       const now = new Date().toISOString()
       const nextBinding = {
         ...binding,
@@ -935,14 +1461,16 @@ export class Broker {
         modelPolicyKey: binding.modelPolicyKey ?? DEFAULT_MODEL_POLICY.key,
         revision: binding.revision + 1,
         targetId: verified.targetId,
+        ...taskSpaceIdentityCommitPatch(verified, binding),
         taskSpaceId: verified.taskSpaceId,
         updatedAt: now,
         verifiedAt: now,
       }
-      await this.#store.persistBinding("binding.checkpointed", nextBinding)
+      await this.#persistIsolatedBinding("binding.checkpointed", nextBinding, binding, admissionOwner)
       return publicBinding(nextBinding)
     } finally {
       this.#activeBindings.delete(bindingKey)
+      this.#releaseTaskSpaceAdmission(admissionOwner)
     }
   }
 
@@ -955,6 +1483,7 @@ export class Broker {
     if (binding.state !== "bound" || !binding.canonicalUrl) {
       throw new EgoChatError("binding_not_bound", "Only a canonical conversation binding can be re-anchored.")
     }
+    taskSpaceIdentityCommitPatch(binding, binding)
     const source = this.#store.getWorkflow(params.sourceWorkflowId)
     if (!source || source.bindingKey !== params.bindingKey || source.kind !== "ego_exchange") {
       throw new EgoChatError(
@@ -1043,18 +1572,41 @@ export class Broker {
       throw new EgoChatError("reanchor_unavailable", "This Ego Chat runtime cannot safely re-anchor a conversation.")
     }
 
+    const admissionOwner = `reanchor-${randomUUID()}`
+    this.#reserveTaskSpaceAdmission(admissionOwner, {
+      canonicalUrl: binding.canonicalUrl,
+      key: binding.key,
+      selector: taskSpaceSelectorForBinding(binding),
+      taskSpaceIdentity: binding.taskSpaceIdentity,
+    })
     this.#activeBindings.add(params.bindingKey)
     try {
       const capture = validateReanchorCapture(
-        await this.#egoAdapter.reanchor({
-          allowTaskSpaceReclaim: true,
-          binding,
-          expectedObservedHeadFingerprint: params.expectedObservedHeadFingerprint,
-        }),
+        await this.#egoAdapter.reanchor(
+          {
+            allowTaskSpaceReclaim: true,
+            binding,
+            expectedObservedHeadFingerprint: params.expectedObservedHeadFingerprint,
+          },
+          undefined,
+          (result) => this.#reserveBrowserTaskSpaceIdentity({
+            expectedCanonicalUrl: binding.canonicalUrl,
+            key: binding.key,
+            owner: admissionOwner,
+            result,
+          }),
+          () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
+        ),
         binding,
         params,
         expectedHeadChange.data,
       )
+      this.#reserveBrowserTaskSpaceIdentity({
+        expectedCanonicalUrl: binding.canonicalUrl,
+        key: binding.key,
+        owner: admissionOwner,
+        result: capture,
+      })
       await this.#assertBrokerAuthority("before_reanchor_commit")
       const now = new Date().toISOString()
       const nextBinding = {
@@ -1071,11 +1623,12 @@ export class Broker {
         messageCount: capture.head.messageCount,
         revision: binding.revision + 1,
         targetId: capture.targetId,
+        ...taskSpaceIdentityCommitPatch(capture, binding),
         taskSpaceId: capture.taskSpaceId,
         updatedAt: now,
         verifiedAt: now,
       }
-      await this.#store.persistBinding("binding.reanchored", nextBinding, binding)
+      await this.#persistIsolatedBinding("binding.reanchored", nextBinding, binding, admissionOwner)
       const currentSource = this.#store.getWorkflow(source.id)
       if (currentSource?.status === "human_required") {
         await this.#transition(currentSource, "workflow.cancelled", {
@@ -1089,6 +1642,7 @@ export class Broker {
       return reanchorResult(nextBinding)
     } finally {
       this.#activeBindings.delete(params.bindingKey)
+      this.#releaseTaskSpaceAdmission(admissionOwner)
     }
   }
 
@@ -1176,6 +1730,16 @@ export class Broker {
       throw new EgoChatError("conversation_busy", "That conversation binding already has an active browser operation.")
     }
 
+    let identityBinding = effectiveWorkflowBinding(binding, workflow)
+    // Exact reconciliation inherits the stopped workflow's durable claim. A
+    // fresh operation must never be able to borrow or replace that claim.
+    const admissionOwner = workflow.id
+    this.#reserveTaskSpaceAdmission(admissionOwner, {
+      canonicalUrl: identityBinding.canonicalUrl,
+      key: identityBinding.key,
+      selector: taskSpaceSelectorForBinding(identityBinding),
+      taskSpaceIdentity: identityBinding.taskSpaceIdentity,
+    })
     this.#activeBindings.add(bindingKey)
     try {
       const persisted = workflow.reconciliation ?? {}
@@ -1205,31 +1769,59 @@ export class Broker {
             responseDigest: workflow.result.responseDigest,
             responseText: await this.#readResponseText(workflow.result),
             targetId: workflow.result.targetId,
+            ...taskSpaceIdentityCommitPatch(workflow.result, identityBinding),
             taskSpaceId: workflow.result.taskSpaceId,
             turnMarker: workflow.result.turnMarker,
           }
         : null
       if (!verified) {
         verified = unboundRecovery
-          ? await this.#egoAdapter.reconcile({
-              binding,
-              expectedTerminalMarker,
-              inputDigest: workflow.inputDigest,
-              turnMarker,
-            })
-          : await this.#egoAdapter.reconcileBound({
-              ...(allowProtocolRepairCapture ? { allowProtocolRepairCapture: true } : {}),
-              allowTaskSpaceReclaim: params.allowTaskSpaceReclaim,
-              binding,
-              expectedPreviousContentDigest,
-              expectedPreviousMessageId,
-              expectedTerminalMarker,
-              inputDigest: workflow.inputDigest,
-              promptMessageId: workflow.reconciliation.promptMessageId,
-              turnMarker,
-              allowDeliveryAbsent,
-            })
+          ? await this.#egoAdapter.reconcile(
+              {
+                binding: identityBinding,
+                expectedTerminalMarker,
+                inputDigest: workflow.inputDigest,
+                turnMarker,
+              },
+              undefined,
+              (result) => this.#reserveBrowserTaskSpaceIdentity({
+                expectedCanonicalUrl: identityBinding.canonicalUrl,
+                key: identityBinding.key,
+                owner: admissionOwner,
+                result,
+              }),
+              () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
+            )
+          : await this.#egoAdapter.reconcileBound(
+              {
+                ...(allowProtocolRepairCapture ? { allowProtocolRepairCapture: true } : {}),
+                allowTaskSpaceReclaim: params.allowTaskSpaceReclaim,
+                binding: identityBinding,
+                expectedPreviousContentDigest,
+                expectedPreviousMessageId,
+                expectedTerminalMarker,
+                inputDigest: workflow.inputDigest,
+                promptMessageId: workflow.reconciliation.promptMessageId,
+                turnMarker,
+                allowDeliveryAbsent,
+              },
+              undefined,
+              (result) => this.#reserveBrowserTaskSpaceIdentity({
+                expectedCanonicalUrl: identityBinding.canonicalUrl,
+                key: identityBinding.key,
+                owner: admissionOwner,
+                result,
+              }),
+              () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
+            )
+        this.#reserveBrowserTaskSpaceIdentity({
+          expectedCanonicalUrl: identityBinding.canonicalUrl,
+          key: identityBinding.key,
+          owner: admissionOwner,
+          result: verified,
+        })
       }
+      const verifiedIdentity = taskSpaceIdentityCommitPatch(verified, identityBinding)
       if (verified.deliveryState === "absent") {
         const beforeHead = persisted.beforeHead ?? {}
         const bindingStillAtBeforeHead = (
@@ -1326,6 +1918,7 @@ export class Broker {
           responseRef,
           responseText: verified.responseText,
           targetId: verified.targetId,
+            ...verifiedIdentity,
           taskSpaceId: verified.taskSpaceId,
           turnMarker,
         }
@@ -1360,6 +1953,7 @@ export class Broker {
           { reason: "recovered_response_state_missing" },
         )
       }
+      identityBinding = effectiveWorkflowBinding(binding, workflow)
       const now = new Date().toISOString()
       let nextBinding
       if (binding.lastReconciledWorkflowId === workflow.id) {
@@ -1417,11 +2011,17 @@ export class Broker {
           revision: binding.revision + 1,
           state: "bound",
           targetId: verified.targetId,
+          ...taskSpaceIdentityCommitPatch(verified, identityBinding),
           taskSpaceId: verified.taskSpaceId,
           updatedAt: now,
           verifiedAt: now,
         }
-        await this.#store.persistBinding("binding.reconciled", nextBinding)
+        await this.#persistIsolatedBinding(
+          "binding.reconciled",
+          nextBinding,
+          binding,
+          admissionOwner,
+        )
       }
       const modelPolicy = await this.#recordModelPolicyObservation(
         recoveredModelPolicyObservation,
@@ -1468,6 +2068,7 @@ export class Broker {
       )
     } finally {
       this.#activeBindings.delete(bindingKey)
+      this.#releaseTaskSpaceAdmission(admissionOwner)
     }
   }
 
@@ -1561,13 +2162,21 @@ export class Broker {
     }
 
     try {
+      this.#reserveTaskSpaceAdmission(workflow.id, {
+        canonicalUrl: binding.canonicalUrl,
+        key: binding.key,
+        selector: taskSpaceSelectorForBinding(binding),
+        taskSpaceIdentity: binding.taskSpaceIdentity,
+      })
       const persisted = await this.#store.persistStarted("workflow.started", workflow)
       if (!persisted.created) {
         this.#activeBindings.delete(params.bindingKey)
+        this.#releaseTaskSpaceAdmission(workflow.id)
         return publicWorkflow(persisted.workflow)
       }
     } catch (error) {
       this.#activeBindings.delete(params.bindingKey)
+      this.#releaseTaskSpaceAdmission(workflow.id)
       throw error
     }
     this.#runEgoExchange(workflow).catch((error) => {
@@ -1808,7 +2417,7 @@ export class Broker {
     }
 
     await this.#assertBrokerAuthority("before_recovery_abandonment_commit")
-    return this.#transition(workflow, "workflow.cancelled", {
+    const abandoned = await this.#transition(workflow, "workflow.cancelled", {
       abandonment: {
         acknowledgedAt: new Date().toISOString(),
         acknowledgePotentialDelivery,
@@ -1820,6 +2429,8 @@ export class Broker {
       private: undefined,
       status: "cancelled",
     })
+    this.#synchronizeDurableClaimUrls()
+    return abandoned
   }
 
   close() {
@@ -1840,6 +2451,8 @@ export class Broker {
     this.#activeConversationUrls.clear()
     this.#adoptionTaskSpaces.clear()
     this.#activeBindings.clear()
+    this.#taskSpaceIdentityReservations.clear()
+    this.#taskSpaceAdmissionReservations.clear()
     for (const waiters of this.#waiters.values()) {
       for (const waiter of waiters) {
         waiter.reject(new EgoChatError("broker_stopped", "The broker stopped while this client was waiting."))
@@ -1912,14 +2525,25 @@ export class Broker {
         }
         try {
           const capture = this.#validateAdoptionCapture(
-            await this.#egoAdapter.adopt({
-              ...current.private.request,
-              allowTaskSpaceReclaim: true,
-              modelPolicy: this.#resolveModelPolicy(),
-              timeoutMs: Math.min(current.private.request.timeoutMs, remainingMs),
-            }, controller.signal),
+            await this.#egoAdapter.adopt(
+              {
+                ...current.private.request,
+                allowTaskSpaceReclaim: true,
+                modelPolicy: this.#resolveModelPolicy(),
+                timeoutMs: Math.min(current.private.request.timeoutMs, remainingMs),
+              },
+              controller.signal,
+              (result) => this.#reserveBrowserTaskSpaceIdentity({
+                expectedCanonicalUrl: current.private.request.canonicalUrl,
+                key: current.bindingKey,
+                owner: workflowId,
+                result,
+              }),
+              () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflowId) }),
+            ),
             current.private.request,
           )
+          this.#reserveAdoptionCaptureIdentity(current, capture)
           current = this.#store.getWorkflow(workflowId)
           if (!current || current.status !== "running") {
             return
@@ -1929,6 +2553,14 @@ export class Broker {
             private: {
               ...current.private,
               capture,
+            },
+            reconciliation: {
+              ...current.reconciliation,
+              adoptionCaptureClaim: {
+                canonicalUrl: capture.canonicalUrl,
+                taskSpaceId: capture.taskSpaceId,
+                taskSpaceIdentity: capture.taskSpaceIdentity,
+              },
             },
           })
           current = this.#store.getWorkflow(workflowId)
@@ -1967,6 +2599,7 @@ export class Broker {
       }
       const request = current.private.request
       const capture = this.#validateAdoptionCapture(current.private.capture, request)
+      this.#reserveAdoptionCaptureIdentity(current, capture)
       const now = new Date().toISOString()
       const candidateBinding = {
         adoptionWorkflowId: workflowId,
@@ -1982,6 +2615,7 @@ export class Broker {
         startUrl: capture.canonicalUrl,
         state: "bound",
         targetId: capture.targetId,
+        ...taskSpaceIdentityCommitPatch(capture),
         taskSpaceId: capture.taskSpaceId,
         updatedAt: now,
         verifiedAt: now,
@@ -2000,7 +2634,12 @@ export class Broker {
           )
         }
       } else {
-        await this.#store.persistBinding("binding.adopted", candidateBinding)
+        await this.#persistIsolatedBinding(
+          "binding.adopted",
+          candidateBinding,
+          undefined,
+          workflowId,
+        )
       }
 
       current = this.#store.getWorkflow(workflowId)
@@ -2022,6 +2661,7 @@ export class Broker {
         responseRef,
         responseText: capture.responseText,
         targetId: capture.targetId,
+        ...taskSpaceIdentityCommitPatch(capture),
         taskSpaceId: capture.taskSpaceId,
       }
       if (responseRef.sizeBytes > 16 * 1024) {
@@ -2063,22 +2703,15 @@ export class Broker {
     } finally {
       this.#controllers.delete(workflowId)
       const final = this.#store.getWorkflow(workflowId)
-      if (final) {
+      if (final && isTerminal(final)) {
+        this.#releaseTaskSpaceAdmission(workflowId)
         this.#activeBindings.delete(final.bindingKey)
         if (this.#activeConversationUrls.get(final.canonicalUrlDigest) === workflowId) {
           this.#activeConversationUrls.delete(final.canonicalUrlDigest)
         }
-        const taskSpace = final.private?.request?.taskSpace
-        if (
-          taskSpace !== undefined
-          && this.#adoptionTaskSpaces.get(String(taskSpace)) === workflowId
-        ) {
-          this.#adoptionTaskSpaces.delete(String(taskSpace))
-        } else {
-          for (const [key, owner] of this.#adoptionTaskSpaces) {
-            if (owner === workflowId) {
-              this.#adoptionTaskSpaces.delete(key)
-            }
+        for (const [key, owner] of this.#adoptionTaskSpaces) {
+          if (owner === workflowId) {
+            this.#adoptionTaskSpaces.delete(key)
           }
         }
       }
@@ -2152,15 +2785,31 @@ export class Broker {
       expectedObservedHeadFingerprint: headChange.observedFingerprint,
     }
     const capture = validateReanchorCapture(
-      await this.#egoAdapter.reanchor({
-        allowTaskSpaceReclaim: true,
-        binding,
-        expectedObservedHeadFingerprint: headChange.observedFingerprint,
-      }, signal),
+      await this.#egoAdapter.reanchor(
+        {
+          allowTaskSpaceReclaim: true,
+          binding,
+          expectedObservedHeadFingerprint: headChange.observedFingerprint,
+        },
+        signal,
+        (result) => this.#reserveBrowserTaskSpaceIdentity({
+          expectedCanonicalUrl: binding.canonicalUrl,
+          key: binding.key,
+          owner: workflow.id,
+          result,
+        }),
+        () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
+      ),
       binding,
       expected,
       headChange,
     )
+    this.#reserveBrowserTaskSpaceIdentity({
+      expectedCanonicalUrl: binding.canonicalUrl,
+      key: binding.key,
+      owner: workflow.id,
+      result: capture,
+    })
     await this.#assertBrokerAuthority("before_automatic_reanchor_commit")
     const now = new Date().toISOString()
     const nextBinding = {
@@ -2176,11 +2825,17 @@ export class Broker {
       messageCount: capture.head.messageCount,
       revision: binding.revision + 1,
       targetId: capture.targetId,
+      ...taskSpaceIdentityCommitPatch(capture, binding),
       taskSpaceId: capture.taskSpaceId,
       updatedAt: now,
       verifiedAt: now,
     }
-    await this.#store.persistBinding("binding.reanchored_automatically", nextBinding, binding)
+    await this.#persistIsolatedBinding(
+      "binding.reanchored_automatically",
+      nextBinding,
+      binding,
+      workflow.id,
+    )
     const current = this.#store.getWorkflow(workflow.id)
     if (!current || current.status !== "running") {
       return nextBinding
@@ -2197,23 +2852,41 @@ export class Broker {
   }
 
   async #recoverBrowserOwnedAfterRestart(workflow, binding, signal) {
+    binding = effectiveWorkflowBinding(binding, workflow)
     let attempt = 0
     while (true) {
       attempt += 1
       try {
-        const verified = await this.#egoAdapter.reconcileBound({
-          ...(workflow.reconciliation.allowProtocolRepairCapture
-            ? { allowProtocolRepairCapture: true }
-            : {}),
-          allowDeliveryAbsent: true,
-          allowTaskSpaceReclaim: true,
-          binding,
-          expectedPreviousContentDigest: workflow.reconciliation.beforeHead.contentDigest,
-          expectedPreviousMessageId: workflow.reconciliation.beforeHead.messageId,
-          expectedTerminalMarker: workflow.reconciliation.expectedTerminalMarker,
-          inputDigest: workflow.inputDigest,
-          turnMarker: workflow.reconciliation.turnMarker,
-        }, signal)
+        const verified = await this.#egoAdapter.reconcileBound(
+          {
+            ...(workflow.reconciliation.allowProtocolRepairCapture
+              ? { allowProtocolRepairCapture: true }
+              : {}),
+            allowDeliveryAbsent: true,
+            allowTaskSpaceReclaim: true,
+            binding,
+            expectedPreviousContentDigest: workflow.reconciliation.beforeHead.contentDigest,
+            expectedPreviousMessageId: workflow.reconciliation.beforeHead.messageId,
+            expectedTerminalMarker: workflow.reconciliation.expectedTerminalMarker,
+            inputDigest: workflow.inputDigest,
+            turnMarker: workflow.reconciliation.turnMarker,
+          },
+          signal,
+          (result) => this.#reserveBrowserTaskSpaceIdentity({
+            expectedCanonicalUrl: binding.canonicalUrl,
+            key: binding.key,
+            owner: workflow.id,
+            result,
+          }),
+          () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
+        )
+        this.#reserveBrowserTaskSpaceIdentity({
+          expectedCanonicalUrl: binding.canonicalUrl,
+          key: binding.key,
+          owner: workflow.id,
+          result: verified,
+        })
+        taskSpaceIdentityCommitPatch(verified, binding)
         if (verified.deliveryState === "absent") {
           const beforeHead = workflow.reconciliation.beforeHead
           const bindingUnchanged = headAnchorsMatch(bindingHeadAnchor(binding), beforeHead)
@@ -2265,11 +2938,16 @@ export class Broker {
             { reason: "recovered_response_invalid" },
           )
         }
-        const observedPolicy = await this.#egoAdapter.ensureModelPolicy({
-          allowTaskSpaceReclaim: true,
-          binding,
-          modelPolicy: workflow.private.modelPolicy ?? this.#resolveModelPolicy(),
-        }, signal)
+        const observedPolicy = await this.#egoAdapter.ensureModelPolicy(
+          {
+            allowTaskSpaceReclaim: true,
+            binding,
+            modelPolicy: workflow.private.modelPolicy ?? this.#resolveModelPolicy(),
+          },
+          signal,
+          undefined,
+          () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
+        )
         return {
           binding,
           result: {
@@ -2345,6 +3023,13 @@ export class Broker {
                     modelPolicy: current.private.modelPolicy ?? this.#resolveModelPolicy(),
                   },
                   controller.signal,
+                  (result) => this.#reserveBrowserTaskSpaceIdentity({
+                    expectedCanonicalUrl: binding.canonicalUrl,
+                    key: binding.key,
+                    owner: workflow.id,
+                    result,
+                  }),
+                  () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
                 )
               } catch (error) {
                 if (controller.signal.aborted || !this.#canRetryPreSend(error)) {
@@ -2375,7 +3060,14 @@ export class Broker {
                 await this.#waitForRecovery(sendRecoveryCount, controller.signal)
               }
             }
+            this.#reserveBrowserTaskSpaceIdentity({
+              expectedCanonicalUrl: binding.canonicalUrl,
+              key: binding.key,
+              owner: workflow.id,
+              result: sent,
+            })
             const observation = this.#validateModelPolicyObservation(sent.modelPolicy)
+            const sendIdentity = taskSpaceIdentityCommitPatch(sent, binding)
             const taskSpaceControlRecovery = validateTaskSpaceControlRecovery(
               sent.taskSpaceControlRecovery,
             )
@@ -2393,12 +3085,18 @@ export class Broker {
                 captureAttempts: 0,
                 send: {
                   ...sent,
+                  ...sendIdentity,
                   modelPolicy: observation,
                   ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
                 },
               },
               reconciliation: {
                 ...current.reconciliation,
+                confirmedTaskSpace: {
+                  canonicalUrl: sent.canonicalUrl,
+                  taskSpaceId: sent.taskSpaceId,
+                  taskSpaceIdentity: sendIdentity.taskSpaceIdentity,
+                },
                 modelPolicyObservation: observation,
                 promptMessageId: sent.promptMessageId,
                 sentAt: sent.sentAt,
@@ -2429,10 +3127,11 @@ export class Broker {
               remainingMs = Date.parse(deadlineAt) - Date.now()
             }
             try {
+              const captureBinding = effectiveWorkflowBinding(binding, current)
               const captured = await this.#egoAdapter.captureExchange(
                 {
                   ...current.private.request,
-                  binding,
+                  binding: captureBinding,
                   canonicalUrl: current.private.send.canonicalUrl,
                   expectedPreviousContentDigest: current.reconciliation.beforeHead.contentDigest,
                   expectedPreviousMessageId: current.reconciliation.beforeHead.messageId,
@@ -2441,7 +3140,20 @@ export class Broker {
                   timeoutMs: remainingMs,
                 },
                 controller.signal,
+                (result) => this.#reserveBrowserTaskSpaceIdentity({
+                  expectedCanonicalUrl: captureBinding.canonicalUrl,
+                  key: captureBinding.key,
+                  owner: workflow.id,
+                  result,
+                }),
+                () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
               )
+              this.#reserveBrowserTaskSpaceIdentity({
+                expectedCanonicalUrl: captureBinding.canonicalUrl,
+                key: captureBinding.key,
+                owner: workflow.id,
+                result: captured,
+              })
               if (validatePendingCapture(captured, current)) {
                 const requeueDelayMs = captured.captureReason === "response_not_terminal"
                   ? 2_000
@@ -2456,7 +3168,10 @@ export class Broker {
                 )
                 continue
               }
-              result = captured
+              result = {
+                ...captured,
+                ...taskSpaceIdentityCommitPatch(captured, captureBinding),
+              }
               result.modelPolicy = current.private.send.modelPolicy
               const taskSpaceControlRecovery = validateTaskSpaceControlRecovery(
                 current.private.send.taskSpaceControlRecovery,
@@ -2490,6 +3205,13 @@ export class Broker {
             }
           }
         } else {
+          if (binding.state === "unbound" || !binding.canonicalUrl) {
+            throw new EgoChatError(
+              "human_required",
+              "Create-once exchange requires staged Send evidence before response capture.",
+              { reason: "create_once_staged_exchange_required" },
+            )
+          }
           result = await this.#egoAdapter.exchange(
             {
               ...current.private.request,
@@ -2497,9 +3219,27 @@ export class Broker {
               modelPolicy: current.private.modelPolicy ?? this.#resolveModelPolicy(),
             },
             controller.signal,
+            (browserResult) => this.#reserveBrowserTaskSpaceIdentity({
+              expectedCanonicalUrl: binding.canonicalUrl,
+              key: binding.key,
+              owner: workflow.id,
+              result: browserResult,
+            }),
+            () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
           )
+          this.#reserveBrowserTaskSpaceIdentity({
+            expectedCanonicalUrl: binding.canonicalUrl,
+            key: binding.key,
+            owner: workflow.id,
+            result,
+          })
         }
 
+        const resultIdentity = taskSpaceIdentityCommitPatch(
+          result,
+          effectiveWorkflowBinding(binding, current),
+        )
+        result = { ...result, ...resultIdentity }
         const observation = this.#validateModelPolicyObservation(result.modelPolicy)
         validateTaskSpaceControlRecovery(result.taskSpaceControlRecovery)
         if (
@@ -2606,13 +3346,19 @@ export class Broker {
           revision: currentBinding.revision + 1,
           state: "bound",
           targetId: result.targetId,
+          ...taskSpaceIdentityCommitPatch(
+            result,
+            effectiveWorkflowBinding(currentBinding, current),
+          ),
           taskSpaceId: result.taskSpaceId,
           updatedAt: now,
           verifiedAt: now,
         }
-        await this.#store.persistBinding(
+        await this.#persistIsolatedBinding(
           currentBinding.state === "unbound" ? "binding.promoted" : "binding.verified",
           nextBinding,
+          currentBinding,
+          workflow.id,
         )
       }
       const modelPolicy = await this.#recordModelPolicyObservation(
@@ -2799,6 +3545,10 @@ export class Broker {
             console.error("Durable convergence review recovery runner failed:", error)
           })
         })
+      }
+      const final = this.#store.getWorkflow(workflow.id)
+      if (final && isTerminal(final)) {
+        this.#releaseTaskSpaceAdmission(workflow.id)
       }
     }
   }
@@ -4159,6 +4909,7 @@ export class Broker {
   }
 
   async #publicReconciliationResult(binding, workflow) {
+    taskSpaceIdentityCommitPatch(workflow.result, binding)
     if (
       binding.lastReconciledWorkflowId !== workflow.id
       || workflow.status !== "succeeded"
@@ -4195,10 +4946,17 @@ export class Broker {
   }
 
   #validateAdoptionCapture(capture, request) {
+    taskSpaceIdentityCommitPatch(capture)
+    if (capture?.canonicalUrl !== request.canonicalUrl) {
+      throw new EgoChatError(
+        "human_required",
+        "The adoption result changed its owner-scoped canonical conversation.",
+        { reason: "canonical_conversation_changed" },
+      )
+    }
     const responseText = capture?.responseText
     const responseDigest = typeof responseText === "string" ? digest(responseText) : null
     const valid = capture
-      && capture.canonicalUrl === request.canonicalUrl
       && typeof capture.adoptedWhileGenerating === "boolean"
       && typeof capture.anchor?.messageId === "string"
       && capture.anchor.messageId.length > 0
@@ -4219,10 +4977,7 @@ export class Broker {
       && capture.head.renderedMessageCount === capture.head.messageCount
       && typeof capture.targetId === "string"
       && capture.targetId.length > 0
-      && (
-        (typeof capture.taskSpaceId === "string" && capture.taskSpaceId.length > 0)
-        || (Number.isInteger(capture.taskSpaceId) && capture.taskSpaceId > 0)
-      )
+      && validTaskSpaceLocation(capture.taskSpaceId)
       && Number.isFinite(capture.durationMs)
       && capture.durationMs >= 0
     if (!valid) {
@@ -4238,8 +4993,571 @@ export class Broker {
     }
   }
 
+  #reserveAdoptionCaptureIdentity(workflow, capture) {
+    this.#reserveBrowserTaskSpaceIdentity({
+      expectedCanonicalUrl: workflow.private?.request?.canonicalUrl
+        ?? workflow.reconciliation?.adoptionCaptureClaim?.canonicalUrl,
+      key: workflow.bindingKey,
+      owner: workflow.id,
+      result: capture,
+    })
+  }
+
   #findBindingByCanonicalUrl(canonicalUrl) {
     return this.#store.listBindings().find((binding) => binding.canonicalUrl === canonicalUrl)
+  }
+
+  #durableTaskSpaceClaims() {
+    const claims = []
+    for (const workflow of this.#store.listWorkflows()) {
+      if (workflow.status === "cancelled" && workflow.abandonment) {
+        continue
+      }
+      const binding = typeof workflow.bindingKey === "string"
+        ? this.#store.getBinding(workflow.bindingKey)
+        : null
+      const evidence = workflow.kind === "conversation_adoption"
+        ? (workflow.reconciliation?.adoptionCaptureClaim ?? workflow.private?.capture)
+        : (workflow.kind === "ego_exchange"
+            ? (
+                workflow.reconciliation?.confirmedTaskSpace
+                ?? workflow.private?.send
+                ?? (workflow.phase === "response_captured" ? workflow.result : null)
+              )
+            : null)
+      if (!evidence) {
+        continue
+      }
+      let canonicalUrl = null
+      let identity
+      let selector = null
+      try {
+        canonicalUrl = canonicalWorkflowEvidenceUrl(evidence.canonicalUrl)
+      } catch (_error) {
+        // Keep the key/selector claim even if corrupt evidence cannot identify a URL.
+      }
+      try {
+        identity = validateTaskSpaceIdentity(evidence.taskSpaceIdentity)
+        selector = identity
+          ? taskSpaceIdentitySelector(identity)
+          : taskSpaceSelectorForBinding(binding ?? workflow.private?.request ?? {})
+      } catch (_error) {
+        // A corrupt selector must not erase the independently usable URL/key
+        // portion of a previously durable browser claim.
+      }
+      let bindingIdentity
+      try {
+        bindingIdentity = validateTaskSpaceIdentity(binding?.taskSpaceIdentity)
+      } catch (_error) {
+        // Corrupt binding evidence cannot establish exact transfer.
+      }
+      const transferred = Boolean(
+        binding
+        && identity
+        && bindingIdentity
+        && canonicalUrl
+        && binding.canonicalUrl === canonicalUrl
+        && isDeepStrictEqual(bindingIdentity, identity)
+        && (
+          (workflow.kind === "conversation_adoption"
+            && binding.adoptionWorkflowId === workflow.id)
+          || (workflow.kind === "ego_exchange"
+            && (
+              binding.lastExchangeWorkflowId === workflow.id
+              || binding.lastReconciledWorkflowId === workflow.id
+              || (workflow.status === "succeeded" && workflow.phase === "head_committed")
+            ))
+        )
+      )
+      if (transferred) {
+        continue
+      }
+      claims.push({
+        canonicalUrl,
+        key: workflow.bindingKey ?? null,
+        owner: workflow.id,
+        selector,
+        ...(identity ? { taskSpaceIdentity: identity } : {}),
+      })
+    }
+    return claims
+  }
+
+  #synchronizeDurableClaimUrls() {
+    const desired = new Map()
+    for (const [owner, admission] of this.#taskSpaceAdmissionReservations) {
+      if (admission.canonicalUrl) {
+        desired.set(digest(admission.canonicalUrl), owner)
+      }
+    }
+    for (const claim of this.#durableTaskSpaceClaims()) {
+      if (claim.canonicalUrl) {
+        desired.set(digest(claim.canonicalUrl), claim.owner)
+      }
+    }
+    for (const [urlDigest] of this.#activeConversationUrls) {
+      if (!desired.has(urlDigest)) {
+        this.#activeConversationUrls.delete(urlDigest)
+      }
+    }
+    for (const [urlDigest, owner] of desired) {
+      this.#activeConversationUrls.set(urlDigest, owner)
+    }
+  }
+
+  #assertCanonicalTaskSpaceSelectorAvailable(selectorValue, owner = undefined, key = undefined) {
+    const selector = validateTaskSpaceSelector(selectorValue)
+    for (const binding of this.#store.listBindings()) {
+      if (binding.key === key) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(binding.taskSpaceIdentity)
+      const bindingSelector = identity
+        ? taskSpaceIdentitySelector(identity)
+        : taskSpaceSelectorForBinding(binding)
+      if (
+        (identity && taskSpaceSelectorConflictsWithIdentity(selector, identity))
+        || (!identity && unresolvedSelectorsConflict(selector, bindingSelector))
+      ) {
+        throw new EgoChatError(
+          "task_space_already_bound",
+          "That stable Ego task-space selector already belongs to another conversation binding.",
+          { bindingKey: binding.key },
+        )
+      }
+    }
+    for (const [reservationOwner, admission] of this.#taskSpaceAdmissionReservations) {
+      if (reservationOwner === owner) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(admission.taskSpaceIdentity)
+      if (
+        (identity && taskSpaceSelectorConflictsWithIdentity(selector, identity))
+        || unresolvedSelectorsConflict(selector, admission.selector)
+      ) {
+        throw new EgoChatError(
+          "task_space_reserved",
+          "That stable Ego task-space selector is being committed for another conversation.",
+          { operationId: reservationOwner },
+        )
+      }
+    }
+  }
+
+  #reserveTaskSpaceAdmission(owner, {
+    canonicalUrl = null,
+    key = null,
+    selector,
+    taskSpaceIdentity = undefined,
+  }) {
+    const current = this.#taskSpaceAdmissionReservations.get(owner)
+    const currentCanonicalUrl = current?.canonicalUrl
+      ? canonicalWorkflowEvidenceUrl(current.canonicalUrl)
+      : null
+    const requestedCanonicalUrl = canonicalUrl
+      ? canonicalWorkflowEvidenceUrl(canonicalUrl)
+      : null
+    if (
+      currentCanonicalUrl
+      && requestedCanonicalUrl
+      && currentCanonicalUrl !== requestedCanonicalUrl
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The task-space admission cannot change its canonical conversation.",
+        { reason: "canonical_conversation_changed" },
+      )
+    }
+    if (current?.key && key && current.key !== key) {
+      throw new EgoChatError(
+        "human_required",
+        "The task-space admission cannot change its binding key.",
+        { reason: "binding_key_changed" },
+      )
+    }
+    const requestedIdentity = validateTaskSpaceIdentity(taskSpaceIdentity)
+    const currentIdentity = validateTaskSpaceIdentity(current?.taskSpaceIdentity)
+    if (
+      requestedIdentity
+      && currentIdentity
+      && !isDeepStrictEqual(requestedIdentity, currentIdentity)
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The task-space admission cannot change its stable identity.",
+        { reason: "task_space_identity_changed" },
+      )
+    }
+    const identity = currentIdentity ?? requestedIdentity
+    const validatedSelector = identity
+      ? taskSpaceIdentitySelector(identity)
+      : validateTaskSpaceSelector(selector)
+    const effectiveCanonicalUrl = currentCanonicalUrl ?? requestedCanonicalUrl
+    const effectiveKey = current?.key ?? key
+    const candidate = {
+      canonicalUrl: effectiveCanonicalUrl,
+      key: effectiveKey,
+      selector: validatedSelector,
+      ...(identity ? { taskSpaceIdentity: identity } : {}),
+    }
+    const assertForeignAdmission = (other, details) => {
+      if (effectiveKey && other.key && effectiveKey === other.key) {
+        throw new EgoChatError(
+          "human_required",
+          "That binding key is already reserved by another operation.",
+          { ...details, reason: "binding_key_reserved" },
+        )
+      }
+      if (
+        effectiveCanonicalUrl
+        && other.canonicalUrl
+        && effectiveCanonicalUrl === other.canonicalUrl
+      ) {
+        throw new EgoChatError(
+          "human_required",
+          "That canonical conversation is already reserved by another operation.",
+          { ...details, reason: "canonical_conversation_already_bound" },
+        )
+      }
+      const otherIdentity = validateTaskSpaceIdentity(other.taskSpaceIdentity)
+      const otherSelector = other.selector ?? null
+      if (
+        (identity && otherIdentity
+          && taskSpaceIdentityRelation(identity, otherIdentity) !== "distinct")
+        || (identity && !otherIdentity && otherSelector
+          && taskSpaceSelectorConflictsWithIdentity(otherSelector, identity))
+        || (!identity && otherIdentity
+          && taskSpaceSelectorConflictsWithIdentity(validatedSelector, otherIdentity))
+        || (!identity && !otherIdentity && otherSelector
+          && unresolvedSelectorsConflict(validatedSelector, otherSelector))
+      ) {
+        throw new EgoChatError(
+          "human_required",
+          "That task-space selector is already reserved by another operation.",
+          { ...details, reason: "task_space_selector_reserved" },
+        )
+      }
+    }
+    for (const [reservationOwner, admission] of this.#taskSpaceAdmissionReservations) {
+      if (reservationOwner !== owner) {
+        assertForeignAdmission(admission, { operationId: reservationOwner })
+      }
+    }
+    for (const claim of this.#durableTaskSpaceClaims()) {
+      if (claim.owner !== owner) {
+        assertForeignAdmission(claim, { workflowId: claim.owner })
+      }
+    }
+    this.#assertCanonicalTaskSpaceSelectorAvailable(validatedSelector, owner, effectiveKey)
+    if (identity) {
+      this.#assertTaskSpaceIdentityAvailable({
+        canonicalUrl: effectiveCanonicalUrl,
+        key: effectiveKey,
+        taskSpaceIdentity: identity,
+      }, owner)
+    }
+    this.#taskSpaceAdmissionReservations.set(owner, candidate)
+    this.#synchronizeDurableClaimUrls()
+  }
+
+  #releaseTaskSpaceAdmission(owner) {
+    this.#taskSpaceAdmissionReservations.delete(owner)
+    this.#taskSpaceIdentityReservations.delete(owner)
+    this.#synchronizeDurableClaimUrls()
+  }
+
+  #taskSpaceGuard(owner) {
+    const ownerAdmission = this.#taskSpaceAdmissionReservations.get(owner)
+    if (!ownerAdmission) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser operation has no owner-scoped task-space admission.",
+        { reason: "task_space_guard_missing" },
+      )
+    }
+    const deniedIdentities = []
+    const deniedSelectors = []
+    const foreignAdmissionKeys = new Set(
+      [...this.#taskSpaceAdmissionReservations.entries()]
+        .filter(([reservationOwner]) => reservationOwner !== owner)
+        .map(([, admission]) => admission.key)
+        .filter((key) => typeof key === "string" && key.length > 0),
+    )
+    for (const binding of this.#store.listBindings()) {
+      if (binding.key === ownerAdmission.key || foreignAdmissionKeys.has(binding.key)) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(binding.taskSpaceIdentity)
+      if (identity) {
+        deniedIdentities.push(identity)
+      } else {
+        const selector = taskSpaceSelectorForBinding(binding)
+        if (selector.kind !== "numeric_location") {
+          deniedSelectors.push(selector)
+        }
+      }
+    }
+    for (const [reservationOwner, admission] of this.#taskSpaceAdmissionReservations) {
+      if (reservationOwner === owner) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(admission.taskSpaceIdentity)
+      if (identity) {
+        deniedIdentities.push(identity)
+      } else {
+        const selector = validateTaskSpaceSelector(admission.selector)
+        if (selector.kind !== "numeric_location") {
+          deniedSelectors.push(selector)
+        }
+      }
+    }
+    for (const [reservationOwner, binding] of this.#taskSpaceIdentityReservations) {
+      if (reservationOwner === owner || this.#taskSpaceAdmissionReservations.has(reservationOwner)) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(binding.taskSpaceIdentity)
+      if (identity) {
+        deniedIdentities.push(identity)
+      }
+    }
+    for (const claim of this.#durableTaskSpaceClaims()) {
+      if (claim.owner === owner || this.#taskSpaceAdmissionReservations.has(claim.owner)) {
+        continue
+      }
+      const identity = validateTaskSpaceIdentity(claim.taskSpaceIdentity)
+      if (identity) {
+        deniedIdentities.push(identity)
+      } else if (claim.selector && claim.selector.kind !== "numeric_location") {
+        deniedSelectors.push(claim.selector)
+      }
+    }
+    const uniqueIdentities = [...new Map(deniedIdentities.map((identity) => [
+      JSON.stringify([identity.name, identity.taskId]),
+      identity,
+    ])).values()]
+      .sort((first, second) => (
+        first.name.localeCompare(second.name) || first.taskId.localeCompare(second.taskId)
+      ))
+    const uniqueSelectors = [...new Map(deniedSelectors.map((selector) => [
+      JSON.stringify(selector),
+      selector,
+    ])).values()]
+      .sort((first, second) => JSON.stringify(first).localeCompare(JSON.stringify(second)))
+    return {
+      deniedIdentities: uniqueIdentities,
+      deniedSelectors: uniqueSelectors,
+      ownerSelector: ownerAdmission.taskSpaceIdentity
+        ? taskSpaceIdentitySelector(ownerAdmission.taskSpaceIdentity)
+        : validateTaskSpaceSelector(ownerAdmission.selector),
+      revision: 1,
+    }
+  }
+
+  #reserveBrowserTaskSpaceIdentity({
+    allowMissingCanonicalUrl = false,
+    expectedCanonicalUrl = null,
+    key,
+    owner,
+    result,
+  }) {
+    const admission = this.#taskSpaceAdmissionReservations.get(owner)
+    if (!admission) {
+      throw new EgoChatError(
+        "human_required",
+        "The observed browser identity has no owner-scoped task-space admission.",
+        { reason: "task_space_guard_missing" },
+      )
+    }
+    const candidateCanonicalUrl = result?.canonicalUrl
+      ? canonicalWorkflowEvidenceUrl(result.canonicalUrl)
+      : null
+    if (!candidateCanonicalUrl && !allowMissingCanonicalUrl) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser result did not contain canonical conversation identity evidence.",
+        { reason: "canonical_conversation_evidence_invalid" },
+      )
+    }
+    const expectedUrl = expectedCanonicalUrl
+      ? canonicalWorkflowEvidenceUrl(expectedCanonicalUrl)
+      : null
+    const admissionCanonicalUrl = admission.canonicalUrl
+      ? canonicalWorkflowEvidenceUrl(admission.canonicalUrl)
+      : null
+    if (expectedUrl && admissionCanonicalUrl && expectedUrl !== admissionCanonicalUrl) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser expectation changed its owner-scoped canonical conversation.",
+        { reason: "canonical_conversation_changed" },
+      )
+    }
+    if (
+      (expectedUrl || admissionCanonicalUrl)
+      && candidateCanonicalUrl
+      && (expectedUrl ?? admissionCanonicalUrl) !== candidateCanonicalUrl
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser result changed its owner-scoped canonical conversation.",
+        { reason: "canonical_conversation_changed" },
+      )
+    }
+    if (admission.key && key && admission.key !== key) {
+      throw new EgoChatError(
+        "human_required",
+        "The browser result changed its owner-scoped binding key.",
+        { reason: "binding_key_changed" },
+      )
+    }
+    const candidate = {
+      canonicalUrl: candidateCanonicalUrl ?? expectedUrl ?? admissionCanonicalUrl,
+      key: admission.key ?? key,
+      taskSpaceIdentity: validateTaskSpaceIdentity(result?.taskSpaceIdentity),
+    }
+    this.#assertTaskSpaceIdentityAvailable(candidate, owner)
+    if (
+      admission.selector.kind !== "numeric_location"
+      && !taskSpaceSelectorMatchesIdentity(admission.selector, candidate.taskSpaceIdentity)
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The observed browser identity does not match its owner-scoped task-space selector.",
+        {
+          reason: admission.selector.kind === "stable_identity"
+            ? "task_space_identity_changed"
+            : "task_space_selector_identity_changed",
+        },
+      )
+    }
+    if (candidate.canonicalUrl) {
+      const urlDigest = digest(candidate.canonicalUrl)
+      const urlOwner = this.#activeConversationUrls.get(urlDigest)
+      if (urlOwner && urlOwner !== owner) {
+        throw new EgoChatError(
+          "human_required",
+          "The observed canonical conversation is already reserved by another operation.",
+          { operationId: urlOwner, reason: "canonical_conversation_already_bound" },
+        )
+      }
+    }
+    this.#taskSpaceIdentityReservations.set(owner, candidate)
+    if (candidate.canonicalUrl) {
+      const urlDigest = digest(candidate.canonicalUrl)
+      this.#activeConversationUrls.set(urlDigest, owner)
+    }
+    this.#taskSpaceAdmissionReservations.set(owner, {
+      ...admission,
+      canonicalUrl: candidate.canonicalUrl,
+      key: candidate.key,
+      selector: taskSpaceIdentitySelector(candidate.taskSpaceIdentity),
+      taskSpaceIdentity: candidate.taskSpaceIdentity,
+    })
+  }
+
+  #assertTaskSpaceIdentityAvailable(candidate, owner) {
+    const identity = validateTaskSpaceIdentity(candidate.taskSpaceIdentity)
+    if (!identity) {
+      throw new EgoChatError(
+        "human_required",
+        "A durable binding cannot be committed without a complete stable task-space identity.",
+        { reason: "task_space_identity_missing" },
+      )
+    }
+    const compare = (other, details, allowSameKey = false) => {
+      if (!other || (allowSameKey && other.key === candidate.key)) {
+        return
+      }
+      if (
+        candidate.canonicalUrl
+        && other.canonicalUrl
+        && candidate.canonicalUrl === other.canonicalUrl
+      ) {
+        throw new EgoChatError(
+          "human_required",
+          "One canonical conversation cannot be committed under two durable bindings.",
+          { ...details, reason: "canonical_conversation_already_bound" },
+        )
+      }
+      const otherIdentity = validateTaskSpaceIdentity(other.taskSpaceIdentity)
+      if (!otherIdentity) {
+        const selector = taskSpaceSelectorForBinding(other)
+        if (
+          selector.kind !== "numeric_location"
+          && taskSpaceSelectorConflictsWithIdentity(selector, identity)
+        ) {
+          throw new EgoChatError(
+            "human_required",
+            "The candidate task-space identity conflicts with another binding's reserved recovery selector.",
+            { ...details, reason: "task_space_selector_already_bound" },
+          )
+        }
+        return
+      }
+      const relation = taskSpaceIdentityRelation(identity, otherIdentity)
+      if (relation === "exact") {
+        throw new EgoChatError(
+          "human_required",
+          "One stable Ego task-space identity cannot be committed for two conversations.",
+          { ...details, reason: "task_space_identity_already_bound" },
+        )
+      }
+      if (relation === "conflict") {
+        throw new EgoChatError(
+          "human_required",
+          "The candidate task-space identity conflicts with another durable stable field.",
+          { ...details, reason: "task_space_identity_conflict" },
+        )
+      }
+    }
+    for (const binding of this.#store.listBindings()) {
+      compare(binding, { bindingKey: binding.key }, true)
+    }
+    for (const [reservationOwner, binding] of this.#taskSpaceIdentityReservations) {
+      if (reservationOwner !== owner) {
+        compare(binding, { operationId: reservationOwner })
+      }
+    }
+    for (const [reservationOwner, admission] of this.#taskSpaceAdmissionReservations) {
+      if (reservationOwner === owner) {
+        continue
+      }
+      const otherIdentity = validateTaskSpaceIdentity(admission.taskSpaceIdentity)
+      if (otherIdentity) {
+        compare(admission, { operationId: reservationOwner })
+      } else if (taskSpaceSelectorConflictsWithIdentity(admission.selector, identity)) {
+        throw new EgoChatError(
+          "human_required",
+          "The candidate task-space identity conflicts with another operation's unresolved selector.",
+          { operationId: reservationOwner, reason: "task_space_selector_reserved" },
+        )
+      }
+    }
+    for (const claim of this.#durableTaskSpaceClaims()) {
+      if (claim.owner === owner) {
+        continue
+      }
+      const otherIdentity = validateTaskSpaceIdentity(claim.taskSpaceIdentity)
+      if (otherIdentity) {
+        compare(claim, { workflowId: claim.owner })
+      } else if (claim.selector && taskSpaceSelectorConflictsWithIdentity(claim.selector, identity)) {
+        throw new EgoChatError(
+          "human_required",
+          "The candidate task-space identity conflicts with an unresolved durable workflow selector.",
+          { workflowId: claim.owner, reason: "task_space_selector_reserved" },
+        )
+      }
+    }
+  }
+
+  async #persistIsolatedBinding(eventType, binding, previous = undefined, owner = undefined) {
+    owner ??= `binding-commit-${randomUUID()}`
+    this.#assertTaskSpaceIdentityAvailable(binding, owner)
+    this.#taskSpaceIdentityReservations.set(owner, structuredClone(binding))
+    try {
+      await this.#store.persistBinding(eventType, binding, previous ?? null)
+    } finally {
+      this.#taskSpaceIdentityReservations.delete(owner)
+    }
   }
 
   #assertBindingAvailable(bindingKey, convergenceId = undefined) {
@@ -4252,8 +5570,8 @@ export class Broker {
       )
     }
     const binding = this.#store.getBinding(bindingKey)
-    const adoptionOwner = binding
-      ? this.#adoptionTaskSpaces.get(String(binding.taskSpaceId))
+    const adoptionOwner = binding && !binding.taskSpaceIdentity && !binding.canonicalUrl
+      ? this.#adoptionTaskSpaces.get(taskSpaceSelectorKey(taskSpaceSelector(binding.taskSpaceId)))
       : undefined
     if (adoptionOwner) {
       throw new EgoChatError(
@@ -4270,7 +5588,7 @@ export class Broker {
         continue
       }
       const activeBinding = this.#store.getBinding(activeBindingKey)
-      if (activeBinding && String(activeBinding.taskSpaceId) === String(binding.taskSpaceId)) {
+      if (bindingsShareTaskSpace(activeBinding, binding)) {
         throw new EgoChatError(
           "task_space_busy",
           "That Ego task space already has an active bound-conversation browser operation.",
@@ -4283,41 +5601,10 @@ export class Broker {
         continue
       }
       const reservedBinding = this.#store.getBinding(reservedBindingKey)
-      if (reservedBinding && String(reservedBinding.taskSpaceId) === String(binding.taskSpaceId)) {
+      if (bindingsShareTaskSpace(reservedBinding, binding)) {
         throw new EgoChatError(
           "task_space_reserved",
           "That Ego task space is reserved by another active convergence workflow.",
-          { workflowId },
-        )
-      }
-    }
-  }
-
-  #assertTaskSpaceAvailable(taskSpace) {
-    const adoptionOwner = this.#adoptionTaskSpaces.get(String(taskSpace))
-    if (adoptionOwner) {
-      throw new EgoChatError(
-        "task_space_reserved",
-        "That Ego task space is reserved by a read-only conversation adoption.",
-        { workflowId: adoptionOwner },
-      )
-    }
-    for (const bindingKey of this.#activeBindings) {
-      const binding = this.#store.getBinding(bindingKey)
-      if (binding && String(binding.taskSpaceId) === String(taskSpace)) {
-        throw new EgoChatError(
-          "task_space_busy",
-          "That Ego task space already has an active bound-conversation browser operation.",
-          { bindingKey },
-        )
-      }
-    }
-    for (const [bindingKey, workflowId] of this.#convergenceBindings) {
-      const binding = this.#store.getBinding(bindingKey)
-      if (binding && String(binding.taskSpaceId) === String(taskSpace)) {
-        throw new EgoChatError(
-          "task_space_reserved",
-          "That Ego task space is reserved by an active convergence workflow.",
           { workflowId },
         )
       }

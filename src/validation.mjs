@@ -7,7 +7,14 @@ import { DEFAULT_MODEL_POLICY, MAX_PROMPT_BYTES, MAX_WAIT_MS } from "./constants
 
 export const WorkflowIdSchema = z.uuid()
 export const BindingKeySchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/)
-export const TaskSpaceSchema = z.union([z.string().min(1).max(120), z.number().int().positive()])
+const TASK_SPACE_FORBIDDEN_CHARACTERS = /[\p{Cc}\p{Cf}\u2028\u2029]/u
+export const TaskSpaceSchema = z.union([
+  z.string().min(1).max(120).refine(
+    (value) => !TASK_SPACE_FORBIDDEN_CHARACTERS.test(value),
+    "Task-space selectors cannot contain control or invisible formatting characters",
+  ),
+  z.number().int().positive().safe(),
+])
 export const TargetIdSchema = z.string().min(1).max(200)
 export const SafeTextSchema = z.string().min(1).refine(
   (value) => Buffer.byteLength(value, "utf8") <= MAX_PROMPT_BYTES,

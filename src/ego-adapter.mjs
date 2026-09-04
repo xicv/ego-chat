@@ -283,33 +283,51 @@ export class EgoAdapter {
     }
   }
 
-  async preflight({ taskSpace }) {
-    return this.#run({ mode: "preflight", taskSpace }, 60_000)
+  async preflight(params, signal = undefined, beforeRun = undefined) {
+    return this.#run(
+      { brokerLease: this.#brokerLease, mode: "preflight", ...params },
+      60_000,
+      signal,
+      undefined,
+      beforeRun,
+    )
   }
 
-  async bind(params, signal = undefined) {
+  async bind(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
     const { mode: bindingMode, ...bindingInput } = params
-    return this.#run({ brokerLease: this.#brokerLease, ...bindingInput, bindingMode, mode: "bind" }, 60_000, signal)
+    return this.#run(
+      { brokerLease: this.#brokerLease, ...bindingInput, bindingMode, mode: "bind" },
+      60_000,
+      signal,
+      onResult,
+      beforeRun,
+    )
   }
 
-  async adopt(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, ...params, mode: "adopt" }, params.timeoutMs + 60_000, signal)
+  async adopt(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run(
+      { brokerLease: this.#brokerLease, ...params, mode: "adopt" },
+      params.timeoutMs + 60_000,
+      signal,
+      onResult,
+      beforeRun,
+    )
   }
 
-  async exchange(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, mode: "exchange", ...params }, params.timeoutMs + 60_000, signal)
+  async exchange(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "exchange", ...params }, params.timeoutMs + 60_000, signal, onResult, beforeRun)
   }
 
-  async sendExchange(params, signal = undefined) {
+  async sendExchange(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
     return this.#run({
       brokerLease: this.#brokerLease,
       exchangeStage: "send_only",
       mode: "exchange",
       ...params,
-    }, 3 * 60_000, signal)
+    }, 3 * 60_000, signal, onResult, beforeRun)
   }
 
-  async captureExchange(params, signal = undefined) {
+  async captureExchange(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
     const timeoutMs = Math.min(params.timeoutMs, this.#captureSliceMs)
     return this.#run({
       brokerLease: this.#brokerLease,
@@ -317,27 +335,27 @@ export class EgoAdapter {
       captureContinuationAllowed: params.timeoutMs > timeoutMs,
       mode: "capture_exchange",
       timeoutMs,
-    }, timeoutMs + 60_000, signal)
+    }, timeoutMs + 60_000, signal, onResult, beforeRun)
   }
 
-  async ensureModelPolicy(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, mode: "model_policy", ...params }, 60_000, signal)
+  async ensureModelPolicy(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "model_policy", ...params }, 60_000, signal, onResult, beforeRun)
   }
 
-  async reconcile(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, mode: "reconcile", ...params }, 60_000, signal)
+  async reconcile(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "reconcile", ...params }, 60_000, signal, onResult, beforeRun)
   }
 
-  async reconcileBound(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, mode: "reconcile_bound", ...params }, 60_000, signal)
+  async reconcileBound(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "reconcile_bound", ...params }, 60_000, signal, onResult, beforeRun)
   }
 
-  async reanchor(params, signal = undefined) {
-    return this.#run({ brokerLease: this.#brokerLease, mode: "reanchor", ...params }, 60_000, signal)
+  async reanchor(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "reanchor", ...params }, 60_000, signal, onResult, beforeRun)
   }
 
-  async verify(params, signal = undefined) {
-    return this.#run({ mode: "verify", ...params }, 60_000, signal)
+  async verify(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, mode: "verify", ...params }, 60_000, signal, onResult, beforeRun)
   }
 
   async #withMailboxLock(operation) {
@@ -570,8 +588,24 @@ export class EgoAdapter {
     })
   }
 
-  async #run(input, timeoutMs, signal = undefined) {
-    return this.#withBrowserLane(() => this.#runExclusive(input, timeoutMs, signal))
+  async #run(input, timeoutMs, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#withBrowserLane(async () => {
+      const inputPatch = typeof beforeRun === "function" ? beforeRun() : undefined
+      if (inputPatch && typeof inputPatch.then === "function") {
+        throw new EgoChatError("invalid_browser_admission", "The in-lane browser admission callback must be synchronous.")
+      }
+      const effectiveInput = inputPatch === undefined
+        ? input
+        : { ...input, ...inputPatch }
+      const result = await this.#runExclusive(effectiveInput, timeoutMs, signal)
+      if (typeof onResult === "function") {
+        const callbackResult = onResult(result)
+        if (callbackResult && typeof callbackResult.then === "function") {
+          throw new EgoChatError("invalid_browser_admission", "The in-lane browser result callback must be synchronous.")
+        }
+      }
+      return result
+    })
   }
 
   async #runExclusive(input, timeoutMs, signal = undefined) {
