@@ -9848,3 +9848,139 @@ test("referenced blob inventory fails closed on identity, layout, and content dr
     }
   }
 })
+
+test("blob reconciliation closes mutations after root and prefix enumeration", async (t) => {
+  const injectionPoints = [
+    "after_blob_root_enumeration",
+    "after_blob_prefix_enumeration",
+  ]
+  for (const injectionPoint of injectionPoints) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+    const options = { maxBlobBytes: 1_024, maxEvents: 1 }
+    const seed = new EventStore(dataDir, options)
+    await seed.initialize()
+    const body = `protected inventory body ${injectionPoint}`
+    const reference = await seed.putBlob(body)
+    const now = "2026-09-05T02:00:00.000Z"
+    const workflow = {
+      createdAt: now,
+      id: `d2d48761-8d55-4466-a0a2-${digest(injectionPoint).slice(0, 12)}`,
+      kind: "ego_exchange",
+      phase: "awaiting_attachment_capture",
+      result: { responseDigest: reference.digest, responseRef: reference },
+      status: "human_required",
+      updatedAt: now,
+    }
+    await seed.persist("workflow.human_required", workflow)
+
+    const blobRoot = path.join(dataDir, "blobs", "sha256")
+    const referencePrefix = reference.digest.slice(0, 2)
+    const orphanBody = Buffer.from(`late orphan ${injectionPoint}`)
+    const orphanDigest = digest(orphanBody)
+    const orphanPrefix = injectionPoint === "after_blob_root_enumeration"
+      ? (referencePrefix === "ff" ? "00" : "ff")
+      : referencePrefix
+    const orphanDirectory = path.join(blobRoot, orphanPrefix)
+    const orphanPath = path.join(orphanDirectory, orphanDigest)
+    let injected = false
+    const recovered = new EventStore(dataDir, {
+      ...options,
+      compactionFaultInjector: async (phase, context) => {
+        if (injected || phase !== injectionPoint) return
+        if (
+          phase === "after_blob_prefix_enumeration"
+          && context?.prefix !== referencePrefix
+        ) return
+        await fs.mkdir(orphanDirectory, { mode: 0o700, recursive: true })
+        await fs.writeFile(orphanPath, orphanBody, { mode: 0o600 })
+        injected = true
+      },
+    })
+
+    await recovered.initialize()
+    assert.equal(injected, true)
+    await assert.rejects(fs.stat(orphanPath), (error) => error.code === "ENOENT")
+    assert.equal(
+      (await recovered.readBlob(reference, { maxBytes: 1_024, offset: 0 })).text,
+      body,
+    )
+    assert.equal(recovered.getMetrics().blobBytes, reference.sizeBytes)
+    assert.equal(recovered.getMetrics().protectedBlobBytes, reference.sizeBytes)
+    assert.deepEqual(await fs.readdir(blobRoot), [referencePrefix])
+    assert.deepEqual(
+      await fs.readdir(path.join(blobRoot, referencePrefix)),
+      [reference.digest],
+    )
+
+    const durableSnapshot = {
+      blob: await fs.readFile(path.join(blobRoot, referencePrefix, reference.digest)),
+      checkpoint: await fs.readFile(path.join(dataDir, "checkpoint.json")),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      manifest: await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+    }
+
+    const restarted = new EventStore(dataDir, options)
+    await restarted.initialize()
+    assert.equal(restarted.getMetrics().blobBytes, reference.sizeBytes)
+    assert.equal(restarted.getMetrics().protectedBlobBytes, reference.sizeBytes)
+    assert.deepEqual({
+      blob: await fs.readFile(path.join(blobRoot, referencePrefix, reference.digest)),
+      checkpoint: await fs.readFile(path.join(dataDir, "checkpoint.json")),
+      events: await fs.readFile(path.join(dataDir, "events.jsonl")),
+      manifest: await fs.readFile(path.join(dataDir, "checkpoint.manifest.json")),
+      state: await fs.readFile(path.join(dataDir, "state.json")),
+    }, durableSnapshot)
+  }
+})
+
+test("orphan quarantine never silently deletes a replacement inode", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+  const seed = new EventStore(dataDir, { maxBlobBytes: 1_024, maxEvents: 1 })
+  await seed.initialize()
+  const orphanBody = Buffer.from("orphan pending quarantine")
+  const orphanDigest = digest(orphanBody)
+  const orphanDirectory = path.join(
+    dataDir,
+    "blobs",
+    "sha256",
+    orphanDigest.slice(0, 2),
+  )
+  const orphanPath = path.join(orphanDirectory, orphanDigest)
+  await fs.mkdir(orphanDirectory, { mode: 0o700, recursive: true })
+  await fs.writeFile(orphanPath, orphanBody, { mode: 0o600 })
+
+  const replacement = Buffer.from("replacement inode retained")
+  let replaced = false
+  const recovered = new EventStore(dataDir, {
+    maxBlobBytes: 1_024,
+    maxEvents: 1,
+    compactionFaultInjector: async (phase, context) => {
+      if (replaced || phase !== "before_orphan_quarantine") return
+      assert.equal(context?.filePath, orphanPath)
+      await fs.rm(orphanPath)
+      await fs.writeFile(orphanPath, replacement, { mode: 0o600 })
+      replaced = true
+    },
+  })
+
+  await assert.rejects(
+    recovered.initialize(),
+    (error) => error.code === "corrupt_result_blob_inventory",
+  )
+  assert.equal(replaced, true)
+  await assert.rejects(fs.stat(orphanPath), (error) => error.code === "ENOENT")
+  const quarantineDirectory = path.join(dataDir, "blob-quarantine")
+  const quarantined = await fs.readdir(quarantineDirectory)
+  assert.equal(quarantined.length, 1)
+  assert.ok((await fs.readFile(path.join(quarantineDirectory, quarantined[0])))
+    .equals(replacement))
+
+  const restarted = new EventStore(dataDir, { maxBlobBytes: 1_024, maxEvents: 1 })
+  await assert.rejects(
+    restarted.initialize(),
+    (error) => error.code === "corrupt_result_blob_inventory",
+  )
+})

@@ -1107,6 +1107,12 @@ export class EventStore {
   }
 
   async initialize() {
+    const operation = this.#tail.then(() => this.#initialize())
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async #initialize() {
     await ensurePrivateDirectory(this.#dataDir)
     this.#state = clone(EMPTY_STATE)
     this.#blobBytes = 0
@@ -2338,14 +2344,98 @@ export class EventStore {
           "An unreferenced result blob changed identity before removal.",
         )
       }
-      await fs.unlink(filePath)
+      await this.#compactionFaultInjector?.("before_orphan_quarantine", {
+        filePath,
+      })
+      const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
+      await ensurePrivateDirectory(quarantineDirectory)
+      const quarantinePath = path.join(
+        quarantineDirectory,
+        `blob-${randomUUID()}`,
+      )
+      await fs.rename(filePath, quarantinePath)
+      const quarantined = await fs.lstat(quarantinePath)
+      const openedAfterMove = await handle.stat()
+      assertPrivateBlobFile(quarantined)
+      assertPrivateBlobFile(openedAfterMove)
+      if (
+        !sameFileIdentity(opened, openedAfterMove)
+        || !sameFileIdentity(openedAfterMove, quarantined)
+      ) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "An unreferenced result blob changed identity during quarantine.",
+        )
+      }
+      await fs.unlink(quarantinePath)
     } finally {
       await handle.close()
     }
   }
 
-  async #reconcileBlobInventory() {
-    const references = this.#referencedBlobMap()
+  async #removeEmptyUnreferencedPrefix(prefixPath) {
+    const named = await fs.lstat(prefixPath)
+    assertPrivateBlobDirectory(named, "result blob prefix")
+    if ((await fs.readdir(prefixPath)).length !== 0) return false
+    const handle = await fs.open(
+      prefixPath,
+      fsConstants.O_RDONLY
+        | fsConstants.O_NOFOLLOW
+        | (fsConstants.O_DIRECTORY ?? 0),
+    )
+    try {
+      const opened = await handle.stat()
+      assertPrivateBlobDirectory(opened, "result blob prefix")
+      if (!sameFileIdentity(named, opened)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "An empty result blob prefix changed identity before quarantine.",
+        )
+      }
+      const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
+      await ensurePrivateDirectory(quarantineDirectory)
+      const quarantinePath = path.join(
+        quarantineDirectory,
+        `prefix-${randomUUID()}`,
+      )
+      await fs.rename(prefixPath, quarantinePath)
+      const quarantined = await fs.lstat(quarantinePath)
+      const openedAfterMove = await handle.stat()
+      assertPrivateBlobDirectory(quarantined, "quarantined result blob prefix")
+      if (
+        !sameFileIdentity(opened, openedAfterMove)
+        || !sameFileIdentity(openedAfterMove, quarantined)
+        || (await fs.readdir(quarantinePath)).length !== 0
+      ) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "An empty result blob prefix changed identity during quarantine.",
+        )
+      }
+      await fs.rmdir(quarantinePath)
+      return true
+    } finally {
+      await handle.close()
+    }
+  }
+
+  async #assertEmptyBlobQuarantine() {
+    const quarantineDirectory = path.join(this.#dataDir, "blob-quarantine")
+    try {
+      const quarantine = await fs.lstat(quarantineDirectory)
+      assertPrivateBlobDirectory(quarantine, "result blob quarantine")
+      if ((await fs.readdir(quarantineDirectory)).length !== 0) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "The result blob quarantine contains unresolved objects.",
+        )
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error
+    }
+  }
+
+  async #removeUnreferencedBlobInventory(references) {
     let rootEntries
     let rootIdentity
     try {
@@ -2353,6 +2443,9 @@ export class EventStore {
       assertPrivateBlobDirectory(rootBefore, "result blob root")
       rootIdentity = rootBefore
       rootEntries = await fs.readdir(this.#blobDirectory, { withFileTypes: true })
+      await this.#compactionFaultInjector?.("after_blob_root_enumeration", {
+        entries: rootEntries.map((entry) => entry.name).sort(),
+      })
       const rootAfter = await fs.lstat(this.#blobDirectory)
       assertPrivateBlobDirectory(rootAfter, "result blob root")
       if (!sameFileIdentity(rootBefore, rootAfter)) {
@@ -2388,6 +2481,10 @@ export class EventStore {
       }
       assertPrivateBlobDirectory(prefixBefore, "result blob prefix")
       const blobEntries = await fs.readdir(prefixPath, { withFileTypes: true })
+      await this.#compactionFaultInjector?.("after_blob_prefix_enumeration", {
+        entries: blobEntries.map((entry) => entry.name).sort(),
+        prefix: prefixEntry.name,
+      })
       for (const blobEntry of blobEntries) {
         const filePath = path.join(prefixPath, blobEntry.name)
         const reference = references.get(blobEntry.name)
@@ -2422,6 +2519,12 @@ export class EventStore {
           "A result blob prefix changed identity during reconciliation.",
         )
       }
+      const expectedInPrefix = [...references.keys()].some(
+        (digest) => digest.startsWith(prefixEntry.name),
+      )
+      if (!expectedInPrefix && (await fs.readdir(prefixPath)).length === 0) {
+        await this.#removeEmptyUnreferencedPrefix(prefixPath)
+      }
     }
     const rootAfterReconciliation = await fs.lstat(this.#blobDirectory)
     assertPrivateBlobDirectory(rootAfterReconciliation, "result blob root")
@@ -2437,7 +2540,120 @@ export class EventStore {
         "A referenced result blob is missing from canonical inventory.",
       )
     }
-    this.#blobBytes = retainedBytes
+    return retainedBytes
+  }
+
+  async #verifyExactBlobInventory(references) {
+    let rootBefore
+    let rootEntries
+    try {
+      rootBefore = await fs.lstat(this.#blobDirectory)
+      assertPrivateBlobDirectory(rootBefore, "result blob root")
+      rootEntries = await fs.readdir(this.#blobDirectory, { withFileTypes: true })
+    } catch (error) {
+      if (error.code === "ENOENT" && references.size === 0) {
+        return { exact: true, retainedBytes: 0 }
+      }
+      if (error.code === "ENOENT") {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "The referenced result blob root is missing.",
+        )
+      }
+      throw error
+    }
+
+    const expectedPrefixes = new Set(
+      [...references.keys()].map((digest) => digest.slice(0, 2)),
+    )
+    const seen = new Set()
+    let retainedBytes = 0
+    let exact = true
+    for (const prefixEntry of rootEntries) {
+      if (!/^[a-f0-9]{2}$/.test(prefixEntry.name)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob prefix directory is not canonical.",
+        )
+      }
+      const prefixPath = path.join(this.#blobDirectory, prefixEntry.name)
+      const prefixBefore = await fs.lstat(prefixPath)
+      assertPrivateBlobDirectory(prefixBefore, "result blob prefix")
+      const entriesBefore = await fs.readdir(prefixPath, { withFileTypes: true })
+      if (!expectedPrefixes.has(prefixEntry.name)) exact = false
+      for (const entry of entriesBefore) {
+        const filePath = path.join(prefixPath, entry.name)
+        const reference = references.get(entry.name)
+        if (!reference) {
+          assertPrivateBlobFile(await fs.lstat(filePath))
+          exact = false
+          continue
+        }
+        if (prefixEntry.name !== entry.name.slice(0, 2) || seen.has(entry.name)) {
+          throw new EgoChatError(
+            "corrupt_result_blob_inventory",
+            "A referenced result blob has a noncanonical or duplicate inventory entry.",
+          )
+        }
+        retainedBytes += await this.#readVerifiedBlob(
+          filePath,
+          entry.name,
+          reference,
+        )
+        seen.add(entry.name)
+      }
+      const entriesAfter = await fs.readdir(prefixPath)
+      const prefixAfter = await fs.lstat(prefixPath)
+      assertPrivateBlobDirectory(prefixAfter, "result blob prefix")
+      if (!sameFileIdentity(prefixBefore, prefixAfter)) {
+        throw new EgoChatError(
+          "corrupt_result_blob_inventory",
+          "A result blob prefix changed identity during final verification.",
+        )
+      }
+      if (!isDeepStrictEqual(
+        entriesBefore.map((entry) => entry.name).sort(),
+        entriesAfter.sort(),
+      )) exact = false
+    }
+    const rootEntriesAfter = await fs.readdir(this.#blobDirectory)
+    const rootAfter = await fs.lstat(this.#blobDirectory)
+    assertPrivateBlobDirectory(rootAfter, "result blob root")
+    if (!sameFileIdentity(rootBefore, rootAfter)) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "The result blob root changed identity during final verification.",
+      )
+    }
+    if (!isDeepStrictEqual(
+      rootEntries.map((entry) => entry.name).sort(),
+      rootEntriesAfter.sort(),
+    )) exact = false
+    if (seen.size !== references.size) {
+      throw new EgoChatError(
+        "corrupt_result_blob_inventory",
+        "A referenced result blob is missing from canonical inventory.",
+      )
+    }
+    return { exact, retainedBytes }
+  }
+
+  async #reconcileBlobInventory() {
+    const references = this.#referencedBlobMap()
+    await this.#assertEmptyBlobQuarantine()
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await this.#removeUnreferencedBlobInventory(references)
+      const verified = await this.#verifyExactBlobInventory(references)
+      if (verified.exact) {
+        await this.#assertEmptyBlobQuarantine()
+        this.#blobBytes = verified.retainedBytes
+        return
+      }
+    }
+    throw new EgoChatError(
+      "corrupt_result_blob_inventory",
+      "The result blob inventory did not stabilize after bounded reconciliation.",
+    )
   }
 
   async #compact() {
