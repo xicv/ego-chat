@@ -192,6 +192,11 @@ export const AttachmentCaptureRequestSchema = z.object({
   source_workflow_id: WorkflowIdSchema,
 }).strict()
 
+export const AttachmentEvidenceRequestSchema = z.object({
+  schema: z.literal("ego-chat-attachment-evidence-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),

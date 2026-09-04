@@ -45,6 +45,7 @@ export const MAX_ATTACHMENT_PERMANENT_BINDINGS = 512
 export const MAX_ATTACHMENT_PERMANENT_RESERVED_BYTES = 16 * 1024 * 1024
 
 export const READ_ONLY_IPC_METHODS = new Set([
+  "attachment.evidence",
   "broker.status",
   "conversation.get",
   "model_policy.get",

@@ -22,7 +22,7 @@ function print(value) {
 
 function failUsage(message) {
   process.stderr.write(`${message}\n`)
-  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | receipt-build-manifest <executable-path> <implementation-git-sha> | receipt-signer-enroll | capture-attachment <input-json-file> | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | reanchor <input-json-file> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
+  process.stderr.write("Usage: ego-chat ping | broker-status | broker-runtime-status | broker-handoff | receipt-build-manifest <executable-path> <implementation-git-sha> | receipt-signer-enroll | capture-attachment <input-json-file> | attachment-evidence <input-json-file> | probe <delay-ms> <value> | status <id> | await <id> <timeout-ms> | read-result <workflow-id> <digest> [offset] [max-bytes] | cancel <id> | abandon <id> --acknowledge-potential-delivery | preflight <task-space> | model-policy | ensure-model-policy <binding-key> | bind <input-json-file> | adopt <input-json-file> | conversation <binding-key> | reanchor <input-json-file> | verify <binding-key> | reconcile <binding-key> <workflow-id> | exchange <input-json-file> | converge <input-json-file>\n")
   process.exit(64)
 }
 
@@ -65,6 +65,12 @@ try {
     }
     const input = JSON.parse(await fs.readFile(args[0], "utf8"))
     print(await requestBroker(config, "attachment.capture", input))
+  } else if (command === "attachment-evidence") {
+    if (args.length !== 1) {
+      failUsage("attachment-evidence requires one JSON input file")
+    }
+    const input = JSON.parse(await fs.readFile(args[0], "utf8"))
+    print(await requestBroker(config, "attachment.evidence", input))
   } else if (command === "probe") {
     const delayMs = Number(args[0])
     const value = args[1]

@@ -893,6 +893,11 @@ export class EventStore {
     return identity ? clone(identity) : undefined
   }
 
+  getConfirmedSendEvent(workflowId) {
+    const event = this.#state.confirmedSendEvents[workflowId]
+    return event ? clone(event) : undefined
+  }
+
   getAttachmentCapture(workflowId) {
     const capture = this.#state.attachmentCaptures[workflowId]
     return capture ? clone(capture) : undefined

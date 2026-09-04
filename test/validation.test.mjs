@@ -4,6 +4,7 @@ import test from "node:test"
 import { MAX_WAIT_MS } from "../src/constants.mjs"
 import {
   AttachmentCaptureRequestSchema,
+  AttachmentEvidenceRequestSchema,
   EgoExchangeSchema,
   StartConvergenceSchema,
   parse,
@@ -76,6 +77,24 @@ test("attachment capture input contains only its schema and source workflow iden
   ]) {
     assert.throws(
       () => parse(AttachmentCaptureRequestSchema, { ...input, ...extra }),
+      (error) => error.code === "invalid_input",
+    )
+  }
+})
+
+test("attachment evidence retrieval accepts only its source workflow identity", () => {
+  const input = {
+    schema: "ego-chat-attachment-evidence-request/v1",
+    source_workflow_id: "4559c675-14a9-4ec0-b5f9-0bb3ec3b73b5",
+  }
+  assert.deepEqual(parse(AttachmentEvidenceRequestSchema, input), input)
+  for (const extra of [
+    { external_binding_sha256: "a".repeat(64) },
+    { output_path: "/tmp/evidence.json" },
+    { expected_outcome: "EXACTLY_ONE" },
+  ]) {
+    assert.throws(
+      () => parse(AttachmentEvidenceRequestSchema, { ...input, ...extra }),
       (error) => error.code === "invalid_input",
     )
   }

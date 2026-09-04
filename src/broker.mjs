@@ -35,6 +35,7 @@ import {
 import {
   AbandonWorkflowSchema,
   AttachmentCaptureRequestSchema,
+  AttachmentEvidenceRequestSchema,
   AwaitWorkflowSchema,
   ConversationAdoptionSchema,
   ConversationBindSchema,
@@ -1592,6 +1593,74 @@ export class Broker {
       this.#scheduleAttachmentCapture(workflow.id)
     }
     return publicWorkflow(started.workflow)
+  }
+
+  getAttachmentEvidence(input) {
+    const params = parse(AttachmentEvidenceRequestSchema, input)
+    const workflow = this.#store.getWorkflow(params.source_workflow_id)
+    if (!workflow) {
+      throw new EgoChatError("workflow_not_found", "No workflow exists with that ID.")
+    }
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    const confirmedSendEvent = this.#store.getConfirmedSendEvent(workflow.id)
+    const confirmedSendIdentity = this.#store.getConfirmedSendIdentity(workflow.id)
+    const capture = this.#store.getAttachmentCapture(workflow.id)
+    const dispositionEnvelope = this.#store.getAttachmentDisposition(workflow.id)
+    const externalBinding = intent && this.#store.getAttachmentExternalBinding(
+      intent.profile,
+      intent.external_binding_sha256,
+    )
+    const prompt = workflow.private?.request?.prompt
+    const promptBytes = typeof prompt === "string" ? Buffer.from(prompt, "utf8") : undefined
+    const confirmedSendEventProjection = confirmedSendEvent && {
+      event_type: confirmedSendEvent.event_type,
+      operation_key_sha256: confirmedSendEvent.operation_key_sha256,
+      prompt_message_id: confirmedSendEvent.prompt_message_id,
+      schema: confirmedSendEvent.schema,
+      sent_at: confirmedSendEvent.sent_at,
+      sequence: confirmedSendEvent.sequence,
+      workflow_id: confirmedSendEvent.workflow_id,
+    }
+    if (
+      workflow.kind !== "ego_exchange"
+      || workflow.phase !== "attachment_disposition_terminal"
+      || workflow.status !== "succeeded"
+      || !intent
+      || !confirmedSendEvent
+      || !confirmedSendIdentity
+      || capture?.state !== "TERMINAL"
+      || !dispositionEnvelope
+      || !externalBinding
+      || !promptBytes
+      || confirmedSendIdentity.exact_prompt_utf8_sha256 !== sha256Hex(promptBytes)
+      || confirmedSendIdentity.exact_prompt_utf8_byte_length !== promptBytes.length
+      || confirmedSendIdentity.send_event_sha256
+        !== sha256Hex(canonicalJsonBytes(confirmedSendEventProjection))
+      || confirmedSendEvent.confirmed_send_identity_sha256
+        !== sha256Hex(canonicalJsonBytes(confirmedSendIdentity))
+      || capture.terminal_disposition_sha256 !== dispositionEnvelope.payload_sha256
+      || capture.terminal_envelope_sha256
+        !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
+      || externalBinding.source_workflow_id !== workflow.id
+      || externalBinding.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
+    ) {
+      throw new EgoChatError(
+        "attachment_evidence_not_terminal",
+        "The source workflow has no complete immutable terminal attachment evidence chain.",
+      )
+    }
+    return {
+      capture,
+      confirmed_send_event: confirmedSendEvent,
+      confirmed_send_identity: confirmedSendIdentity,
+      disposition_envelope: dispositionEnvelope,
+      exact_prompt_utf8_base64url: promptBytes.toString("base64url"),
+      external_binding: externalBinding,
+      intent,
+      schema: "ego-chat-attachment-evidence-bundle/v1",
+      source_operation_key: workflow.operationKey,
+      source_workflow_id: workflow.id,
+    }
   }
 
   #canRunAttachmentCapture() {
