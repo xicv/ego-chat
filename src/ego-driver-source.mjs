@@ -2307,11 +2307,39 @@ async function egoDriverMain(
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
-    const expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
-    const selected = await selectConversation({
-      ...input.binding,
-      canonicalUrl: expectedCanonicalUrl,
-    })
+    let expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
+    let selected
+    if (input.binding.state === "unbound") {
+      if (!isCanonicalConversationUrl(expectedCanonicalUrl)) {
+        humanRequired("confirmed_send_canonical_url_invalid", "The confirmed create-once send has no canonical conversation locator.", {
+          targetId: input.binding.targetId,
+          taskSpaceId: input.binding.taskSpaceId,
+        })
+        return
+      }
+      selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
+      if (!selected) {
+        return
+      }
+      const inspection = await waitForReadyInspection()
+      if (!assertReady(inspection, selected)) {
+        return
+      }
+      if (!isCanonicalConversationUrl(inspection.info.url)) {
+        humanRequired("confirmed_send_conversation_missing", "The confirmed create-once send no longer has a canonical conversation page.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      expectedCanonicalUrl = normalizeUrl(inspection.info.url)
+      selected = { ...selected, inspection }
+    } else {
+      selected = await selectConversation({
+        ...input.binding,
+        canonicalUrl: expectedCanonicalUrl,
+      })
+    }
     if (!selected) {
       return
     }

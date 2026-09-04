@@ -1064,6 +1064,7 @@ async function runTaskSpaceReconciliationCase({
   attachmentObservation = null,
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
+  bindingState = "bound",
   captureContinuationAllowed = false,
   composerDraft = "",
   fallbackTaskSpaceOwnership = null,
@@ -1073,6 +1074,7 @@ async function runTaskSpaceReconciliationCase({
   promptIdentityMatches = true,
   requestedTaskSpaceOwnership = null,
   responseText = "Partial review",
+  sentCanonicalUrl = null,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
@@ -1098,7 +1100,9 @@ async function runTaskSpaceReconciliationCase({
   const promptText = `${turnMarker}\nReview this candidate.`
   const promptMessageId = "reconcile-user"
   const captureEntries = [
-    { messageId: "previous-assistant", role: "assistant", text: previousText },
+    ...(bindingState === "bound"
+      ? [{ messageId: "previous-assistant", role: "assistant", text: previousText }]
+      : []),
     {
       messageId: promptIdentityMatches ? promptMessageId : "different-user",
       role: "user",
@@ -1120,12 +1124,13 @@ async function runTaskSpaceReconciliationCase({
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     ...(captureContinuationAllowed ? { captureContinuationAllowed: true } : {}),
     binding: {
-      canonicalUrl,
-      headRole: "assistant",
+      canonicalUrl: bindingState === "bound" ? canonicalUrl : null,
+      headRole: bindingState === "bound" ? "assistant" : null,
       key: "ego-chat-main",
-      messageCount: 2,
-      state: "bound",
-      targetId: "stale-bound-tab",
+      messageCount: bindingState === "bound" ? 2 : 0,
+      startUrl: bindingState === "bound" ? canonicalUrl : "https://chatgpt.com/",
+      state: bindingState,
+      targetId: bindingState === "bound" ? "stale-bound-tab" : "recovered-bound-tab",
       ...(adoptedTaskSpaceOwnership
         ? {
             taskSpaceIdentity: {
@@ -1143,7 +1148,7 @@ async function runTaskSpaceReconciliationCase({
       pid: process.pid,
     },
     browserContractRevision: 13,
-    canonicalUrl,
+    canonicalUrl: sentCanonicalUrl ?? canonicalUrl,
     ...(mode === "capture_attachment_execution"
       ? {
           captureOperationKeySha256: "a".repeat(64),
@@ -1152,8 +1157,8 @@ async function runTaskSpaceReconciliationCase({
           sourceConfirmedSendIdentitySha256: "b".repeat(64),
         }
       : {}),
-    expectedPreviousContentDigest: previousDigest,
-    expectedPreviousMessageId: "previous-assistant",
+    expectedPreviousContentDigest: bindingState === "bound" ? previousDigest : null,
+    expectedPreviousMessageId: bindingState === "bound" ? "previous-assistant" : null,
     expectedTerminalMarker: terminalMarker,
     inputDigest: createHash("sha256").update(promptText, "utf8").digest("hex"),
     mode,
@@ -1171,7 +1176,7 @@ async function runTaskSpaceReconciliationCase({
 
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
-let opened = false
+let opened = ${JSON.stringify(bindingState === "unbound")}
 let composerDraft = ${JSON.stringify(composerDraft)}
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
@@ -2628,6 +2633,22 @@ test("bounded capture yields only with the exact confirmed prompt identity", asy
     taskSpaceId: 11,
     turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
   })
+})
+
+test("bounded capture promotes a confirmed create-once send to its canonical conversation", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    sentCanonicalUrl: "https://chatgpt.com/c/WEB:create-once-provisional",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.canonicalUrl, "https://chatgpt.com/c/reconcile-driver-test")
+  assert.equal(captured.result.responseText, "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST")
+  assert.equal(captured.result.head.lastMessageId, "partial-assistant")
 })
 
 test("bounded capture tolerates a transient missing generation control", async () => {

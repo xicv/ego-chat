@@ -2348,6 +2348,98 @@ test("confirmed exchanges resume after a bounded pending capture without another
   })
 })
 
+test("confirmed create-once capture promotes a provisional locator without another Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/create-once-promoted"
+  const provisionalUrl = "https://chatgpt.com/c/WEB:create-once-provisional"
+  const terminalMarker = "EGO_CHAT_CREATE_ONCE_PROMOTED_DONE"
+  const turnMarker = "EGO_CHAT_CREATE_ONCE_PROMOTED_TEST"
+  const promptMessageId = "create-once-promoted-user"
+  let captures = 0
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: null,
+      targetId: input.targetId,
+      taskSpaceId: 19,
+    }),
+    captureExchange: async () => {
+      captures += 1
+      if (captures === 1) {
+        return {
+          canonicalUrl,
+          captureReason: "response_not_terminal",
+          captureState: "pending",
+          generationRunning: false,
+          promptMessageId,
+          targetId: "create-once-promoted-tab",
+          taskSpaceId: 19,
+          turnMarker,
+        }
+      }
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "create-once-promoted-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "create-once-promoted-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "create-once-promoted-tab",
+        taskSpaceId: 19,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => {
+      sends += 1
+      return {
+        canonicalUrl: provisionalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId,
+        sentAt: new Date().toISOString(),
+        targetId: "create-once-promoted-tab",
+        taskSpaceId: 19,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "create-once-promoted",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "create-once-promoted-tab",
+    taskSpace: 19,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "create-once-promoted",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nCapture the promoted conversation.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.captureRecoveryCount ?? 0, 0)
+  assert.equal(completed.result.canonicalUrl, canonicalUrl)
+  assert.equal(sends, 1)
+  assert.equal(captures, 2)
+  const binding = broker.getConversationBinding({ bindingKey: "create-once-promoted" })
+  assert.equal(binding.state, "bound")
+  assert.equal(binding.canonicalUrl, canonicalUrl)
+})
+
 test("recoverable maximum-model UI uncertainty stays in the same exchange until Send succeeds", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

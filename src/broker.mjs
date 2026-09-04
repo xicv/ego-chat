@@ -62,6 +62,20 @@ function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }
 
+function isCanonicalChatGptConversationUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === "https:"
+      && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
+      && parsed.username === ""
+      && parsed.password === ""
+      && parsed.port === ""
+      && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(parsed.pathname)
+  } catch {
+    return false
+  }
+}
+
 function compactHistoricalConvergenceCycle(record) {
   return {
     candidateDigest: record.candidateDigest,
@@ -215,7 +229,7 @@ function validateTaskSpaceIdentity(value) {
   return structuredClone(value)
 }
 
-function validatePendingCapture(value, workflow) {
+function validatePendingCapture(value, workflow, binding) {
   if (value?.captureState !== "pending") {
     return false
   }
@@ -232,8 +246,15 @@ function validatePendingCapture(value, workflow) {
     value.captureReason === "response_not_terminal"
     && value.generationRunning === false
   )
+  const canonicalIdentity = value.canonicalUrl === sent?.canonicalUrl || (
+    binding?.state === "unbound"
+    && value.targetId === sent?.targetId
+    && value.taskSpaceId === sent?.taskSpaceId
+    && isCanonicalChatGptConversationUrl(sent?.canonicalUrl)
+    && isCanonicalChatGptConversationUrl(value.canonicalUrl)
+  )
   const exactIdentity = sent
-    && value.canonicalUrl === sent.canonicalUrl
+    && canonicalIdentity
     && validPendingReason
     && value.promptMessageId === sent.promptMessageId
     && typeof value.targetId === "string"
@@ -3065,7 +3086,7 @@ export class Broker {
                 },
                 controller.signal,
               )
-              if (validatePendingCapture(captured, current)) {
+              if (validatePendingCapture(captured, current, binding)) {
                 const capturePending = {
                   generationRunning: captured.generationRunning,
                   observedAt: new Date().toISOString(),
