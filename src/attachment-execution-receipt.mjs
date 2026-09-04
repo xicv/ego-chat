@@ -540,6 +540,7 @@ export function buildAttachmentCaptureOperation({
     attempt_journal: [],
     candidate_generation: 0,
     candidate_observations: [],
+    candidate_pair_count: 0,
     capture_deadline_at: new Date(startedAtMs + 10 * 60 * 1_000).toISOString(),
     capture_operation_key_sha256: attachmentCaptureOperationKeyDigest(
       confirmedSendIdentityDigest,
@@ -792,7 +793,9 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
     || Date.parse(disposition.first_stable_observation_at)
       > Date.parse(disposition.final_stable_observation_at)
     || Date.parse(disposition.final_stable_observation_at) > Date.parse(disposition.terminal_at)
-    || disposition.stable_observation_count !== 2
+    || !Number.isSafeInteger(disposition.stable_observation_count)
+    || disposition.stable_observation_count < 0
+    || disposition.stable_observation_count > 2
     || !isNullableOpaqueId(disposition.save_association_id)
     || counts.some((value) => !isCount(value))
   ) {
@@ -823,6 +826,7 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
       || disposition.non_image_artifact_count !== 0
       || disposition.unclassified_artifact_count !== 0
       || disposition.normal_save_control_count !== 1
+      || disposition.stable_observation_count !== 2
       || !isBoundedOpaqueId(disposition.save_association_id)
       || !validPositiveReceipt(disposition.receipt, disposition)
     ) {
@@ -844,6 +848,7 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
     )
     if (
       !reasonMatchesCounts
+      || disposition.stable_observation_count !== 2
       || counts.slice(0, 5).includes(null)
       || disposition.receipt !== null
       || disposition.save_association_id !== null
@@ -856,6 +861,7 @@ export function assertValidAttachmentExecutionDisposition(disposition) {
   } else if (disposition.outcome === "ZERO") {
     if (
       disposition.reason !== "ZERO_GENERATED_IMAGES"
+      || disposition.stable_observation_count !== 2
       || disposition.direct_response_branch_count === null
       || disposition.direct_response_branch_count > 1
       || counts.slice(1, 5).includes(null)
@@ -957,14 +963,24 @@ export function buildAttachmentExecutionDisposition({
   confirmedSendIdentity,
   confirmedSendIdentityDigest,
   observations,
+  terminalReason = undefined,
   terminalAt,
 }) {
+  const forcedUnknownReason = terminalReason !== undefined
+    && ATTACHMENT_UNKNOWN_REASONS.has(terminalReason)
+  if (terminalReason !== undefined && !forcedUnknownReason) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "The forced terminal disposition reason is invalid.",
+    )
+  }
   if (
     captureOperation?.source_workflow_id !== confirmedSendIdentity?.source_workflow_id
     || captureOperation?.confirmed_send_identity_sha256 !== confirmedSendIdentityDigest
     || captureOperation?.capture_operation_key_sha256
       !== attachmentCaptureOperationKeyDigest(confirmedSendIdentityDigest)
-    || observations?.some((observation) => (
+    || !Array.isArray(observations)
+    || observations.some((observation) => (
       observation.source_confirmed_send_identity_sha256 !== confirmedSendIdentityDigest
       || observation.capture_operation_key_sha256
         !== captureOperation.capture_operation_key_sha256
@@ -975,9 +991,26 @@ export function buildAttachmentExecutionDisposition({
       "The disposition lineage does not match its confirmed Send.",
     )
   }
-  const classification = classifyAttachmentExecutionObservations(observations)
-  const [first, final] = observations
-  const stableProjection = stableObservationProjection(final)
+  if (!forcedUnknownReason && observations.length !== 2) {
+    throw new EgoChatError(
+      "invalid_attachment_disposition",
+      "A non-exhaustion disposition requires exactly two observations.",
+    )
+  }
+  for (const observation of observations) assertValidAttachmentGraphObservation(observation)
+  const classification = forcedUnknownReason
+    ? { outcome: "UNKNOWN", reason: terminalReason }
+    : classifyAttachmentExecutionObservations(observations)
+  const first = observations[0]
+  const final = observations.at(-1)
+  const firstObservedAt = first?.observed_at ?? captureOperation.capture_started_at
+  const finalObservedAt = final?.observed_at ?? firstObservedAt
+  const stableProjection = final
+    ? stableObservationProjection(final)
+    : {
+        capture_operation_key_sha256: captureOperation.capture_operation_key_sha256,
+        source_confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+      }
   const graphDigest = sha256Hex(canonicalJsonBytes(stableProjection))
   const runtimeIdentity = confirmedSendIdentity.qualified_runtime_identity
   const artifact = classification.outcome === "EXACTLY_ONE" ? final.artifacts[0] : null
@@ -991,8 +1024,8 @@ export function buildAttachmentExecutionDisposition({
         capture_runtime_identity_sha256: runtimeIdentity.runtime_identity_sha256,
         dom_attachment_id: artifact.dom_wrapper_id,
         external_binding_sha256: confirmedSendIdentity.external_binding_sha256 ?? null,
-        final_stable_observation_at: final.observed_at,
-        first_stable_observation_at: first.observed_at,
+        final_stable_observation_at: finalObservedAt,
+        first_stable_observation_at: firstObservedAt,
         graph_attachment_id: artifact.graph_attachment_id,
         normalized_complete_graph_sha256: graphDigest,
         response_message_id: final.response_message_id,
@@ -1008,15 +1041,15 @@ export function buildAttachmentExecutionDisposition({
     capture_runtime_identity_sha256: runtimeIdentity.runtime_identity_sha256,
     consumer_signer_authorization_sha256:
       confirmedSendIdentity.consumer_signer_authorization_sha256,
-    direct_response_branch_count: final.direct_response_branch_count,
+    direct_response_branch_count: final?.direct_response_branch_count ?? null,
     external_binding_sha256: confirmedSendIdentity.external_binding_sha256 ?? null,
-    final_stable_observation_at: final.observed_at,
-    first_stable_observation_at: first.observed_at,
-    generated_image_artifact_count: final.generated_image_artifact_count,
+    final_stable_observation_at: finalObservedAt,
+    first_stable_observation_at: firstObservedAt,
+    generated_image_artifact_count: final?.generated_image_artifact_count ?? null,
     media_type: "application/vnd.ego-chat.attachment-execution-disposition.v1+jcs",
-    non_image_artifact_count: final.non_image_artifact_count,
-    normal_download_control_count: final.normal_download_control_count,
-    normal_save_control_count: final.normal_save_control_count,
+    non_image_artifact_count: final?.non_image_artifact_count ?? null,
+    normal_download_control_count: final?.normal_download_control_count ?? null,
+    normal_save_control_count: final?.normal_save_control_count ?? null,
     outcome: classification.outcome,
     qualified_runtime_identity: runtimeIdentity,
     reason: classification.reason,
@@ -1029,11 +1062,11 @@ export function buildAttachmentExecutionDisposition({
     signer_enrollment_sha256: confirmedSendIdentity.signer_enrollment_sha256,
     signer_key_id: confirmedSendIdentity.signer_key_id,
     source_confirmed_send_identity_sha256: confirmedSendIdentityDigest,
-    stable_observation_count: 2,
+    stable_observation_count: observations.length,
     stable_observation_sha256: graphDigest,
     terminal_at: terminalAt,
-    total_artifact_count: final.total_artifact_count,
-    unclassified_artifact_count: final.unclassified_artifact_count,
+    total_artifact_count: final?.total_artifact_count ?? null,
+    unclassified_artifact_count: final?.unclassified_artifact_count ?? null,
   }
   return assertValidAttachmentExecutionDisposition(disposition)
 }

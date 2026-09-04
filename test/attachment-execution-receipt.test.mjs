@@ -262,13 +262,13 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
     current.capture_operation_key_sha256 = captureOperationKeySha256
     current.source_confirmed_send_identity_sha256 = confirmedSendIdentityDigest
   }
-  const disposition = buildAttachmentExecutionDisposition({
-    captureOperation: {
-      capture_operation_key_sha256: captureOperationKeySha256,
-      confirmed_send_identity_sha256: confirmedSendIdentityDigest,
-      source_workflow_id: "workflow-1",
-    },
-    confirmedSendIdentity: {
+  const captureOperation = {
+    capture_operation_key_sha256: captureOperationKeySha256,
+    capture_started_at: "2026-09-04T05:00:00.000Z",
+    confirmed_send_identity_sha256: confirmedSendIdentityDigest,
+    source_workflow_id: "workflow-1",
+  }
+  const confirmedSendIdentity = {
       consumer_signer_authorization_sha256: "d".repeat(64),
       external_binding_sha256: "e".repeat(64),
       qualified_runtime_identity: {
@@ -278,7 +278,10 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
       signer_enrollment_sha256: "f".repeat(64),
       signer_key_id: `ed25519-spki-sha256:${"9".repeat(64)}`,
       source_workflow_id: "workflow-1",
-    },
+  }
+  const disposition = buildAttachmentExecutionDisposition({
+    captureOperation,
+    confirmedSendIdentity,
     confirmedSendIdentityDigest,
     observations,
     terminalAt: "2026-09-04T05:00:02.000Z",
@@ -293,4 +296,17 @@ test("terminal disposition binds a stable unsupported-Save observation pair", ()
   assert.equal(disposition.final_stable_observation_at, observations[1].observed_at)
   assert.equal(disposition.capture_operation_key_sha256, captureOperationKeySha256)
   assert.match(disposition.stable_observation_sha256, /^[a-f0-9]{64}$/)
+
+  const exhausted = buildAttachmentExecutionDisposition({
+    captureOperation,
+    confirmedSendIdentity,
+    confirmedSendIdentityDigest,
+    observations: [],
+    terminalAt: "2026-09-04T05:00:02.000Z",
+    terminalReason: "CAPTURE_ATTEMPT_LIMIT",
+  })
+  assert.equal(exhausted.outcome, "UNKNOWN")
+  assert.equal(exhausted.reason, "CAPTURE_ATTEMPT_LIMIT")
+  assert.equal(exhausted.stable_observation_count, 0)
+  assert.equal(exhausted.total_artifact_count, null)
 })

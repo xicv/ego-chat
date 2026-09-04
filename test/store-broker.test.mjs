@@ -1021,6 +1021,253 @@ test("attachment observations and terminal disposition remain create-once across
   assert.equal(terminalRestart.getMetrics().attachmentReservedBytes, 1024 * 1024)
 })
 
+test("broker recovers a driver failure then signs one quiet terminal disposition", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/a3k-broker-capture"
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl,
+    headContentDigest: "1".repeat(64),
+    headFingerprint: "2".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-broker-capture",
+    messageCount: 2,
+    revision: 1,
+    state: "bound",
+    targetId: "tab-broker-capture",
+    taskSpaceId: 6,
+  })
+  let captureCalls = 0
+  let sendCalls = 0
+  let signCalls = 0
+  const broker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "3".repeat(64),
+          implementation_git_sha: "4".repeat(40),
+          package_inventory_sha256: "5".repeat(64),
+        },
+        signerEnrollmentDigest: "6".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"7".repeat(64)}`,
+      }),
+      signAttachmentDisposition: async ({ disposition }) => {
+        signCalls += 1
+        return signedAttachmentEnvelope(disposition)
+      },
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureAttachmentExecution: async (input) => {
+        captureCalls += 1
+        if (captureCalls === 1) {
+          throw new EgoChatError("ego_driver_failed", "transient read-only capture failure")
+        }
+        return attachmentGraphObservation({
+          canonicalConversationLocatorSha256: sha256Hex(Buffer.from(canonicalUrl)),
+          captureOperationKeySha256: input.captureOperationKeySha256,
+          observedAt: new Date().toISOString(),
+          sequence: input.observationSequence,
+          sourceConfirmedSendIdentitySha256: input.sourceConfirmedSendIdentitySha256,
+        })
+      },
+      captureExchange: async () => new Promise(() => {}),
+      sendExchange: async (input) => {
+        sendCalls += 1
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "prompt-confirmed",
+          sentAt: new Date().toISOString(),
+          targetId: "tab-broker-capture",
+          taskSpaceId: 6,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store,
+  })
+  t.after(() => broker.close())
+  const started = await broker.startEgoExchange({
+    bindingKey: "a3k-broker-capture",
+    expectedTerminalMarker: "DONE_BROKER_CAPTURE",
+    prompt: "EGO_CHAT_A3K_RECEIPT_BROKER1\nprepare",
+    receiptCapture: {
+      consumer_signer_authorization_sha256: "8".repeat(64),
+      external_binding_sha256: "9".repeat(64),
+      profile: "a3k-manual-canary-v1",
+      receipt_capture_requested: true,
+      schema: "ego-chat-receipt-enabled-exchange-request/v1",
+    },
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_A3K_RECEIPT_BROKER1",
+  })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (store.getWorkflow(started.id)?.phase === "awaiting_attachment_capture") break
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+  }
+  assert.equal(store.getWorkflow(started.id).phase, "awaiting_attachment_capture")
+  await broker.startAttachmentCapture({
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: started.id,
+  })
+  const completed = await broker.awaitWorkflow({
+    timeoutMs: 5_000,
+    workflowId: started.id,
+  })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.phase, "attachment_disposition_terminal")
+  assert.equal(completed.result.outcome, "UNKNOWN")
+  assert.equal(completed.result.reason, "UNSUPPORTED_SAVE_ASSOCIATION")
+  assert.equal(sendCalls, 1)
+  assert.equal(captureCalls, 3)
+  assert.equal(signCalls, 1)
+  assert.equal(store.getAttachmentCapture(started.id).attempt_journal.length, 3)
+  assert.equal(
+    store.getAttachmentCapture(started.id).attempt_journal[0].reason,
+    "DRIVER_RECOVERY",
+  )
+  assert.equal(store.getAttachmentCapture(started.id).candidate_pair_count, 1)
+  assert.ok(store.getAttachmentDisposition(started.id))
+})
+
+test("broker restart resumes the same capture lineage without another Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/a3k-restarted-capture"
+  const firstStore = new EventStore(dataDir)
+  await firstStore.initialize()
+  await firstStore.persistBinding("binding.created", {
+    canonicalUrl,
+    headContentDigest: "1".repeat(64),
+    headFingerprint: "2".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-restarted-capture",
+    messageCount: 2,
+    revision: 1,
+    state: "bound",
+    targetId: "tab-restarted-capture",
+    taskSpaceId: 7,
+  })
+  let sendCalls = 0
+  const qualification = async (request) => ({
+    consumerSignerAuthorizationDigest: request.consumer_signer_authorization_sha256,
+    runtimeIdentity: {
+      executable_sha256: "3".repeat(64),
+      implementation_git_sha: "4".repeat(40),
+      package_inventory_sha256: "5".repeat(64),
+    },
+    signerEnrollmentDigest: "6".repeat(64),
+    signerKeyId: `ed25519-spki-sha256:${"7".repeat(64)}`,
+  })
+  const firstBroker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: qualification,
+      signAttachmentDisposition: async ({ disposition }) => (
+        signedAttachmentEnvelope(disposition)
+      ),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureAttachmentExecution: async (input) => attachmentGraphObservation({
+        canonicalConversationLocatorSha256: sha256Hex(Buffer.from(canonicalUrl)),
+        captureOperationKeySha256: input.captureOperationKeySha256,
+        observedAt: new Date().toISOString(),
+        sequence: input.observationSequence,
+        sourceConfirmedSendIdentitySha256: input.sourceConfirmedSendIdentitySha256,
+      }),
+      captureExchange: async () => new Promise(() => {}),
+      sendExchange: async (input) => {
+        sendCalls += 1
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "prompt-confirmed",
+          sentAt: new Date().toISOString(),
+          targetId: "tab-restarted-capture",
+          taskSpaceId: 7,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store: firstStore,
+  })
+  const started = await firstBroker.startEgoExchange({
+    bindingKey: "a3k-restarted-capture",
+    expectedTerminalMarker: "DONE_RESTARTED_CAPTURE",
+    prompt: "EGO_CHAT_A3K_RECEIPT_RESTARTED1\nprepare",
+    receiptCapture: {
+      consumer_signer_authorization_sha256: "8".repeat(64),
+      external_binding_sha256: "9".repeat(64),
+      profile: "a3k-manual-canary-v1",
+      receipt_capture_requested: true,
+      schema: "ego-chat-receipt-enabled-exchange-request/v1",
+    },
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_A3K_RECEIPT_RESTARTED1",
+  })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (firstStore.getWorkflow(started.id)?.phase === "awaiting_attachment_capture") break
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+  }
+  await firstBroker.startAttachmentCapture({
+    schema: "ego-chat-attachment-capture-request/v1",
+    source_workflow_id: started.id,
+  })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (firstStore.getAttachmentCapture(started.id)?.attempt_journal.length === 1) break
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+  }
+  assert.equal(firstStore.getAttachmentCapture(started.id).attempt_journal.length, 1)
+  firstBroker.close()
+
+  const restartedStore = new EventStore(dataDir)
+  let restartedCaptureCalls = 0
+  const restartedBroker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: qualification,
+      signAttachmentDisposition: async ({ disposition }) => (
+        signedAttachmentEnvelope(disposition)
+      ),
+    },
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      captureAttachmentExecution: async (input) => {
+        restartedCaptureCalls += 1
+        return attachmentGraphObservation({
+          canonicalConversationLocatorSha256: sha256Hex(Buffer.from(canonicalUrl)),
+          captureOperationKeySha256: input.captureOperationKeySha256,
+          observedAt: new Date().toISOString(),
+          sequence: input.observationSequence,
+          sourceConfirmedSendIdentitySha256: input.sourceConfirmedSendIdentitySha256,
+        })
+      },
+    },
+    store: restartedStore,
+  })
+  t.after(() => restartedBroker.close())
+  await restartedBroker.initialize()
+  const completed = await restartedBroker.awaitWorkflow({
+    timeoutMs: 5_000,
+    workflowId: started.id,
+  })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.reason, "UNSUPPORTED_SAVE_ASSOCIATION")
+  assert.equal(sendCalls, 1)
+  assert.equal(restartedCaptureCalls, 2)
+  const terminalCapture = restartedStore.getAttachmentCapture(started.id)
+  assert.equal(terminalCapture.attempt_journal.length, 4)
+  assert.equal(terminalCapture.attempt_journal[1].reason, "BROKER_RESTART")
+  assert.equal(terminalCapture.candidate_pair_count, 1)
+})
+
 test("receipt evidence replay rejects a confirmed Send event without its immutable identity", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

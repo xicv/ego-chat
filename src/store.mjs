@@ -86,7 +86,11 @@ function exactTimestamp(value) {
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
 }
 
-function attachmentAttemptJournalEntry(observation, candidateGeneration) {
+function attachmentObservationJournalEntry(
+  observation,
+  candidateGeneration,
+  completedPair,
+) {
   const entry = {
     attempt_number: observation.observation_sequence,
     attempted_at: observation.observed_at,
@@ -108,7 +112,40 @@ function attachmentAttemptJournalEntry(observation, candidateGeneration) {
       selected_branch_id: observation.selected_branch_id,
     })),
     schema: "ego-chat-attachment-capture-attempt/v1",
-    state: "CANDIDATE",
+    state: completedPair ? "PAIR_COMPLETED" : "CANDIDATE",
+  }
+  if (canonicalJsonBytes(entry).length > 768) {
+    throw new EgoChatError(
+      "attachment_capture_journal_entry_too_large",
+      "The attachment capture journal entry exceeds its fixed bound.",
+    )
+  }
+  return entry
+}
+
+function attachmentRecoveryJournalEntry({
+  attemptNumber,
+  attemptedAt,
+  candidateGeneration,
+  captureOperationKeySha256,
+  reason,
+}) {
+  const digest = sha256Hex(canonicalJsonBytes({
+    attempt_number: attemptNumber,
+    attempted_at: attemptedAt,
+    capture_operation_key_sha256: captureOperationKeySha256,
+    reason,
+  }))
+  const entry = {
+    attempt_number: attemptNumber,
+    attempted_at: attemptedAt,
+    candidate_generation: candidateGeneration,
+    dom_snapshot_sha256: digest,
+    graph_snapshot_sha256: digest,
+    reason,
+    response_snapshot_sha256: digest,
+    schema: "ego-chat-attachment-capture-attempt/v1",
+    state: "RECOVERABLE",
   }
   if (canonicalJsonBytes(entry).length > 768) {
     throw new EgoChatError(
@@ -237,6 +274,7 @@ function migrateState(value) {
   for (const capture of Object.values(state.attachmentCaptures)) {
     capture.candidate_generation ??= 0
     capture.candidate_observations ??= []
+    capture.candidate_pair_count ??= 0
     capture.terminal_disposition_sha256 ??= null
     capture.terminal_envelope_sha256 ??= null
   }
@@ -417,8 +455,12 @@ function validateAttachmentEvidenceState(state) {
       && attemptJournal.every((entry, index) => (
         hasExactKeys(entry, ATTACHMENT_ATTEMPT_JOURNAL_KEYS)
         && entry.schema === "ego-chat-attachment-capture-attempt/v1"
-        && entry.state === "CANDIDATE"
-        && entry.reason === "OBSERVATION_RECORDED"
+        && (
+          ["CANDIDATE", "PAIR_COMPLETED"].includes(entry.state)
+            ? entry.reason === "OBSERVATION_RECORDED"
+            : entry.state === "RECOVERABLE"
+              && ["BROKER_RESTART", "DRIVER_RECOVERY"].includes(entry.reason)
+        )
         && entry.attempt_number === index + 1
         && Number.isSafeInteger(entry.candidate_generation)
         && entry.candidate_generation === index + 1
@@ -431,7 +473,7 @@ function validateAttachmentEvidenceState(state) {
     const candidatesValid = Array.isArray(candidateObservations)
       && Array.isArray(attemptJournal)
       && candidateObservations.length <= 2
-      && candidateObservations.every((observation, index) => {
+      && candidateObservations.every((observation) => {
         try {
           assertValidAttachmentGraphObservation(observation)
         } catch {
@@ -439,8 +481,12 @@ function validateAttachmentEvidenceState(state) {
         }
         return observation.source_confirmed_send_identity_sha256 === identityDigest
           && observation.capture_operation_key_sha256 === expectedOperationKeyDigest
-          && observation.observation_sequence
-            === attemptJournal.length - candidateObservations.length + index + 1
+          && attemptJournal.some((entry) => (
+            entry.attempt_number === observation.observation_sequence
+            && entry.reason === "OBSERVATION_RECORDED"
+            && entry.graph_snapshot_sha256
+              === sha256Hex(canonicalJsonBytes(observation))
+          ))
       })
     const terminalEnvelope = dispositions[workflowId]
     let terminalDispositionValid = false
@@ -454,6 +500,10 @@ function validateAttachmentEvidenceState(state) {
           confirmedSendIdentity: identity,
           confirmedSendIdentityDigest: identityDigest,
           observations: candidateObservations,
+          terminalReason: [
+            "CAPTURE_ATTEMPT_LIMIT",
+            "CAPTURE_DEADLINE_EXPIRED",
+          ].includes(disposition.reason) ? disposition.reason : undefined,
           terminalAt: disposition.terminal_at,
         })
         terminalDispositionValid = isDeepStrictEqual(disposition, expectedDisposition)
@@ -480,6 +530,12 @@ function validateAttachmentEvidenceState(state) {
       || !journalValid
       || !candidatesValid
       || capture.candidate_generation !== attemptJournal.length
+      || !Number.isSafeInteger(capture.candidate_pair_count)
+      || capture.candidate_pair_count < 0
+      || capture.candidate_pair_count > 8
+      || capture.candidate_pair_count !== attemptJournal.filter(
+        (entry) => entry.state === "PAIR_COMPLETED",
+      ).length
       || (
         capture.state === "CAPTURING"
         && (
@@ -1173,20 +1229,29 @@ export class EventStore {
           "The attachment capture attempt limit has been reached.",
         )
       }
+      const completingPair = current.candidate_observations.length === 1
+      if (completingPair && current.candidate_pair_count >= 8) {
+        throw new EgoChatError(
+          "attachment_capture_pair_limit",
+          "The attachment capture candidate-pair limit has been reached.",
+        )
+      }
       const candidateGeneration = current.candidate_generation + 1
-      const journalEntry = attachmentAttemptJournalEntry(
+      const journalEntry = attachmentObservationJournalEntry(
         observation,
         candidateGeneration,
+        completingPair,
       )
+      const candidateObservations = current.candidate_observations.length >= 2
+        ? [clone(observation)]
+        : [...current.candidate_observations, clone(observation)]
       const next = {
         ...current,
         accumulated_monotonic_ms: current.accumulated_monotonic_ms + elapsedMonotonicMs,
         attempt_journal: [...current.attempt_journal, journalEntry],
         candidate_generation: candidateGeneration,
-        candidate_observations: [
-          ...current.candidate_observations,
-          clone(observation),
-        ].slice(-2),
+        candidate_observations: candidateObservations,
+        candidate_pair_count: current.candidate_pair_count + (completingPair ? 1 : 0),
       }
       const workflow = this.#state.workflows[current.source_workflow_id]
       await this.#appendEvent({
@@ -1195,6 +1260,71 @@ export class EventStore {
         schemaVersion: 1,
         seq: this.#state.nextSeq,
         type: "attachment.capture_attempt_recorded",
+        workflow,
+      })
+      return clone(next)
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async recordAttachmentCaptureRecovery({
+    attemptedAt,
+    capture,
+    elapsedMonotonicMs,
+    reason,
+  }) {
+    const operation = this.#tail.then(async () => {
+      const current = this.#state.attachmentCaptures[capture?.source_workflow_id]
+      if (!current || !capture || !isDeepStrictEqual(current, capture)) {
+        throw new EgoChatError(
+          "attachment_capture_transition_conflict",
+          "The attachment capture changed before its recovery boundary could be committed.",
+        )
+      }
+      if (
+        current.state !== "CAPTURING"
+        || !["BROKER_RESTART", "DRIVER_RECOVERY"].includes(reason)
+        || !exactTimestamp(attemptedAt)
+        || Date.parse(attemptedAt) < Date.parse(current.capture_started_at)
+        || Date.parse(attemptedAt) > Date.parse(current.capture_deadline_at)
+        || !Number.isSafeInteger(elapsedMonotonicMs)
+        || elapsedMonotonicMs < 0
+        || current.accumulated_monotonic_ms + elapsedMonotonicMs > 10 * 60 * 1_000
+      ) {
+        throw new EgoChatError(
+          "invalid_attachment_capture_recovery",
+          "The attachment capture recovery boundary is outside its fixed bounds.",
+        )
+      }
+      if (current.attempt_journal.length >= 32) {
+        throw new EgoChatError(
+          "attachment_capture_attempt_limit",
+          "The attachment capture attempt limit has been reached.",
+        )
+      }
+      const candidateGeneration = current.candidate_generation + 1
+      const journalEntry = attachmentRecoveryJournalEntry({
+        attemptNumber: current.attempt_journal.length + 1,
+        attemptedAt,
+        candidateGeneration,
+        captureOperationKeySha256: current.capture_operation_key_sha256,
+        reason,
+      })
+      const next = {
+        ...current,
+        accumulated_monotonic_ms: current.accumulated_monotonic_ms + elapsedMonotonicMs,
+        attempt_journal: [...current.attempt_journal, journalEntry],
+        candidate_generation: candidateGeneration,
+        candidate_observations: [],
+      }
+      const workflow = this.#state.workflows[current.source_workflow_id]
+      await this.#appendEvent({
+        at: attemptedAt,
+        attachmentCapture: next,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.capture_recovery_recorded",
         workflow,
       })
       return clone(next)
@@ -1243,6 +1373,10 @@ export class EventStore {
         confirmedSendIdentity: identity,
         confirmedSendIdentityDigest: identityDigest,
         observations: current.candidate_observations,
+        terminalReason: [
+          "CAPTURE_ATTEMPT_LIMIT",
+          "CAPTURE_DEADLINE_EXPIRED",
+        ].includes(disposition.reason) ? disposition.reason : undefined,
         terminalAt: disposition.terminal_at,
       })
       if (!isDeepStrictEqual(disposition, expectedDisposition)) {

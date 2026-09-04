@@ -4,7 +4,13 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
-import { buildAttachmentCaptureIntent } from "./attachment-execution-receipt.mjs"
+import {
+  buildAttachmentCaptureIntent,
+  buildAttachmentExecutionDisposition,
+  canonicalJsonBytes,
+  classifyAttachmentExecutionObservations,
+  sha256Hex,
+} from "./attachment-execution-receipt.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
 import {
   DEFAULT_CHATGPT_GENERATION_MS,
@@ -526,12 +532,27 @@ function isRetryableAppServerError(error) {
     || ["thread_identity_mismatch", "turn_identity_mismatch"].includes(error.code)
 }
 
+const ATTACHMENT_CAPTURE_QUIET_INTERVAL_MS = 750
+const RETRYABLE_ATTACHMENT_OBSERVATION_REASONS = new Set([
+  "GENERATION_ACTIVE",
+  "HYDRATION_PENDING",
+  "INCOMPLETE_GRAPH",
+  "UNSTABLE_EVIDENCE",
+])
+
+function monotonicMilliseconds() {
+  return Number(process.hrtime.bigint() / 1_000_000n)
+}
+
 export class Broker {
   #activeBindings = new Set()
   #activeConversationUrls = new Map()
   #adoptionTaskSpaces = new Map()
   #appServerFactory
   #attachmentReceiptAuthority
+  #attachmentCaptureBindings = new Map()
+  #attachmentCaptureControllers = new Map()
+  #attachmentCaptureWorkflows = new Set()
   #brokerIdentity
   #brokerLease
   #convergenceBindings = new Map()
@@ -681,6 +702,12 @@ export class Broker {
           )
         )
       ) {
+        if (
+          workflow.phase === "attachment_capture_started"
+          && this.#canRunAttachmentCapture()
+        ) {
+          this.#scheduleAttachmentCapture(workflow.id, { restarted: true })
+        }
         continue
       } else if (
         workflow.kind === "ego_exchange"
@@ -1552,13 +1579,240 @@ export class Broker {
           "The attachment capture operation and source workflow phase do not match.",
         )
       }
+      if (this.#canRunAttachmentCapture()) {
+        this.#scheduleAttachmentCapture(workflow.id)
+      }
       return publicWorkflow(workflow)
     }
     const started = await this.#store.beginAttachmentCapture(
       workflow,
       new Date().toISOString(),
     )
+    if (this.#canRunAttachmentCapture()) {
+      this.#scheduleAttachmentCapture(workflow.id)
+    }
     return publicWorkflow(started.workflow)
+  }
+
+  #canRunAttachmentCapture() {
+    return typeof this.#egoAdapter?.captureAttachmentExecution === "function"
+      && typeof this.#attachmentReceiptAuthority?.signAttachmentDisposition === "function"
+  }
+
+  #scheduleAttachmentCapture(workflowId, { restarted = false } = {}) {
+    if (this.#attachmentCaptureWorkflows.has(workflowId)) return
+    const workflow = this.#store.getWorkflow(workflowId)
+    if (!workflow || workflow.status !== "running") return
+    const existingOwner = this.#attachmentCaptureBindings.get(workflow.bindingKey)
+    if (existingOwner && existingOwner !== workflowId) {
+      throw new EgoChatError(
+        "conversation_reserved",
+        "That conversation is reserved by another attachment capture.",
+        { workflowId: existingOwner },
+      )
+    }
+    this.#attachmentCaptureWorkflows.add(workflowId)
+    this.#attachmentCaptureBindings.set(workflow.bindingKey, workflowId)
+    this.#runAttachmentCapture(workflowId, { restarted }).catch((error) => {
+      console.error("Attachment capture runner failed:", error)
+    })
+  }
+
+  async #terminalizeAttachmentCapture(capture, terminalReason = undefined) {
+    const identity = this.#store.getConfirmedSendIdentity(capture.source_workflow_id)
+    const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+    const finalObservedAt = capture.candidate_observations.at(-1)?.observed_at
+    const terminalAt = new Date(Math.max(
+      Date.now(),
+      finalObservedAt ? Date.parse(finalObservedAt) : Date.parse(capture.capture_started_at),
+    )).toISOString()
+    const disposition = buildAttachmentExecutionDisposition({
+      captureOperation: capture,
+      confirmedSendIdentity: identity,
+      confirmedSendIdentityDigest: identityDigest,
+      observations: capture.candidate_observations,
+      terminalReason,
+      terminalAt,
+    })
+    const envelope = await this.#attachmentReceiptAuthority.signAttachmentDisposition({
+      consumerSignerAuthorizationDigest:
+        identity.consumer_signer_authorization_sha256,
+      disposition,
+    })
+    await this.#assertBrokerAuthority("before_attachment_disposition_commit")
+    const persisted = await this.#store.persistAttachmentDisposition({
+      capture,
+      envelope,
+    })
+    if (isTerminal(persisted.workflow)) {
+      for (const waiter of [...(this.#waiters.get(persisted.workflow.id) ?? [])]) {
+        waiter.resolve(publicWorkflow(persisted.workflow))
+      }
+    }
+    return persisted
+  }
+
+  async #runAttachmentCapture(workflowId, { restarted }) {
+    const controller = new AbortController()
+    this.#attachmentCaptureControllers.set(workflowId, controller)
+    try {
+      let capture = this.#store.getAttachmentCapture(workflowId)
+      if (!capture || capture.state !== "CAPTURING") return
+      if (restarted) {
+        const restartedAt = new Date().toISOString()
+        if (
+          Date.parse(restartedAt) < Date.parse(capture.capture_deadline_at)
+          && capture.attempt_journal.length < 32
+        ) {
+          capture = await this.#store.recordAttachmentCaptureRecovery({
+            attemptedAt: restartedAt,
+            capture,
+            elapsedMonotonicMs: 0,
+            reason: "BROKER_RESTART",
+          })
+        }
+      }
+
+      while (!controller.signal.aborted) {
+        capture = this.#store.getAttachmentCapture(workflowId)
+        if (!capture || capture.state !== "CAPTURING") return
+        const deadlineExpired = Date.now() >= Date.parse(capture.capture_deadline_at)
+          || capture.accumulated_monotonic_ms >= 10 * 60 * 1_000
+        if (deadlineExpired) {
+          await this.#terminalizeAttachmentCapture(capture, "CAPTURE_DEADLINE_EXPIRED")
+          return
+        }
+        if (
+          capture.attempt_journal.length >= 32
+          || capture.candidate_pair_count >= 8
+        ) {
+          await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+          return
+        }
+        const workflow = this.#store.getWorkflow(workflowId)
+        const identity = this.#store.getConfirmedSendIdentity(workflowId)
+        if (!workflow || workflow.status !== "running" || !identity) {
+          throw new EgoChatError(
+            "corrupt_attachment_evidence_state",
+            "Attachment capture lost its durable workflow, binding, or confirmed Send.",
+          )
+        }
+        const binding = this.#store.getBinding(workflow.bindingKey)
+        if (!binding) {
+          throw new EgoChatError(
+            "corrupt_attachment_evidence_state",
+            "Attachment capture lost its durable conversation binding.",
+          )
+        }
+        const attemptStarted = monotonicMilliseconds()
+        let observation
+        try {
+          observation = await this.#egoAdapter.captureAttachmentExecution({
+            binding,
+            captureOperationKeySha256: capture.capture_operation_key_sha256,
+            observationSequence: capture.attempt_journal.length + 1,
+            providerPromptMessageId: identity.provider_prompt_message_id,
+            sourceConfirmedSendIdentitySha256: sha256Hex(canonicalJsonBytes(identity)),
+          }, controller.signal)
+        } catch (_error) {
+          if (controller.signal.aborted) return
+          const elapsedMonotonicMs = Math.max(
+            0,
+            monotonicMilliseconds() - attemptStarted,
+          )
+          capture = this.#store.getAttachmentCapture(workflowId)
+          const recoveryAt = new Date().toISOString()
+          if (
+            Date.parse(recoveryAt) >= Date.parse(capture.capture_deadline_at)
+            || capture.accumulated_monotonic_ms + elapsedMonotonicMs
+              >= 10 * 60 * 1_000
+          ) {
+            await this.#terminalizeAttachmentCapture(
+              capture,
+              "CAPTURE_DEADLINE_EXPIRED",
+            )
+            return
+          }
+          if (capture.attempt_journal.length >= 31) {
+            await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+            return
+          }
+          capture = await this.#store.recordAttachmentCaptureRecovery({
+            attemptedAt: recoveryAt,
+            capture,
+            elapsedMonotonicMs,
+            reason: "DRIVER_RECOVERY",
+          })
+          await sleep(
+            Math.min(
+              250,
+              Math.max(1, Date.parse(capture.capture_deadline_at) - Date.now()),
+            ),
+            undefined,
+            { signal: controller.signal },
+          )
+          continue
+        }
+        const elapsedMonotonicMs = Math.max(
+          0,
+          monotonicMilliseconds() - attemptStarted,
+        )
+        capture = await this.#store.recordAttachmentCaptureAttempt({
+          capture,
+          elapsedMonotonicMs,
+          observation,
+        })
+        if (capture.candidate_observations.length < 2) {
+          const quietDelayMs = Math.max(
+            1,
+            Date.parse(observation.observed_at)
+              + ATTACHMENT_CAPTURE_QUIET_INTERVAL_MS
+              - Date.now(),
+          )
+          if (Date.now() + quietDelayMs >= Date.parse(capture.capture_deadline_at)) {
+            await this.#terminalizeAttachmentCapture(
+              capture,
+              "CAPTURE_DEADLINE_EXPIRED",
+            )
+            return
+          }
+          await sleep(quietDelayMs, undefined, { signal: controller.signal })
+          continue
+        }
+        const classification = classifyAttachmentExecutionObservations(
+          capture.candidate_observations,
+        )
+        if (RETRYABLE_ATTACHMENT_OBSERVATION_REASONS.has(classification.reason)) {
+          if (capture.candidate_pair_count >= 8) {
+            await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+            return
+          }
+          continue
+        }
+        await this.#terminalizeAttachmentCapture(capture)
+        return
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const workflow = this.#store.getWorkflow(workflowId)
+      if (workflow && !isTerminal(workflow)) {
+        await this.#transition(workflow, "workflow.human_required", {
+          humanRequired: {
+            code: "attachment_capture_runner_failed",
+            message: "The attachment capture runner stopped before terminal evidence was committed.",
+          },
+          status: "human_required",
+        })
+      }
+      throw error
+    } finally {
+      this.#attachmentCaptureControllers.delete(workflowId)
+      this.#attachmentCaptureWorkflows.delete(workflowId)
+      const workflow = this.#store.getWorkflow(workflowId)
+      if (workflow && this.#attachmentCaptureBindings.get(workflow.bindingKey) === workflowId) {
+        this.#attachmentCaptureBindings.delete(workflow.bindingKey)
+      }
+    }
   }
 
   async #startEgoExchange(input, convergenceId = undefined) {
@@ -1917,6 +2171,8 @@ export class Broker {
 
     this.#controllers.get(workflowId)?.abort()
     this.#controllers.delete(workflowId)
+    this.#attachmentCaptureControllers.get(workflowId)?.abort()
+    this.#attachmentCaptureControllers.delete(workflowId)
 
     if (workflow.kind === "ego_exchange") {
       return this.#transition(workflow, "workflow.human_required", {
@@ -1977,12 +2233,18 @@ export class Broker {
       controller.abort()
     }
     this.#controllers.clear()
+    for (const controller of this.#attachmentCaptureControllers.values()) {
+      controller.abort()
+    }
+    this.#attachmentCaptureControllers.clear()
     for (const client of this.#convergenceClients.values()) {
       client.close().catch(() => {})
     }
     this.#convergenceClients.clear()
     this.#convergenceChildren.clear()
     this.#convergenceBindings.clear()
+    this.#attachmentCaptureBindings.clear()
+    this.#attachmentCaptureWorkflows.clear()
     this.#activeConversationUrls.clear()
     this.#adoptionTaskSpaces.clear()
     this.#activeBindings.clear()
@@ -4615,6 +4877,14 @@ export class Broker {
   }
 
   #assertBindingAvailable(bindingKey, convergenceId = undefined) {
+    const attachmentCaptureOwner = this.#attachmentCaptureBindings.get(bindingKey)
+    if (attachmentCaptureOwner) {
+      throw new EgoChatError(
+        "conversation_reserved",
+        "That conversation is reserved by an active attachment capture.",
+        { workflowId: attachmentCaptureOwner },
+      )
+    }
     const owner = this.#convergenceBindings.get(bindingKey)
     if (owner && owner !== convergenceId) {
       throw new EgoChatError(
@@ -4663,6 +4933,17 @@ export class Broker {
         )
       }
     }
+    for (const [reservedBindingKey, workflowId] of this.#attachmentCaptureBindings) {
+      if (reservedBindingKey === bindingKey) continue
+      const reservedBinding = this.#store.getBinding(reservedBindingKey)
+      if (reservedBinding && String(reservedBinding.taskSpaceId) === String(binding.taskSpaceId)) {
+        throw new EgoChatError(
+          "task_space_reserved",
+          "That Ego task space is reserved by an active attachment capture.",
+          { workflowId },
+        )
+      }
+    }
   }
 
   #assertTaskSpaceAvailable(taskSpace) {
@@ -4690,6 +4971,16 @@ export class Broker {
         throw new EgoChatError(
           "task_space_reserved",
           "That Ego task space is reserved by an active convergence workflow.",
+          { workflowId },
+        )
+      }
+    }
+    for (const [bindingKey, workflowId] of this.#attachmentCaptureBindings) {
+      const binding = this.#store.getBinding(bindingKey)
+      if (binding && String(binding.taskSpaceId) === String(taskSpace)) {
+        throw new EgoChatError(
+          "task_space_reserved",
+          "That Ego task space is reserved by an active attachment capture.",
           { workflowId },
         )
       }
