@@ -2281,7 +2281,10 @@ export class EventStore {
       }
       if (entityName === "binding" && expectedEntity !== undefined) {
         const current = this.#state.bindings[entity.key]
-        if (!isDeepStrictEqual(current, expectedEntity)) {
+        const matches = expectedEntity === null
+          ? current === undefined
+          : isDeepStrictEqual(current, expectedEntity)
+        if (!matches) {
           throw new EgoChatError(
             "binding_transition_conflict",
             "The conversation binding changed before this state transition could be committed.",

@@ -231,6 +231,11 @@ function signedAttachmentConsumerAcknowledgement(acknowledgement, fill = 2) {
   }
 }
 
+function browserTaskSpaceIdentity(label = "default") {
+  const value = `test-task-space-${label}`
+  return { name: value, taskId: value }
+}
+
 function parseConvergenceIdentity(prompt) {
   return {
     candidateDigest: prompt.match(/Candidate digest: ([a-f0-9]{64})/)?.[1],
@@ -267,6 +272,7 @@ async function seedRestartBinding(dataDir, canonicalUrl) {
           messageCount: 2,
         },
         targetId: "restart-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity("convergence"),
         taskSpaceId: 10,
       }),
     },
@@ -507,6 +513,7 @@ function createConvergenceEgoAdapter(reviewFactory) {
         canonicalUrl: input.canonicalUrl,
         head: { fingerprint: "initial-head", lastRole: "assistant", messageCount: 2 },
         targetId: "convergence-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity("convergence"),
         taskSpaceId: 10,
       }),
       exchange: async (input) => {
@@ -531,6 +538,7 @@ function createConvergenceEgoAdapter(reviewFactory) {
           responseDigest: digest(responseText),
           responseText,
           targetId: "convergence-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity("convergence"),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -973,6 +981,7 @@ test("receipt restart reconciles an armed dispatch without a second Send", async
     revision: 7,
     state: "bound",
     targetId: "tab-armed-restart",
+    taskSpaceIdentity: browserTaskSpaceIdentity("3"),
     taskSpaceId: 3,
   })
   let firstSendCalls = 0
@@ -1052,6 +1061,7 @@ test("receipt restart reconciles an armed dispatch without a second Send", async
           messageCount: input.binding.messageCount,
         },
         targetId: "tab-armed-restart",
+        taskSpaceIdentity: browserTaskSpaceIdentity("3"),
         taskSpaceId: 3,
       }),
       sendExchange: async () => {
@@ -1100,6 +1110,7 @@ test("receipt Send confirmation atomically persists its immutable identity and e
     revision: 7,
     state: "bound",
     targetId: "tab-confirmed",
+    taskSpaceIdentity: browserTaskSpaceIdentity("4"),
     taskSpaceId: 4,
   })
   const sentAt = "2026-09-04T04:30:00.000Z"
@@ -1119,6 +1130,7 @@ test("receipt Send confirmation atomically persists its immutable identity and e
           generationRunning: true,
           promptMessageId: input.promptMessageId,
           targetId: "tab-confirmed",
+          taskSpaceIdentity: browserTaskSpaceIdentity("4"),
           taskSpaceId: 4,
           turnMarker: input.turnMarker,
         }
@@ -1129,6 +1141,7 @@ test("receipt Send confirmation atomically persists its immutable identity and e
         promptMessageId: "prompt-confirmed",
         sentAt,
         targetId: "tab-confirmed",
+        taskSpaceIdentity: browserTaskSpaceIdentity("4"),
         taskSpaceId: 4,
         turnMarker: input.turnMarker,
       }),
@@ -1255,6 +1268,7 @@ test("attachment observations and terminal disposition remain create-once across
     revision: 1,
     state: "bound",
     targetId: "tab-durable-capture",
+    taskSpaceIdentity: browserTaskSpaceIdentity("5"),
     taskSpaceId: 5,
   })
   const broker = new Broker({
@@ -1279,6 +1293,7 @@ test("attachment observations and terminal disposition remain create-once across
         promptMessageId: "prompt-confirmed",
         sentAt: "2026-09-04T05:29:59.000Z",
         targetId: "tab-durable-capture",
+        taskSpaceIdentity: browserTaskSpaceIdentity("5"),
         taskSpaceId: 5,
         turnMarker: input.turnMarker,
       }),
@@ -1410,6 +1425,7 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
     revision: 1,
     state: "bound",
     targetId: "tab-evidence",
+    taskSpaceIdentity: browserTaskSpaceIdentity("1"),
     taskSpaceId: 1,
   })
   const broker = new Broker({
@@ -1430,6 +1446,7 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
         promptMessageId: "prompt-confirmed",
         sentAt: "2026-09-04T05:00:00.000Z",
         targetId: "tab-evidence",
+        taskSpaceIdentity: browserTaskSpaceIdentity("1"),
         taskSpaceId: 1,
         turnMarker: input.turnMarker,
       }),
@@ -1638,29 +1655,52 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
     "CONSUMED_LEGACY_RECOVERY_REQUIRED",
   )
 
+  const freshCanonicalUrl = "https://chatgpt.com/c/evidence-chain-fresh"
   const freshBroker = new Broker({
     attachmentReceiptAuthority: {
       qualify: async (request) => fakeReceiptQualification(request),
     },
     egoAdapter: {
       ...unusedEgoAdapter,
+      bind: async () => ({
+        canonicalUrl: freshCanonicalUrl,
+        head: {
+          fingerprint: "fresh-contract-before",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: "e".repeat(64),
+          lastMessageId: "fresh-contract-assistant-before",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        targetId: "tab-evidence-fresh",
+        taskSpaceIdentity: browserTaskSpaceIdentity("2"),
+        taskSpaceId: 2,
+      }),
       captureAttachmentExecution: async () => new Promise(() => {}),
       captureExchange: async () => new Promise(() => {}),
       sendExchange: async (input) => ({
-        canonicalUrl: "https://chatgpt.com/c/evidence-chain",
+        canonicalUrl: freshCanonicalUrl,
         modelPolicy: modelPolicyObservation(),
         promptMessageId: "prompt-fresh-contract",
         sentAt: "2026-09-04T06:00:00.000Z",
-        targetId: "tab-evidence",
-        taskSpaceId: 1,
+        targetId: "tab-evidence-fresh",
+        taskSpaceIdentity: browserTaskSpaceIdentity("2"),
+        taskSpaceId: 2,
         turnMarker: input.turnMarker,
       }),
     },
     store: legacyReplay,
   })
   t.after(() => freshBroker.close())
+  await freshBroker.initialize()
+  await freshBroker.bindConversation({
+    bindingKey: "a3k-evidence-fresh",
+    canonicalUrl: freshCanonicalUrl,
+    mode: "existing",
+    taskSpace: 2,
+  })
   const fresh = await freshBroker.startEgoExchange({
-    bindingKey: "a3k-evidence",
+    bindingKey: "a3k-evidence-fresh",
     expectedTerminalMarker: "EGO_CHAT_A3K_FRESH_RESULT",
     prompt: "EGO_CHAT_A3K_FRESH_12345678\nprepare",
     receiptCapture: {
@@ -2275,6 +2315,7 @@ test("broker recovers a driver failure then signs one quiet terminal disposition
     revision: 1,
     state: "bound",
     targetId: "tab-broker-capture",
+    taskSpaceIdentity: browserTaskSpaceIdentity("6"),
     taskSpaceId: 6,
   })
   let captureCalls = 0
@@ -2320,6 +2361,7 @@ test("broker recovers a driver failure then signs one quiet terminal disposition
           promptMessageId: "prompt-confirmed",
           sentAt: new Date().toISOString(),
           targetId: "tab-broker-capture",
+          taskSpaceIdentity: browserTaskSpaceIdentity("6"),
           taskSpaceId: 6,
           turnMarker: input.turnMarker,
         }
@@ -2389,6 +2431,7 @@ test("broker restart resumes the same capture lineage without another Send", asy
     revision: 1,
     state: "bound",
     targetId: "tab-restarted-capture",
+    taskSpaceIdentity: browserTaskSpaceIdentity("7"),
     taskSpaceId: 7,
   })
   let sendCalls = 0
@@ -2426,6 +2469,7 @@ test("broker restart resumes the same capture lineage without another Send", asy
           promptMessageId: "prompt-confirmed",
           sentAt: new Date().toISOString(),
           targetId: "tab-restarted-capture",
+          taskSpaceIdentity: browserTaskSpaceIdentity("7"),
           taskSpaceId: 7,
           turnMarker: input.turnMarker,
         }
@@ -2609,6 +2653,267 @@ test("binding persistence compare-and-swap rejects a stale re-anchor commit", as
   assert.deepEqual(store.getBinding("ego-chat-main"), concurrent)
 })
 
+test("binding creation rejects incomplete or malformed browser task-space identity evidence", async (t) => {
+  const invalidIdentities = [
+    { name: "missing-task-id" },
+    { taskId: "missing-name" },
+    { name: "", taskId: "empty-name" },
+    { name: "wrong-type", taskId: 7 },
+    { name: "x".repeat(201), taskId: "over-limit" },
+    { extra: "not-closed", name: "closed", taskId: "closed" },
+  ]
+
+  for (const [index, taskSpaceIdentity] of invalidIdentities.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const store = new EventStore(dataDir)
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        bind: async (input) => ({
+          canonicalUrl: input.canonicalUrl,
+          head: { fingerprint: `invalid-identity-${index}`, lastRole: "assistant", messageCount: 2 },
+          targetId: `invalid-identity-tab-${index}`,
+          taskSpaceIdentity,
+          taskSpaceId: 10 + index,
+        }),
+      },
+      store,
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    const bindingKey = `invalid-identity-${index}`
+    await assert.rejects(
+      broker.bindConversation({
+        bindingKey,
+        canonicalUrl: `https://chatgpt.com/c/${bindingKey}`,
+        mode: "existing",
+        taskSpace: 10 + index,
+      }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === "task_space_identity_invalid",
+    )
+    assert.throws(
+      () => broker.getConversationBinding({ bindingKey }),
+      (error) => error.code === "binding_not_found",
+    )
+  }
+})
+
+test("binding creation rejects a successful browser result with no task-space identity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: { fingerprint: "missing-identity-head", lastRole: "assistant", messageCount: 2 },
+        targetId: "missing-identity-tab",
+        taskSpaceId: 10,
+      }),
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey: "missing-identity",
+      canonicalUrl: "https://chatgpt.com/c/missing-identity",
+      mode: "existing",
+      taskSpace: 10,
+    }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_missing",
+  )
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: "missing-identity" }),
+    (error) => error.code === "binding_not_found",
+  )
+})
+
+test("exchange results cannot omit or replace an established task-space identity", async (t) => {
+  const cases = [
+    { expectedReason: "task_space_identity_missing", resultIdentity: undefined },
+    { expectedReason: "task_space_identity_changed", resultIdentity: browserTaskSpaceIdentity("other") },
+  ]
+  for (const [index, identityCase] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const taskSpaceIdentity = browserTaskSpaceIdentity(`exchange-${index}`)
+    const terminalMarker = `EGO_CHAT_IDENTITY_RESULT_DONE_${index}`
+    const turnMarker = `EGO_CHAT_IDENTITY_RESULT_TEST_${index}`
+    const store = new EventStore(dataDir)
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        bind: async (input) => ({
+          canonicalUrl: input.canonicalUrl,
+          head: { fingerprint: `identity-result-before-${index}`, lastRole: "assistant", messageCount: 2 },
+          targetId: `identity-result-tab-${index}`,
+          taskSpaceIdentity,
+          taskSpaceId: 40 + index,
+        }),
+        exchange: async (input) => ({
+          canonicalUrl: input.binding.canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: `identity-result-after-${index}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(terminalMarker),
+            lastMessageId: `identity-result-assistant-${index}`,
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(terminalMarker),
+          responseText: terminalMarker,
+          targetId: `identity-result-tab-${index}`,
+          ...(identityCase.resultIdentity
+            ? { taskSpaceIdentity: identityCase.resultIdentity }
+            : {}),
+          taskSpaceId: 40 + index,
+          turnMarker: input.turnMarker,
+        }),
+      },
+      store,
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: `identity-result-${index}`,
+      canonicalUrl: `https://chatgpt.com/c/identity-result-${index}`,
+      mode: "existing",
+      taskSpace: 40 + index,
+    })
+    const before = broker.getConversationBinding({ bindingKey: `identity-result-${index}` })
+    const started = await broker.startEgoExchange({
+      bindingKey: `identity-result-${index}`,
+      expectedTerminalMarker: terminalMarker,
+      prompt: `${turnMarker}\nReject unsafe identity evidence.`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+    assert.equal(completed.status, "human_required")
+    assert.equal(completed.humanRequired.code, identityCase.expectedReason)
+    assert.deepEqual(
+      broker.getConversationBinding({ bindingKey: `identity-result-${index}` }),
+      before,
+    )
+    const durable = store.getWorkflow(started.id)
+    assert.equal(durable.result, undefined)
+    const workflowEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.workflow?.id === started.id)
+    assert.equal(workflowEvents.some((event) => event.type === "exchange.response_captured"), false)
+    assert.deepEqual(
+      await fs.readdir(path.join(dataDir, "blobs")).catch((error) => {
+        if (error.code === "ENOENT") return []
+        throw error
+      }),
+      [],
+    )
+  }
+})
+
+test("staged terminal capture validates task-space identity before result or blob persistence", async (t) => {
+  const cases = [
+    { expectedReason: "task_space_identity_missing", resultIdentity: undefined },
+    { expectedReason: "task_space_identity_changed", resultIdentity: browserTaskSpaceIdentity("staged-other") },
+  ]
+  for (const [index, identityCase] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const taskSpaceIdentity = browserTaskSpaceIdentity(`staged-${index}`)
+    const terminalMarker = `EGO_CHAT_STAGED_IDENTITY_DONE_${index}`
+    const responseText = terminalMarker
+    const turnMarker = `EGO_CHAT_STAGED_IDENTITY_TEST_${index}`
+    const store = new EventStore(dataDir)
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        bind: async (input) => ({
+          canonicalUrl: input.canonicalUrl,
+          head: { fingerprint: `staged-before-${index}`, lastRole: "assistant", messageCount: 2 },
+          targetId: `staged-tab-${index}`,
+          taskSpaceIdentity,
+          taskSpaceId: 70 + index,
+        }),
+        sendExchange: async (input) => ({
+          canonicalUrl: input.binding.canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: `staged-user-${index}`,
+          sentAt: new Date().toISOString(),
+          targetId: `staged-tab-${index}`,
+          taskSpaceIdentity,
+          taskSpaceId: 70 + index,
+          turnMarker: input.turnMarker,
+        }),
+        captureExchange: async (input) => ({
+          canonicalUrl: input.canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: `staged-after-${index}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: `staged-assistant-${index}`,
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: `staged-tab-${index}`,
+          ...(identityCase.resultIdentity
+            ? { taskSpaceIdentity: identityCase.resultIdentity }
+            : {}),
+          taskSpaceId: 70 + index,
+          turnMarker,
+        }),
+      },
+      store,
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: `staged-identity-${index}`,
+      canonicalUrl: `https://chatgpt.com/c/staged-identity-${index}`,
+      mode: "existing",
+      taskSpace: 70 + index,
+    })
+    const started = await broker.startEgoExchange({
+      bindingKey: `staged-identity-${index}`,
+      expectedTerminalMarker: terminalMarker,
+      prompt: `${turnMarker}\nReject unsafe staged identity evidence.`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+    assert.equal(completed.status, "human_required")
+    assert.equal(completed.humanRequired.code, identityCase.expectedReason)
+    assert.equal(store.getWorkflow(started.id).result, undefined)
+    const workflowEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.workflow?.id === started.id)
+    assert.equal(workflowEvents.some((event) => event.type === "exchange.response_captured"), false)
+    assert.deepEqual(
+      await fs.readdir(path.join(dataDir, "blobs")).catch((error) => {
+        if (error.code === "ENOENT") return []
+        throw error
+      }),
+      [],
+    )
+  }
+})
+
 test("create-once binding is promoted and reused for every later exchange", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -2619,14 +2924,27 @@ test("create-once binding is promoted and reused for every later exchange", asyn
     bind: async (input) => ({
       canonicalUrl: null,
       targetId: input.targetId,
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
-    exchange: async (input) => {
+    sendExchange: async (input) => {
       seenTimeouts.push(input.timeoutMs)
       seenBindingStates.push({
         canonicalUrl: input.binding.canonicalUrl,
         state: input.binding.state,
       })
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: `prompt-${seenBindingStates.length}`,
+        sentAt: new Date().toISOString(),
+        targetId: "bound-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
+        taskSpaceId: 10,
+        turnMarker: input.turnMarker,
+      }
+    },
+    captureExchange: async (input) => {
       const responseText = input.expectedTerminalMarker
       return {
         canonicalUrl,
@@ -2639,10 +2957,10 @@ test("create-once binding is promoted and reused for every later exchange", asyn
           lastRole: "assistant",
           messageCount: seenBindingStates.length * 2,
         },
-        modelPolicy: modelPolicyObservation(),
         responseDigest: digest(responseText),
         responseText,
         targetId: "bound-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
         turnMarker: input.turnMarker,
       }
@@ -2709,6 +3027,645 @@ test("create-once binding is promoted and reused for every later exchange", asyn
   assert.equal(modelPolicy.lastObserved.powerLevel, 5)
 })
 
+test("unbound create-once refuses a monolithic adapter before Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  let monolithicCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: null,
+        targetId: input.targetId,
+        taskSpaceIdentity: browserTaskSpaceIdentity("monolithic-create-once"),
+        taskSpaceId: 65,
+      }),
+      exchange: async () => {
+        monolithicCalls += 1
+        throw new Error("an unbound create-once Send must require staged evidence")
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "monolithic-create-once",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "monolithic-create-once-tab",
+    taskSpace: 65,
+  })
+  const turnMarker = "EGO_CHAT_MONOLITHIC_CREATE_ONCE"
+  const started = await broker.startEgoExchange({
+    bindingKey: "monolithic-create-once",
+    expectedTerminalMarker: `${turnMarker}_DONE`,
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "create_once_staged_exchange_required")
+  assert.equal(monolithicCalls, 0)
+  assert.equal(broker.getConversationBinding({ bindingKey: "monolithic-create-once" }).state, "unbound")
+})
+
+test("a create-once canonical URL is reserved in-lane before another binding can claim it", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/create-once-in-lane-reservation"
+  const taskSpaceIdentity = { name: "create-once-space", taskId: "create-once-task" }
+  const turnMarker = "EGO_CHAT_CREATE_ONCE_RESERVATION"
+  const terminalMarker = "EGO_CHAT_CREATE_ONCE_RESERVATION_DONE"
+  let releaseSend
+  let reportReserved
+  const released = new Promise((resolve) => {
+    releaseSend = resolve
+  })
+  const reserved = new Promise((resolve) => {
+    reportReserved = resolve
+  })
+  let competingBrowserCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => {
+        if (input.bindingKey !== "create-once-owner") {
+          competingBrowserCalls += 1
+        }
+        return {
+          canonicalUrl: null,
+          head: {
+            fingerprint: digest("blank-head"),
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: null,
+            lastMessageId: null,
+            lastRole: null,
+            messageCount: 0,
+          },
+          targetId: "create-once-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 61,
+        }
+      },
+      captureExchange: async () => ({
+        canonicalUrl,
+        durationMs: 10,
+        head: {
+          fingerprint: digest(terminalMarker),
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(terminalMarker),
+          lastMessageId: "create-once-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        responseDigest: digest(terminalMarker),
+        responseText: terminalMarker,
+        targetId: "create-once-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 61,
+        turnMarker,
+      }),
+      sendExchange: async (input, _signal, onResult) => {
+        const result = {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "create-once-user",
+          sentAt: new Date().toISOString(),
+          targetId: "create-once-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 61,
+          turnMarker: input.turnMarker,
+        }
+        onResult(result)
+        reportReserved()
+        await released
+        return result
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "create-once-owner",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "create-once-tab",
+    taskSpace: 61,
+  })
+  const started = await broker.startEgoExchange({
+    bindingKey: "create-once-owner",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nReserve the learned canonical URL.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  await reserved
+  try {
+    await assert.rejects(
+      broker.bindConversation({
+        bindingKey: "create-once-competitor",
+        canonicalUrl,
+        mode: "existing",
+        taskSpace: 62,
+      }),
+      (error) => error.code === "conversation_reserved",
+    )
+    assert.equal(competingBrowserCalls, 0)
+  } finally {
+    releaseSend()
+  }
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(
+    broker.getConversationBinding({ bindingKey: "create-once-owner" }).canonicalUrl,
+    canonicalUrl,
+  )
+})
+
+test("create-once learns one canonical URL exactly once inside Send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const firstUrl = "https://chatgpt.com/c/create-once-first-canonical"
+  const secondUrl = "https://chatgpt.com/c/create-once-second-canonical"
+  const taskSpaceIdentity = { name: "create-once-single-url", taskId: "create-once-single-task" }
+  let captureCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: null,
+        targetId: input.targetId,
+        taskSpaceIdentity,
+        taskSpaceId: 71,
+      }),
+      captureExchange: async () => {
+        captureCalls += 1
+        throw new Error("a changed canonical URL must stop before capture")
+      },
+      sendExchange: async (input, _signal, onResult) => {
+        const first = {
+          canonicalUrl: firstUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "create-once-single-user",
+          sentAt: new Date().toISOString(),
+          targetId: "create-once-single-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 71,
+          turnMarker: input.turnMarker,
+        }
+        onResult(first)
+        return { ...first, canonicalUrl: secondUrl }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "create-once-single-url",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "create-once-single-tab",
+    taskSpace: 71,
+  })
+  const turnMarker = "EGO_CHAT_CREATE_ONCE_SINGLE_URL"
+  const started = await broker.startEgoExchange({
+    bindingKey: "create-once-single-url",
+    expectedTerminalMarker: `${turnMarker}_DONE`,
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "canonical_conversation_changed")
+  assert.equal(captureCalls, 0)
+  assert.equal(broker.getConversationBinding({ bindingKey: "create-once-single-url" }).state, "unbound")
+  const workflowEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.workflow?.id === started.id)
+  assert.equal(workflowEvents.some((event) => event.type === "exchange.send_confirmed"), false)
+})
+
+test("bind and verify reject canonical retargeting without residual reservation state", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/canonical-transaction"
+  const wrongUrl = "https://chatgpt.com/c/canonical-transaction-wrong"
+  const taskSpaceIdentity = { name: "canonical-transaction-space", taskId: "canonical-transaction-task" }
+  let bindWrong = true
+  let verifyWrong = true
+  const head = {
+    fingerprint: "canonical-transaction-head",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: digest("canonical-transaction-head"),
+    lastMessageId: "canonical-transaction-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async () => ({
+        canonicalUrl: bindWrong ? wrongUrl : canonicalUrl,
+        head,
+        targetId: "canonical-transaction-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 66,
+      }),
+      verify: async () => ({
+        canonicalUrl: verifyWrong ? wrongUrl : canonicalUrl,
+        head,
+        targetId: "canonical-transaction-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 66,
+      }),
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const bindInput = {
+    bindingKey: "canonical-transaction",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: "canonical-transaction-space",
+  }
+  await assert.rejects(
+    broker.bindConversation(bindInput),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "canonical_conversation_changed",
+  )
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: bindInput.bindingKey }),
+    (error) => error.code === "binding_not_found",
+  )
+  bindWrong = false
+  const bound = await broker.bindConversation(bindInput)
+  assert.equal(bound.canonicalUrl, canonicalUrl)
+
+  const bindingBeforeVerify = broker.getConversationBinding({ bindingKey: bindInput.bindingKey })
+  await assert.rejects(
+    broker.verifyConversation({ bindingKey: bindInput.bindingKey }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "canonical_conversation_changed",
+  )
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: bindInput.bindingKey }),
+    bindingBeforeVerify,
+  )
+  verifyWrong = false
+  const verified = await broker.verifyConversation({ bindingKey: bindInput.bindingKey })
+  assert.equal(verified.revision, bindingBeforeVerify.revision + 1)
+})
+
+test("adoption rejects canonical retargeting and can retry the same unbound key", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adoption-canonical-transaction"
+  const taskSpaceIdentity = { name: "adoption-canonical-space", taskId: "adoption-canonical-task" }
+  let wrong = true
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => {
+        const responseText = "Stable adopted response."
+        return {
+          adoptedWhileGenerating: false,
+          anchor: { contentDigest: digest("adoption-user"), messageId: "adoption-user" },
+          canonicalUrl: wrong
+            ? "https://chatgpt.com/c/adoption-canonical-transaction-wrong"
+            : canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: "adoption-canonical-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "adoption-canonical-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+            renderedMessageCount: 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "adoption-canonical-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 67,
+        }
+      },
+    },
+    recoveryDelaysMs: [1],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const input = {
+    bindingKey: "adoption-canonical-transaction",
+    canonicalUrl,
+    taskSpace: "adoption-canonical-space",
+    timeoutMs: 30_000,
+  }
+
+  const first = await broker.startConversationAdoption(input)
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: first.id })
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.humanRequired.code, "canonical_conversation_changed")
+  wrong = false
+  const second = await broker.startConversationAdoption(input)
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: second.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(
+    broker.getConversationBinding({ bindingKey: input.bindingKey }).canonicalUrl,
+    canonicalUrl,
+  )
+})
+
+test("Send and capture reject canonical retargeting before result or head persistence", async (t) => {
+  for (const stage of ["send", "capture"]) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const canonicalUrl = `https://chatgpt.com/c/${stage}-canonical-transaction`
+    const wrongUrl = `https://chatgpt.com/c/${stage}-canonical-transaction-wrong`
+    const taskSpaceIdentity = {
+      name: `${stage}-canonical-space`,
+      taskId: `${stage}-canonical-task`,
+    }
+    const initialHead = {
+      fingerprint: `${stage}-canonical-head-before`,
+      fingerprintVersion: "tail-v1",
+      lastContentDigest: digest(`${stage}-canonical-head-before`),
+      lastMessageId: `${stage}-canonical-assistant-before`,
+      lastRole: "assistant",
+      messageCount: 2,
+    }
+    let captureCalls = 0
+    let verifyCalls = 0
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        bind: async () => ({
+          canonicalUrl,
+          head: initialHead,
+          targetId: `${stage}-canonical-tab`,
+          taskSpaceIdentity,
+          taskSpaceId: 68,
+        }),
+        captureExchange: async (input) => {
+          captureCalls += 1
+          const responseText = input.expectedTerminalMarker
+          return {
+            canonicalUrl: stage === "capture" ? wrongUrl : canonicalUrl,
+            head: {
+              fingerprint: `${stage}-canonical-head-after`,
+              fingerprintVersion: "tail-v1",
+              lastContentDigest: digest(responseText),
+              lastMessageId: `${stage}-canonical-assistant-after`,
+              lastRole: "assistant",
+              messageCount: 4,
+            },
+            responseDigest: digest(responseText),
+            responseText,
+            targetId: `${stage}-canonical-tab`,
+            taskSpaceIdentity,
+            taskSpaceId: 68,
+            turnMarker: input.turnMarker,
+          }
+        },
+        sendExchange: async (input) => ({
+          canonicalUrl: stage === "send" ? wrongUrl : canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: `${stage}-canonical-user`,
+          sentAt: new Date().toISOString(),
+          targetId: `${stage}-canonical-tab`,
+          taskSpaceIdentity,
+          taskSpaceId: 68,
+          turnMarker: input.turnMarker,
+        }),
+        verify: async () => {
+          verifyCalls += 1
+          return {
+            canonicalUrl,
+            head: initialHead,
+            targetId: `${stage}-canonical-tab`,
+            taskSpaceIdentity,
+            taskSpaceId: 68,
+          }
+        },
+      },
+      store: new EventStore(dataDir),
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: `${stage}-canonical-transaction`,
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: `${stage}-canonical-space`,
+    })
+    const bindingBefore = broker.getConversationBinding({
+      bindingKey: `${stage}-canonical-transaction`,
+    })
+    const turnMarker = `EGO_CHAT_${stage.toUpperCase()}_CANONICAL_TRANSACTION`
+    const started = await broker.startEgoExchange({
+      bindingKey: `${stage}-canonical-transaction`,
+      expectedTerminalMarker: `${turnMarker}_DONE`,
+      prompt: `${turnMarker}\nreview`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+    assert.equal(stopped.status, "human_required")
+    assert.equal(stopped.humanRequired.code, "canonical_conversation_changed")
+    assert.equal(captureCalls, stage === "capture" ? 1 : 0)
+    assert.equal(stopped.result, undefined)
+    assert.deepEqual(
+      broker.getConversationBinding({ bindingKey: `${stage}-canonical-transaction` }),
+      bindingBefore,
+    )
+    if (stage === "capture") {
+      await assert.rejects(
+        broker.verifyConversation({ bindingKey: `${stage}-canonical-transaction` }),
+        (error) => error.code === "human_required"
+          && error.details?.reason === "binding_key_reserved",
+      )
+      await broker.abandonWorkflow({
+        acknowledgePotentialDelivery: true,
+        workflowId: started.id,
+      })
+    }
+    await broker.verifyConversation({ bindingKey: `${stage}-canonical-transaction` })
+    assert.equal(verifyCalls, 1)
+    const workflowEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.workflow?.id === started.id)
+    assert.equal(workflowEvents.some((event) => event.type === "exchange.response_captured"), false)
+  }
+})
+
+test("a legacy Project binding persists its complete task-space identity across exchange and restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/g/g-p-a3k-isolation/c/a3k-isolation-chat"
+  const taskSpaceIdentity = {
+    name: `ego-chat-bound-${digest(`canonical-conversation\0${canonicalUrl}`).slice(0, 32)}`,
+    taskId: "opaque-a3k-isolation-task-id",
+  }
+  const initialHead = {
+    fingerprint: "legacy-identity-before",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "a".repeat(64),
+    lastMessageId: "legacy-identity-assistant-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const now = "2026-08-24T00:00:00.000Z"
+  const legacyBinding = {
+    canonicalUrl,
+    createdAt: now,
+    headContentDigest: initialHead.lastContentDigest,
+    headFingerprint: initialHead.fingerprint,
+    headFingerprintVersion: initialHead.fingerprintVersion,
+    headMessageId: initialHead.lastMessageId,
+    headRole: initialHead.lastRole,
+    key: "legacy-a3k",
+    messageCount: initialHead.messageCount,
+    mode: "existing",
+    modelPolicyKey: "chatgpt-web-default",
+    projectUrl: "https://chatgpt.com/g/g-p-a3k-isolation",
+    revision: 1,
+    startUrl: canonicalUrl,
+    state: "bound",
+    targetId: "legacy-identity-tab-before",
+    taskSpaceId: 3,
+    updatedAt: now,
+    verifiedAt: now,
+  }
+  const legacyEvent = `${JSON.stringify({
+    at: now,
+    binding: legacyBinding,
+    schemaVersion: 1,
+    seq: 1,
+    type: "binding.created",
+  })}\n`
+  await fs.writeFile(path.join(dataDir, "events.jsonl"), legacyEvent, { mode: 0o600 })
+
+  const legacyStore = new EventStore(dataDir)
+  await legacyStore.initialize()
+  assert.deepEqual(legacyStore.getBinding("legacy-a3k"), legacyBinding)
+
+  const missingIdentityBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      verify: async () => ({
+        canonicalUrl,
+        head: initialHead,
+        targetId: "legacy-identity-tab-before",
+        taskSpaceId: 3,
+      }),
+    },
+    store: new EventStore(dataDir),
+  })
+  await missingIdentityBroker.initialize()
+  const eventsBeforeMissingIdentityAttempt = await fs.readFile(
+    path.join(dataDir, "events.jsonl"),
+    "utf8",
+  )
+  await assert.rejects(
+    missingIdentityBroker.verifyConversation({ bindingKey: "legacy-a3k" }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_missing",
+  )
+  assert.equal(
+    missingIdentityBroker.getConversationBinding({ bindingKey: "legacy-a3k" }).revision,
+    1,
+  )
+  missingIdentityBroker.close()
+  assert.equal(
+    await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+    eventsBeforeMissingIdentityAttempt,
+  )
+
+  const migrationBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      verify: async ({ binding }) => {
+        assert.equal(binding.canonicalUrl, canonicalUrl)
+        assert.equal(binding.taskSpaceIdentity, undefined)
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: binding.headFingerprint,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: binding.headContentDigest,
+            lastMessageId: binding.headMessageId,
+            lastRole: binding.headRole,
+            messageCount: binding.messageCount,
+          },
+          targetId: "legacy-identity-tab-verified",
+          taskSpaceIdentity,
+          taskSpaceId: 31,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await migrationBroker.initialize()
+  const verified = await migrationBroker.verifyConversation({ bindingKey: "legacy-a3k" })
+  assert.equal(verified.canonicalUrl, canonicalUrl)
+  assert.deepEqual(verified.taskSpaceIdentity, taskSpaceIdentity)
+  assert.equal(verified.revision, 2)
+  migrationBroker.close()
+
+  const finalStore = new EventStore(dataDir)
+  await finalStore.initialize()
+  const migrated = finalStore.getBinding("legacy-a3k")
+  assert.equal(migrated.canonicalUrl, canonicalUrl)
+  assert.equal(migrated.taskSpaceId, 31)
+  assert.deepEqual(migrated.taskSpaceIdentity, taskSpaceIdentity)
+
+  const beforeDriftAttempt = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+  const driftBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      verify: async () => ({
+        canonicalUrl,
+        head: initialHead,
+        targetId: "legacy-identity-tab-drifted",
+        taskSpaceIdentity: browserTaskSpaceIdentity("drifted"),
+        taskSpaceId: 99,
+      }),
+    },
+    store: finalStore,
+  })
+  await driftBroker.initialize()
+  await assert.rejects(
+    driftBroker.verifyConversation({ bindingKey: "legacy-a3k" }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_changed",
+  )
+  assert.deepEqual(
+    driftBroker.getConversationBinding({ bindingKey: "legacy-a3k" }).taskSpaceIdentity,
+    taskSpaceIdentity,
+  )
+  driftBroker.close()
+  assert.equal(
+    await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+    beforeDriftAttempt,
+  )
+})
+
 test("binding-owned task-space reclaim remains available during read-only capture", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -2730,6 +3687,7 @@ test("binding-owned task-space reclaim remains available during read-only captur
         messageCount: 2,
       },
       targetId: "task-space-reclaim-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(12)),
       taskSpaceId: 12,
     }),
     captureExchange: async (input) => {
@@ -2749,6 +3707,7 @@ test("binding-owned task-space reclaim remains available during read-only captur
         responseDigest: digest(responseText),
         responseText,
         targetId: "task-space-reclaim-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(12)),
         taskSpaceId: 12,
         turnMarker,
       }
@@ -2763,6 +3722,7 @@ test("binding-owned task-space reclaim remains available during read-only captur
         sentAt: new Date().toISOString(),
         targetId: "task-space-reclaim-tab",
         taskSpaceControlRecovery: { method: "claim", taskSpaceId: 12 },
+        taskSpaceIdentity: browserTaskSpaceIdentity("12"),
         taskSpaceId: 12,
         turnMarker,
       }
@@ -2819,6 +3779,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
         messageCount: 2,
       },
       targetId: "capture-slice-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(18)),
       taskSpaceId: 18,
     }),
     captureExchange: async () => {
@@ -2831,6 +3792,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
           generationRunning: false,
           promptMessageId,
           targetId: "capture-slice-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(18)),
           taskSpaceId: 18,
           turnMarker,
         }
@@ -2849,6 +3811,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
         responseDigest: digest(responseText),
         responseText,
         targetId: "capture-slice-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(18)),
         taskSpaceId: 18,
         turnMarker,
       }
@@ -2862,6 +3825,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
         promptMessageId,
         sentAt: new Date().toISOString(),
         targetId: "capture-slice-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(18)),
         taskSpaceId: 18,
         turnMarker,
       }
@@ -2921,6 +3885,7 @@ test("confirmed create-once capture promotes a provisional locator without anoth
     bind: async (input) => ({
       canonicalUrl: null,
       targetId: input.targetId,
+      taskSpaceIdentity: browserTaskSpaceIdentity("19"),
       taskSpaceId: 19,
     }),
     captureExchange: async () => {
@@ -2933,6 +3898,7 @@ test("confirmed create-once capture promotes a provisional locator without anoth
           generationRunning: false,
           promptMessageId,
           targetId: "create-once-promoted-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity("19"),
           taskSpaceId: 19,
           turnMarker,
         }
@@ -2951,6 +3917,7 @@ test("confirmed create-once capture promotes a provisional locator without anoth
         responseDigest: digest(responseText),
         responseText,
         targetId: "create-once-promoted-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity("19"),
         taskSpaceId: 19,
         turnMarker,
       }
@@ -2963,6 +3930,7 @@ test("confirmed create-once capture promotes a provisional locator without anoth
         promptMessageId,
         sentAt: new Date().toISOString(),
         targetId: "create-once-promoted-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity("19"),
         taskSpaceId: 19,
         turnMarker,
       }
@@ -3018,6 +3986,7 @@ test("recoverable maximum-model UI uncertainty stays in the same exchange until 
         messageCount: 2,
       },
       targetId: "model-policy-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
       taskSpaceId: 21,
     }),
     captureExchange: async () => {
@@ -3035,6 +4004,7 @@ test("recoverable maximum-model UI uncertainty stays in the same exchange until 
         responseDigest: digest(responseText),
         responseText,
         targetId: "model-policy-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
         taskSpaceId: 21,
         turnMarker,
       }
@@ -3054,6 +4024,7 @@ test("recoverable maximum-model UI uncertainty stays in the same exchange until 
         promptMessageId: "model-policy-user",
         sentAt: new Date().toISOString(),
         targetId: "model-policy-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
         taskSpaceId: 21,
         turnMarker,
       }
@@ -3128,6 +4099,7 @@ test("a stable external assistant turn is automatically re-anchored before the s
       canonicalUrl,
       head: initialHead,
       targetId: "automatic-reanchor-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(23)),
       taskSpaceId: 23,
     }),
     captureExchange: async () => {
@@ -3145,6 +4117,7 @@ test("a stable external assistant turn is automatically re-anchored before the s
         responseDigest: digest(responseText),
         responseText,
         targetId: "automatic-reanchor-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(23)),
         taskSpaceId: 23,
         turnMarker,
       }
@@ -3158,6 +4131,7 @@ test("a stable external assistant turn is automatically re-anchored before the s
         head: observedHead,
         headChange,
         targetId: "automatic-reanchor-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(23)),
         taskSpaceId: 23,
       }
     },
@@ -3177,6 +4151,7 @@ test("a stable external assistant turn is automatically re-anchored before the s
         promptMessageId: "automatic-reanchor-user",
         sentAt: new Date().toISOString(),
         targetId: "automatic-reanchor-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(23)),
         taskSpaceId: 23,
         turnMarker,
       }
@@ -3235,6 +4210,7 @@ test("confirmed response capture retries beyond three transient transport failur
         messageCount: 2,
       },
       targetId: "capture-recovery-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(22)),
       taskSpaceId: 22,
     }),
     captureExchange: async () => {
@@ -3267,6 +4243,7 @@ test("confirmed response capture retries beyond three transient transport failur
         responseDigest: digest(responseText),
         responseText,
         targetId: "capture-recovery-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(22)),
         taskSpaceId: 22,
         turnMarker,
       }
@@ -3277,6 +4254,7 @@ test("confirmed response capture retries beyond three transient transport failur
       promptMessageId: "capture-recovery-user",
       sentAt: new Date().toISOString(),
       targetId: "capture-recovery-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(22)),
       taskSpaceId: 22,
       turnMarker,
     }),
@@ -3338,6 +4316,7 @@ test("an image-only response protocol gap stops capture without retrying", async
         messageCount: 2,
       },
       targetId: "image-only-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity("24"),
       taskSpaceId: 24,
     }),
     captureExchange: async () => {
@@ -3367,6 +4346,7 @@ test("an image-only response protocol gap stops capture without retrying", async
       promptMessageId: "image-only-user",
       sentAt: new Date().toISOString(),
       targetId: "image-only-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity("24"),
       taskSpaceId: 24,
       turnMarker,
     }),
@@ -3590,6 +4570,7 @@ test("large ChatGPT responses persist by reference and remain digest-bound reada
     startUrl: "https://chatgpt.com/c/large-result",
     state: "bound",
     targetId: "large-result-tab",
+    taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
     taskSpaceId: 10,
     updatedAt: now,
     verifiedAt: now,
@@ -3628,6 +4609,7 @@ test("large ChatGPT responses persist by reference and remain digest-bound reada
       responseDigest: digest(responseText),
       responseText,
       targetId: input.binding.targetId,
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(input.binding.taskSpaceId)),
       taskSpaceId: input.binding.taskSpaceId,
       turnMarker: input.turnMarker,
     }),
@@ -3833,6 +4815,7 @@ test("protected-capacity rejection occurs before policy mutation, composition, o
     revision: 1,
     state: "bound",
     targetId: "capacity-tab",
+    taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
     taskSpaceId: 10,
     updatedAt: new Date().toISOString(),
   })
@@ -3911,6 +4894,7 @@ test("a bodyless late response keeps quota reserved across restart until exact r
       canonicalUrl: input.canonicalUrl,
       head: beforeHead,
       targetId: "reserved-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -3940,6 +4924,7 @@ test("a bodyless late response keeps quota reserved across restart until exact r
         responseDigest,
         responseText,
         targetId: "reserved-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
         turnMarker,
       }
@@ -4144,6 +5129,24 @@ test("durable state rejects growth beyond its hard checkpoint byte limit", async
   assert.equal(store.getBinding("oversized-state"), undefined)
 })
 
+test("binding create persistence is compare-and-set and cannot overwrite an existing key", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const first = { key: "binding-create-cas", revision: 1, state: "bound" }
+  await store.persistBinding("binding.created", first, null)
+  await assert.rejects(
+    store.persistBinding("binding.created", {
+      key: first.key,
+      revision: 1,
+      state: "unbound",
+    }, null),
+    (error) => error.code === "binding_transition_conflict",
+  )
+  assert.deepEqual(store.getBinding(first.key), first)
+})
+
 test("operation identity survives workflow-detail retention and still blocks a resend", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -4208,8 +5211,8 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
         responseText,
         targetId: "adopted-tab",
         taskSpaceIdentity: {
-          name: "adoption-driver-space",
-          taskId: "adoption-driver-space",
+          name: "adopted-review-space",
+          taskId: "adopted-review-space",
         },
         taskSpaceId: 10,
       }
@@ -4262,8 +5265,8 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(binding.mode, "existing")
   assert.equal(binding.state, "bound")
   assert.deepEqual(binding.taskSpaceIdentity, {
-    name: "adoption-driver-space",
-    taskId: "adoption-driver-space",
+    name: "adopted-review-space",
+    taskId: "adopted-review-space",
   })
   await assert.rejects(
     broker.startConversationAdoption({
@@ -4277,6 +5280,394 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
     ),
   )
   assert.equal(adoptionCalls, 1)
+})
+
+test("conversation adoption rejects a complete capture without stable task-space identity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adoption-missing-identity"
+  const responseText = "Adoption response."
+  const responseDigest = digest(responseText)
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => ({
+        adoptedWhileGenerating: false,
+        anchor: { contentDigest: "a".repeat(64), messageId: "adoption-user" },
+        canonicalUrl,
+        durationMs: 10,
+        head: {
+          fingerprint: "adoption-missing-identity-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: responseDigest,
+          lastMessageId: "adoption-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest,
+        responseText,
+        targetId: "adoption-missing-identity-tab",
+        taskSpaceId: 55,
+      }),
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const started = await broker.startConversationAdoption({
+    bindingKey: "adoption-missing-identity",
+    canonicalUrl,
+    taskSpace: 55,
+    timeoutMs: 30_000,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "human_required")
+  assert.equal(completed.humanRequired.code, "task_space_identity_missing")
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: "adoption-missing-identity" }),
+    (error) => error.code === "binding_not_found",
+  )
+})
+
+test("default adoption task spaces use a domain-separated 128-bit full-Project URL identity", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/g/g-p-adoption-project/c/adoption-project-chat"
+  const responseText = "Project adoption response."
+  let receivedTaskSpace
+  let receivedTaskSpaceGuard
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async (input, _signal, _onResult, beforeRun) => {
+        const effectiveInput = { ...input, ...beforeRun() }
+        receivedTaskSpace = input.taskSpace
+        receivedTaskSpaceGuard = effectiveInput.taskSpaceGuard
+        return {
+          adoptedWhileGenerating: false,
+          anchor: { contentDigest: "a".repeat(64), messageId: "project-adoption-user" },
+          canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: "project-adoption-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "project-adoption-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+            renderedMessageCount: 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "project-adoption-tab",
+          taskSpaceIdentity: {
+            name: input.taskSpace,
+            taskId: "opaque-project-adoption-task-id",
+          },
+          taskSpaceId: 88,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const started = await broker.startConversationAdoption({
+    bindingKey: "project-adoption",
+    canonicalUrl,
+    timeoutMs: 30_000,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  const expected = `ego-chat-adopt-${digest(`canonical-adoption\0${canonicalUrl}`).slice(0, 32)}`
+  const boundNamespace = `ego-chat-bound-${digest(`canonical-conversation\0${canonicalUrl}`).slice(0, 32)}`
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(receivedTaskSpace, expected)
+  assert.deepEqual(receivedTaskSpaceGuard, {
+    deniedIdentities: [],
+    deniedSelectors: [],
+    ownerSelector: { kind: "name", value: expected },
+    revision: 1,
+  })
+  assert.match(receivedTaskSpace, /^ego-chat-adopt-[a-f0-9]{32}$/)
+  assert.notEqual(receivedTaskSpace, boundNamespace)
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: "project-adoption" }).taskSpaceIdentity,
+    { name: expected, taskId: "opaque-project-adoption-task-id" },
+  )
+})
+
+test("adoption cannot persist an exact or one-field-conflicting identity owned by another chat", async (t) => {
+  const existingIdentity = { name: "existing-space", taskId: "existing-task" }
+  const cases = [
+    { expectedReason: "task_space_identity_already_bound", identity: existingIdentity },
+    {
+      expectedReason: "task_space_identity_conflict",
+      identity: { name: existingIdentity.name, taskId: "different-task" },
+    },
+    {
+      expectedReason: "task_space_identity_conflict",
+      identity: { name: "different-name", taskId: existingIdentity.taskId },
+    },
+  ]
+  for (const [index, identityCase] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const canonicalUrl = `https://chatgpt.com/c/adoption-conflict-${index}`
+    const responseText = `Adoption conflict response ${index}.`
+    const store = new EventStore(dataDir)
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        bind: async (input) => ({
+          canonicalUrl: input.canonicalUrl,
+          head: { fingerprint: "existing-head", lastRole: "assistant", messageCount: 2 },
+          targetId: "existing-tab",
+          taskSpaceIdentity: existingIdentity,
+          taskSpaceId: 10,
+        }),
+        adopt: async () => ({
+          adoptedWhileGenerating: false,
+          anchor: { contentDigest: "a".repeat(64), messageId: `adoption-user-${index}` },
+          canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: `adoption-conflict-head-${index}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: `adoption-assistant-${index}`,
+            lastRole: "assistant",
+            messageCount: 2,
+            renderedMessageCount: 2,
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: `adoption-tab-${index}`,
+          taskSpaceIdentity: identityCase.identity,
+          taskSpaceId: 20 + index,
+        }),
+      },
+      store,
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: "existing-chat",
+      canonicalUrl: "https://chatgpt.com/c/existing-chat",
+      mode: "existing",
+      taskSpace: 10,
+    })
+
+    const started = await broker.startConversationAdoption({
+      bindingKey: `adoption-conflict-${index}`,
+      canonicalUrl,
+      taskSpace: 20 + index,
+      timeoutMs: 30_000,
+    })
+    const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+    assert.equal(completed.status, "human_required")
+    assert.equal(completed.humanRequired.code, identityCase.expectedReason)
+    assert.throws(
+      () => broker.getConversationBinding({ bindingKey: `adoption-conflict-${index}` }),
+      (error) => error.code === "binding_not_found",
+    )
+    const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.workflow?.id === started.id)
+    assert.equal(events.some((event) => event.type === "adoption.response_captured"), false)
+  }
+})
+
+test("a captured adoption keeps its URL and tuple claim across binding failure and restart", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adoption-durable-claim"
+  const identity = { name: "adoption-durable-space", taskId: "adoption-durable-task" }
+  const responseText = "The adoption capture is durable."
+  let foreignBrowserCalls = 0
+  class FailingAdoptionCommitStore extends EventStore {
+    async persistBinding(eventType, binding, previous = undefined) {
+      if (eventType === "binding.adopted") {
+        throw new EgoChatError("injected_binding_failure", "Injected binding commit failure.")
+      }
+      return super.persistBinding(eventType, binding, previous)
+    }
+  }
+  const firstBroker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => ({
+        adoptedWhileGenerating: false,
+        anchor: { contentDigest: "a".repeat(64), messageId: "adoption-durable-user" },
+        canonicalUrl,
+        durationMs: 5,
+        head: {
+          fingerprint: "adoption-durable-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "adoption-durable-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "adoption-durable-tab",
+        taskSpaceIdentity: identity,
+        taskSpaceId: 77,
+      }),
+    },
+    store: new FailingAdoptionCommitStore(dataDir),
+  })
+  await firstBroker.initialize()
+  const started = await firstBroker.startConversationAdoption({
+    bindingKey: "adoption-durable-owner",
+    canonicalUrl,
+    taskSpace: identity.name,
+    timeoutMs: 30_000,
+  })
+  const stopped = await firstBroker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(stopped.status, "failed")
+  assert.deepEqual(stopped.reconciliation.adoptionCaptureClaim.taskSpaceIdentity, identity)
+  await assert.rejects(
+    firstBroker.bindConversation({
+      bindingKey: "adoption-durable-foreign",
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: identity.name,
+    }),
+    (error) => ["conversation_reserved", "human_required"].includes(error.code),
+  )
+  firstBroker.close()
+
+  const restarted = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => {
+        foreignBrowserCalls += 1
+        return {
+          canonicalUrl: input.canonicalUrl,
+          head: {
+            fingerprint: "adoption-durable-foreign-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: "b".repeat(64),
+            lastMessageId: "adoption-durable-foreign-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          targetId: "adoption-durable-foreign-tab",
+          taskSpaceIdentity: identity,
+          taskSpaceId: 77,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await restarted.initialize()
+  t.after(() => restarted.close())
+  await assert.rejects(
+    restarted.bindConversation({
+      bindingKey: "adoption-durable-foreign",
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: identity.name,
+    }),
+    (error) => ["conversation_reserved", "human_required"].includes(error.code),
+  )
+  assert.equal(foreignBrowserCalls, 0)
+  await restarted.abandonWorkflow({
+    acknowledgePotentialDelivery: true,
+    workflowId: started.id,
+  })
+  const rebound = await restarted.bindConversation({
+    bindingKey: "adoption-durable-foreign",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: identity.name,
+  })
+  assert.equal(rebound.canonicalUrl, canonicalUrl)
+  assert.equal(foreignBrowserCalls, 1)
+})
+
+test("an adoption transition failure leaves its running browser admission fenced", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adoption-transition-fence"
+  const identity = { name: "adoption-transition-space", taskId: "adoption-transition-task" }
+  const responseText = "Captured before the injected transition failure."
+  let reportFailedTransition
+  const failedTransition = new Promise((resolve) => { reportFailedTransition = resolve })
+  class FailingAdoptionTransitionStore extends EventStore {
+    async persist(eventType, workflow, expected = undefined) {
+      if ([
+        "adoption.response_captured",
+        "adoption.recovery_scheduled",
+        "workflow.failed",
+      ].includes(eventType)) {
+        if (eventType === "workflow.failed") reportFailedTransition()
+        throw new Error(`injected ${eventType} failure`)
+      }
+      return super.persist(eventType, workflow, expected)
+    }
+  }
+  let preflightCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => ({
+        adoptedWhileGenerating: false,
+        anchor: { contentDigest: "a".repeat(64), messageId: "transition-fence-user" },
+        canonicalUrl,
+        durationMs: 5,
+        head: {
+          fingerprint: "transition-fence-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "transition-fence-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "transition-fence-tab",
+        taskSpaceIdentity: identity,
+        taskSpaceId: 78,
+      }),
+      preflight: async () => {
+        preflightCalls += 1
+        return { safe: true }
+      },
+    },
+    store: new FailingAdoptionTransitionStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const started = await broker.startConversationAdoption({
+    bindingKey: "adoption-transition-fence",
+    canonicalUrl,
+    taskSpace: identity.name,
+    timeoutMs: 30_000,
+  })
+  await failedTransition
+  assert.equal(broker.getWorkflow({ workflowId: started.id }).status, "running")
+  await assert.rejects(
+    broker.egoPreflight({ taskSpace: identity.name }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_selector_reserved",
+  )
+  assert.equal(preflightCalls, 0)
 })
 
 test("conversation adoption keeps retrying transient browser and model-policy state", async (t) => {
@@ -4317,6 +5708,7 @@ test("conversation adoption keeps retrying transient browser and model-policy st
           responseDigest,
           responseText,
           targetId: "recovering-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(14)),
           taskSpaceId: 14,
         }
       },
@@ -4392,6 +5784,7 @@ test("a read-only conversation adoption resumes safely after a broker restart", 
         responseDigest,
         responseText,
         targetId: "restart-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(11)),
         taskSpaceId: 11,
       }
     },
@@ -4431,6 +5824,7 @@ test("a captured adoption finalizes its binding after restart without reopening 
     responseDigest,
     responseText,
     targetId: "captured-tab",
+    taskSpaceIdentity: browserTaskSpaceIdentity(String(13)),
     taskSpaceId: 13,
   }
   const workflow = {
@@ -4456,7 +5850,25 @@ test("a captured adoption finalizes its binding after restart without reopening 
   const store = new EventStore(dataDir)
   await store.initialize()
   await store.persist("adoption.response_captured", workflow)
+  let releaseBindingCommit
+  let reportBindingCommit
+  const bindingCommitReleased = new Promise((resolve) => {
+    releaseBindingCommit = resolve
+  })
+  const bindingCommitStarted = new Promise((resolve) => {
+    reportBindingCommit = resolve
+  })
+  class PausingAdoptionStore extends EventStore {
+    async persistBinding(eventType, binding, previous = undefined) {
+      if (eventType === "binding.adopted") {
+        reportBindingCommit()
+        await bindingCommitReleased
+      }
+      return super.persistBinding(eventType, binding, previous)
+    }
+  }
   let adoptionCalls = 0
+  let preflightMutations = 0
   const broker = new Broker({
     egoAdapter: {
       ...unusedEgoAdapter,
@@ -4464,11 +5876,36 @@ test("a captured adoption finalizes its binding after restart without reopening 
         adoptionCalls += 1
         throw new Error("captured adoption must not reopen the browser")
       },
+      preflight: async (_input, _signal, beforeRun) => {
+        const guard = beforeRun().taskSpaceGuard
+        if (guard.deniedIdentities.some((identity) => (
+          identity.name === capture.taskSpaceIdentity.name
+          || identity.taskId === capture.taskSpaceIdentity.taskId
+        ))) {
+          throw new EgoChatError("human_required", "The restored adoption tuple remains reserved.", {
+            reason: "task_space_identity_already_bound",
+          })
+        }
+        preflightMutations += 1
+        return { safe: true }
+      },
     },
-    store: new EventStore(dataDir),
+    store: new PausingAdoptionStore(dataDir),
   })
   await broker.initialize()
   t.after(() => broker.close())
+
+  await bindingCommitStarted
+  try {
+    await assert.rejects(
+      broker.egoPreflight({ taskSpace: capture.taskSpaceId }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === "task_space_identity_already_bound",
+    )
+    assert.equal(preflightMutations, 0)
+  } finally {
+    releaseBindingCommit()
+  }
 
   const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: workflow.id })
   assert.equal(completed.status, "succeeded")
@@ -4512,16 +5949,38 @@ test("conversation adoption rejects non-private canonical URLs before opening th
   assert.equal(adoptionCalls, 0)
 })
 
-test("conversation adoption does not enter a task space with an active bound operation", async (t) => {
+test("a recycled numeric id does not block adoption into a distinct stable task space", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   let releaseExchange
   let adoptionCalls = 0
+  const adoptionCanonicalUrl = "https://chatgpt.com/c/new-adoption"
+  const adoptionResponse = "Distinct adoption response."
   const egoAdapter = {
     ...unusedEgoAdapter,
     adopt: async () => {
       adoptionCalls += 1
-      throw new Error("busy task space must not reach adoption")
+      return {
+        adoptedWhileGenerating: false,
+        anchor: { contentDigest: "a".repeat(64), messageId: "adoption-user" },
+        canonicalUrl: adoptionCanonicalUrl,
+        durationMs: 10,
+        head: {
+          fingerprint: "distinct-adoption-head",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(adoptionResponse),
+          lastMessageId: "distinct-adoption-assistant",
+          lastRole: "assistant",
+          messageCount: 2,
+          renderedMessageCount: 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest: digest(adoptionResponse),
+        responseText: adoptionResponse,
+        targetId: "distinct-adoption-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity("distinct-adoption"),
+        taskSpaceId: 15,
+      }
     },
     bind: async (input) => ({
       canonicalUrl: input.canonicalUrl,
@@ -4531,6 +5990,7 @@ test("conversation adoption does not enter a task space with an active bound ope
         messageCount: 2,
       },
       targetId: "busy-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(15)),
       taskSpaceId: 15,
     }),
     exchange: async () => {
@@ -4561,33 +6021,24 @@ test("conversation adoption does not enter a task space with an active bound ope
     turnMarker,
   })
 
-  await assert.rejects(
-    broker.startConversationAdoption({
-      canonicalUrl: "https://chatgpt.com/c/new-adoption",
-      taskSpace: 15,
-      timeoutMs: 30_000,
-    }),
-    (error) => error.code === "task_space_busy",
-  )
-  assert.equal(adoptionCalls, 0)
+  const adoption = await broker.startConversationAdoption({
+    canonicalUrl: adoptionCanonicalUrl,
+    taskSpace: 15,
+    timeoutMs: 30_000,
+  })
+  const adopted = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: adoption.id })
+  assert.equal(adopted.status, "succeeded")
+  assert.deepEqual(adopted.result.taskSpaceIdentity, browserTaskSpaceIdentity("distinct-adoption"))
+  assert.equal(adoptionCalls, 1)
 
   releaseExchange()
   const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: exchange.id })
   assert.equal(stopped.status, "human_required")
 })
 
-test("one Ego task space cannot run browser operations for two bindings concurrently", async (t) => {
+test("one stable Ego task-space identity cannot be durably bound to two conversations", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
-  let releaseFirst
-  let firstEntered
-  const entered = new Promise((resolve) => {
-    firstEntered = resolve
-  })
-  const released = new Promise((resolve) => {
-    releaseFirst = resolve
-  })
-  let exchanges = 0
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => ({
@@ -4601,71 +6052,1268 @@ test("one Ego task space cannot run browser operations for two bindings concurre
         messageCount: 2,
       },
       targetId: `tab-${input.bindingKey}`,
-      taskSpaceId: 10,
+      taskSpaceIdentity: {
+        name: "shared-browser-workspace",
+        taskId: "shared-browser-workspace",
+      },
+      taskSpaceId: input.taskSpace,
     }),
-    exchange: async (input) => {
-      exchanges += 1
-      firstEntered()
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-first",
+    canonicalUrl: "https://chatgpt.com/c/task-space-first",
+    mode: "existing",
+    taskSpace: 10,
+  })
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey: "task-space-second",
+      canonicalUrl: "https://chatgpt.com/c/task-space-second",
+      mode: "existing",
+      taskSpace: 11,
+    }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_already_bound"
+      && error.details?.bindingKey === "task-space-first",
+  )
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: "task-space-second" }),
+    (error) => error.code === "binding_not_found",
+  )
+})
+
+test("a live task-space identity is reserved before another binding enters browser work", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const firstIdentity = { name: "reserved-before-persist", taskId: "opaque-reserved-task" }
+  let releaseFirst
+  let markFirstReserved
+  const firstReleased = new Promise((resolve) => {
+    releaseFirst = resolve
+  })
+  const firstReserved = new Promise((resolve) => {
+    markFirstReserved = resolve
+  })
+  const browserActions = []
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input, _signal, onResult, beforeRun) => {
+        const effectiveInput = { ...input, ...beforeRun() }
+        const result = {
+          canonicalUrl: input.canonicalUrl,
+          head: {
+            fingerprint: `head-${input.bindingKey}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(`head-${input.bindingKey}`),
+            lastMessageId: `assistant-${input.bindingKey}`,
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          targetId: `tab-${input.bindingKey}`,
+          taskSpaceIdentity: firstIdentity,
+          taskSpaceId: input.taskSpace,
+        }
+        if (input.bindingKey === "reservation-first") {
+          browserActions.push(input.bindingKey)
+          onResult(result)
+          markFirstReserved()
+          await firstReleased
+          return result
+        }
+        const denied = effectiveInput.taskSpaceGuard.deniedIdentities.some((identity) => (
+          identity.name === firstIdentity.name && identity.taskId === firstIdentity.taskId
+        ))
+        if (denied) {
+          throw new EgoChatError("human_required", "The live task-space identity is already reserved.", {
+            reason: "task_space_identity_already_bound",
+          })
+        }
+        browserActions.push(input.bindingKey)
+        return result
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const first = broker.bindConversation({
+    bindingKey: "reservation-first",
+    canonicalUrl: "https://chatgpt.com/c/reservation-first",
+    mode: "existing",
+    taskSpace: 101,
+  })
+  await firstReserved
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey: "reservation-second",
+      canonicalUrl: "https://chatgpt.com/c/reservation-second",
+      mode: "existing",
+      taskSpace: 102,
+    }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_already_bound",
+  )
+  assert.deepEqual(browserActions, ["reservation-first"])
+  assert.throws(
+    () => broker.getConversationBinding({ bindingKey: "reservation-second" }),
+    (error) => error.code === "binding_not_found",
+  )
+
+  releaseFirst()
+  const persisted = await first
+  assert.deepEqual(persisted.taskSpaceIdentity, firstIdentity)
+})
+
+test("unresolved adoption, bind, and legacy-migration selectors block a recycled numeric target before mutation", async (t) => {
+  for (const mode of ["adoption", "bind", "legacy_migration"]) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const canonicalUrl = `https://chatgpt.com/c/unresolved-${mode}`
+    const bindingKey = `unresolved-${mode}`
+    const selectorName = mode === "legacy_migration"
+      ? `ego-chat-bound-${digest(`canonical-conversation\0${canonicalUrl}`).slice(0, 32)}`
+      : `unresolved-selector-${mode}`
+    const identity = { name: selectorName, taskId: `opaque-${mode}-task-id` }
+    const responseText = `Stable ${mode} response.`
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    if (mode === "legacy_migration") {
+      const now = new Date().toISOString()
+      await store.persistBinding("binding.created", {
+        canonicalUrl,
+        createdAt: now,
+        headContentDigest: digest("legacy-head"),
+        headFingerprint: "legacy-head",
+        headFingerprintVersion: "tail-v1",
+        headMessageId: "legacy-assistant",
+        headRole: "assistant",
+        key: bindingKey,
+        messageCount: 2,
+        mode: "existing",
+        modelPolicyKey: "chatgpt-web-default",
+        revision: 1,
+        startUrl: canonicalUrl,
+        state: "bound",
+        targetId: "legacy-tab",
+        taskSpaceId: 77,
+        updatedAt: now,
+        verifiedAt: now,
+      })
+    }
+    let releaseBrowser
+    let reportEntered
+    const released = new Promise((resolve) => {
+      releaseBrowser = resolve
+    })
+    const entered = new Promise((resolve) => {
+      reportEntered = resolve
+    })
+    let preflightMutations = 0
+    const browserResult = (input) => ({
+      canonicalUrl,
+      head: {
+        fingerprint: `head-${mode}`,
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: digest(responseText),
+        lastMessageId: `assistant-${mode}`,
+        lastRole: "assistant",
+        messageCount: 2,
+        renderedMessageCount: 2,
+      },
+      targetId: `tab-${mode}`,
+      taskSpaceIdentity: identity,
+      taskSpaceId: input.taskSpace ?? 77,
+    })
+    const pauseAndReturn = async (input) => {
+      reportEntered()
       await released
-      const responseText = input.expectedTerminalMarker
-      return {
-        canonicalUrl: input.binding.canonicalUrl,
-        durationMs: 10,
-        head: {
-          fingerprint: "first-completed-head",
-          fingerprintVersion: "tail-v1",
-          lastContentDigest: digest(responseText),
-          lastMessageId: "first-completed-assistant",
-          lastRole: "assistant",
-          messageCount: 4,
+      return browserResult(input)
+    }
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        adopt: async (input) => ({
+          ...await pauseAndReturn(input),
+          adoptedWhileGenerating: false,
+          anchor: { contentDigest: digest("user"), messageId: `user-${mode}` },
+          durationMs: 10,
+          modelPolicy: modelPolicyObservation(),
+          responseDigest: digest(responseText),
+          responseText,
+        }),
+        bind: pauseAndReturn,
+        preflight: async (_input, _signal, beforeRun) => {
+          const guard = beforeRun().taskSpaceGuard
+          const reserved = guard.deniedSelectors.some((selector) => (
+            ["legacy_string", "name", "task_id"].includes(selector.kind)
+            && (selector.kind === "task_id" ? identity.taskId : identity.name) === selector.value
+          ))
+          if (reserved) {
+            throw new EgoChatError("human_required", "The live numeric target matches a reserved selector.", {
+              reason: "task_space_selector_reserved",
+            })
+          }
+          preflightMutations += 1
+          return { safe: true }
         },
-        modelPolicy: modelPolicyObservation(),
-        responseDigest: digest(responseText),
-        responseText,
-        targetId: input.binding.targetId,
-        taskSpaceId: 10,
-        turnMarker: input.turnMarker,
+        verify: pauseAndReturn,
+      },
+      store,
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+
+    let pending
+    if (mode === "adoption") {
+      pending = await broker.startConversationAdoption({
+        bindingKey,
+        canonicalUrl,
+        taskSpace: selectorName,
+        timeoutMs: 30_000,
+      })
+    } else if (mode === "bind") {
+      pending = broker.bindConversation({
+        bindingKey,
+        canonicalUrl,
+        mode: "existing",
+        taskSpace: selectorName,
+      })
+    } else {
+      pending = broker.verifyConversation({ bindingKey })
+    }
+
+    await entered
+    try {
+      await assert.rejects(
+        broker.egoPreflight({ taskSpace: 77 }),
+        (error) => error.code === "human_required"
+          && error.details?.reason === "task_space_selector_reserved",
+      )
+      assert.equal(preflightMutations, 0)
+    } finally {
+      releaseBrowser()
+    }
+    if (mode === "adoption") {
+      const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: pending.id })
+      assert.equal(completed.status, "succeeded")
+    } else {
+      await pending
+    }
+  }
+})
+
+test("public string task spaces are typed names for bind and preflight", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const guards = []
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input, _signal, _onResult, beforeRun) => {
+        guards.push(beforeRun().taskSpaceGuard)
+        return {
+          canonicalUrl: input.canonicalUrl,
+          head: {
+            fingerprint: "named-bind-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest("named-bind-head"),
+            lastMessageId: "named-bind-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          targetId: "named-bind-tab",
+          taskSpaceIdentity: { name: input.taskSpace, taskId: "opaque-named-bind-id" },
+          taskSpaceId: 61,
+        }
+      },
+      preflight: async (input, _signal, beforeRun) => {
+        guards.push(beforeRun().taskSpaceGuard)
+        return {
+          safe: true,
+          taskSpaceIdentity: { name: input.taskSpace, taskId: "opaque-named-preflight-id" },
+          taskSpaceId: 62,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  await broker.bindConversation({
+    bindingKey: "named-bind",
+    canonicalUrl: "https://chatgpt.com/c/named-bind",
+    mode: "existing",
+    taskSpace: "named-bind-space",
+  })
+  await broker.egoPreflight({ taskSpace: "named-preflight-space" })
+
+  assert.deepEqual(guards.map((guard) => guard.ownerSelector), [
+    { kind: "name", value: "named-bind-space" },
+    { kind: "name", value: "named-preflight-space" },
+  ])
+})
+
+test("public and restored task-space selectors reject non-strings, C1 controls, and invisible formatting", async (t) => {
+  const invalidPublicValues = ["bad\u0085space", "bad\u009bspace", "bad\u200bspace"]
+  let browserCalls = 0
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      preflight: async () => {
+        browserCalls += 1
+        return { safe: true }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  for (const taskSpace of invalidPublicValues) {
+    await assert.rejects(
+      broker.egoPreflight({ taskSpace }),
+      (error) => error.code === "invalid_input",
+    )
+  }
+  assert.equal(browserCalls, 0)
+
+  for (const [index, taskSpace] of [undefined, null, { name: "synthetic" }].entries()) {
+    const restartDir = await createDataDir()
+    t.after(() => fs.rm(restartDir, { force: false, recursive: true }))
+    const store = new EventStore(restartDir)
+    await store.initialize()
+    const canonicalUrl = `https://chatgpt.com/c/malformed-restored-selector-${index}`
+    const workflow = {
+      bindingKey: `malformed-restored-${index}`,
+      canonicalUrlDigest: digest(canonicalUrl),
+      createdAt: "2026-09-04T00:00:00.000Z",
+      deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+      id: `42000000-0000-4000-8000-00000000000${index}`,
+      kind: "conversation_adoption",
+      phase: "waiting",
+      private: {
+        request: {
+          bindingKey: `malformed-restored-${index}`,
+          canonicalUrl,
+          taskSpace,
+          timeoutMs: 30_000,
+        },
+      },
+      status: "running",
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    }
+    await store.persist("workflow.started", workflow)
+    const restored = new Broker({
+      egoAdapter: new Proxy(unusedEgoAdapter, {
+        get(target, property) {
+          if (typeof target[property] !== "function") return target[property]
+          return async () => {
+            browserCalls += 1
+            throw new Error("malformed restored selectors must stop before browser work")
+          }
+        },
+      }),
+      store: new EventStore(restartDir),
+    })
+    await restored.initialize()
+    t.after(() => restored.close())
+    const stopped = restored.getWorkflow({ workflowId: workflow.id })
+    assert.equal(stopped.status, "human_required")
+    assert.equal(stopped.humanRequired.code, "task_space_selector_invalid")
+  }
+  assert.equal(browserCalls, 0)
+
+  for (const [index, taskSpaceId] of [
+    undefined,
+    null,
+    { name: "synthetic" },
+    "bad\u0085space",
+    "bad\u200bspace",
+  ].entries()) {
+    const restartDir = await createDataDir()
+    t.after(() => fs.rm(restartDir, { force: false, recursive: true }))
+    const store = new EventStore(restartDir)
+    await store.initialize()
+    const now = "2026-09-04T00:00:00.000Z"
+    const bindingKey = `malformed-legacy-binding-${index}`
+    const canonicalUrl = `https://chatgpt.com/c/${bindingKey}`
+    await store.persistBinding("binding.created", {
+      canonicalUrl,
+      createdAt: now,
+      headContentDigest: "a".repeat(64),
+      headFingerprint: `malformed-legacy-head-${index}`,
+      headFingerprintVersion: "tail-v1",
+      headMessageId: `malformed-legacy-assistant-${index}`,
+      headRole: "assistant",
+      key: bindingKey,
+      messageCount: 2,
+      mode: "existing",
+      modelPolicyKey: "chatgpt-web-default",
+      revision: 1,
+      startUrl: canonicalUrl,
+      state: "bound",
+      targetId: `malformed-legacy-tab-${index}`,
+      ...(taskSpaceId === undefined ? {} : { taskSpaceId }),
+      updatedAt: now,
+      verifiedAt: now,
+    })
+    const restored = new Broker({
+      egoAdapter: new Proxy(unusedEgoAdapter, {
+        get(target, property) {
+          if (typeof target[property] !== "function") return target[property]
+          return async () => {
+            browserCalls += 1
+            throw new Error("malformed legacy selectors must stop before browser work")
+          }
+        },
+      }),
+      store: new EventStore(restartDir),
+    })
+    await restored.initialize()
+    t.after(() => restored.close())
+    await assert.rejects(
+      restored.verifyConversation({ bindingKey }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === "task_space_selector_invalid",
+    )
+  }
+  assert.equal(browserCalls, 0)
+})
+
+test("restart bookkeeping keeps numeric locations distinct from typed names", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const now = "2026-09-05T00:00:00.000Z"
+  const deadlineAt = new Date(Date.now() + 30_000).toISOString()
+  const workflows = [
+    {
+      bindingKey: "numeric-restart-adoption",
+      canonicalUrl: "https://chatgpt.com/c/numeric-restart-adoption",
+      id: "43000000-0000-4000-8000-000000000001",
+      taskSpace: 7,
+      taskSpaceSelector: { kind: "numeric_location", value: 7 },
+    },
+    {
+      bindingKey: "named-restart-adoption",
+      canonicalUrl: "https://chatgpt.com/c/named-restart-adoption",
+      id: "43000000-0000-4000-8000-000000000002",
+      taskSpace: "7",
+      taskSpaceSelector: { kind: "name", value: "7" },
+    },
+  ]
+  for (const seeded of workflows) {
+    await store.persist("workflow.started", {
+      bindingKey: seeded.bindingKey,
+      canonicalUrlDigest: digest(seeded.canonicalUrl),
+      createdAt: now,
+      deadlineAt,
+      id: seeded.id,
+      kind: "conversation_adoption",
+      phase: "waiting",
+      private: {
+        request: {
+          bindingKey: seeded.bindingKey,
+          canonicalUrl: seeded.canonicalUrl,
+          taskSpace: seeded.taskSpace,
+          taskSpaceSelector: seeded.taskSpaceSelector,
+          timeoutMs: 30_000,
+        },
+      },
+      status: "running",
+      updatedAt: now,
+    })
+  }
+
+  const entered = []
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async (input) => {
+        entered.push(input.bindingKey)
+        return new Promise(() => {})
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  assert.deepEqual(entered.sort(), workflows.map((workflow) => workflow.bindingKey).sort())
+  for (const workflow of workflows) {
+    assert.equal(broker.getWorkflow({ workflowId: workflow.id }).status, "running")
+  }
+})
+
+test("a malformed durable capture still reserves its binding key and canonical URL", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const canonicalUrl = "https://chatgpt.com/c/malformed-durable-claim"
+  const bindingKey = "malformed-durable-claim"
+  await store.persist("workflow.failed", {
+    bindingKey,
+    canonicalUrlDigest: digest(canonicalUrl),
+    createdAt: "2026-09-05T00:00:00.000Z",
+    error: { code: "injected_failure", message: "Injected post-capture failure." },
+    id: "44000000-0000-4000-8000-000000000001",
+    kind: "conversation_adoption",
+    phase: "stopped",
+    reconciliation: {
+      adoptionCaptureClaim: {
+        canonicalUrl,
+        taskSpaceId: null,
+        taskSpaceIdentity: { name: "incomplete" },
+      },
+    },
+    status: "failed",
+    updatedAt: "2026-09-05T00:00:01.000Z",
+  })
+  let browserCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async () => {
+        browserCalls += 1
+        throw new Error("a malformed durable claim must stop before browser work")
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey,
+      canonicalUrl: "https://chatgpt.com/c/foreign-after-malformed-claim",
+      mode: "existing",
+      taskSpace: "foreign-after-malformed-claim",
+    }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "binding_key_reserved",
+  )
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey: "foreign-malformed-claim-url",
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: "foreign-malformed-claim-url",
+    }),
+    (error) => ["conversation_reserved", "human_required"].includes(error.code),
+  )
+  assert.equal(browserCalls, 0)
+})
+
+test("browser results must carry canonical URL evidence except for pre-Send create-once binding", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/canonical-evidence-required"
+  const identity = { name: "canonical-evidence-space", taskId: "canonical-evidence-task" }
+  let returnCanonical = false
+  let mode = "existing"
+  const browserResult = (input = {}) => ({
+    canonicalUrl: returnCanonical ? canonicalUrl : null,
+    head: {
+      fingerprint: "canonical-evidence-head",
+      fingerprintVersion: "tail-v1",
+      lastContentDigest: "a".repeat(64),
+      lastMessageId: "canonical-evidence-assistant",
+      lastRole: "assistant",
+      messageCount: 2,
+    },
+    targetId: "canonical-evidence-tab",
+    taskSpaceIdentity: input.mode === "create_once"
+      ? { name: "canonical-evidence-create-once", taskId: "canonical-evidence-create-once-task" }
+      : identity,
+    taskSpaceId: input.mode === "create_once" ? 76 : 75,
+  })
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => browserResult(input),
+      verify: async () => browserResult(),
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const input = {
+    bindingKey: "canonical-evidence",
+    canonicalUrl,
+    mode,
+    taskSpace: identity.name,
+  }
+  await assert.rejects(
+    broker.bindConversation(input),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "canonical_conversation_evidence_invalid",
+  )
+  returnCanonical = true
+  await broker.bindConversation(input)
+  returnCanonical = false
+  await assert.rejects(
+    broker.verifyConversation({ bindingKey: input.bindingKey }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "canonical_conversation_evidence_invalid",
+  )
+
+  mode = "create_once"
+  const created = await broker.bindConversation({
+    bindingKey: "canonical-evidence-create-once",
+    mode,
+    startUrl: "https://chatgpt.com/",
+    targetId: "canonical-evidence-new-tab",
+    taskSpace: 75,
+  })
+  assert.equal(created.state, "unbound")
+  assert.equal(created.canonicalUrl, null)
+})
+
+test("one binding key has an owner-scoped admission and is reusable after the owner fails", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  let enterFirst
+  let releaseFirst
+  let adoptionCalls = 0
+  let calls = 0
+  const entered = new Promise((resolve) => { enterFirst = resolve })
+  const released = new Promise((resolve) => { releaseFirst = resolve })
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      adopt: async () => {
+        adoptionCalls += 1
+        throw new Error("a competing adoption must not enter browser work")
+      },
+      bind: async (input) => {
+        calls += 1
+        if (calls === 1) {
+          enterFirst()
+          await released
+          throw new Error("injected first owner failure")
+        }
+        return {
+          canonicalUrl: input.canonicalUrl,
+          head: {
+            fingerprint: "binding-key-lease-head",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: "b".repeat(64),
+            lastMessageId: "binding-key-lease-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          targetId: "binding-key-lease-tab",
+          taskSpaceIdentity: { name: input.taskSpace, taskId: "binding-key-lease-task" },
+          taskSpaceId: 76,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const firstInput = {
+    bindingKey: "binding-key-lease",
+    canonicalUrl: "https://chatgpt.com/c/binding-key-lease-first",
+    mode: "existing",
+    taskSpace: "binding-key-lease-space",
+  }
+  const first = broker.bindConversation(firstInput)
+  await entered
+  await assert.rejects(
+    broker.bindConversation({
+      ...firstInput,
+      canonicalUrl: "https://chatgpt.com/c/binding-key-lease-second",
+      taskSpace: "binding-key-lease-other-space",
+    }),
+    (error) => error.code === "conversation_busy",
+  )
+  await assert.rejects(
+    broker.startConversationAdoption({
+      bindingKey: firstInput.bindingKey,
+      canonicalUrl: "https://chatgpt.com/c/binding-key-lease-adoption",
+      taskSpace: "binding-key-lease-adoption-space",
+      timeoutMs: 30_000,
+    }),
+    (error) => error.code === "conversation_busy",
+  )
+  assert.equal(calls, 1)
+  assert.equal(adoptionCalls, 0)
+  releaseFirst()
+  await assert.rejects(first, /injected first owner failure/)
+  const bound = await broker.bindConversation(firstInput)
+  assert.equal(bound.key, firstInput.bindingKey)
+  assert.equal(calls, 2)
+})
+
+test("completed exchanges do not reclaim their binding after a later exchange advances it", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const bindingKey = "sequential-exchange-claim"
+  const canonicalUrl = "https://chatgpt.com/c/sequential-exchange-claim"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("sequential-exchange-claim")
+  let exchangeCount = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: {
+          fingerprint: "sequential-exchange-head-0",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest("sequential-exchange-response-0"),
+          lastMessageId: "sequential-exchange-assistant-0",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        targetId: "sequential-exchange-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 77,
+      }),
+      sendExchange: async (input) => {
+        exchangeCount += 1
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: `sequential-exchange-user-${exchangeCount}`,
+          sentAt: new Date().toISOString(),
+          targetId: "sequential-exchange-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 77,
+          turnMarker: input.turnMarker,
+        }
+      },
+      captureExchange: async (input) => {
+        const responseText = `sequential-exchange-response-${exchangeCount}`
+        const responseDigest = digest(responseText)
+        return {
+          canonicalUrl,
+          durationMs: 10,
+          head: {
+            fingerprint: `sequential-exchange-head-${exchangeCount}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: responseDigest,
+            lastMessageId: `sequential-exchange-assistant-${exchangeCount}`,
+            lastRole: "assistant",
+            messageCount: 2 + (exchangeCount * 2),
+          },
+          modelPolicy: modelPolicyObservation(),
+          responseDigest,
+          responseText,
+          targetId: "sequential-exchange-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 77,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey,
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: taskSpaceIdentity.name,
+  })
+
+  for (let index = 1; index <= 3; index += 1) {
+    const turnMarker = `EGO_CHAT_SEQUENTIAL_EXCHANGE_${index}`
+    const started = await broker.startEgoExchange({
+      bindingKey,
+      expectedTerminalMarker: `SEQUENTIAL_EXCHANGE_DONE_${index}`,
+      prompt: `${turnMarker}\nContinue the same durable review.`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+    assert.equal(completed.status, "succeeded")
+  }
+
+  assert.equal(exchangeCount, 3)
+})
+
+test("a dormant legacy binding reserves its deterministic recovery name", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/dormant-legacy-binding"
+  const recoveryName = `ego-chat-bound-${digest(`canonical-conversation\0${canonicalUrl}`).slice(0, 32)}`
+  const now = new Date().toISOString()
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl,
+    createdAt: now,
+    headContentDigest: digest("dormant-legacy-head"),
+    headFingerprint: "dormant-legacy-head",
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "dormant-legacy-assistant",
+    headRole: "assistant",
+    key: "dormant-legacy",
+    messageCount: 2,
+    mode: "existing",
+    modelPolicyKey: "chatgpt-web-default",
+    revision: 1,
+    startUrl: canonicalUrl,
+    state: "bound",
+    targetId: "dormant-legacy-tab",
+    taskSpaceId: 63,
+    updatedAt: now,
+    verifiedAt: now,
+  })
+  let bindCalls = 0
+  let verifyCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async () => {
+        bindCalls += 1
+        throw new Error("the dormant recovery name must be reserved before browser work")
+      },
+      verify: async ({ binding }, _signal, _onResult, beforeRun) => {
+        verifyCalls += 1
+        assert.deepEqual(beforeRun().taskSpaceGuard.ownerSelector, {
+          kind: "name",
+          value: recoveryName,
+        })
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: binding.headFingerprint,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: binding.headContentDigest,
+            lastMessageId: binding.headMessageId,
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          targetId: binding.targetId,
+          taskSpaceIdentity: { name: recoveryName, taskId: "opaque-dormant-legacy-id" },
+          taskSpaceId: 64,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  await assert.rejects(
+    broker.bindConversation({
+      bindingKey: "recovery-name-thief",
+      canonicalUrl: "https://chatgpt.com/c/recovery-name-thief",
+      mode: "existing",
+      taskSpace: recoveryName,
+    }),
+    (error) => error.code === "task_space_already_bound",
+  )
+  assert.equal(bindCalls, 0)
+
+  const migrated = await broker.verifyConversation({ bindingKey: "dormant-legacy" })
+  assert.deepEqual(migrated.taskSpaceIdentity, {
+    name: recoveryName,
+    taskId: "opaque-dormant-legacy-id",
+  })
+  assert.equal(verifyCalls, 1)
+})
+
+test("one canonical conversation cannot run through two distinct task-space identities", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/g/g-p-a3k/c/shared-canonical-chat"
+  const now = "2026-08-24T00:00:00.000Z"
+  const seeded = new EventStore(dataDir)
+  await seeded.initialize()
+  for (const [index, bindingKey] of ["canonical-first", "canonical-second"].entries()) {
+    await seeded.persistBinding("binding.created", {
+      canonicalUrl,
+      createdAt: now,
+      key: bindingKey,
+      modelPolicyKey: "chatgpt-web-default",
+      revision: 1,
+      state: "bound",
+      targetId: `canonical-tab-${index}`,
+      taskSpaceIdentity: browserTaskSpaceIdentity(`canonical-${index}`),
+      taskSpaceId: 30 + index,
+      updatedAt: now,
+      verifiedAt: now,
+    })
+  }
+
+  let adapterCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      ensureModelPolicy: async () => {
+        adapterCalls += 1
+        return modelPolicyObservation()
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  for (const bindingKey of ["canonical-first", "canonical-second"]) {
+    await assert.rejects(
+      broker.ensureModelPolicy({ bindingKey }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === "canonical_conversation_already_bound",
+    )
+  }
+  assert.equal(adapterCalls, 0)
+})
+
+test("recycled numeric task-space ids do not serialize different conversation identities", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const now = "2026-08-24T00:00:00.000Z"
+  const seeded = new EventStore(dataDir)
+  await seeded.initialize()
+  for (const [index, bindingKey] of ["recycled-a3k", "recycled-people-planner"].entries()) {
+    const canonicalUrl = `https://chatgpt.com/c/${bindingKey}`
+    await seeded.persistBinding("binding.created", {
+      canonicalUrl,
+      createdAt: now,
+      headContentDigest: digest(`head-${bindingKey}`),
+      headFingerprint: `head-${bindingKey}`,
+      headFingerprintVersion: "tail-v1",
+      headMessageId: `assistant-${bindingKey}`,
+      headRole: "assistant",
+      key: bindingKey,
+      messageCount: 2,
+      mode: "existing",
+      modelPolicyKey: "chatgpt-web-default",
+      projectUrl: null,
+      revision: 1,
+      startUrl: canonicalUrl,
+      state: "bound",
+      targetId: `tab-${bindingKey}`,
+      ...(index === 0 ? { taskSpaceIdentity: browserTaskSpaceIdentity("stable-a3k") } : {}),
+      taskSpaceId: 10,
+      updatedAt: now,
+      verifiedAt: now,
+    })
+  }
+  const entered = []
+  let release
+  const released = new Promise((resolve) => {
+    release = resolve
+  })
+  let bothEntered
+  const bothActive = new Promise((resolve) => {
+    bothEntered = resolve
+  })
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    exchange: async (input) => {
+      entered.push(input.binding.key)
+      if (entered.length === 2) {
+        bothEntered()
       }
+      await released
+      throw new EgoChatError("human_required", "Test exchange stopped.", {
+        reason: "test_exchange_stopped",
+      })
     },
   }
   const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
   await broker.initialize()
   t.after(() => broker.close())
-  for (const bindingKey of ["task-space-first", "task-space-second"]) {
-    await broker.bindConversation({
+
+  const workflows = []
+  for (const bindingKey of ["recycled-a3k", "recycled-people-planner"]) {
+    const marker = `EGO_CHAT_${bindingKey.toUpperCase().replaceAll("-", "_")}_TEST`
+    workflows.push(await broker.startEgoExchange({
       bindingKey,
-      canonicalUrl: `https://chatgpt.com/c/${bindingKey}`,
-      mode: "existing",
-      taskSpace: 10,
-    })
+      expectedTerminalMarker: `${marker}_DONE`,
+      prompt: `${marker}\nreview`,
+      timeoutMs: 30_000,
+      turnMarker: marker,
+    }))
   }
 
-  const firstMarker = "EGO_CHAT_TASK_SPACE_FIRST_20260825"
-  const first = await broker.startEgoExchange({
-    bindingKey: "task-space-first",
-    expectedTerminalMarker: "EGO_CHAT_TASK_SPACE_FIRST_DONE",
-    prompt: `${firstMarker}\nreview`,
-    timeoutMs: 30_000,
-    turnMarker: firstMarker,
-  })
-  await entered
-  const secondMarker = "EGO_CHAT_TASK_SPACE_SECOND_20260825"
-  await assert.rejects(
-    broker.startEgoExchange({
-      bindingKey: "task-space-second",
-      expectedTerminalMarker: "EGO_CHAT_TASK_SPACE_SECOND_DONE",
-      prompt: `${secondMarker}\nreview`,
-      timeoutMs: 30_000,
-      turnMarker: secondMarker,
-    }),
-    (error) => error.code === "task_space_busy"
-      && error.details?.bindingKey === "task-space-first",
-  )
-  assert.equal(exchanges, 1)
+  await Promise.race([
+    bothActive,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("both bindings did not enter")), 1_000)),
+  ])
+  assert.deepEqual(entered.sort(), ["recycled-a3k", "recycled-people-planner"])
 
-  releaseFirst()
-  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: first.id })
-  assert.equal(completed.status, "succeeded")
+  release()
+  const completed = await Promise.all(workflows.map((workflow) => (
+    broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: workflow.id })
+  )))
+  assert.ok(completed.every((workflow) => workflow.status === "human_required"))
+})
+
+test("preflight admits a recycled numeric location only after fresh live tuple comparison", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const persistedIdentity = { name: "old-space", taskId: "old-task-id" }
+  const liveIdentity = { name: "new-space", taskId: "new-task-id" }
+  const now = new Date().toISOString()
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/old-space",
+    createdAt: now,
+    key: "old-space",
+    modelPolicyKey: "chatgpt-web-default",
+    revision: 1,
+    state: "bound",
+    targetId: "old-tab",
+    taskSpaceIdentity: persistedIdentity,
+    taskSpaceId: 44,
+    updatedAt: now,
+    verifiedAt: now,
+  })
+  let observedGuard
+  let mutations = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      preflight: async (_input, _signal, beforeRun) => {
+        observedGuard = beforeRun().taskSpaceGuard
+        const conflicts = observedGuard.deniedIdentities.some((identity) => (
+          identity.name === liveIdentity.name || identity.taskId === liveIdentity.taskId
+        ))
+        if (conflicts) {
+          throw new Error("fresh live identity should be distinct")
+        }
+        mutations += 1
+        return {
+          safe: true,
+          taskSpaceIdentity: liveIdentity,
+          taskSpaceId: 44,
+        }
+      },
+    },
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const result = await broker.egoPreflight({ taskSpace: 44 })
+  assert.equal(result.safe, true)
+  assert.equal(mutations, 1)
+  assert.deepEqual(observedGuard.ownerSelector, { kind: "numeric_location", value: 44 })
+  assert.deepEqual(observedGuard.deniedIdentities, [persistedIdentity])
+})
+
+test("stable task-space identity comparison rejects discordant tuples and permits distinct tuples", async (t) => {
+  const cases = [
+    {
+      expectedReason: "task_space_identity_conflict",
+      first: { name: "same-name", taskId: "task-one" },
+      second: { name: "same-name", taskId: "task-two" },
+    },
+    {
+      expectedReason: "task_space_identity_conflict",
+      first: { name: "name-one", taskId: "same-task" },
+      second: { name: "name-two", taskId: "same-task" },
+    },
+    {
+      expectedReason: null,
+      first: { name: "name-one", taskId: "task-one" },
+      second: { name: "name-two", taskId: "task-two" },
+    },
+  ]
+
+  for (const [index, identityCase] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    let release
+    const released = new Promise((resolve) => {
+      release = resolve
+    })
+    let enteredCount = 0
+    let firstEntered
+    const entered = new Promise((resolve) => {
+      firstEntered = resolve
+    })
+    const identities = new Map([
+      ["identity-first", identityCase.first],
+      ["identity-second", identityCase.second],
+    ])
+    const egoAdapter = {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: { fingerprint: `identity-head-${index}`, lastRole: "assistant", messageCount: 2 },
+        targetId: `identity-tab-${index}`,
+        taskSpaceIdentity: identities.get(input.bindingKey),
+        taskSpaceId: input.taskSpace,
+      }),
+      ensureModelPolicy: async () => {
+        enteredCount += 1
+        firstEntered()
+        await released
+        return modelPolicyObservation()
+      },
+    }
+    const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: "identity-first",
+      canonicalUrl: `https://chatgpt.com/c/identity-first-${index}`,
+      mode: "existing",
+      taskSpace: 20 + index,
+    })
+    if (identityCase.expectedReason) {
+      await assert.rejects(
+        broker.bindConversation({
+          bindingKey: "identity-second",
+          canonicalUrl: `https://chatgpt.com/c/identity-second-${index}`,
+          mode: "existing",
+          taskSpace: 30 + index,
+        }),
+        (error) => error.code === "human_required"
+          && error.details?.reason === identityCase.expectedReason,
+      )
+      assert.throws(
+        () => broker.getConversationBinding({ bindingKey: "identity-second" }),
+        (error) => error.code === "binding_not_found",
+      )
+      continue
+    }
+    await broker.bindConversation({
+      bindingKey: "identity-second",
+      canonicalUrl: `https://chatgpt.com/c/identity-second-${index}`,
+      mode: "existing",
+      taskSpace: 30 + index,
+    })
+
+    const first = broker.ensureModelPolicy({ bindingKey: "identity-first" })
+    await entered
+    const second = broker.ensureModelPolicy({ bindingKey: "identity-second" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(enteredCount, 2)
+    release()
+    await first
+    await second
+  }
+})
+
+test("simultaneous legacy migrations reserve deterministic names and reject a shared opaque task ID", async (t) => {
+  const cases = [
+    {
+      expectedFulfilled: 1,
+      firstTaskId: "shared-migrated-task",
+      secondTaskId: "shared-migrated-task",
+    },
+    {
+      expectedFulfilled: 2,
+      firstTaskId: "distinct-migrated-task-a",
+      secondTaskId: "distinct-migrated-task-b",
+    },
+  ]
+  for (const [index, identityCase] of cases.entries()) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const seeded = new EventStore(dataDir)
+    await seeded.initialize()
+    const now = new Date().toISOString()
+    for (const [bindingIndex, bindingKey] of ["legacy-first", "legacy-second"].entries()) {
+      await seeded.persistBinding("binding.created", {
+        canonicalUrl: `https://chatgpt.com/c/${bindingKey}-${index}`,
+        createdAt: now,
+        headContentDigest: digest(`legacy-head-${bindingKey}-${index}`),
+        headFingerprint: `legacy-head-${bindingKey}-${index}`,
+        headFingerprintVersion: "tail-v1",
+        headMessageId: `legacy-assistant-${bindingKey}-${index}`,
+        headRole: "assistant",
+        key: bindingKey,
+        messageCount: 2,
+        mode: "existing",
+        modelPolicyKey: "chatgpt-web-default",
+        revision: 1,
+        startUrl: `https://chatgpt.com/c/${bindingKey}-${index}`,
+        state: "bound",
+        targetId: `legacy-tab-${bindingKey}-${index}`,
+        taskSpaceId: 90 + bindingIndex,
+        updatedAt: now,
+        verifiedAt: now,
+      })
+    }
+    let entered = 0
+    let release
+    let bothEntered
+    const released = new Promise((resolve) => {
+      release = resolve
+    })
+    const ready = new Promise((resolve) => {
+      bothEntered = resolve
+    })
+    const taskIds = new Map([
+      ["legacy-first", identityCase.firstTaskId],
+      ["legacy-second", identityCase.secondTaskId],
+    ])
+    const broker = new Broker({
+      egoAdapter: {
+        ...unusedEgoAdapter,
+        verify: async ({ binding }) => {
+          entered += 1
+          if (entered === 2) {
+            bothEntered()
+          }
+          await released
+          return {
+            canonicalUrl: binding.canonicalUrl,
+            head: {
+              fingerprint: binding.headFingerprint,
+              fingerprintVersion: "tail-v1",
+              lastContentDigest: binding.headContentDigest,
+              lastMessageId: binding.headMessageId,
+              lastRole: "assistant",
+              messageCount: 2,
+            },
+            targetId: binding.targetId,
+            taskSpaceIdentity: {
+              name: `ego-chat-bound-${digest(`canonical-conversation\0${binding.canonicalUrl}`).slice(0, 32)}`,
+              taskId: taskIds.get(binding.key),
+            },
+            taskSpaceId: binding.taskSpaceId,
+          }
+        },
+      },
+      store: new EventStore(dataDir),
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+
+    const migrations = [
+      broker.verifyConversation({ bindingKey: "legacy-first" }),
+      broker.verifyConversation({ bindingKey: "legacy-second" }),
+    ]
+    await ready
+    release()
+    const outcomes = await Promise.allSettled(migrations)
+    const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled")
+    const rejected = outcomes.filter((outcome) => outcome.status === "rejected")
+
+    assert.equal(fulfilled.length, identityCase.expectedFulfilled)
+    assert.equal(rejected.length, 2 - identityCase.expectedFulfilled)
+    if (rejected.length > 0) {
+      assert.equal(rejected[0].reason.code, "human_required")
+      assert.equal(rejected[0].reason.details?.reason, "task_space_identity_conflict")
+    }
+    const migratedBindings = ["legacy-first", "legacy-second"]
+      .map((bindingKey) => broker.getConversationBinding({ bindingKey }))
+      .filter((binding) => binding.taskSpaceIdentity)
+    assert.equal(migratedBindings.length, identityCase.expectedFulfilled)
+  }
 })
 
 test("maximum policy automatically records a future strongest model without a code change", async (t) => {
@@ -4687,6 +7335,7 @@ test("maximum policy automatically records a future strongest model without a co
       canonicalUrl: input.canonicalUrl,
       head: { fingerprint: "head-0", lastRole: "assistant", messageCount: 4 },
       targetId: input.targetId ?? "policy-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
     ensureModelPolicy: async ({ modelPolicy }) => {
@@ -5171,6 +7820,7 @@ test("broker-owned convergence reconciles an ambiguous review send without human
         canonicalUrl: input.canonicalUrl,
         head: beforeHead,
         targetId: "ambiguous-review-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
       }),
       exchange: async (input) => {
@@ -5211,6 +7861,7 @@ test("broker-owned convergence reconciles an ambiguous review send without human
           responseDigest: digest(responseText),
           responseText,
           targetId: "ambiguous-review-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity("10"),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -5224,6 +7875,7 @@ test("broker-owned convergence reconciles an ambiguous review send without human
           deliveryState: "absent",
           head: beforeHead,
           targetId: "ambiguous-review-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -7269,6 +9921,7 @@ test("cancellation remains terminal when an older App Server phase finishes late
         canonicalUrl: input.canonicalUrl,
         head: { fingerprint: "cancel-head", lastRole: "assistant", messageCount: 2 },
         targetId: "cancel-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
       }),
     },
@@ -7309,9 +9962,31 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   const terminalMarker = "DONE_RECONCILE123"
   const responseText = `Recovered create-once response.\n${terminalMarker}`
   const responseDigest = digest(responseText)
+  const taskSpaceIdentity = browserTaskSpaceIdentity("10")
+  const reconciliationIdentities = [
+    undefined,
+    browserTaskSpaceIdentity("reconcile-drift"),
+    taskSpaceIdentity,
+  ]
+  let reconciliationCalls = 0
   const egoAdapter = {
-    bind: async (input) => ({ canonicalUrl: null, targetId: input.targetId, taskSpaceId: 10 }),
-    exchange: async () => {
+    bind: async (input) => ({
+      canonicalUrl: null,
+      targetId: input.targetId,
+      taskSpaceIdentity,
+      taskSpaceId: 10,
+    }),
+    sendExchange: async (input) => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "reconciled-prompt",
+      sentAt: new Date().toISOString(),
+      targetId: "reconciled-tab",
+      taskSpaceIdentity,
+      taskSpaceId: 10,
+      turnMarker: input.turnMarker,
+    }),
+    captureExchange: async () => {
       throw new EgoChatError(
         "human_required",
         "Canonical URL appeared late.",
@@ -7325,6 +10000,7 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
       throw new Error("not expected")
     },
     reconcile: async ({ expectedTerminalMarker, inputDigest, turnMarker }) => {
+      reconciliationCalls += 1
       assert.match(inputDigest, /^[a-f0-9]{64}$/)
       assert.equal(expectedTerminalMarker, terminalMarker)
       assert.equal(turnMarker, "EGO_CHAT_GATE0_RECONCILE123")
@@ -7341,6 +10017,9 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
         responseDigest,
         responseText,
         targetId: "reconciled-tab",
+        ...(reconciliationIdentities[reconciliationCalls - 1]
+          ? { taskSpaceIdentity: reconciliationIdentities[reconciliationCalls - 1] }
+          : {}),
         taskSpaceId: 10,
         turnMarker,
       }
@@ -7370,6 +10049,27 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
   assert.equal(stopped.humanRequired.code, "canonical_conversation_missing")
 
+  const bindingBeforeUnsafeResults = broker.getConversationBinding({ bindingKey: "ego-chat-main" })
+  const ledgerBeforeUnsafeResults = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+  for (const expectedReason of ["task_space_identity_missing", "task_space_identity_changed"]) {
+    await assert.rejects(
+      broker.reconcileConversation({
+        bindingKey: "ego-chat-main",
+        workflowId: stopped.id,
+      }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === expectedReason,
+    )
+    assert.deepEqual(
+      broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
+      bindingBeforeUnsafeResults,
+    )
+    assert.equal(
+      await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+      ledgerBeforeUnsafeResults,
+    )
+  }
+
   await assert.rejects(
     broker.reconcileWorkflowObservation({
       bindingKey: "ego-chat-main",
@@ -7388,6 +10088,116 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   assert.equal(reconciled.state, "bound")
   assert.equal(reconciled.recovery.responseText, responseText)
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "succeeded")
+  assert.equal(reconciliationCalls, 3)
+})
+
+test("reconciliation rejects canonical retargeting before blob or binding persistence", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/reconcile-canonical-transaction"
+  const wrongUrl = "https://chatgpt.com/c/reconcile-canonical-transaction-wrong"
+  const terminalMarker = "EGO_CHAT_RECONCILE_CANONICAL_TRANSACTION_DONE"
+  const turnMarker = "EGO_CHAT_RECONCILE_CANONICAL_TRANSACTION"
+  const taskSpaceIdentity = { name: "reconcile-canonical-space", taskId: "reconcile-canonical-task" }
+  const initialHead = {
+    fingerprint: "reconcile-canonical-before",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: digest("reconcile-canonical-before"),
+    lastMessageId: "reconcile-canonical-assistant-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  let verifyCalls = 0
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async () => ({
+        canonicalUrl,
+        head: initialHead,
+        targetId: "reconcile-canonical-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 69,
+      }),
+      exchange: async () => {
+        throw new EgoChatError("human_required", "The Send confirmation is ambiguous.", {
+          reason: "send_confirmation_ambiguous",
+        })
+      },
+      reconcileBound: async (input) => {
+        const responseText = terminalMarker
+        return {
+          canonicalUrl: wrongUrl,
+          head: {
+            fingerprint: "reconcile-canonical-after",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "reconcile-canonical-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "reconcile-canonical-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 69,
+          turnMarker: input.turnMarker,
+        }
+      },
+      verify: async () => {
+        verifyCalls += 1
+        return {
+          canonicalUrl,
+          head: initialHead,
+          targetId: "reconcile-canonical-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 69,
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "reconcile-canonical-transaction",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: "reconcile-canonical-space",
+  })
+  const bindingBefore = broker.getConversationBinding({
+    bindingKey: "reconcile-canonical-transaction",
+  })
+  const started = await broker.startEgoExchange({
+    bindingKey: "reconcile-canonical-transaction",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(stopped.humanRequired.code, "send_confirmation_ambiguous")
+
+  await assert.rejects(
+    broker.reconcileConversation({
+      bindingKey: "reconcile-canonical-transaction",
+      workflowId: started.id,
+    }),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "canonical_conversation_changed",
+  )
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: "reconcile-canonical-transaction" }),
+    bindingBefore,
+  )
+  assert.deepEqual(
+    await fs.readdir(path.join(dataDir, "blobs")).catch((error) => {
+      if (error.code === "ENOENT") return []
+      throw error
+    }),
+    [],
+  )
+  await broker.verifyConversation({ bindingKey: "reconcile-canonical-transaction" })
+  assert.equal(verifyCalls, 1)
 })
 
 test("monitor observation reconciliation leaves durable and browser effects unchanged; explicit reconciliation remains exact", async (t) => {
@@ -7402,6 +10212,7 @@ test("monitor observation reconciliation leaves durable and browser effects unch
   let browserOperationCalls = 0
   let reconciliationCalls = 0
   let sendCalls = 0
+  const taskSpaceIdentity = { name: "bound-late-space", taskId: "bound-late-space" }
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => {
@@ -7417,6 +10228,7 @@ test("monitor observation reconciliation leaves durable and browser effects unch
           messageCount: 4,
         },
         targetId: "bound-tab",
+        taskSpaceIdentity,
         taskSpaceId: 10,
       }
     },
@@ -7456,6 +10268,7 @@ test("monitor observation reconciliation leaves durable and browser effects unch
         responseDigest,
         responseText,
         targetId: "bound-tab",
+        taskSpaceIdentity,
         taskSpaceId: 10,
         turnMarker,
       }
@@ -7536,6 +10349,7 @@ test("monitor observation reconciliation leaves durable and browser effects unch
   assert.match(reconciled.recovery.responseDigest, /^[a-f0-9]{64}$/)
   assert.equal(reconciled.recovery.responseText, terminalMarker)
   assert.equal(reconciled.revision, 2)
+  assert.deepEqual(reconciled.taskSpaceIdentity, taskSpaceIdentity)
   const completed = broker.getWorkflow({ workflowId: stopped.id })
   assert.equal(completed.status, "succeeded")
   assert.equal(completed.humanRequired, undefined)
@@ -7548,6 +10362,19 @@ test("monitor observation reconciliation leaves durable and browser effects unch
   assert.equal(exactRetry.recovery.responseText, terminalMarker)
   assert.equal(exactRetry.revision, 2)
   assert.equal(reconciliationCalls, 1)
+
+  const nextTurnMarker = "EGO_CHAT_POST_RECONCILIATION_SEND"
+  const next = await broker.startEgoExchange({
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "EGO_CHAT_POST_RECONCILIATION_DONE",
+    prompt: `${nextTurnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker: nextTurnMarker,
+  })
+  const nextStopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: next.id })
+  assert.equal(nextStopped.status, "human_required")
+  assert.equal(nextStopped.humanRequired.code, "send_confirmation_ambiguous")
+  assert.equal(sendCalls, 2)
 })
 
 test("a changed conversation head records actionable pre-send evidence", async (t) => {
@@ -7584,6 +10411,7 @@ test("a changed conversation head records actionable pre-send evidence", async (
       canonicalUrl: input.canonicalUrl,
       head: initialHead,
       targetId: "head-change-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -7688,12 +10516,19 @@ test("an explicitly acknowledged stable external head can re-anchor one safe sto
     observedRole: "assistant",
   }
   let reanchorCalls = 0
+  const taskSpaceIdentity = { name: "reanchor-space", taskId: "reanchor-space" }
+  const reanchorIdentities = [
+    undefined,
+    browserTaskSpaceIdentity("reanchor-drift"),
+    taskSpaceIdentity,
+  ]
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => ({
       canonicalUrl: input.canonicalUrl,
       head: initialHead,
       targetId: "reanchor-tab",
+      taskSpaceIdentity,
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -7712,6 +10547,9 @@ test("an explicitly acknowledged stable external head can re-anchor one safe sto
         head: observedHead,
         headChange,
         targetId: "reanchor-tab",
+        ...(reanchorIdentities[reanchorCalls - 1]
+          ? { taskSpaceIdentity: reanchorIdentities[reanchorCalls - 1] }
+          : {}),
         taskSpaceId: 10,
       }
     },
@@ -7743,6 +10581,28 @@ test("an explicitly acknowledged stable external head can re-anchor one safe sto
     expectedObservedHeadFingerprint: observedHead.fingerprint,
     sourceWorkflowId: stopped.id,
   }
+  const bindingBeforeUnsafeResults = broker.getConversationBinding({ bindingKey: "ego-chat-main" })
+  const ledgerBeforeUnsafeResults = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+  await assert.rejects(
+    broker.reanchorConversation(input),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_missing",
+  )
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
+    bindingBeforeUnsafeResults,
+  )
+  assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), ledgerBeforeUnsafeResults)
+  await assert.rejects(
+    broker.reanchorConversation(input),
+    (error) => error.code === "human_required"
+      && error.details?.reason === "task_space_identity_changed",
+  )
+  assert.deepEqual(
+    broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
+    bindingBeforeUnsafeResults,
+  )
+  assert.equal(await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"), ledgerBeforeUnsafeResults)
   const reanchored = await broker.reanchorConversation(input)
 
   assert.equal(reanchored.headFingerprint, observedHead.fingerprint)
@@ -7751,6 +10611,7 @@ test("an explicitly acknowledged stable external head can re-anchor one safe sto
   assert.equal(reanchored.messageCount, 4)
   assert.equal(reanchored.reanchor.changeKind, "message_appended")
   assert.equal(reanchored.revision, 2)
+  assert.deepEqual(reanchored.taskSpaceIdentity, taskSpaceIdentity)
   const completed = broker.getWorkflow({ workflowId: stopped.id })
   assert.equal(completed.phase, "head_reanchored")
   assert.equal(completed.status, "cancelled")
@@ -7766,7 +10627,7 @@ test("an explicitly acknowledged stable external head can re-anchor one safe sto
   await store.persist("test.reanchor_commit_interrupted", stopped, completed)
   const replayed = await broker.reanchorConversation(input)
   assert.equal(replayed.revision, 2)
-  assert.equal(reanchorCalls, 1)
+  assert.equal(reanchorCalls, 3)
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).phase, "head_reanchored")
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "cancelled")
 })
@@ -7789,6 +10650,7 @@ test("re-anchoring rejects an ambiguous possible send before browser work", asyn
       canonicalUrl: input.canonicalUrl,
       head: initialHead,
       targetId: "ambiguous-reanchor-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -7849,12 +10711,14 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
     messageCount: 8,
   }
   let exchangeCalls = 0
+  let reconciliationCalls = 0
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => ({
       canonicalUrl: input.canonicalUrl,
       head: beforeHead,
       targetId: "driver-interruption-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -7871,6 +10735,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
       )
     },
     reconcileBound: async (input) => {
+      reconciliationCalls += 1
       assert.equal(input.allowDeliveryAbsent, true)
       assert.equal(input.expectedPreviousContentDigest, beforeHead.lastContentDigest)
       assert.equal(input.expectedPreviousMessageId, beforeHead.lastMessageId)
@@ -7879,6 +10744,13 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
         deliveryState: "absent",
         head: beforeHead,
         targetId: "driver-interruption-tab",
+        ...(reconciliationCalls === 1
+          ? {}
+          : {
+              taskSpaceIdentity: reconciliationCalls === 2
+                ? browserTaskSpaceIdentity("delivery-absence-drift")
+                : browserTaskSpaceIdentity(String(10)),
+            }),
         taskSpaceId: 10,
         turnMarker,
       }
@@ -7893,6 +10765,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
         messageCount: 10,
       },
       targetId: "driver-interruption-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
       taskSpaceId: 10,
     }),
   }
@@ -7928,6 +10801,26 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
   })
   assert.equal(stopped.reconciliation.modelPolicyObservation.effortLabel, "Pro")
 
+  const ledgerBeforeUnsafeAbsence = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+  for (const expectedReason of ["task_space_identity_missing", "task_space_identity_changed"]) {
+    await assert.rejects(
+      broker.reconcileConversation({
+        bindingKey: "ego-chat-main",
+        workflowId: stopped.id,
+      }),
+      (error) => error.code === "human_required"
+        && error.details?.reason === expectedReason,
+    )
+    assert.deepEqual(
+      broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
+      bindingBefore,
+    )
+    assert.equal(
+      await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+      ledgerBeforeUnsafeAbsence,
+    )
+  }
+
   const reconciled = await broker.reconcileConversation({
     bindingKey: "ego-chat-main",
     workflowId: stopped.id,
@@ -7939,6 +10832,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
     broker.getConversationBinding({ bindingKey: "ego-chat-main" }),
     bindingBefore,
   )
+  assert.equal(reconciliationCalls, 3)
 
   await broker.verifyConversation({ bindingKey: "ego-chat-main" })
   await assert.rejects(
@@ -8041,6 +10935,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
     startUrl: canonicalUrl,
     state: "bound",
     targetId: "restart-presend-tab",
+    taskSpaceIdentity: browserTaskSpaceIdentity(String(24)),
     taskSpaceId: 24,
     updatedAt: now,
     verifiedAt: now,
@@ -8087,6 +10982,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
   let captures = 0
   let reconciliations = 0
   let sends = 0
+  let restartForeignGuard
   let firstReconciliationStarted
   const reconciliationStarted = new Promise((resolve) => {
     firstReconciliationStarted = resolve
@@ -8094,8 +10990,16 @@ test("a fully identified pre-send exchange reconciles and continues after broker
   const firstBroker = new Broker({
     egoAdapter: {
       ...unusedEgoAdapter,
-      reconcileBound: async () => {
+      preflight: async (_input, _signal, beforeRun) => {
+        restartForeignGuard = beforeRun().taskSpaceGuard
+        return { safe: true }
+      },
+      reconcileBound: async (_input, _signal, _onResult, beforeRun) => {
         reconciliations += 1
+        assert.deepEqual(beforeRun().taskSpaceGuard.ownerSelector, {
+          identity: browserTaskSpaceIdentity(String(24)),
+          kind: "stable_identity",
+        })
         firstReconciliationStarted()
         return new Promise(() => {})
       },
@@ -8109,6 +11013,9 @@ test("a fully identified pre-send exchange reconciles and continues after broker
     firstBroker.getWorkflow({ workflowId: workflow.id }).phase,
     "restart_reconciling",
   )
+  await firstBroker.egoPreflight({ taskSpace: 999 })
+  assert.deepEqual(restartForeignGuard.deniedIdentities, [browserTaskSpaceIdentity(String(24))])
+  assert.deepEqual(restartForeignGuard.deniedSelectors, [])
   firstBroker.close()
 
   const broker = new Broker({
@@ -8130,6 +11037,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
           responseDigest: digest(responseText),
           responseText,
           targetId: "restart-presend-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(24)),
           taskSpaceId: 24,
           turnMarker,
         }
@@ -8150,6 +11058,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
             messageCount: 2,
           },
           targetId: "restart-presend-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(24)),
           taskSpaceId: 24,
           turnMarker,
         }
@@ -8162,6 +11071,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
           promptMessageId: "restart-presend-user",
           sentAt: new Date().toISOString(),
           targetId: "restart-presend-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(24)),
           taskSpaceId: 24,
           turnMarker,
         }
@@ -8181,7 +11091,7 @@ test("a fully identified pre-send exchange reconciles and continues after broker
   assert.equal(captures, 1)
 })
 
-test("a confirmed send resumes read-only capture after broker restart without resending", async (t) => {
+test("a legacy binding resumes confirmed-Send capture with the Send tuple after restart without resending", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const store = new EventStore(dataDir)
@@ -8262,6 +11172,7 @@ test("a confirmed send resumes read-only capture after broker restart without re
         promptMessageId: "user-confirmed-before-restart",
         sentAt: now,
         targetId: "resumable-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
         turnMarker,
       },
@@ -8293,6 +11204,7 @@ test("a confirmed send resumes read-only capture after broker restart without re
       captureExchange: async (input) => {
         captures += 1
         assert.equal(input.canonicalUrl, canonicalUrl)
+        assert.deepEqual(input.binding.taskSpaceIdentity, browserTaskSpaceIdentity(String(10)))
         assert.equal(input.expectedPreviousMessageId, "assistant-before-restart")
         assert.ok(input.timeoutMs > 15 * 60_000)
         return {
@@ -8309,6 +11221,7 @@ test("a confirmed send resumes read-only capture after broker restart without re
           responseDigest: digest(terminalMarker),
           responseText: terminalMarker,
           targetId: "resumable-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
           taskSpaceId: 10,
           turnMarker,
         }
@@ -8330,6 +11243,7 @@ test("a confirmed send resumes read-only capture after broker restart without re
   assert.equal(captures, 1)
 
   const committedBinding = broker.getConversationBinding({ bindingKey: "ego-chat-main" })
+  assert.deepEqual(committedBinding.taskSpaceIdentity, browserTaskSpaceIdentity(String(10)))
   const committedPolicy = broker.getModelPolicy()
   broker.close()
   const rewindStore = new EventStore(dataDir)
@@ -8371,6 +11285,155 @@ test("a confirmed send resumes read-only capture after broker restart without re
     committedBinding.revision,
   )
   assert.equal(resumedBroker.getModelPolicy().revision, committedPolicy.revision)
+})
+
+test("restart rejects every incomplete or conflicting post-Send identity record before browser work", async (t) => {
+  const taskSpaceIdentity = { name: "restart-evidence-space", taskId: "restart-evidence-task" }
+  const canonicalUrl = "https://chatgpt.com/c/restart-evidence"
+  const cases = [
+    {
+      id: "154869d6-3548-4afb-af8e-799a1853c7e1",
+      reason: "confirmed_task_space_identity_missing",
+      send: {
+        canonicalUrl,
+        promptMessageId: "restart-evidence-user",
+        sentAt: "2026-08-24T00:00:00.000Z",
+        targetId: "restart-evidence-tab",
+        taskSpaceId: 70,
+      },
+    },
+    {
+      id: "c4824cd6-4afe-4f82-8983-e61d75f8d63b",
+      reason: "confirmed_task_space_identity_missing",
+      result: { canonicalUrl },
+      send: {
+        canonicalUrl,
+        promptMessageId: "restart-evidence-user",
+        sentAt: "2026-08-24T00:00:00.000Z",
+        targetId: "restart-evidence-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 70,
+      },
+    },
+    {
+      bindingCanonicalUrl: null,
+      id: "27a1563f-ecf4-4acc-8c07-c7e66d4a7408",
+      reason: "canonical_conversation_changed",
+      result: {
+        canonicalUrl: "https://chatgpt.com/c/restart-evidence-other",
+        taskSpaceIdentity,
+        taskSpaceId: 70,
+      },
+      send: {
+        canonicalUrl,
+        promptMessageId: "restart-evidence-user",
+        sentAt: "2026-08-24T00:00:00.000Z",
+        targetId: "restart-evidence-tab",
+        taskSpaceIdentity,
+        taskSpaceId: 70,
+      },
+    },
+  ]
+
+  for (const evidenceCase of cases) {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const now = "2026-08-24T00:00:00.000Z"
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const bindingCanonicalUrl = evidenceCase.bindingCanonicalUrl === null ? null : canonicalUrl
+    const binding = {
+      canonicalUrl: bindingCanonicalUrl,
+      createdAt: now,
+      headContentDigest: "a".repeat(64),
+      headFingerprint: "restart-evidence-head",
+      headFingerprintVersion: "tail-v1",
+      headMessageId: "restart-evidence-assistant",
+      headRole: "assistant",
+      key: `restart-evidence-${evidenceCase.id.slice(0, 8)}`,
+      messageCount: 2,
+      mode: bindingCanonicalUrl ? "existing" : "create_once",
+      modelPolicyKey: "chatgpt-web-default",
+      revision: 1,
+      startUrl: bindingCanonicalUrl ?? "https://chatgpt.com/",
+      state: bindingCanonicalUrl ? "bound" : "unbound",
+      targetId: "restart-evidence-tab",
+      taskSpaceIdentity,
+      taskSpaceId: 70,
+      updatedAt: now,
+      verifiedAt: now,
+    }
+    await store.persistBinding("binding.created", binding)
+    const turnMarker = `EGO_CHAT_RESTART_EVIDENCE_${evidenceCase.id.slice(0, 8).toUpperCase()}`
+    const workflow = {
+      bindingKey: binding.key,
+      createdAt: now,
+      deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+      id: evidenceCase.id,
+      inputDigest: digest(`${turnMarker}\nreview`),
+      kind: "ego_exchange",
+      operationKey: `exchange:${binding.key}:${turnMarker}`,
+      phase: evidenceCase.result ? "response_captured" : "send_confirmed",
+      private: {
+        request: {
+          bindingKey: binding.key,
+          expectedTerminalMarker: `${turnMarker}_DONE`,
+          prompt: `${turnMarker}\nreview`,
+          timeoutMs: 30_000,
+          turnMarker,
+        },
+        send: evidenceCase.send,
+      },
+      reconciliation: {
+        beforeHead: {
+          contentDigest: binding.headContentDigest,
+          fingerprint: binding.headFingerprint,
+          fingerprintVersion: binding.headFingerprintVersion,
+          messageId: binding.headMessageId,
+          role: binding.headRole,
+        },
+        confirmedTaskSpace: {
+          canonicalUrl,
+          taskSpaceIdentity,
+          taskSpaceId: 70,
+        },
+        expectedTerminalMarker: `${turnMarker}_DONE`,
+        turnMarker,
+      },
+      ...(evidenceCase.result ? { result: evidenceCase.result } : {}),
+      status: "running",
+      updatedAt: now,
+    }
+    await store.persist("workflow.started", workflow)
+    let browserCalls = 0
+    const broker = new Broker({
+      egoAdapter: new Proxy(unusedEgoAdapter, {
+        get(target, property) {
+          if (typeof target[property] !== "function") return target[property]
+          return async () => {
+            browserCalls += 1
+            throw new Error("invalid post-Send evidence must stop before browser work")
+          }
+        },
+      }),
+      store: new EventStore(dataDir),
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+
+    const stopped = broker.getWorkflow({ workflowId: workflow.id })
+    assert.equal(stopped.status, "human_required")
+    assert.equal(stopped.humanRequired.details?.reason, evidenceCase.reason)
+    assert.equal(browserCalls, 0)
+    assert.equal(broker.getConversationBinding({ bindingKey: binding.key }).revision, 1)
+    assert.deepEqual(
+      await fs.readdir(path.join(dataDir, "blobs")).catch((error) => {
+        if (error.code === "ENOENT") return []
+        throw error
+      }),
+      [],
+    )
+  }
 })
 
 test("incomplete legacy convergence metadata remains non-resumable after broker restart", async (t) => {
@@ -9422,6 +12485,7 @@ test("broker restart retires an old-thread review before accepting settlement", 
           responseDigest: digest(staleResponseText),
           responseText: staleResponseText,
           targetId: "restart-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity("convergence"),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -9743,6 +12807,7 @@ test("running convergence consumes its exact completed ChatGPT child after broke
           responseDigest: digest(responseText),
           responseText,
           targetId: "restart-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity("convergence"),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -9817,6 +12882,7 @@ test("running convergence resumes confirmed ChatGPT capture after broker restart
           messageCount: 2,
         },
         targetId: "confirmed-review-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
         taskSpaceId: 10,
       }),
       captureExchange: async (_input, signal) => {
@@ -9835,6 +12901,7 @@ test("running convergence resumes confirmed ChatGPT capture after broker restart
           promptMessageId: "confirmed-review-user",
           sentAt: new Date().toISOString(),
           targetId: "confirmed-review-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -9902,6 +12969,7 @@ test("running convergence resumes confirmed ChatGPT capture after broker restart
           responseDigest: digest(responseText),
           responseText,
           targetId: "confirmed-review-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }

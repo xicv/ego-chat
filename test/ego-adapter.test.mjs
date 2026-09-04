@@ -29,6 +29,47 @@ function conversationTailFingerprint(entry) {
 
 let driverCase = 0
 
+function completeTaskSpaceGuard(ownerSelector, partial = undefined) {
+  if (partial && Object.hasOwn(partial, "revision")) {
+    return partial
+  }
+  const legacyExpectedName = partial?.expectedName
+  return {
+    deniedIdentities: partial?.deniedIdentities ?? [],
+    deniedSelectors: partial?.deniedSelectors ?? [],
+    ownerSelector: partial?.ownerSelector ?? (legacyExpectedName
+      ? { kind: "name", value: legacyExpectedName }
+      : ownerSelector),
+    revision: 1,
+  }
+}
+
+function completeTaskSpaceIdentity(identity) {
+  return identity
+    && typeof identity.name === "string"
+    && identity.name.length > 0
+    && identity.name.length <= 200
+    && !/[\u0000-\u001F\u007F]/.test(identity.name)
+    && typeof identity.taskId === "string"
+    && identity.taskId.length > 0
+    && identity.taskId.length <= 200
+    && !/[\u0000-\u001F\u007F]/.test(identity.taskId)
+}
+
+function preflightWithGuard(adapter, taskSpace) {
+  return adapter.preflight(
+    { taskSpace },
+    undefined,
+    () => ({
+      taskSpaceGuard: completeTaskSpaceGuard(
+        Number.isSafeInteger(taskSpace)
+          ? { kind: "numeric_location", value: taskSpace }
+          : { kind: "legacy_string", value: String(taskSpace) },
+      ),
+    }),
+  )
+}
+
 async function runMalformedModelPolicyCase(attributes, {
   currentModelLabels = null,
   pillCount = 1,
@@ -40,11 +81,15 @@ async function runMalformedModelPolicyCase(attributes, {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 13,
+    browserContractRevision: 14,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
       targetId: "policy-tab",
+      taskSpaceIdentity: {
+        name: "model-policy-test-space",
+        taskId: "model-policy-test-space",
+      },
       taskSpaceId: 10,
     },
     brokerLease: {
@@ -62,6 +107,10 @@ async function runMalformedModelPolicyCase(attributes, {
       thinkingEffort: "maximum_available",
     },
     prompt: "EGO_CHAT_POLICY_TEST_MARKER",
+    taskSpaceGuard: completeTaskSpaceGuard({
+      identity: { name: "model-policy-test-space", taskId: "model-policy-test-space" },
+      kind: "stable_identity",
+    }),
     timeoutMs: 1_000,
     turnMarker: "EGO_CHAT_POLICY_TEST_MARKER",
   }
@@ -170,6 +219,12 @@ const pageDocument = {
 }
 globalThis.cliLog = (value) => console.log(value)
 globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+globalThis.listTaskSpaces = async () => [{
+  id: 10,
+  name: 'model-policy-test-space',
+  ownership: 'agent',
+  taskId: 'model-policy-test-space',
+}]
 globalThis.listTabs = async () => [{ active: true, targetId: 'policy-tab' }]
 globalThis.switchTab = async () => {}
 globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
@@ -251,13 +306,22 @@ async function runPreSendDriverCase({
   allowTaskSpaceReclaim = false,
   boundTaskSpaceOwnership = null,
   changeSendControlAtRecheck = false,
+  cleanupFirstAttemptFails = false,
   currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
   deferFirstPolicyOpenWithDraft = false,
   downgradeAtPresend = false,
+  driftBeforeCleanupRetry = false,
+  driftBetweenFocusAndInsert = false,
   fenceAtRecheck = false,
+  omitUnboundTaskSpaceIdentity = false,
   policyUiVariant = "legacy",
   prompt = null,
+  recycleUnboundTaskSpace = false,
+  rawTaskSpaceGuard = undefined,
+  taskSpaceGuard = null,
+  taskSpaceDriftAtFence = null,
+  taskSpaceLocation = 10,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-presend-${process.pid}-${driverCase}`
@@ -266,7 +330,7 @@ async function runPreSendDriverCase({
   const turnMarker = "EGO_CHAT_PRESEND_POLICY_TEST_MARKER"
   const bindingKey = "presend-driver-test"
   const canonicalUrl = "https://chatgpt.com/c/presend-driver-test"
-  const fallbackName = `ego-chat-bound-${createHash("sha256").update(bindingKey, "utf8").digest("hex").slice(0, 16)}`
+  const fallbackName = `ego-chat-bound-${createHash("sha256").update(`canonical-conversation\0${canonicalUrl}`, "utf8").digest("hex").slice(0, 32)}`
   const priorAssistant = {
     messageId: "presend-assistant-before",
     role: "assistant",
@@ -274,14 +338,22 @@ async function runPreSendDriverCase({
   }
   const input = {
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-    browserContractRevision: 13,
+    browserContractRevision: 14,
     binding: boundTaskSpaceOwnership === null
       ? {
           messageCount: 0,
           startUrl: "https://chatgpt.com/",
           state: "unbound",
           targetId: "presend-tab",
-          taskSpaceId: 10,
+          ...(omitUnboundTaskSpaceIdentity
+            ? {}
+            : {
+                taskSpaceIdentity: {
+                  name: "presend-new-workspace",
+                  taskId: "presend-new-workspace",
+                },
+              }),
+          taskSpaceId: taskSpaceLocation,
         }
       : {
           canonicalUrl,
@@ -312,6 +384,21 @@ async function runPreSendDriverCase({
       thinkingEffort: "maximum_available",
     },
     prompt: prompt ?? `${turnMarker}\nReview the pre-send fence.`,
+    ...(rawTaskSpaceGuard === null
+      ? {}
+      : {
+          taskSpaceGuard: rawTaskSpaceGuard ?? completeTaskSpaceGuard(
+            boundTaskSpaceOwnership === null
+              ? (omitUnboundTaskSpaceIdentity
+                  ? { kind: "numeric_location", value: taskSpaceLocation }
+                  : {
+                      identity: { name: "presend-new-workspace", taskId: "presend-new-workspace" },
+                      kind: "stable_identity",
+                    })
+              : { kind: "name", value: fallbackName },
+            taskSpaceGuard ?? undefined,
+          ),
+        }),
     timeoutMs: 1_000,
     turnMarker,
   }
@@ -344,25 +431,53 @@ let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
 let focusedPolicyControl = null
 let policyReads = 0
 let sendTargetReads = 0
+let taskSpaceListReads = 0
 let taskSpaceOwnership = ${JSON.stringify(boundTaskSpaceOwnership)}
 const counters = {
   claimTaskSpace: 0,
+  composerClears: 0,
   composerFocusSettlements: 0,
   composerMutations: 0,
   injectedPromptLength: 0,
   insertText: 0,
   mouseEvents: 0,
   modelSelections: 0,
+  openNavigations: 0,
   policyActivationDeferrals: 0,
   policyActivationRetries: 0,
   policyReads: 0,
   sendTargetReads: 0,
+  switches: 0,
+  taskSpaceLists: 0,
+  taskSpaceSelections: 0,
   takeOverTaskSpace: 0,
 }
 globalThis.cliLog = (value) => console.log(value)
-globalThis.listTaskSpaces = async () => taskSpaceOwnership === null
-  ? []
-  : [{ id: 12, name: ${JSON.stringify(fallbackName)}, ownership: taskSpaceOwnership, taskId: ${JSON.stringify(fallbackName)} }]
+globalThis.listTaskSpaces = async () => {
+  taskSpaceListReads += 1
+  counters.taskSpaceLists += 1
+  if (taskSpaceOwnership !== null) {
+    return [{ id: 12, name: ${JSON.stringify(fallbackName)}, ownership: taskSpaceOwnership, taskId: ${JSON.stringify(fallbackName)} }]
+  }
+  const driftPoint = ${JSON.stringify(taskSpaceDriftAtFence)}
+  const recycled = ${JSON.stringify(recycleUnboundTaskSpace)}
+    || (driftPoint === 'before_navigation' && taskSpaceListReads >= 4)
+    || (
+      driftPoint === 'before_composition'
+      && counters.switches >= 1
+      && policyReads >= 1
+      && counters.composerMutations === 0
+    )
+    || (driftPoint === 'before_send_click' && counters.composerMutations >= 1)
+    || (${JSON.stringify(driftBetweenFocusAndInsert)} && composerFocused && counters.composerMutations === 0)
+    || (${JSON.stringify(driftBeforeCleanupRetry)} && counters.composerClears >= 1)
+  return [{
+    id: ${JSON.stringify(taskSpaceLocation)},
+    name: recycled ? 'recycled-unbound-workspace' : 'presend-new-workspace',
+    ownership: 'agent',
+    taskId: recycled ? 'recycled-unbound-workspace' : 'presend-new-workspace',
+  }]
+}
 globalThis.claimTaskSpace = async (taskSpaceId) => {
   if (taskSpaceId !== 12) throw new Error('unexpected claim target')
   counters.claimTaskSpace += 1
@@ -375,10 +490,16 @@ globalThis.takeOverTaskSpace = async (taskSpaceId) => {
   taskSpaceOwnership = 'agent'
   return { id: 12, ownership: 'agent' }
 }
-globalThis.useOrCreateTaskSpace = async (value) => ({ id: value === 12 ? 12 : 10 })
+globalThis.useOrCreateTaskSpace = async (value) => {
+  counters.taskSpaceSelections += 1
+  return { id: value === 12 ? 12 : ${JSON.stringify(taskSpaceLocation)} }
+}
 globalThis.listTabs = async () => [{ active: true, targetId: 'presend-tab' }]
-globalThis.switchTab = async () => {}
-globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
+globalThis.switchTab = async () => { counters.switches += 1 }
+globalThis.openOrReuseTab = async () => {
+  counters.openNavigations += 1
+  throw new Error('unexpected navigation')
+}
 globalThis.pageInfo = async () => ({
   url: taskSpaceOwnership === null ? 'https://chatgpt.com/' : ${JSON.stringify(canonicalUrl)},
 })
@@ -544,7 +665,10 @@ globalThis.js = async (source) => {
     if (blurred) counters.composerFocusSettlements += 1
     return { blurred, ok: true }
   }
-  if (source.includes('composer.focus()')) return true
+  if (source.includes('composer.focus()')) {
+    composerFocused = true
+    return true
+  }
   if (source.includes('const blockChildren')) return [input.prompt]
   if (source.includes('document.elementFromPoint')) {
     sendTargetReads += 1
@@ -556,10 +680,13 @@ globalThis.js = async (source) => {
     return { hit: true, ok: true, x: 10, y: 20 }
   }
   if (source.includes('composer.replaceChildren()')) {
-    composerHasDraft = false
+    counters.composerClears += 1
+    if (!${JSON.stringify(cleanupFirstAttemptFails)} || counters.composerClears > 1) {
+      composerHasDraft = false
+    }
     return true
   }
-  if (source.includes("return String(draft).trim().length === 0")) return true
+  if (source.includes("return String(draft).trim().length === 0")) return !composerHasDraft
   throw new Error('Unexpected page script: ' + source.slice(0, 120))
 }
 await ${EGO_DRIVER_SOURCE.trim()}
@@ -592,6 +719,7 @@ console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
 }
 
 async function runBoundHeadDriverCase({
+  driftAtResult = false,
   finalDraft = false,
   finalGeneration = false,
   finalUrl = null,
@@ -617,7 +745,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 13,
+    browserContractRevision: 14,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -630,6 +758,7 @@ async function runBoundHeadDriverCase({
       revision: 1,
       state: "bound",
       targetId: "reanchor-tab",
+      taskSpaceIdentity: { name: "bound", taskId: "bound" },
       taskSpaceId: 10,
     },
     brokerLease: {
@@ -640,6 +769,10 @@ async function runBoundHeadDriverCase({
     },
     expectedObservedHeadFingerprint: conversationTailFingerprint(observedEntries.at(-1)),
     mode,
+    taskSpaceGuard: completeTaskSpaceGuard({
+      identity: { name: "bound", taskId: "bound" },
+      kind: "stable_identity",
+    }),
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
   await fs.writeFile(ownerPath, JSON.stringify(input.brokerLease), { mode: 0o600 })
@@ -653,7 +786,12 @@ let generationReads = 0
 let inspectionReads = 0
 let pageInfoReads = 0
 globalThis.cliLog = (value) => console.log(value)
-globalThis.listTaskSpaces = async () => [{ id: 10, name: 'bound', ownership: 'agent' }]
+globalThis.listTaskSpaces = async () => [{
+  id: 10,
+  name: ${JSON.stringify(driftAtResult)} && entryReads > 0 ? 'drifted-before-bound-head-result' : 'bound',
+  ownership: 'agent',
+  taskId: ${JSON.stringify(driftAtResult)} && entryReads > 0 ? 'drifted-before-bound-head-result' : 'bound',
+}]
 globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
 globalThis.listTabs = async () => [{ active: true, targetId: 'reanchor-tab' }]
 globalThis.switchTab = async () => {}
@@ -711,9 +849,11 @@ await ${EGO_DRIVER_SOURCE.trim()}
 }
 
 async function runAdoptionDriverCase({
+  additionalTaskSpaces = [],
   allowTaskSpaceReclaim = false,
   currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
+  driftAtFinalResult = false,
   fallbackTaskSpaceOwnership = null,
   hydrateAnchorPrefix = false,
   interleave = false,
@@ -725,9 +865,14 @@ async function runAdoptionDriverCase({
   policyInspectionFailures = 0,
   policyUiVariant = "legacy",
   policyInitiallyMaximum = true,
+  redirectAtFinalResult = false,
   redirectAfterModelVerification = false,
   taskSpaceAvailable = true,
+  taskSpaceGuard = null,
+  taskSpaceName = "adoption-driver-space",
   taskSpaceOwnership = "agent",
+  taskSpaceSelector = 10,
+  taskSpaceTaskId = "adoption-driver-space",
   targetId = null,
   timeoutMs = 30_000,
   unrelatedActiveAfterOpen = false,
@@ -740,11 +885,12 @@ async function runAdoptionDriverCase({
   const fallbackName = `ego-chat-bound-${createHash("sha256").update("adoption-driver-test", "utf8").digest("hex").slice(0, 16)}`
   const listedTaskSpaces = [
     ...(taskSpaceAvailable
-      ? [{ id: 10, name: "adoption-driver-space", ownership: taskSpaceOwnership, taskId: "adoption-driver-space" }]
+      ? [{ id: 10, name: taskSpaceName, ownership: taskSpaceOwnership, taskId: taskSpaceTaskId }]
       : []),
     ...(fallbackTaskSpaceOwnership
       ? [{ id: 12, name: fallbackName, ownership: fallbackTaskSpaceOwnership, taskId: fallbackName }]
       : []),
+    ...additionalTaskSpaces,
   ]
   const input = {
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
@@ -764,7 +910,13 @@ async function runAdoptionDriverCase({
       thinkingEffort: "maximum_available",
     },
     targetId,
-    taskSpace: 10,
+    taskSpace: taskSpaceSelector,
+    taskSpaceGuard: completeTaskSpaceGuard(
+      Number.isSafeInteger(taskSpaceSelector)
+        ? { kind: "numeric_location", value: taskSpaceSelector }
+        : { kind: "legacy_string", value: String(taskSpaceSelector) },
+      taskSpaceGuard ?? undefined,
+    ),
     timeoutMs,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
@@ -790,6 +942,7 @@ let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
 let pageInspection = 0
 let pageInfoRead = 0
 let pageUrlOverride = null
+let finalCaptureRead = false
 let openedRecoveredTab = false
 let messageReads = 0
 const pageStates = ${JSON.stringify(pageStates)}
@@ -823,7 +976,13 @@ const messages = () => {
 }
 globalThis.cliLog = (value) => console.log(value)
 let listedTaskSpaces = ${JSON.stringify(listedTaskSpaces)}
-globalThis.listTaskSpaces = async () => listedTaskSpaces
+globalThis.listTaskSpaces = async () => finalCaptureRead && ${JSON.stringify(driftAtFinalResult)}
+  ? listedTaskSpaces.map((space) => ({
+      ...space,
+      name: 'drifted-before-adoption-result',
+      taskId: 'drifted-before-adoption-result',
+    }))
+  : listedTaskSpaces
 globalThis.claimTaskSpace = async (id) => {
   listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
 }
@@ -835,7 +994,7 @@ globalThis.useOrCreateTaskSpace = async (value) => {
   if (!${JSON.stringify(taskSpaceAvailable)} && value === 10) {
     throw new Error('No task space matches numeric id 10')
   }
-  return { id: value === 10 ? 10 : 11 }
+  return { id: value === 10 || value === ${JSON.stringify(taskSpaceName)} ? 10 : 11 }
 }
 globalThis.listTabs = async () => {
   if (!${JSON.stringify(taskSpaceAvailable)}) {
@@ -860,7 +1019,15 @@ globalThis.openOrReuseTab = async () => {
 globalThis.pageInfo = async () => {
   const sequencedUrl = pageUrls?.[Math.min(pageInfoRead, pageUrls.length - 1)]
   pageInfoRead += 1
-  return { url: pageUrlOverride || sequencedUrl || pageUrl || canonicalUrl }
+  return {
+    url: pageUrlOverride
+      || (finalCaptureRead && ${JSON.stringify(redirectAtFinalResult)}
+        ? 'https://chatgpt.com/c/adoption-result-retargeted'
+        : null)
+      || sequencedUrl
+      || pageUrl
+      || canonicalUrl,
+  }
 }
 globalThis.snapshotText = async () => (
   pageStates[Math.min(pageInspection, pageStates.length - 1)] === 'verification'
@@ -941,8 +1108,16 @@ globalThis.js = async (source) => {
   if (source.includes('composer.contains(active)')) {
     return { blurred: false, ok: true }
   }
-  if (source.includes("const messageNodes = [")) {
-    return messages()
+  if (
+    source.includes("const messageNodes = [")
+    || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
+  ) {
+    const result = messages()
+    if (
+      (${JSON.stringify(driftAtFinalResult)} || ${JSON.stringify(redirectAtFinalResult)})
+      && policyInspections > 0
+    ) finalCaptureRead = true
+    return result
   }
   if (source.includes('selectorKind: classPills.length') && !source.includes('visibleModelChoiceCount')) {
     return {
@@ -1065,32 +1240,78 @@ async function runTaskSpaceReconciliationCase({
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
   bindingState = "bound",
+  bindingKey = "ego-chat-main",
+  brokerFenceChangesDuringReclaimRelist = false,
   captureContinuationAllowed = false,
+  canonicalUrl = "https://chatgpt.com/c/reconcile-driver-test",
   composerDraft = "",
+  createdTaskSpaceIdentity = undefined,
+  duplicateAfterSelection = false,
+  duplicateFallback = false,
+  duplicateFallbackAfterCreation = false,
+  duplicateIdentity = false,
+  driftAfterConversationRead = false,
   fallbackTaskSpaceOwnership = null,
+  fallbackTaskId = null,
   generationRunning = false,
   imageOnlyResponse = false,
+  identityTaskSpaceLiveIdentity = null,
+  identityTaskSpaceOwnership = null,
   mode = "reconcile_bound",
+  ownershipAfterSelection = null,
+  postSelectionConflictingIdentity = null,
   promptIdentityMatches = true,
+  postReclaimIdentity = null,
+  recycleBeforeReclaim = false,
   requestedTaskSpaceOwnership = null,
   responseText = "Partial review",
   sentCanonicalUrl = null,
+  createdTaskSpaceTaskId = null,
+  recycleIdentityAfterSelection = false,
+  selectorIdentityOverride = null,
+  taskSpaceIdentity = null,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
-  const canonicalUrl = "https://chatgpt.com/c/reconcile-driver-test"
-  const fallbackName = `ego-chat-bound-${createHash("sha256").update("ego-chat-main", "utf8").digest("hex").slice(0, 16)}`
+  const fallbackName = `ego-chat-bound-${createHash("sha256").update(`canonical-conversation\0${canonicalUrl}`, "utf8").digest("hex").slice(0, 32)}`
+  const effectiveTaskSpaceIdentity = taskSpaceIdentity ?? (
+    adoptedTaskSpaceOwnership
+      ? { name: "adoption-driver-space", taskId: "adoption-driver-space" }
+      : bindingState === "unbound"
+        ? { name: "create-once-driver-space", taskId: "create-once-driver-space" }
+        : null
+  )
   const listedTaskSpaces = [
     ...(adoptedTaskSpaceOwnership
       ? [{ id: 10, name: "adoption-driver-space", ownership: adoptedTaskSpaceOwnership, taskId: "adoption-driver-space" }]
+      : []),
+    ...(bindingState === "unbound"
+      ? [{ id: 10, ...effectiveTaskSpaceIdentity, ownership: "agent" }]
       : []),
     ...(requestedTaskSpaceOwnership
       ? [{ id: 10, name: "unrelated-agent-space", ownership: requestedTaskSpaceOwnership, taskId: "unrelated-agent-space" }]
       : []),
     ...(fallbackTaskSpaceOwnership
-      ? [{ id: 12, name: fallbackName, ownership: fallbackTaskSpaceOwnership, taskId: fallbackName }]
+      ? [{
+          id: 12,
+          name: fallbackName,
+          ownership: fallbackTaskSpaceOwnership,
+          taskId: fallbackTaskId ?? fallbackName,
+        }]
+      : []),
+    ...(duplicateFallback
+      ? [
+          { id: 15, name: fallbackName, ownership: "agent", taskId: fallbackName },
+          { id: 16, name: fallbackName, ownership: "agent", taskId: fallbackName },
+        ]
+      : []),
+    ...(identityTaskSpaceOwnership && effectiveTaskSpaceIdentity
+      ? [{ id: 13, ...(identityTaskSpaceLiveIdentity || effectiveTaskSpaceIdentity), ownership: identityTaskSpaceOwnership }]
+      : []),
+    ...(duplicateIdentity && effectiveTaskSpaceIdentity
+      ? [{ id: 14, ...effectiveTaskSpaceIdentity, ownership: "agent" }]
       : []),
   ]
   const previousText = "Prior assistant response."
@@ -1126,19 +1347,12 @@ async function runTaskSpaceReconciliationCase({
     binding: {
       canonicalUrl: bindingState === "bound" ? canonicalUrl : null,
       headRole: bindingState === "bound" ? "assistant" : null,
-      key: "ego-chat-main",
+      key: bindingKey,
       messageCount: bindingState === "bound" ? 2 : 0,
       startUrl: bindingState === "bound" ? canonicalUrl : "https://chatgpt.com/",
       state: bindingState,
       targetId: bindingState === "bound" ? "stale-bound-tab" : "recovered-bound-tab",
-      ...(adoptedTaskSpaceOwnership
-        ? {
-            taskSpaceIdentity: {
-              name: "adoption-driver-space",
-              taskId: "adoption-driver-space",
-            },
-          }
-        : {}),
+      ...(effectiveTaskSpaceIdentity ? { taskSpaceIdentity: effectiveTaskSpaceIdentity } : {}),
       taskSpaceId: 10,
     },
     brokerLease: {
@@ -1147,7 +1361,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 13,
+    browserContractRevision: 14,
     canonicalUrl: sentCanonicalUrl ?? canonicalUrl,
     ...(mode === "capture_attachment_execution"
       ? {
@@ -1164,6 +1378,11 @@ async function runTaskSpaceReconciliationCase({
     mode,
     promptMessageId,
     timeoutMs: mode === "capture_exchange" ? 1 : 1_000,
+    taskSpaceGuard: completeTaskSpaceGuard(
+      completeTaskSpaceIdentity(effectiveTaskSpaceIdentity)
+        ? { identity: effectiveTaskSpaceIdentity, kind: "stable_identity" }
+        : { kind: "name", value: fallbackName },
+    ),
     turnMarker,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
@@ -1176,27 +1395,104 @@ async function runTaskSpaceReconciliationCase({
 
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
+const fs = await import('node:fs/promises')
 let opened = ${JSON.stringify(bindingState === "unbound")}
 let composerDraft = ${JSON.stringify(composerDraft)}
+let driftTaskSpace = false
+let listTaskSpaceCalls = 0
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
 globalThis.cliLog = (value) => console.log(value)
 const fallbackName = ${JSON.stringify(fallbackName)}
 let listedTaskSpaces = ${JSON.stringify(listedTaskSpaces)}
-globalThis.listTaskSpaces = async () => listedTaskSpaces
+globalThis.listTaskSpaces = async () => {
+  listTaskSpaceCalls += 1
+  if (${JSON.stringify(brokerFenceChangesDuringReclaimRelist)} && listTaskSpaceCalls === 2) {
+    await fs.writeFile(${JSON.stringify(ownerPath)}, JSON.stringify({
+      brokerId: 'replacement-broker',
+      epoch: 2,
+      pid: process.pid,
+    }))
+  }
+  if (${JSON.stringify(recycleBeforeReclaim)} && listTaskSpaceCalls === 2) {
+    listedTaskSpaces = listedTaskSpaces.map((space) => space.id === 12
+      ? { id: 12, name: 'recycled-before-reclaim', ownership: space.ownership, taskId: 'recycled-before-reclaim' }
+      : space)
+  }
+  return driftTaskSpace
+    ? listedTaskSpaces.map((space) => ({
+        ...space,
+        name: 'drifted-before-result',
+        taskId: 'drifted-before-result',
+      }))
+    : listedTaskSpaces
+}
 globalThis.claimTaskSpace = async (id) => {
   counters.claimTaskSpace += 1
-  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id
+    ? { ...space, ...(${JSON.stringify(postReclaimIdentity)} || {}), ownership: 'agent' }
+    : space)
 }
 globalThis.takeOverTaskSpace = async (id) => {
   counters.takeOverTaskSpace += 1
-  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
+  listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id
+    ? { ...space, ...(${JSON.stringify(postReclaimIdentity)} || {}), ownership: 'agent' }
+    : space)
 }
 globalThis.useOrCreateTaskSpace = async (value) => {
   taskSpaceRequests.push(value)
   if (value === 10) return { id: 10 }
   if (value === 12) return { id: 12 }
-  if (value === fallbackName) return { id: 11 }
+  if (value === 13) {
+    if (${JSON.stringify(recycleIdentityAfterSelection)}) {
+      listedTaskSpaces = listedTaskSpaces.map((space) => space.id === 13
+        ? { id: 13, name: 'recycled-after-selection', ownership: 'agent', taskId: 'recycled-after-selection' }
+        : space)
+    }
+    if (${JSON.stringify(duplicateAfterSelection)}) {
+      listedTaskSpaces.push({ ...listedTaskSpaces.find((space) => space.id === 13) })
+    }
+    if (${JSON.stringify(ownershipAfterSelection)} !== null) {
+      listedTaskSpaces = listedTaskSpaces.map((space) => space.id === 13
+        ? { ...space, ownership: ${JSON.stringify(ownershipAfterSelection)} }
+        : space)
+    }
+    return { id: 13, ...(${JSON.stringify(selectorIdentityOverride)} || {}) }
+  }
+  if (value === 14) return { id: 14 }
+  if (value === fallbackName) {
+    if (!listedTaskSpaces.some((space) => space.name === fallbackName)) {
+      const configuredIdentity = ${JSON.stringify(createdTaskSpaceIdentity ?? "__default_identity__")}
+      listedTaskSpaces.push({
+        id: 11,
+        ...(configuredIdentity === '__default_identity__'
+          ? { name: fallbackName, taskId: ${JSON.stringify(createdTaskSpaceTaskId)} || fallbackName }
+          : configuredIdentity),
+        ownership: 'agent',
+      })
+      if (${JSON.stringify(duplicateFallbackAfterCreation)}) {
+        listedTaskSpaces.push({
+          id: 17,
+          name: fallbackName,
+          ownership: 'agent',
+          taskId: fallbackName,
+        })
+      }
+      if (${JSON.stringify(postSelectionConflictingIdentity)} !== null) {
+        listedTaskSpaces.push({
+          id: 18,
+          ...${JSON.stringify(postSelectionConflictingIdentity)},
+          ownership: 'agent',
+        })
+      }
+    }
+    if (${JSON.stringify(ownershipAfterSelection)} !== null) {
+      listedTaskSpaces = listedTaskSpaces.map((space) => space.name === fallbackName
+        ? { ...space, ownership: ${JSON.stringify(ownershipAfterSelection)} }
+        : space)
+    }
+    return { id: listedTaskSpaces.find((space) => space.name === fallbackName)?.id ?? 11 }
+  }
   throw new Error('Unexpected task space request: ' + value)
 }
 globalThis.listTabs = async () => opened ? [{ active: true, targetId: 'recovered-bound-tab' }] : []
@@ -1230,10 +1526,15 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("const messageNodes = [")) {
-    return ${JSON.stringify(mode === "capture_exchange"
+  if (
+    source.includes("const messageNodes = [")
+    || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
+  ) {
+    const result = ${JSON.stringify(mode === "capture_exchange"
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
+    if (${JSON.stringify(driftAfterConversationRead)}) driftTaskSpace = true
+    return result
   }
   if (source.includes('ego-chat-attachment-graph-observation/v1')) {
     return ${JSON.stringify(attachmentObservation)}
@@ -1445,6 +1746,19 @@ test("a persistent external tail returns classified evidence without changing br
   )
 })
 
+test("verify and re-anchor re-observe live task-space identity before returning a head", async () => {
+  for (const options of [
+    { driftAtResult: true },
+    { driftAtResult: true, hydrateToBinding: true, mode: "verify" },
+  ]) {
+    await assert.rejects(
+      runBoundHeadDriverCase(options),
+      (error) => error.code === "human_required"
+        && error.details?.reason === "bound_task_space_identity_changed",
+    )
+  }
+})
+
 test("per-operation Ego driver source embeds only a private unique mailbox path", () => {
   const inputPath = `/tmp/egc-driver-${process.getuid()}/input-${process.pid}-123e4567-e89b-42d3-a456-426614174000.json`
   const source = egoDriverSourceForInput(inputPath)
@@ -1584,7 +1898,7 @@ process.stdin.on("end", () => {
   t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
   assert.equal((await adapter.initialize()).files, 1)
   await assert.rejects(
-    adapter.preflight({ taskSpace: 10 }),
+    preflightWithGuard(adapter, 10),
     (error) => error.code === "driver_mailbox_capacity_exhausted"
       && error.details.requiredFiles === 2,
   )
@@ -1600,12 +1914,12 @@ process.stdin.on("end", () => {
     mailboxRetentionMs: 60_000,
   })
   await assert.rejects(
-    byteLimitedAdapter.preflight({ taskSpace: 10 }),
+    preflightWithGuard(byteLimitedAdapter, 10),
     (error) => error.code === "driver_mailbox_capacity_exhausted"
       && error.details.requiredBytes > error.details.byteLimit,
   )
   await assert.rejects(fs.access(spawnedPath), { code: "ENOENT" })
-  assert.equal((await adapter.preflight({ taskSpace: 10 })).safe, true)
+  assert.equal((await preflightWithGuard(adapter, 10)).safe, true)
   await fs.access(spawnedPath)
   assert.deepEqual(await fs.readdir(mailboxDirectory), [])
 })
@@ -1640,6 +1954,14 @@ test("child-read acknowledgement removes the prompt-bearing path before long bro
   const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-mailbox-consume-test-"))
   const consumedPath = path.join(fixtureDirectory, "consumed")
   const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  const ownerPath = path.join(fixtureDirectory, "owner.json")
+  const brokerLease = {
+    brokerId: "mailbox-consume-broker",
+    epoch: 1,
+    ownerPath,
+    pid: process.pid,
+  }
+  await fs.writeFile(ownerPath, JSON.stringify(brokerLease), { mode: 0o600 })
   await fs.writeFile(command, `#!/usr/bin/env node
 import fs from "node:fs/promises"
 let source = ""
@@ -1657,6 +1979,12 @@ process.stdin.on("end", async () => {
     await new Promise((resolve) => setTimeout(resolve, 500))
     return { id: 10 }
   }
+  globalThis.listTaskSpaces = async () => [{
+    id: 10,
+    name: "mailbox-consume-space",
+    ownership: "agent",
+    taskId: "mailbox-consume-space",
+  }]
   globalThis.openOrReuseTab = async () => ({ active: true, targetId: "consume-tab" })
   globalThis.listTabs = async () => [{ active: true, targetId: "consume-tab" }]
   globalThis.pageInfo = async () => ({ url: "https://chatgpt.com/" })
@@ -1673,13 +2001,14 @@ process.stdin.on("end", async () => {
 `, { mode: 0o700 })
   const adapter = new EgoAdapter({
     brokerLease: {
+      ...brokerLease,
       registerChild: async () => {},
       unregisterChild: async () => {},
     },
     command,
   })
   t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
-  const running = adapter.preflight({ taskSpace: 10 })
+  const running = preflightWithGuard(adapter, 10)
   for (let attempt = 0; attempt < 80; attempt += 1) {
     try {
       await fs.access(consumedPath)
@@ -1733,7 +2062,7 @@ process.stdin.on("end", () => {
     command,
   })
 
-  const result = await adapter.preflight({ taskSpace: 10 })
+  const result = await preflightWithGuard(adapter, 10)
   assert.equal(result.safe, true)
   assert.equal(lifecycle.length, 2)
   assert.equal(lifecycle[0][0], "register")
@@ -1774,14 +2103,58 @@ process.stdin.on("end", async () => {
   })
 
   const results = await Promise.all([
-    adapter.preflight({ taskSpace: 10 }),
-    adapter.preflight({ taskSpace: 11 }),
+    preflightWithGuard(adapter, 10),
+    preflightWithGuard(adapter, 11),
   ])
 
   assert.deepEqual(results, [
     { overlapped: false },
     { overlapped: false },
   ])
+})
+
+test("queued browser work computes admission after the preceding in-lane result reservation", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-adapter-admission-test-"))
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  await fs.writeFile(command, `#!/usr/bin/env node
+let source = ""
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => { source += chunk })
+process.stdin.on("end", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  const envelope = Buffer.from(JSON.stringify({ ok: true, result: { reserved: true } }), "utf8").toString("base64url")
+  process.stdout.write("${EGO_DRIVER_RESULT_PREFIX}" + envelope + "\\n")
+})
+`, { mode: 0o700 })
+  const adapter = new EgoAdapter({
+    command,
+    mailboxDirectory: path.join(fixtureDirectory, "mailbox"),
+  })
+  let firstReserved = false
+  let secondAdmissionObservedReservation = false
+
+  const first = adapter.bind(
+    { bindingKey: "first", mode: "existing" },
+    undefined,
+    () => {
+      firstReserved = true
+    },
+    () => ({ admissionGeneration: "first" }),
+  )
+  const second = adapter.adopt(
+    { timeoutMs: 1_000 },
+    undefined,
+    undefined,
+    () => {
+      secondAdmissionObservedReservation = firstReserved
+      return { admissionGeneration: "second" }
+    },
+  )
+
+  await Promise.all([first, second])
+  assert.equal(firstReserved, true)
+  assert.equal(secondAdmissionObservedReservation, true)
 })
 
 test("Ego adapter bounds one capture turn and preserves the durable outer deadline", async (t) => {
@@ -1872,7 +2245,7 @@ setInterval(() => {}, 1000)
   })
 
   await assert.rejects(
-    adapter.preflight({ taskSpace: 10 }),
+    preflightWithGuard(adapter, 10),
     /simulated durable child registration failure/,
   )
   assert.throws(() => process.kill(registeredPid, 0), { code: "ESRCH" })
@@ -1925,7 +2298,7 @@ setInterval(() => {}, 1000)
     command,
     mailboxDirectory,
   })
-  const running = adapter.preflight({ taskSpace: 10 })
+  const running = preflightWithGuard(adapter, 10)
   const runningResult = running.then(
     (value) => ({ value }),
     (error) => ({ error }),
@@ -1967,7 +2340,7 @@ setInterval(() => {}, 1000)
   assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" })
   assert.deepEqual(await fs.readdir(mailboxDirectory), [])
   await assert.rejects(
-    adapter.preflight({ taskSpace: 10 }),
+    preflightWithGuard(adapter, 10),
     (error) => error.code === "ego_adapter_draining",
   )
 })
@@ -2172,6 +2545,203 @@ test("a broker fence change after Send hit-testing stops before dispatch", async
   assert.equal(stopped.counters.mouseEvents, 0)
 })
 
+test("create-once continuation requires its persisted stable task-space identity", async () => {
+  const stopped = await runPreSendDriverCase({ omitUnboundTaskSpaceIdentity: true })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "task_space_identity_missing")
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.composerClears, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+  assert.equal(stopped.counters.openNavigations, 0)
+  assert.equal(stopped.counters.switches, 0)
+})
+
+test("create-once continuation rejects a recycled numeric task-space id", async () => {
+  const stopped = await runPreSendDriverCase({ recycleUnboundTaskSpace: true })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.composerClears, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+  assert.equal(stopped.counters.openNavigations, 0)
+  assert.equal(stopped.counters.switches, 0)
+})
+
+test("browser-observed task-space locations must be safe positive integers before selection", async () => {
+  const stopped = await runPreSendDriverCase({ taskSpaceLocation: Number.MAX_SAFE_INTEGER + 1 })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "task_space_identity_unavailable")
+  assert.equal(stopped.counters.taskSpaceSelections, 0)
+  assert.equal(stopped.counters.switches, 0)
+  assert.equal(stopped.counters.openNavigations, 0)
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("selected task-space identity is re-proved at every critical browser action", async () => {
+  for (const taskSpaceDriftAtFence of [
+    "before_navigation",
+    "before_composition",
+    "before_send_click",
+  ]) {
+    const stopped = await runPreSendDriverCase({ taskSpaceDriftAtFence })
+    assert.equal(stopped.error?.code, "human_required")
+    assert.equal(stopped.error?.details?.reason, "bound_task_space_identity_changed")
+    assert.equal(stopped.counters.composerClears, 0)
+    assert.equal(stopped.counters.mouseEvents, 0)
+    assert.equal(stopped.counters.openNavigations, 0)
+    assert.equal(
+      stopped.counters.composerMutations,
+      taskSpaceDriftAtFence === "before_send_click" ? 1 : 0,
+    )
+    assert.equal(
+      stopped.counters.switches,
+      taskSpaceDriftAtFence === "before_navigation" ? 0 : 1,
+    )
+  }
+})
+
+test("broker task-space guards reject exact and half conflicts before numeric selection", async () => {
+  const selectedIdentity = { name: "presend-new-workspace", taskId: "presend-new-workspace" }
+  for (const deniedIdentity of [
+    selectedIdentity,
+    { name: selectedIdentity.name, taskId: "other-task-id" },
+    { name: "other-workspace", taskId: selectedIdentity.taskId },
+  ]) {
+    const stopped = await runPreSendDriverCase({
+      taskSpaceGuard: { deniedIdentities: [deniedIdentity] },
+    })
+    assert.equal(stopped.error?.code, "human_required")
+    assert.ok([
+      "task_space_guard_invalid",
+      "task_space_identity_already_bound",
+      "task_space_identity_conflict",
+    ].includes(stopped.error?.details?.reason))
+    assert.equal(stopped.counters.taskSpaceSelections, 0)
+    assert.equal(stopped.counters.switches, 0)
+    assert.equal(stopped.counters.openNavigations, 0)
+    assert.equal(stopped.counters.composerMutations, 0)
+    assert.equal(stopped.counters.composerClears, 0)
+    assert.equal(stopped.counters.mouseEvents, 0)
+  }
+
+  for (const deniedSelector of [
+    { identity: { name: selectedIdentity.name, taskId: "foreign-task-id" }, kind: "stable_identity" },
+    { identity: { name: "foreign-space", taskId: selectedIdentity.taskId }, kind: "stable_identity" },
+  ]) {
+    const stopped = await runPreSendDriverCase({
+      taskSpaceGuard: { deniedSelectors: [deniedSelector] },
+    })
+    assert.equal(stopped.error?.code, "human_required")
+    assert.ok([
+      "task_space_guard_invalid",
+      "task_space_selector_reserved",
+    ].includes(stopped.error?.details?.reason))
+    assert.equal(stopped.counters.taskSpaceSelections, 0)
+    assert.equal(stopped.counters.openNavigations, 0)
+    assert.equal(stopped.counters.composerMutations, 0)
+    assert.equal(stopped.counters.mouseEvents, 0)
+  }
+
+  const distinct = await runPreSendDriverCase({
+    downgradeAtPresend: true,
+    taskSpaceGuard: {
+      deniedIdentities: [{ name: "other-workspace", taskId: "other-task-id" }],
+    },
+  })
+  assert.equal(distinct.error?.details?.reason, "model_policy_mismatch")
+  assert.equal(distinct.counters.taskSpaceSelections, 1)
+  assert.equal(distinct.counters.switches, 1)
+  assert.equal(distinct.counters.composerMutations, 1)
+})
+
+test("missing or malformed task-space guards fail before browser discovery or mutation", async () => {
+  const identity = { name: "presend-new-workspace", taskId: "presend-new-workspace" }
+  const ownerSelector = { identity, kind: "stable_identity" }
+  const malformedGuards = [
+    null,
+    {},
+    { deniedIdentities: [], deniedSelectors: [], ownerSelector, revision: 2 },
+    { deniedIdentities: [], deniedSelectors: [], extra: true, ownerSelector, revision: 1 },
+    { deniedIdentities: {}, deniedSelectors: [], ownerSelector, revision: 1 },
+    {
+      deniedIdentities: [{ name: "incomplete" }],
+      deniedSelectors: [],
+      ownerSelector,
+      revision: 1,
+    },
+    {
+      deniedIdentities: [
+        { name: "denied", taskId: "denied-task" },
+        { name: "denied", taskId: "denied-task" },
+      ],
+      deniedSelectors: [],
+      ownerSelector,
+      revision: 1,
+    },
+    {
+      deniedIdentities: [
+        { name: "denied", taskId: "denied-a" },
+        { name: "denied", taskId: "denied-b" },
+      ],
+      deniedSelectors: [],
+      ownerSelector,
+      revision: 1,
+    },
+    {
+      deniedIdentities: [],
+      deniedSelectors: [
+        { kind: "name", value: "reserved" },
+        { kind: "legacy_string", value: "reserved" },
+      ],
+      ownerSelector,
+      revision: 1,
+    },
+    {
+      deniedIdentities: [identity],
+      deniedSelectors: [],
+      ownerSelector,
+      revision: 1,
+    },
+    {
+      deniedIdentities: [],
+      deniedSelectors: [],
+      ownerSelector: { kind: "name", value: "bad\nselector" },
+      revision: 1,
+    },
+  ]
+
+  for (const rawTaskSpaceGuard of malformedGuards) {
+    const stopped = await runPreSendDriverCase({ rawTaskSpaceGuard })
+    assert.equal(stopped.error?.code, "human_required")
+    assert.equal(stopped.error?.details?.reason, "task_space_guard_invalid")
+    assert.equal(stopped.counters.taskSpaceLists, 0)
+    assert.equal(stopped.counters.taskSpaceSelections, 0)
+    assert.equal(stopped.counters.switches, 0)
+    assert.equal(stopped.counters.openNavigations, 0)
+    assert.equal(stopped.counters.composerMutations, 0)
+    assert.equal(stopped.counters.mouseEvents, 0)
+  }
+})
+
+test("composer identity fences cover focus-to-insert and every cleanup retry", async () => {
+  const beforeInsert = await runPreSendDriverCase({ driftBetweenFocusAndInsert: true })
+  assert.equal(beforeInsert.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.equal(beforeInsert.counters.composerMutations, 0)
+  assert.equal(beforeInsert.counters.composerClears, 0)
+  assert.equal(beforeInsert.counters.mouseEvents, 0)
+
+  const beforeRetry = await runPreSendDriverCase({
+    cleanupFirstAttemptFails: true,
+    downgradeAtPresend: true,
+    driftBeforeCleanupRetry: true,
+  })
+  assert.equal(beforeRetry.error?.details?.reason, "model_policy_mismatch")
+  assert.equal(beforeRetry.counters.composerMutations, 1)
+  assert.equal(beforeRetry.counters.composerClears, 1)
+  assert.equal(beforeRetry.counters.mouseEvents, 0)
+})
+
 test("driver envelope returns structured data without log scraping", () => {
   const result = decodeDriverResult(envelope({ ok: true, result: { accountState: "authenticated" } }))
   assert.deepEqual(result, { accountState: "authenticated" })
@@ -2238,6 +2808,10 @@ test("conversation adoption waits for a stable assistant tail without composing 
   assert.equal(adopted.result.anchor.messageId, "adopt-user-1")
   assert.equal(adopted.result.head.lastMessageId, "adopt-assistant-1")
   assert.equal(adopted.result.responseText, "The stable long review is complete.")
+  assert.deepEqual(adopted.result.taskSpaceIdentity, {
+    name: "adoption-driver-space",
+    taskId: "adoption-driver-space",
+  })
   assert.deepEqual(adopted.taskSpaceRequests, [10])
   assert.deepEqual(adopted.counters, {
     click: 2,
@@ -2247,6 +2821,101 @@ test("conversation adoption waits for a stable assistant tail without composing 
     typeText: 0,
     waits: 4,
   })
+})
+
+test("conversation adoption treats the recovery name and opaque task ID as independent identity fields", async () => {
+  const adopted = await runAdoptionDriverCase({
+    additionalTaskSpaces: [{
+      id: 13,
+      name: "unrelated-name",
+      ownership: "agent",
+      taskId: "adoption-driver-space",
+    }],
+    taskSpaceGuard: { deniedIdentities: [], expectedName: "adoption-driver-space" },
+    taskSpaceSelector: "adoption-driver-space",
+    taskSpaceTaskId: "opaque-adoption-driver-task-id",
+  })
+  assert.equal(adopted.error, undefined)
+  assert.deepEqual(adopted.result.taskSpaceIdentity, {
+    name: "adoption-driver-space",
+    taskId: "opaque-adoption-driver-task-id",
+  })
+  assert.deepEqual(adopted.taskSpaceRequests, [10])
+
+  const wrongName = await runAdoptionDriverCase({
+    taskSpaceGuard: { deniedIdentities: [], expectedName: "expected-recovery-name" },
+    taskSpaceName: "same-selector-but-wrong-name",
+    taskSpaceTaskId: "expected-recovery-name",
+  })
+  assert.equal(wrongName.error?.details?.reason, "task_space_selector_ambiguous")
+  assert.deepEqual(wrongName.taskSpaceRequests, [])
+  assert.equal(wrongName.counters.sendClick, 0)
+})
+
+test("typed task-space selectors distinguish names, opaque task IDs, and legacy ambiguity", async () => {
+  const opaqueTaskId = "opaque-adoption-task-id"
+  const byTaskId = await runAdoptionDriverCase({
+    taskSpaceGuard: completeTaskSpaceGuard({ kind: "task_id", value: opaqueTaskId }),
+    taskSpaceName: "independent-adoption-name",
+    taskSpaceSelector: opaqueTaskId,
+    taskSpaceTaskId: opaqueTaskId,
+  })
+  assert.equal(byTaskId.error, undefined)
+  assert.deepEqual(byTaskId.result.taskSpaceIdentity, {
+    name: "independent-adoption-name",
+    taskId: opaqueTaskId,
+  })
+  assert.deepEqual(byTaskId.taskSpaceRequests, [10])
+
+  const splitLegacy = await runAdoptionDriverCase({
+    additionalTaskSpaces: [{
+      id: 13,
+      name: "different-name",
+      ownership: "agent",
+      taskId: "shared-legacy-selector",
+    }],
+    taskSpaceGuard: completeTaskSpaceGuard({ kind: "legacy_string", value: "shared-legacy-selector" }),
+    taskSpaceName: "shared-legacy-selector",
+    taskSpaceSelector: "shared-legacy-selector",
+    taskSpaceTaskId: "different-task-id",
+  })
+  assert.equal(splitLegacy.error?.details?.reason, "task_space_identity_ambiguous")
+  assert.deepEqual(splitLegacy.taskSpaceRequests, [])
+  assert.equal(splitLegacy.counters.sendClick, 0)
+
+  const namedDecoy = await runAdoptionDriverCase({
+    taskSpaceGuard: completeTaskSpaceGuard({ kind: "name", value: "named-workspace" }),
+    taskSpaceName: "unrelated-workspace",
+    taskSpaceSelector: "named-workspace",
+    taskSpaceTaskId: "named-workspace",
+  })
+  assert.equal(namedDecoy.error?.details?.reason, "task_space_selector_ambiguous")
+  assert.deepEqual(namedDecoy.taskSpaceRequests, [])
+  assert.equal(namedDecoy.counters.sendClick, 0)
+
+  const incompleteNamedDecoy = await runAdoptionDriverCase({
+    additionalTaskSpaces: [{
+      id: 13,
+      ownership: "agent",
+      taskId: "incomplete-named-workspace",
+    }],
+    taskSpaceGuard: completeTaskSpaceGuard({ kind: "name", value: "incomplete-named-workspace" }),
+    taskSpaceName: "unrelated-workspace",
+    taskSpaceSelector: "incomplete-named-workspace",
+    taskSpaceTaskId: "unrelated-task-id",
+  })
+  assert.equal(incompleteNamedDecoy.error?.details?.reason, "task_space_identity_invalid")
+  assert.deepEqual(incompleteNamedDecoy.taskSpaceRequests, [])
+  assert.equal(incompleteNamedDecoy.counters.sendClick, 0)
+
+  const missingLegacy = await runAdoptionDriverCase({
+    taskSpaceAvailable: false,
+    taskSpaceGuard: completeTaskSpaceGuard({ kind: "legacy_string", value: "missing-legacy" }),
+    taskSpaceSelector: "missing-legacy",
+  })
+  assert.equal(missingLegacy.error?.details?.reason, "task_space_identity_unavailable")
+  assert.deepEqual(missingLegacy.taskSpaceRequests, [])
+  assert.equal(missingLegacy.counters.sendClick, 0)
 })
 
 test("conversation adoption tolerates transient ChatGPT hydration without asking for authentication", async () => {
@@ -2395,6 +3064,17 @@ test("conversation adoption rechecks the URL after maximum-model verification", 
   assert.equal(adopted.counters.typeText, 0)
 })
 
+test("conversation adoption emits only a freshly observed actual canonical URL", async () => {
+  const adopted = await runAdoptionDriverCase({ redirectAtFinalResult: true })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "canonical_conversation_changed")
+  assert.equal(adopted.counters.sendClick, 0)
+  assert.equal(adopted.counters.fillInput, 0)
+  assert.equal(adopted.counters.pressKey, 0)
+  assert.equal(adopted.counters.typeText, 0)
+})
+
 test("conversation adoption reads the current semantic model policy", async () => {
   const adopted = await runAdoptionDriverCase({ policyUiVariant: "current" })
   assert.equal(adopted.error, undefined)
@@ -2511,7 +3191,7 @@ test("bound recovery reopens a canonical conversation after its task space disap
   assert.equal(reconciled.error, undefined)
   assert.equal(reconciled.result.deliveryState, "absent")
   assert.equal(reconciled.result.taskSpaceId, 11)
-  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
   assert.deepEqual(reconciled.counters, {
     claimTaskSpace: 0,
@@ -2523,6 +3203,25 @@ test("bound recovery reopens a canonical conversation after its task space disap
   })
 })
 
+test("deterministic recovery preserves an independently assigned opaque task ID", async () => {
+  const existing = await runTaskSpaceReconciliationCase({
+    fallbackTaskId: "opaque-existing-task-id",
+    fallbackTaskSpaceOwnership: "agent",
+  })
+  assert.equal(existing.error, undefined)
+  assert.match(existing.result.taskSpaceIdentity.name, /^ego-chat-bound-[a-f0-9]{32}$/)
+  assert.equal(existing.result.taskSpaceIdentity.taskId, "opaque-existing-task-id")
+  assert.deepEqual(existing.taskSpaceRequests, [12])
+
+  const created = await runTaskSpaceReconciliationCase({
+    createdTaskSpaceTaskId: "opaque-created-task-id",
+  })
+  assert.equal(created.error, undefined)
+  assert.equal(created.result.taskSpaceIdentity.taskId, "opaque-created-task-id")
+  assert.match(created.result.taskSpaceIdentity.name, /^ego-chat-bound-[a-f0-9]{32}$/)
+  assert.deepEqual(created.taskSpaceRequests, [created.result.taskSpaceIdentity.name])
+})
+
 test("bound recovery ignores a recycled agent-owned numeric task space", async () => {
   const reconciled = await runTaskSpaceReconciliationCase({
     requestedTaskSpaceOwnership: "agent",
@@ -2530,7 +3229,7 @@ test("bound recovery ignores a recycled agent-owned numeric task space", async (
   assert.equal(reconciled.error, undefined)
   assert.equal(reconciled.result.deliveryState, "absent")
   assert.equal(reconciled.result.taskSpaceId, 11)
-  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
 })
 
@@ -2541,7 +3240,7 @@ test("bound recovery ignores a recycled user-controlled numeric task space", asy
   assert.equal(reconciled.error, undefined)
   assert.equal(reconciled.result.deliveryState, "absent")
   assert.equal(reconciled.result.taskSpaceId, 11)
-  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{16}$/)
+  assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
 })
 
@@ -2566,6 +3265,326 @@ test("bound recovery reclaims the adopted task-space identity before reuse", asy
   assert.equal(reconciled.counters.claimTaskSpace, 0)
   assert.equal(reconciled.counters.takeOverTaskSpace, 1)
   assert.deepEqual(reconciled.taskSpaceRequests, [10])
+})
+
+test("different canonical chats never share a deterministic recovery task space", async () => {
+  const first = await runTaskSpaceReconciliationCase({
+    bindingKey: "shared-cross-session-key",
+    canonicalUrl: "https://chatgpt.com/c/concurrent-chat-one",
+  })
+  const second = await runTaskSpaceReconciliationCase({
+    bindingKey: "shared-cross-session-key",
+    canonicalUrl: "https://chatgpt.com/c/concurrent-chat-two",
+  })
+
+  assert.equal(first.error, undefined)
+  assert.equal(second.error, undefined)
+  assert.match(first.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
+  assert.match(second.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
+  assert.notEqual(first.taskSpaceRequests[0], second.taskSpaceRequests[0])
+  assert.deepEqual(first.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+  assert.deepEqual(second.counters, first.counters)
+})
+
+test("bound recovery follows the persisted task-space identity instead of a recycled numeric id", async () => {
+  const taskSpaceIdentity = {
+    name: "a3k-stable-workspace",
+    taskId: "a3k-stable-workspace",
+  }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    identityTaskSpaceOwnership: "agent",
+    requestedTaskSpaceOwnership: "agent",
+    taskSpaceIdentity,
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.deepEqual(reconciled.taskSpaceRequests, [13])
+  assert.equal(reconciled.result.taskSpaceId, 13)
+  assert.deepEqual(reconciled.result.taskSpaceIdentity, taskSpaceIdentity)
+})
+
+test("an established identity that disappears cannot fall through to a replacement workspace", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    taskSpaceIdentity: {
+      name: "disappeared-workspace",
+      taskId: "disappeared-workspace",
+    },
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("bound recovery fails closed when a persisted task-space identity is ambiguous", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    duplicateIdentity: true,
+    identityTaskSpaceOwnership: "agent",
+    taskSpaceIdentity: {
+      name: "duplicated-workspace",
+      taskId: "duplicated-workspace",
+    },
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_ambiguous")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("bound recovery fails closed when only one stable identity field matches", async () => {
+  const taskSpaceIdentity = {
+    name: "persisted-workspace",
+    taskId: "persisted-task-id",
+  }
+  for (const identityTaskSpaceLiveIdentity of [
+    { name: taskSpaceIdentity.name, taskId: "different-task-id" },
+    { name: "different-workspace", taskId: taskSpaceIdentity.taskId },
+    { name: taskSpaceIdentity.name },
+    { taskId: taskSpaceIdentity.taskId },
+  ]) {
+    const reconciled = await runTaskSpaceReconciliationCase({
+      identityTaskSpaceLiveIdentity,
+      identityTaskSpaceOwnership: "agent",
+      taskSpaceIdentity,
+    })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_conflict")
+    assert.deepEqual(reconciled.taskSpaceRequests, [])
+    assert.equal(reconciled.counters.click, 0)
+  }
+})
+
+test("bound recovery rejects incomplete persisted task-space identities before selection", async () => {
+  for (const taskSpaceIdentity of [
+    { name: "missing-task-id" },
+    { taskId: "missing-name" },
+    { name: "", taskId: "empty-name" },
+    { name: "wrong-type", taskId: 42 },
+    { name: "x".repeat(201), taskId: "over-limit" },
+  ]) {
+    const reconciled = await runTaskSpaceReconciliationCase({ taskSpaceIdentity })
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_invalid")
+    assert.deepEqual(reconciled.taskSpaceRequests, [])
+  }
+})
+
+test("deterministic recovery rejects duplicate fallback names before selection", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({ duplicateFallback: true })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_ambiguous")
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("deterministic recovery requires a complete live identity after creation", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({ createdTaskSpaceIdentity: {} })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "task_space_identity_unavailable")
+  assert.equal(reconciled.taskSpaceRequests.length, 1)
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("bound recovery rejects numeric-id recycling between selection and live re-observation", async () => {
+  const taskSpaceIdentity = {
+    name: "stable-before-selection",
+    taskId: "stable-before-selection",
+  }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    identityTaskSpaceOwnership: "agent",
+    recycleIdentityAfterSelection: true,
+    taskSpaceIdentity,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.deepEqual(reconciled.taskSpaceRequests, [13])
+  assert.equal(reconciled.counters.click, 0)
+})
+
+test("bound recovery rejects selector identity disagreement before navigation", async () => {
+  const taskSpaceIdentity = {
+    name: "stable-live-selection",
+    taskId: "stable-live-selection",
+  }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    identityTaskSpaceOwnership: "agent",
+    selectorIdentityOverride: { name: "different-selector", taskId: "different-selector" },
+    taskSpaceIdentity,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "task_space_identity_changed")
+  assert.deepEqual(reconciled.taskSpaceRequests, [13])
+  assert.equal(reconciled.counters.click, 0)
+})
+
+test("bound recovery rejects duplicate live records after selecting an exact identity", async () => {
+  const taskSpaceIdentity = {
+    name: "duplicated-after-selection",
+    taskId: "duplicated-after-selection",
+  }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    duplicateAfterSelection: true,
+    identityTaskSpaceOwnership: "agent",
+    taskSpaceIdentity,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "task_space_identity_ambiguous")
+  assert.equal(reconciled.counters.click, 0)
+})
+
+test("deterministic recovery rejects a duplicate created concurrently with selection", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    duplicateFallbackAfterCreation: true,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_ambiguous")
+  assert.equal(reconciled.counters.click, 0)
+})
+
+test("new selection rejects one-field live identity conflicts before navigation", async () => {
+  for (const postSelectionConflictingIdentity of [
+    { name: "placeholder", taskId: "other-task" },
+    { name: "other-name", taskId: "placeholder" },
+  ]) {
+    const canonicalUrl = "https://chatgpt.com/c/new-selection-conflict"
+    const fallbackName = `ego-chat-bound-${createHash("sha256")
+      .update(`canonical-conversation\0${canonicalUrl}`, "utf8")
+      .digest("hex")
+      .slice(0, 32)}`
+    const identity = {
+      name: postSelectionConflictingIdentity.name === "placeholder"
+        ? fallbackName
+        : postSelectionConflictingIdentity.name,
+      taskId: postSelectionConflictingIdentity.taskId === "placeholder"
+        ? fallbackName
+        : postSelectionConflictingIdentity.taskId,
+    }
+    const reconciled = await runTaskSpaceReconciliationCase({
+      canonicalUrl,
+      postSelectionConflictingIdentity: identity,
+    })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_conflict")
+    assert.equal(reconciled.counters.click, 0)
+    assert.equal(reconciled.counters.fillInput, 0)
+  }
+})
+
+test("final task-space observation rejects lost agent ownership", async () => {
+  for (const ownershipAfterSelection of ["user", "inactive"]) {
+    const reconciled = await runTaskSpaceReconciliationCase({ ownershipAfterSelection })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "browser_control_unavailable")
+    assert.equal(reconciled.counters.click, 0)
+    assert.equal(reconciled.counters.fillInput, 0)
+  }
+})
+
+test("task-space reclaim revalidates identity before either ownership mutation", async () => {
+  for (const fallbackTaskSpaceOwnership of ["user", "agentDelegatedToUser"]) {
+    const reconciled = await runTaskSpaceReconciliationCase({
+      allowTaskSpaceReclaim: true,
+      fallbackTaskSpaceOwnership,
+      recycleBeforeReclaim: true,
+    })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(
+      reconciled.error?.details?.reason,
+      "bound_task_space_reclaim_precondition_changed",
+    )
+    assert.equal(reconciled.counters.claimTaskSpace, 0)
+    assert.equal(reconciled.counters.takeOverTaskSpace, 0)
+    assert.deepEqual(reconciled.taskSpaceRequests, [])
+    assert.equal(reconciled.counters.click, 0)
+  }
+})
+
+test("task-space reclaim rechecks broker authority after its awaited relist", async () => {
+  for (const fallbackTaskSpaceOwnership of ["user", "agentDelegatedToUser"]) {
+    const reconciled = await runTaskSpaceReconciliationCase({
+      allowTaskSpaceReclaim: true,
+      brokerFenceChangesDuringReclaimRelist: true,
+      fallbackTaskSpaceOwnership,
+    })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "broker_fence_lost")
+    assert.equal(reconciled.counters.claimTaskSpace, 0)
+    assert.equal(reconciled.counters.takeOverTaskSpace, 0)
+  }
+})
+
+test("full Project conversation URLs define distinct deterministic recovery identities", async () => {
+  const urls = [
+    "https://chatgpt.com/g/g-p-project-one/c/project-chat-one",
+    "https://chatgpt.com/g/g-p-project-two/c/project-chat-two",
+  ]
+  const recovered = await Promise.all(urls.map((canonicalUrl) => (
+    runTaskSpaceReconciliationCase({
+      bindingKey: "same-isolated-session-key",
+      canonicalUrl,
+    })
+  )))
+
+  for (let index = 0; index < recovered.length; index += 1) {
+    const expected = `ego-chat-bound-${createHash("sha256")
+      .update(`canonical-conversation\0${urls[index]}`, "utf8")
+      .digest("hex")
+      .slice(0, 32)}`
+    assert.equal(recovered[index].error, undefined)
+    assert.equal(recovered[index].result.canonicalUrl, urls[index])
+    assert.deepEqual(recovered[index].taskSpaceRequests, [expected])
+    assert.equal(recovered[index].counters.click, 0)
+    assert.equal(recovered[index].counters.fillInput, 0)
+    assert.equal(recovered[index].counters.pressKey, 0)
+    assert.equal(recovered[index].counters.typeText, 0)
+  }
+  assert.notEqual(recovered[0].taskSpaceRequests[0], recovered[1].taskSpaceRequests[0])
 })
 
 test("bound recovery stops instead of bypassing a user-controlled deterministic task space", async () => {
@@ -2631,6 +3650,10 @@ test("bounded capture yields only with the exact confirmed prompt identity", asy
     promptMessageId: "reconcile-user",
     targetId: "recovered-bound-tab",
     taskSpaceId: 11,
+    taskSpaceIdentity: {
+      name: `ego-chat-bound-${createHash("sha256").update("canonical-conversation\0https://chatgpt.com/c/reconcile-driver-test", "utf8").digest("hex").slice(0, 32)}`,
+      taskId: `ego-chat-bound-${createHash("sha256").update("canonical-conversation\0https://chatgpt.com/c/reconcile-driver-test", "utf8").digest("hex").slice(0, 32)}`,
+    },
     turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
   })
 })
@@ -2714,6 +3737,29 @@ test("bound capture accepts an exact assistant response that repeats the user tu
 
   assert.equal(captured.error, undefined)
   assert.equal(captured.result.responseText, responseText)
+})
+
+test("final live identity fences reject cached self-attestation for every capture outcome", async () => {
+  const cases = [
+    { captureContinuationAllowed: true, generationRunning: true, mode: "capture_exchange" },
+    { captureContinuationAllowed: true, generationRunning: false, mode: "capture_exchange" },
+    {
+      allowProtocolRepairCapture: true,
+      captureContinuationAllowed: true,
+      generationRunning: false,
+      mode: "capture_exchange",
+    },
+    { mode: "reconcile_bound" },
+  ]
+  for (const options of cases) {
+    const stopped = await runTaskSpaceReconciliationCase({
+      ...options,
+      driftAfterConversationRead: true,
+    })
+    assert.equal(stopped.result, undefined)
+    assert.equal(stopped.error?.code, "human_required")
+    assert.equal(stopped.error?.details?.reason, "bound_task_space_identity_changed")
+  }
 })
 
 test("bounded capture fails closed when the confirmed prompt identity changes", async () => {
@@ -2832,4 +3878,12 @@ test("conversation adoption repairs and verifies a below-maximum thinking policy
   assert.equal(adopted.counters.fillInput, 0)
   assert.equal(adopted.counters.pressKey, 1)
   assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption rejects live task-space drift immediately before capture emission", async () => {
+  const adopted = await runAdoptionDriverCase({ driftAtFinalResult: true })
+  assert.equal(adopted.result, undefined)
+  assert.equal(adopted.error?.code, "human_required")
+  assert.equal(adopted.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.equal(adopted.counters.sendClick, 0)
 })

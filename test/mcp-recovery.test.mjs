@@ -38,6 +38,10 @@ function modelPolicyObservation() {
   }
 }
 
+function taskSpaceIdentity() {
+  return { name: "mcp-test-space", taskId: "mcp-test-space" }
+}
+
 test("the Codex MCP gate explicitly forwards its isolated broker environment", async () => {
   const source = await fs.readFile(
     new URL("../scripts/codex-mcp-gate.mjs", import.meta.url),
@@ -256,6 +260,7 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
         responseDigest,
         responseText,
         targetId: "mcp-adopt-tab",
+        taskSpaceIdentity: { name: input.taskSpace, taskId: "mcp-adoption-opaque-task-id" },
         taskSpaceId: 12,
       }
     },
@@ -307,7 +312,10 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
   assert.equal(adoptionCalls, 1)
   assert.equal(exchangeCalls, 0)
   assert.equal(receivedAllowTaskSpaceReclaim, true)
-  assert.equal(receivedTaskSpace, `ego-chat-adopt-${digest(canonicalUrl).slice(0, 16)}`)
+  assert.equal(
+    receivedTaskSpace,
+    `ego-chat-adopt-${digest(`canonical-adoption\0${canonicalUrl}`).slice(0, 32)}`,
+  )
   assert.equal(receivedTimeoutMs > 0 && receivedTimeoutMs <= 15 * 60 * 1_000, true)
   assert.equal(broker.getConversationBinding({ bindingKey: derivedBindingKey }).state, "bound")
 })
@@ -347,6 +355,7 @@ test("MCP re-anchors only the exact acknowledged stable head from a proven pre-s
       canonicalUrl: input.canonicalUrl,
       head: initialHead,
       targetId: "mcp-reanchor-tab",
+      taskSpaceIdentity: taskSpaceIdentity(),
       taskSpaceId: 10,
     }),
     exchange: async () => {
@@ -363,6 +372,7 @@ test("MCP re-anchors only the exact acknowledged stable head from a proven pre-s
         head: observedHead,
         headChange,
         targetId: "mcp-reanchor-tab",
+        taskSpaceIdentity: taskSpaceIdentity(),
         taskSpaceId: 10,
       }
     },
@@ -456,6 +466,7 @@ test("two MCP facades cannot interleave sends on one conversation binding", asyn
         messageCount: 2,
       },
       targetId: "two-facade-tab",
+      taskSpaceIdentity: taskSpaceIdentity(),
       taskSpaceId: 10,
     }),
     exchange: async (input) => {
@@ -477,6 +488,7 @@ test("two MCP facades cannot interleave sends on one conversation binding", asyn
         responseDigest: digest(responseText),
         responseText,
         targetId: "two-facade-tab",
+        taskSpaceIdentity: taskSpaceIdentity(),
         taskSpaceId: 10,
         turnMarker: input.turnMarker,
       }
@@ -621,6 +633,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
         messageCount: 2,
       },
       targetId: "controlled-tab",
+      taskSpaceIdentity: taskSpaceIdentity(),
       taskSpaceId: 10,
     }),
     exchange: async (input) => {
@@ -670,6 +683,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
           responseDigest: digest(responseText),
           responseText,
           targetId: "controlled-tab",
+          taskSpaceIdentity: taskSpaceIdentity(),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -711,6 +725,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
           responseDigest: digest(responseText),
           responseText,
           targetId: "controlled-tab",
+          taskSpaceIdentity: taskSpaceIdentity(),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -748,6 +763,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
           responseDigest: digest(responseText),
           responseText,
           targetId: "controlled-tab",
+          taskSpaceIdentity: taskSpaceIdentity(),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -823,6 +839,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
         responseDigest: digest(returnedText),
         responseText: returnedText,
         targetId: "controlled-tab",
+        taskSpaceIdentity: taskSpaceIdentity(),
         taskSpaceId: 10,
         turnMarker: input.turnMarker,
       }
@@ -853,6 +870,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
             messageCount: input.binding.messageCount,
           },
           targetId: "controlled-tab",
+          taskSpaceIdentity: taskSpaceIdentity(),
           taskSpaceId: 10,
           turnMarker: input.turnMarker,
         }
@@ -872,6 +890,7 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
         responseDigest: digest(responseText),
         responseText,
         targetId: "controlled-tab",
+        taskSpaceIdentity: taskSpaceIdentity(),
         taskSpaceId: 10,
         turnMarker: input.turnMarker,
       }
