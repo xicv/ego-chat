@@ -31,6 +31,14 @@ struct EmbeddedFile {
 
 const RUNTIME_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
+        path: "bin/eagle-monitor.mjs",
+        bytes: include_bytes!("../bin/eagle-monitor.mjs"),
+    },
+    EmbeddedFile {
+        path: "bin/eagle-monitord.mjs",
+        bytes: include_bytes!("../bin/eagle-monitord.mjs"),
+    },
+    EmbeddedFile {
         path: "package.json",
         bytes: include_bytes!("../package.json"),
     },
@@ -77,6 +85,50 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
         path: "src/convergence.mjs",
         bytes: include_bytes!("../src/convergence.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-broker.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-broker.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-cli.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-cli.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-config.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-config.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-constants.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-constants.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-engine.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-engine.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-fs.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-fs.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-lease.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-lease.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-lifecycle.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-lifecycle.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-policy.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-policy.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-runtime.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-runtime.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/eagle-monitor-store.mjs",
+        bytes: include_bytes!("../src/eagle-monitor-store.mjs"),
     },
     EmbeddedFile {
         path: "src/ego-adapter.mjs",

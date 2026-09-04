@@ -163,6 +163,11 @@ export const ConversationReconcileSchema = z.object({
   workflowId: WorkflowIdSchema,
 })
 
+export const WorkflowReconcileObservationSchema = z.object({
+  bindingKey: BindingKeySchema,
+  workflowId: WorkflowIdSchema,
+}).strict()
+
 export const ConversationReanchorSchema = z.object({
   acknowledgeExternalChange: z.literal(true),
   bindingKey: BindingKeySchema,

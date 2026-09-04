@@ -119,6 +119,51 @@ function liveOwnerProcesses(owner) {
   }
 }
 
+export async function inspectBrokerLease(dataDir) {
+  const lockPath = path.join(dataDir, "broker.lock")
+  const existing = await inspectClaim(lockPath)
+  if (!existing) {
+    return {
+      browserProcessGroups: [],
+      browserPids: [],
+      conclusivelyDead: true,
+      epoch: null,
+      ownerPresent: false,
+      runtimeIdentity: null,
+      state: "absent",
+    }
+  }
+  if (
+    !Number.isSafeInteger(existing.owner.pid)
+    || existing.owner.pid < 1
+    || !Number.isSafeInteger(existing.owner.epoch)
+    || existing.owner.epoch < 0
+    || !["active", "claiming"].includes(existing.owner.state)
+    || !existing.owner.runtimeIdentity
+    || typeof existing.owner.runtimeIdentity !== "object"
+  ) {
+    throw new EgoChatError(
+      "corrupt_broker_lease",
+      "The authoritative broker claim is incomplete; Eagle Monitor will not infer broker death.",
+    )
+  }
+  const live = liveOwnerProcesses(existing.owner)
+  const alive = live.pids.length > 0 || live.processGroups.length > 0
+  return {
+    browserProcessGroups: Array.isArray(existing.owner.browserProcessGroups)
+      ? [...existing.owner.browserProcessGroups]
+      : [],
+    browserPids: Array.isArray(existing.owner.browserPids)
+      ? [...existing.owner.browserPids]
+      : [],
+    conclusivelyDead: !alive,
+    epoch: Number.isSafeInteger(existing.owner.epoch) ? existing.owner.epoch : null,
+    ownerPresent: true,
+    runtimeIdentity: existing.owner.runtimeIdentity ?? null,
+    state: alive ? "alive" : "stale",
+  }
+}
+
 async function retireStaleClaim(lockPath) {
   const stalePath = `${lockPath}.stale.${randomUUID()}`
   try {

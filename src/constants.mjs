@@ -10,7 +10,7 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 10,
-  runtimeGeneration: "2026-09-03.2",
+  runtimeGeneration: "2026-09-04.1",
   storeSchemaRevision: 4,
   taskStoreSchemaRevision: 1,
 }
@@ -46,6 +46,7 @@ export const READ_ONLY_IPC_METHODS = new Set([
   "result.read",
   "workflow.await",
   "workflow.get",
+  "workflow.reconcile_observation",
 ])
 
 export const TERMINAL_STATUSES = new Set([

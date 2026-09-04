@@ -27,6 +27,10 @@ include = [
 name = "ego-chat"
 path = "rust/main.rs"
 
+[[bin]]
+name = "eagle-monitor"
+path = "rust/eagle_monitor.rs"
+
 [dependencies]
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 toml_edit = "0.25.13"
