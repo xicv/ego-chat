@@ -15,12 +15,31 @@ import {
   writeAtomicJson,
 } from "./eagle-monitor-fs.mjs"
 import { safeDigest } from "./eagle-monitor-config.mjs"
+import {
+  deriveEagleSemanticIncidentKey,
+  publicEagleSemanticStatus,
+  validateEagleSemanticState,
+} from "./eagle-monitor-semantic.mjs"
 import { MonitorAction, MonitorState } from "./eagle-monitor-policy.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const BINDING_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+const GENUINE_HUMAN_BOUNDARY_CODES = new Set([
+  "authentication_required",
+  "captcha_required",
+  "human_verification_required",
+  "verification_challenge",
+])
+const SEMANTIC_INCIDENT_FIELDS = [
+  "semanticCheckpointDigest",
+  "semanticEvidenceWindow",
+  "semanticIncidentKey",
+  "semanticReasonCode",
+  "semanticState",
+  "semanticStepFingerprint",
+]
 const SESSION_KEYS = new Set([
   "active",
   "bindingKey",
@@ -50,6 +69,7 @@ const STATE_KEYS = new Set([
   "reconciliation",
   "recoveryCount",
   "schemaVersion",
+  "semantic",
   "state",
   "updatedAt",
   "workflowDigest",
@@ -110,12 +130,20 @@ function assertIncident(value) {
     "brokerEpoch",
     "humanRequired",
     "id",
+    "kind",
+    "loopPattern",
     "monitorEpoch",
     "occurredAt",
     "phase",
     "reasonCode",
     "recoveryCount",
     "runtimeDigest",
+    "semanticCheckpointDigest",
+    "semanticEvidenceWindow",
+    "semanticIncidentKey",
+    "semanticReasonCode",
+    "semanticState",
+    "semanticStepFingerprint",
     "state",
     "workflowDigest",
   ])
@@ -133,12 +161,81 @@ function assertIncident(value) {
     || !Number.isSafeInteger(value.recoveryCount)
     || value.recoveryCount < 0
     || !(value.runtimeDigest === null || DIGEST_PATTERN.test(value.runtimeDigest ?? ""))
+    || !(value.kind === undefined || ["operational", "semantic"].includes(value.kind))
+    || !(value.loopPattern === undefined
+      || value.loopPattern === null
+      || ["alternating", "repeated", "short_cycle"].includes(value.loopPattern))
+    || !(value.semanticCheckpointDigest === undefined
+      || value.semanticCheckpointDigest === null
+      || DIGEST_PATTERN.test(value.semanticCheckpointDigest ?? ""))
+    || !(value.semanticEvidenceWindow === undefined
+      || value.semanticEvidenceWindow === null
+      || DIGEST_PATTERN.test(value.semanticEvidenceWindow ?? ""))
+    || !(value.semanticIncidentKey === undefined
+      || value.semanticIncidentKey === null
+      || DIGEST_PATTERN.test(value.semanticIncidentKey ?? ""))
+    || !(value.semanticReasonCode === undefined || validNullableEvidenceCode(value.semanticReasonCode))
+    || !(value.semanticState === undefined
+      || value.semanticState === null
+      || [
+        "expected_wait",
+        "human_required",
+        "looping",
+        "progressing",
+        "settled",
+        "stagnant",
+        "suspect",
+      ].includes(value.semanticState))
+    || !(value.semanticStepFingerprint === undefined
+      || value.semanticStepFingerprint === null
+      || DIGEST_PATTERN.test(value.semanticStepFingerprint ?? ""))
     || !Object.values(MonitorState).includes(value.state)
     || !DIGEST_PATTERN.test(value.workflowDigest ?? "")
   ) {
     failCorrupt("An Eagle Monitor incident has an invalid value.")
   }
+  if (value.kind === "semantic") {
+    const expectedReason = value.semanticState === "looping" && value.loopPattern !== null
+      ? `${value.loopPattern}_loop_detected`
+      : {
+          stagnant: "useful_progress_lease_expired",
+          suspect: "useful_progress_unconfirmed",
+        }[value.semanticState]
+    const expectedKey = deriveEagleSemanticIncidentKey({
+      brokerEpoch: value.brokerEpoch,
+      classification: value.semanticState,
+      evidenceWindow: value.semanticEvidenceWindow,
+      loopPattern: value.semanticState === "looping" ? value.loopPattern : null,
+      phase: value.phase,
+      stepFingerprint: value.semanticStepFingerprint,
+      workflowDigest: value.workflowDigest,
+    })
+    if (!["looping", "stagnant", "suspect"].includes(value.semanticState)
+      || !DIGEST_PATTERN.test(value.semanticCheckpointDigest ?? "")
+      || !(value.semanticEvidenceWindow === null
+        || DIGEST_PATTERN.test(value.semanticEvidenceWindow ?? ""))
+      || !DIGEST_PATTERN.test(value.semanticIncidentKey ?? "")
+      || !DIGEST_PATTERN.test(value.semanticStepFingerprint ?? "")
+      || value.semanticIncidentKey !== expectedKey
+      || value.id !== semanticIncidentId(expectedKey)
+      || value.reasonCode !== expectedReason
+      || value.semanticReasonCode !== expectedReason
+      || value.humanRequired !== false
+      || ![MonitorState.HEALTHY, MonitorState.SEND_CONFIRMED_CAPTURE].includes(value.state)
+      || (value.semanticState === "looping") !== (value.loopPattern !== null)) {
+      failCorrupt("A semantic incident has inconsistent derivation evidence.")
+    }
+  } else if ((value.loopPattern !== undefined && value.loopPattern !== null)
+    || SEMANTIC_INCIDENT_FIELDS.some((field) => Object.hasOwn(value, field))) {
+    failCorrupt("A non-semantic incident cannot carry semantic derivation evidence.")
+  }
   return value
+}
+
+function semanticIncidentId(hex) {
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${(
+    (Number.parseInt(hex[16], 16) & 0x3) | 0x8
+  ).toString(16)}${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
 function assertState(value) {
@@ -183,6 +280,9 @@ function assertState(value) {
     || value.incidents.length > EAGLE_MONITOR_INCIDENT_LIMIT
   ) failCorrupt("The incident history is invalid.")
   value.incidents.forEach(assertIncident)
+  if (new Set(value.incidents.map((incident) => incident.id)).size !== value.incidents.length) {
+    failCorrupt("The incident history contains a duplicate identity.")
+  }
   if (value.lastAction !== undefined && value.lastAction !== null) {
     assertKeys(
       value.lastAction,
@@ -249,6 +349,51 @@ function assertState(value) {
     value.state !== undefined
     && ![...Object.values(MonitorState), "stopped"].includes(value.state)
   ) failCorrupt("The monitor state is invalid.")
+  if (value.semantic !== undefined && value.semantic !== null) {
+    validateEagleSemanticState(value.semantic)
+  }
+  if (value.semantic && value.workflowDigest !== undefined
+    && value.workflowDigest !== null
+    && value.semantic.workflowDigest !== value.workflowDigest) {
+    failCorrupt("The semantic state does not match the monitored workflow.")
+  }
+  if (value.semantic && value.broker !== undefined && value.broker !== null
+    && value.semantic.brokerEpoch !== value.broker.epoch) {
+    failCorrupt("The semantic state does not match the observed broker epoch.")
+  }
+  if (value.semantic && value.updatedAt !== undefined
+    && value.semantic.observedAt !== value.updatedAt) {
+    failCorrupt("The semantic state does not match the monitor observation time.")
+  }
+  if (value.semantic) {
+    const operationalSettled = value.state === MonitorState.SETTLED
+    const semanticSettled = value.semantic.classification === "settled"
+    if (operationalSettled !== semanticSettled) {
+      failCorrupt("Semantic settlement does not match the operational monitor state.")
+    }
+    const genuineHumanBoundary = value.state === MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE
+      && value.humanRequired?.required === true
+      && GENUINE_HUMAN_BOUNDARY_CODES.has(value.humanRequired?.reasonCode)
+    if ((value.semantic.classification === "human_required") !== genuineHumanBoundary) {
+      failCorrupt("The semantic human boundary is not backed by operational evidence.")
+    }
+    if (value.semantic.incidentKey !== null) {
+      const expectedIncidentKey = deriveEagleSemanticIncidentKey({
+        brokerEpoch: value.semantic.brokerEpoch,
+        classification: value.semantic.classification,
+        evidenceWindow: value.semantic.usefulProgressLease?.evidenceDigest ?? null,
+        loopPattern: value.semantic.classification === "looping"
+          ? value.semantic.metrics.loopPattern
+          : null,
+        phase: value.phase ?? null,
+        stepFingerprint: value.semantic.fingerprintHistory.at(-1),
+        workflowDigest: value.semantic.workflowDigest,
+      })
+      if (value.semantic.incidentKey !== expectedIncidentKey) {
+        failCorrupt("The semantic incident identity is inconsistent.")
+      }
+    }
+  }
   if (value.updatedAt !== undefined && !validTimestamp(value.updatedAt)) {
     failCorrupt("The state timestamp is invalid.")
   }
@@ -284,11 +429,13 @@ function publicSession(session) {
 }
 
 function safeIncident(incident) {
-  return {
+  const value = {
     bindingDigest: incident.bindingDigest ?? null,
     brokerEpoch: incident.brokerEpoch ?? null,
     humanRequired: incident.humanRequired === true,
     id: incident.id,
+    kind: incident.kind ?? "operational",
+    loopPattern: incident.loopPattern ?? null,
     monitorEpoch: incident.monitorEpoch,
     occurredAt: incident.occurredAt,
     phase: incident.phase ?? null,
@@ -298,6 +445,17 @@ function safeIncident(incident) {
     state: incident.state,
     workflowDigest: incident.workflowDigest,
   }
+  if (incident.kind === "semantic") {
+    Object.assign(value, {
+      semanticCheckpointDigest: incident.semanticCheckpointDigest,
+      semanticEvidenceWindow: incident.semanticEvidenceWindow,
+      semanticIncidentKey: incident.semanticIncidentKey,
+      semanticReasonCode: incident.semanticReasonCode,
+      semanticState: incident.semanticState,
+      semanticStepFingerprint: incident.semanticStepFingerprint,
+    })
+  }
+  return value
 }
 
 export class EagleMonitorStore {
@@ -381,6 +539,7 @@ export class EagleMonitorStore {
       )
     }
     await this.initialize()
+    if (Array.isArray(state.incidents)) state.incidents.forEach(assertIncident)
     const incidents = Array.isArray(state.incidents)
       ? state.incidents.slice(-Math.min(this.#config.incidentLimit, EAGLE_MONITOR_INCIDENT_LIMIT))
       : []
@@ -400,6 +559,7 @@ export class EagleMonitorStore {
       brokerEpoch: observation.broker?.epoch ?? null,
       humanRequired: classification.humanRequired,
       id: randomUUID(),
+      kind: "operational",
       monitorEpoch,
       occurredAt: new Date(observation.nowMs).toISOString(),
       phase: safeEvidenceCode(observation.workflow?.phase),
@@ -411,7 +571,39 @@ export class EagleMonitorStore {
     })
   }
 
-  publicStatus(session, state, service, monitor = null, policyMatches = null) {
+  createSemanticIncident({ classification, monitorEpoch, observation, recoveryCount, semantic, session }) {
+    if (!semantic?.incidentKey) {
+      throw new EgoChatError(
+        "invalid_semantic_incident",
+        "A semantic incident requires a stable semantic incident key.",
+      )
+    }
+    const id = semanticIncidentId(semantic.incidentKey)
+    return safeIncident({
+      bindingDigest: safeDigest(session.bindingKey),
+      brokerEpoch: observation.broker?.epoch ?? null,
+      humanRequired: semantic.classification === "human_required",
+      id,
+      kind: "semantic",
+      loopPattern: semantic.classification === "looping" ? semantic.metrics.loopPattern : null,
+      monitorEpoch,
+      occurredAt: new Date(observation.nowMs).toISOString(),
+      phase: safeEvidenceCode(observation.workflow?.phase),
+      reasonCode: semantic.reasonCode,
+      recoveryCount,
+      runtimeDigest: safeDigest(observation.broker?.runtimeIdentity?.contractDigest),
+      semanticCheckpointDigest: semantic.checkpointDigest,
+      semanticEvidenceWindow: semantic.usefulProgressLease?.evidenceDigest ?? null,
+      semanticIncidentKey: semantic.incidentKey,
+      semanticReasonCode: semantic.reasonCode,
+      semanticState: semantic.classification,
+      semanticStepFingerprint: semantic.fingerprintHistory.at(-1),
+      state: classification.state,
+      workflowDigest: safeDigest(session.workflowId),
+    })
+  }
+
+  publicStatus(session, state, service, monitor = null, policyMatches = null, nowMs = Date.now()) {
     const active = session?.active === true
     const currentState = active && state?.workflowDigest !== safeDigest(session.workflowId)
       ? null
@@ -427,6 +619,12 @@ export class EagleMonitorStore {
       phase: currentState?.phase ?? null,
       policyMatches,
       recoveryCount: currentState?.recoveryCount ?? 0,
+      semantic: active
+        ? publicEagleSemanticStatus(
+            currentState?.semantic,
+            Number.isSafeInteger(nowMs) && nowMs >= 0 ? nowMs : Date.now(),
+          )
+        : null,
       service,
       session: publicSession(session),
       state: active ? (currentState?.state ?? MonitorState.STARTUP) : "stopped",

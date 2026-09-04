@@ -213,7 +213,14 @@ export async function runEagleMonitorCli({
       )
       const monitor = await observeMonitor(resolvedConfig)
       const policyMatches = !session || session.policyDigest === resolvedConfig.policy.digest
-      result = monitorStore.publicStatus(session, state, service, monitor, policyMatches)
+      result = monitorStore.publicStatus(
+        session,
+        state,
+        service,
+        monitor,
+        policyMatches,
+        Date.parse(now()),
+      )
       if (!session?.active && !service.loaded && !service.definitionPresent && !monitor.active) {
         exitCode = EAGLE_MONITOR_EXIT.NOT_RUNNING
       }
@@ -224,6 +231,7 @@ export async function runEagleMonitorCli({
         || !policyMatches
         || result.humanRequired.required
         || ["crash_loop", "disk_full", "version_skew"].includes(result.state)
+        || ["human_required", "looping", "stagnant"].includes(result.semantic?.classification)
       ) exitCode = EAGLE_MONITOR_EXIT.ATTENTION_REQUIRED
     } else if (command === "stop") {
       assertOnly(options, [])
@@ -285,7 +293,14 @@ export async function runEagleMonitorCli({
         healthy,
         mvpDependencies: { llm: false, network: false },
         service,
-        status: monitorStore.publicStatus(session, state, service, monitor, policyMatches),
+        status: monitorStore.publicStatus(
+          session,
+          state,
+          service,
+          monitor,
+          policyMatches,
+          Date.parse(now()),
+        ),
       }
       if (!healthy) exitCode = EAGLE_MONITOR_EXIT.ATTENTION_REQUIRED
     }
