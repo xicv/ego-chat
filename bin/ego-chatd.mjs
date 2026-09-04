@@ -77,6 +77,7 @@ try {
 const methods = new Map([
   ["attachment.capture", (params) => broker.startAttachmentCapture(params)],
   ["attachment.evidence", (params) => broker.getAttachmentEvidence(params)],
+  ["attachment.release", (params) => broker.releaseAttachmentEvidence(params)],
   ["broker.status", () => broker.getStatus()],
   ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
   ["conversation.bind", (params) => broker.bindConversation(params)],

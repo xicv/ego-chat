@@ -24,6 +24,7 @@ import {
   operationKeyDigest,
   sha256Hex,
 } from "./attachment-execution-receipt.mjs"
+import { assertValidSignedAttachmentConsumerAcknowledgementEnvelope } from "./attachment-consumer-ack.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const DEFAULT_MAX_BINDINGS = 256
@@ -52,17 +53,19 @@ const EMPTY_STATE = Object.freeze({
     permanentEntryCount: 0,
     permanentReservedBytes: 0,
   },
+  attachmentConsumerAcknowledgements: {},
   attachmentExternalBindings: {},
   attachmentCaptures: {},
   attachmentDispositions: {},
   attachmentIntents: {},
+  attachmentEvidenceTombstones: {},
   confirmedSendEvents: {},
   confirmedSendIdentities: {},
   bindings: {},
   modelPolicies: {},
   nextSeq: 1,
   operations: {},
-  schemaVersion: 6,
+  schemaVersion: 7,
   workflows: {},
 })
 
@@ -254,7 +257,7 @@ function validateCheckpoint(value) {
     || !value.workflows
     || !value.bindings
     || !value.modelPolicies
-    || ![3, 4, 5, 6].includes(value.schemaVersion)
+    || ![3, 4, 5, 6, 7].includes(value.schemaVersion)
   ) {
     throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint is invalid.")
   }
@@ -264,10 +267,12 @@ function migrateState(value) {
   validateCheckpoint(value)
   const state = clone(value)
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
+  state.attachmentConsumerAcknowledgements ??= {}
   state.attachmentExternalBindings ??= {}
   state.attachmentCaptures ??= {}
   state.attachmentDispositions ??= {}
   state.attachmentIntents ??= {}
+  state.attachmentEvidenceTombstones ??= {}
   state.confirmedSendEvents ??= {}
   state.confirmedSendIdentities ??= {}
   state.operations ??= {}
@@ -314,7 +319,7 @@ function migrateState(value) {
     }
   }
 
-  state.schemaVersion = 6
+  state.schemaVersion = 7
   validateAttachmentEvidenceState(state)
   return state
 }
@@ -341,8 +346,10 @@ function preserveConvergenceLivenessCheckpoint(workflow, previousWorkflow = unde
 function validateAttachmentEvidenceState(state) {
   const capacity = state.attachmentCapacity
   const captures = state.attachmentCaptures
+  const acknowledgements = state.attachmentConsumerAcknowledgements
   const dispositions = state.attachmentDispositions
   const intents = state.attachmentIntents
+  const tombstones = state.attachmentEvidenceTombstones
   const bindings = state.attachmentExternalBindings
   const confirmedEvents = state.confirmedSendEvents
   const confirmedIdentities = state.confirmedSendIdentities
@@ -353,6 +360,12 @@ function validateAttachmentEvidenceState(state) {
     || !intents
     || typeof intents !== "object"
     || Array.isArray(intents)
+    || !acknowledgements
+    || typeof acknowledgements !== "object"
+    || Array.isArray(acknowledgements)
+    || !tombstones
+    || typeof tombstones !== "object"
+    || Array.isArray(tombstones)
     || !captures
     || typeof captures !== "object"
     || Array.isArray(captures)
@@ -375,8 +388,10 @@ function validateAttachmentEvidenceState(state) {
     )
   }
   const expectedCapacity = {
-    liveIntentCount: Object.keys(intents).length,
-    liveReservedBytes: Object.keys(intents).length * ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
+    liveIntentCount: Object.keys(intents).filter((workflowId) => !tombstones[workflowId]).length,
+    liveReservedBytes: Object.keys(intents).filter(
+      (workflowId) => !tombstones[workflowId],
+    ).length * ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
     permanentEntryCount: Object.keys(bindings).length,
     permanentReservedBytes: (
       Object.keys(bindings).length * ATTACHMENT_PERMANENT_RESERVATION_BYTES
@@ -399,7 +414,7 @@ function validateAttachmentEvidenceState(state) {
       || intent.permanent_reservation_bytes !== ATTACHMENT_PERMANENT_RESERVATION_BYTES
       || entry?.source_workflow_id !== workflowId
       || entry.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
-      || entry.state !== "RESERVED"
+      || entry.state !== (tombstones[workflowId] ? "CONSUMED_RELEASED" : "RESERVED")
     ) {
       throw new EgoChatError(
         "corrupt_attachment_evidence_state",
@@ -548,7 +563,10 @@ function validateAttachmentEvidenceState(state) {
       || (
         capture.state === "TERMINAL"
         && (
-          state.workflows[workflowId]?.phase !== "attachment_disposition_terminal"
+          ![
+            "attachment_disposition_terminal",
+            "attachment_evidence_released",
+          ].includes(state.workflows[workflowId]?.phase)
           || state.workflows[workflowId]?.status !== "succeeded"
           || state.workflows[workflowId]?.result?.attachmentDispositionEnvelopeSha256
             !== capture.terminal_envelope_sha256
@@ -568,6 +586,68 @@ function validateAttachmentEvidenceState(state) {
       "corrupt_attachment_evidence_state",
       "A terminal attachment disposition has no capture operation.",
     )
+  }
+  if (!isDeepStrictEqual(
+    Object.keys(acknowledgements).sort(),
+    Object.keys(tombstones).sort(),
+  )) {
+    throw new EgoChatError(
+      "corrupt_attachment_evidence_state",
+      "The attachment consumer acknowledgement and tombstone ledgers differ.",
+    )
+  }
+  for (const [workflowId, envelope] of Object.entries(acknowledgements)) {
+    let acknowledgement
+    try {
+      acknowledgement = assertValidSignedAttachmentConsumerAcknowledgementEnvelope(
+        envelope,
+      ).acknowledgement
+    } catch {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The attachment consumer acknowledgement ledger is invalid.",
+      )
+    }
+    const identity = confirmedIdentities[workflowId]
+    const dispositionEnvelope = dispositions[workflowId]
+    const disposition = dispositionEnvelope
+      && assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+    const intent = intents[workflowId]
+    const tombstone = tombstones[workflowId]
+    const externalBinding = intent && bindings[`${intent.profile}:${intent.external_binding_sha256}`]
+    const acknowledgementEnvelopeDigest = sha256Hex(canonicalJsonBytes(envelope))
+    if (
+      !intent
+      || !identity
+      || !dispositionEnvelope
+      || externalBinding?.state !== "CONSUMED_RELEASED"
+      || acknowledgement.confirmed_send_identity_sha256
+        !== sha256Hex(canonicalJsonBytes(identity))
+      || acknowledgement.disposition_envelope_sha256
+        !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
+      || acknowledgement.terminal_evidence_digest !== dispositionEnvelope.payload_sha256
+      || acknowledgement.external_binding_sha256 !== intent.external_binding_sha256
+      || acknowledgement.terminal_outcome !== disposition.outcome
+      || !tombstone
+      || tombstone.schema !== "ego-chat-attachment-evidence-tombstone/v1"
+      || tombstone.source_workflow_id !== workflowId
+      || tombstone.profile !== intent.profile
+      || tombstone.external_binding_sha256 !== intent.external_binding_sha256
+      || tombstone.acknowledgement_envelope_sha256 !== acknowledgementEnvelopeDigest
+      || tombstone.disposition_envelope_sha256
+        !== acknowledgement.disposition_envelope_sha256
+      || tombstone.terminal_evidence_digest !== acknowledgement.terminal_evidence_digest
+      || tombstone.terminal_outcome !== acknowledgement.terminal_outcome
+      || tombstone.consumer_state !== acknowledgement.consumer_state
+      || externalBinding.acknowledgement_envelope_sha256 !== acknowledgementEnvelopeDigest
+      || externalBinding.tombstone_sha256 !== sha256Hex(canonicalJsonBytes(tombstone))
+      || state.workflows[workflowId]?.phase !== "attachment_evidence_released"
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The released attachment evidence does not match its terminal chain.",
+      )
+    }
   }
 }
 
@@ -617,6 +697,22 @@ function applyEvent(state, event) {
     }
     if (event.attachmentIntent && typeof event.attachmentIntent.source_workflow_id === "string") {
       state.attachmentIntents[event.attachmentIntent.source_workflow_id] = event.attachmentIntent
+    }
+    if (
+      event.attachmentConsumerAcknowledgement
+      && typeof event.attachmentConsumerAcknowledgement.source_workflow_id === "string"
+      && event.attachmentConsumerAcknowledgement.envelope
+    ) {
+      state.attachmentConsumerAcknowledgements[
+        event.attachmentConsumerAcknowledgement.source_workflow_id
+      ] = event.attachmentConsumerAcknowledgement.envelope
+    }
+    if (
+      event.attachmentEvidenceTombstone
+      && typeof event.attachmentEvidenceTombstone.source_workflow_id === "string"
+    ) {
+      state.attachmentEvidenceTombstones[event.attachmentEvidenceTombstone.source_workflow_id]
+        = event.attachmentEvidenceTombstone
     }
     if (
       event.attachmentCapture
@@ -879,6 +975,16 @@ export class EventStore {
   getAttachmentIntent(workflowId) {
     const intent = this.#state.attachmentIntents[workflowId]
     return intent ? clone(intent) : undefined
+  }
+
+  getAttachmentConsumerAcknowledgement(workflowId) {
+    const envelope = this.#state.attachmentConsumerAcknowledgements[workflowId]
+    return envelope ? clone(envelope) : undefined
+  }
+
+  getAttachmentEvidenceTombstone(workflowId) {
+    const tombstone = this.#state.attachmentEvidenceTombstones[workflowId]
+    return tombstone ? clone(tombstone) : undefined
   }
 
   getAttachmentExternalBinding(profile, externalBindingDigest) {
@@ -1426,6 +1532,131 @@ export class EventStore {
         created: true,
         disposition: clone(disposition),
         envelope: clone(envelope),
+        workflow: clone(nextWorkflow),
+      }
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async releaseAttachmentEvidence({ acknowledgement, envelope, workflowId }) {
+    const operation = this.#tail.then(async () => {
+      const existing = this.#state.attachmentConsumerAcknowledgements[workflowId]
+      if (existing) {
+        if (!isDeepStrictEqual(existing, envelope)) {
+          throw new EgoChatError(
+            "attachment_consumer_acknowledgement_conflict",
+            "A different attachment evidence consumer acknowledgement is already durable.",
+          )
+        }
+        return {
+          acknowledgement: clone(acknowledgement),
+          created: false,
+          envelope: clone(existing),
+          tombstone: clone(this.#state.attachmentEvidenceTombstones[workflowId]),
+          workflow: clone(this.#state.workflows[workflowId]),
+        }
+      }
+      const parsed = assertValidSignedAttachmentConsumerAcknowledgementEnvelope(envelope)
+      if (!isDeepStrictEqual(parsed.acknowledgement, acknowledgement)) {
+        throw new EgoChatError(
+          "attachment_consumer_acknowledgement_mismatch",
+          "The verified attachment evidence consumer acknowledgement changed before commit.",
+        )
+      }
+      const workflow = this.#state.workflows[workflowId]
+      const intent = this.#state.attachmentIntents[workflowId]
+      const identity = this.#state.confirmedSendIdentities[workflowId]
+      const dispositionEnvelope = this.#state.attachmentDispositions[workflowId]
+      const externalBinding = intent && this.#state.attachmentExternalBindings[
+        `${intent.profile}:${intent.external_binding_sha256}`
+      ]
+      const disposition = dispositionEnvelope
+        && assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+      if (
+        workflow?.phase !== "attachment_disposition_terminal"
+        || workflow.status !== "succeeded"
+        || !intent
+        || !identity
+        || !dispositionEnvelope
+        || externalBinding?.state !== "RESERVED"
+        || acknowledgement.confirmed_send_identity_sha256
+          !== sha256Hex(canonicalJsonBytes(identity))
+        || acknowledgement.disposition_envelope_sha256
+          !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
+        || acknowledgement.terminal_evidence_digest !== dispositionEnvelope.payload_sha256
+        || acknowledgement.external_binding_sha256 !== intent.external_binding_sha256
+        || acknowledgement.terminal_outcome !== disposition.outcome
+      ) {
+        throw new EgoChatError(
+          "attachment_consumer_acknowledgement_lineage_mismatch",
+          "The acknowledgement does not match the immutable terminal attachment evidence.",
+        )
+      }
+      const acknowledgementEnvelopeDigest = sha256Hex(canonicalJsonBytes(envelope))
+      const tombstone = {
+        acknowledgement_envelope_sha256: acknowledgementEnvelopeDigest,
+        consumer_state: acknowledgement.consumer_state,
+        disposition_envelope_sha256: acknowledgement.disposition_envelope_sha256,
+        external_binding_sha256: intent.external_binding_sha256,
+        profile: intent.profile,
+        schema: "ego-chat-attachment-evidence-tombstone/v1",
+        source_workflow_id: workflowId,
+        terminal_evidence_digest: acknowledgement.terminal_evidence_digest,
+        terminal_outcome: acknowledgement.terminal_outcome,
+      }
+      const nextExternalBinding = {
+        ...externalBinding,
+        acknowledgement_envelope_sha256: acknowledgementEnvelopeDigest,
+        consumer_state: acknowledgement.consumer_state,
+        state: "CONSUMED_RELEASED",
+        tombstone_sha256: sha256Hex(canonicalJsonBytes(tombstone)),
+      }
+      const nextCapacity = {
+        ...this.#state.attachmentCapacity,
+        liveIntentCount: this.#state.attachmentCapacity.liveIntentCount - 1,
+        liveReservedBytes: (
+          this.#state.attachmentCapacity.liveReservedBytes
+          - ATTACHMENT_EVIDENCE_RESERVATION_BYTES
+        ),
+      }
+      if (nextCapacity.liveIntentCount < 0 || nextCapacity.liveReservedBytes < 0) {
+        throw new EgoChatError(
+          "corrupt_attachment_evidence_state",
+          "The attachment evidence reservation counters cannot be released safely.",
+        )
+      }
+      const nextWorkflow = {
+        ...workflow,
+        phase: "attachment_evidence_released",
+        result: {
+          ...workflow.result,
+          attachmentConsumerAcknowledgementEnvelopeSha256:
+            acknowledgementEnvelopeDigest,
+          attachmentEvidenceTombstoneSha256: sha256Hex(canonicalJsonBytes(tombstone)),
+          consumerState: acknowledgement.consumer_state,
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await this.#appendEvent({
+        at: nextWorkflow.updatedAt,
+        attachmentCapacity: nextCapacity,
+        attachmentConsumerAcknowledgement: {
+          envelope: clone(envelope),
+          source_workflow_id: workflowId,
+        },
+        attachmentEvidenceTombstone: tombstone,
+        attachmentExternalBinding: nextExternalBinding,
+        schemaVersion: 1,
+        seq: this.#state.nextSeq,
+        type: "attachment.consumer_acknowledged",
+        workflow: nextWorkflow,
+      })
+      return {
+        acknowledgement: clone(acknowledgement),
+        created: true,
+        envelope: clone(envelope),
+        tombstone: clone(tombstone),
         workflow: clone(nextWorkflow),
       }
     })

@@ -7,6 +7,10 @@ import test from "node:test"
 
 import { Broker } from "../src/broker.mjs"
 import {
+  ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT,
+  assertValidSignedAttachmentConsumerAcknowledgementEnvelope,
+} from "../src/attachment-consumer-ack.mjs"
+import {
   buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   operationKeyDigest,
@@ -142,6 +146,54 @@ function signedAttachmentEnvelope(disposition, fill = 1) {
     signature_base64url: Buffer.alloc(64, fill).toString("base64url"),
     signature_input_domain: disposition.signature_input_domain,
     signer_key_id: disposition.signer_key_id,
+  }
+}
+
+function attachmentConsumerAcknowledgement(evidence, overrides = {}) {
+  const disposition = JSON.parse(
+    Buffer.from(evidence.disposition_envelope.payload_base64url, "base64url"),
+  )
+  return {
+    authority_domain: "attachment-evidence-retention-release-only",
+    authority_key_id: "a3k-human-approval-root-v1",
+    authorized_action: "release-attachment-evidence-reservation",
+    confirmed_send_identity_sha256: sha256Hex(
+      canonicalJsonBytes(evidence.confirmed_send_identity),
+    ),
+    consumer_profile: "a3k-manual-canary-v1",
+    consumer_state: disposition.outcome === "EXACTLY_ONE"
+      ? "WAITING_HUMAN_SOURCE_APPROVAL"
+      : "RECOVERY_REQUIRED",
+    consumer_state_record_sha256: "a".repeat(64),
+    disposition_envelope_sha256: sha256Hex(
+      canonicalJsonBytes(evidence.disposition_envelope),
+    ),
+    does_not_grant: ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT,
+    external_binding_sha256: evidence.intent.external_binding_sha256,
+    idempotency_key_sha256: "b".repeat(64),
+    media_type: "application/vnd.a3k.attachment-disposition-consumer-acknowledgement.v1+jcs",
+    recovery_policy_sha256: "c".repeat(64),
+    schema: "a3k-attachment-disposition-consumer-acknowledgement/v1",
+    signature_input_domain: "A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1",
+    terminal_evidence_digest: evidence.disposition_envelope.payload_sha256,
+    terminal_evidence_kind: "attachment-execution-disposition",
+    terminal_outcome: disposition.outcome,
+    work_order_id: "CANARY-IMAGE-002",
+    ...overrides,
+  }
+}
+
+function signedAttachmentConsumerAcknowledgement(acknowledgement, fill = 2) {
+  const payloadBytes = canonicalJsonBytes(acknowledgement)
+  return {
+    authority_domain: acknowledgement.authority_domain,
+    media_type: acknowledgement.media_type,
+    payload_base64url: payloadBytes.toString("base64url"),
+    payload_sha256: sha256Hex(payloadBytes),
+    schema: "a3k-signed-attachment-disposition-consumer-acknowledgement-envelope/v1",
+    signature_base64url: Buffer.alloc(256, fill).toString("base64url"),
+    signature_input_domain: acknowledgement.signature_input_domain,
+    signer_key_id: acknowledgement.authority_key_id,
   }
 }
 
@@ -1052,6 +1104,10 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
         signerEnrollmentDigest: "e".repeat(64),
         signerKeyId: `ed25519-spki-sha256:${"f".repeat(64)}`,
       }),
+      verifyConsumerAcknowledgement: async (envelope) => (
+        assertValidSignedAttachmentConsumerAcknowledgementEnvelope(envelope)
+          .acknowledgement
+      ),
     },
     egoAdapter: {
       ...unusedEgoAdapter,
@@ -1144,6 +1200,71 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
   assert.equal(evidence.capture.state, "TERMINAL")
   assert.equal(evidence.disposition_envelope.payload_sha256, evidence.capture.terminal_disposition_sha256)
   assert.equal(evidence.external_binding.external_binding_sha256, "9".repeat(64))
+  const wrongLineageEnvelope = signedAttachmentConsumerAcknowledgement(
+    attachmentConsumerAcknowledgement(evidence, {
+      external_binding_sha256: "e".repeat(64),
+    }),
+  )
+  await assert.rejects(
+    broker.releaseAttachmentEvidence({
+      acknowledgement_envelope: wrongLineageEnvelope,
+      schema: "ego-chat-attachment-evidence-release-request/v1",
+      source_workflow_id: started.id,
+    }),
+    (error) => error.code === "attachment_consumer_acknowledgement_lineage_mismatch",
+  )
+  assert.equal(store.getMetrics().attachmentReservedBytes, 1024 * 1024)
+  const acknowledgement = attachmentConsumerAcknowledgement(evidence)
+  const acknowledgementEnvelope = signedAttachmentConsumerAcknowledgement(acknowledgement)
+  const released = await broker.releaseAttachmentEvidence({
+    acknowledgement_envelope: acknowledgementEnvelope,
+    schema: "ego-chat-attachment-evidence-release-request/v1",
+    source_workflow_id: started.id,
+  })
+  assert.equal(released.created, true)
+  assert.equal(released.consumer_state, "RECOVERY_REQUIRED")
+  assert.equal(store.getMetrics().attachmentIntentCount, 0)
+  assert.equal(store.getMetrics().attachmentReservedBytes, 0)
+  assert.equal(
+    store.getAttachmentExternalBinding("a3k-manual-canary-v1", "9".repeat(64)).state,
+    "CONSUMED_RELEASED",
+  )
+  const retrievedAfterRelease = broker.getAttachmentEvidence({
+    schema: "ego-chat-attachment-evidence-request/v1",
+    source_workflow_id: started.id,
+  })
+  assert.deepEqual(
+    retrievedAfterRelease.consumer_acknowledgement_envelope,
+    acknowledgementEnvelope,
+  )
+  assert.equal(retrievedAfterRelease.evidence_tombstone.consumer_state, "RECOVERY_REQUIRED")
+  const replayed = await broker.releaseAttachmentEvidence({
+    acknowledgement_envelope: acknowledgementEnvelope,
+    schema: "ego-chat-attachment-evidence-release-request/v1",
+    source_workflow_id: started.id,
+  })
+  assert.equal(replayed.created, false)
+  const conflictingEnvelope = signedAttachmentConsumerAcknowledgement(
+    attachmentConsumerAcknowledgement(evidence, {
+      consumer_state_record_sha256: "d".repeat(64),
+    }),
+    3,
+  )
+  await assert.rejects(
+    broker.releaseAttachmentEvidence({
+      acknowledgement_envelope: conflictingEnvelope,
+      schema: "ego-chat-attachment-evidence-release-request/v1",
+      source_workflow_id: started.id,
+    }),
+    (error) => error.code === "attachment_consumer_acknowledgement_conflict",
+  )
+  const restarted = new EventStore(dataDir)
+  await restarted.initialize()
+  assert.equal(restarted.getMetrics().attachmentReservedBytes, 0)
+  assert.deepEqual(
+    restarted.getAttachmentConsumerAcknowledgement(started.id),
+    acknowledgementEnvelope,
+  )
   assert.throws(
     () => broker.getAttachmentEvidence({
       schema: "ego-chat-attachment-evidence-request/v1",

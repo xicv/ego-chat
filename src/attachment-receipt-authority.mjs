@@ -18,6 +18,7 @@ import {
   canonicalJsonBytes,
   sha256Hex,
 } from "./attachment-execution-receipt.mjs"
+import { verifyAttachmentConsumerAcknowledgementEnvelope } from "./attachment-consumer-ack.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const AUTHORIZATION_KEYS = [
@@ -114,6 +115,7 @@ export const RECEIPT_RELEVANT_RUNTIME_PATHS = Object.freeze([
   "bin/ego-chatd.mjs",
   "src/app-server-client.mjs",
   "src/attachment-execution-receipt.mjs",
+  "src/attachment-consumer-ack.mjs",
   "src/attachment-receipt-authority.mjs",
   "src/auth-token.mjs",
   "src/broker-lease.mjs",
@@ -748,5 +750,14 @@ export class AttachmentReceiptAuthority {
       signature_input_domain: disposition.signature_input_domain,
       signer_key_id: disposition.signer_key_id,
     }
+  }
+
+  async verifyConsumerAcknowledgement(envelope) {
+    const publicKey = await readBoundedRegularFile(
+      this.#humanApprovalPublicKeyPath,
+      MAX_AUTHORIZATION_BYTES,
+      "attachment_consumer_acknowledgement_authority_unavailable",
+    )
+    return verifyAttachmentConsumerAcknowledgementEnvelope(envelope, publicKey)
   }
 }

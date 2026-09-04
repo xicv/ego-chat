@@ -197,6 +197,29 @@ export const AttachmentEvidenceRequestSchema = z.object({
   source_workflow_id: WorkflowIdSchema,
 }).strict()
 
+const AttachmentConsumerAcknowledgementEnvelopeSchema = z.object({
+  authority_domain: z.literal("attachment-evidence-retention-release-only"),
+  media_type: z.literal(
+    "application/vnd.a3k.attachment-disposition-consumer-acknowledgement.v1+jcs",
+  ),
+  payload_base64url: z.string().regex(/^[A-Za-z0-9_-]+$/).max(24 * 1024),
+  payload_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  schema: z.literal(
+    "a3k-signed-attachment-disposition-consumer-acknowledgement-envelope/v1",
+  ),
+  signature_base64url: z.string().regex(/^[A-Za-z0-9_-]+$/).max(2 * 1024),
+  signature_input_domain: z.literal(
+    "A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1",
+  ),
+  signer_key_id: z.literal("a3k-human-approval-root-v1"),
+}).strict()
+
+export const AttachmentEvidenceReleaseRequestSchema = z.object({
+  acknowledgement_envelope: AttachmentConsumerAcknowledgementEnvelopeSchema,
+  schema: z.literal("ego-chat-attachment-evidence-release-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),

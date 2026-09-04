@@ -36,6 +36,7 @@ import {
   AbandonWorkflowSchema,
   AttachmentCaptureRequestSchema,
   AttachmentEvidenceRequestSchema,
+  AttachmentEvidenceReleaseRequestSchema,
   AwaitWorkflowSchema,
   ConversationAdoptionSchema,
   ConversationBindSchema,
@@ -1623,7 +1624,10 @@ export class Broker {
     }
     if (
       workflow.kind !== "ego_exchange"
-      || workflow.phase !== "attachment_disposition_terminal"
+      || ![
+        "attachment_disposition_terminal",
+        "attachment_evidence_released",
+      ].includes(workflow.phase)
       || workflow.status !== "succeeded"
       || !intent
       || !confirmedSendEvent
@@ -1650,6 +1654,13 @@ export class Broker {
       )
     }
     return {
+      ...(this.#store.getAttachmentConsumerAcknowledgement(workflow.id)
+        ? {
+            consumer_acknowledgement_envelope:
+              this.#store.getAttachmentConsumerAcknowledgement(workflow.id),
+            evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
+          }
+        : {}),
       capture,
       confirmed_send_event: confirmedSendEvent,
       confirmed_send_identity: confirmedSendIdentity,
@@ -1660,6 +1671,36 @@ export class Broker {
       schema: "ego-chat-attachment-evidence-bundle/v1",
       source_operation_key: workflow.operationKey,
       source_workflow_id: workflow.id,
+    }
+  }
+
+  async releaseAttachmentEvidence(input) {
+    const params = parse(AttachmentEvidenceReleaseRequestSchema, input)
+    if (
+      typeof this.#attachmentReceiptAuthority?.verifyConsumerAcknowledgement
+        !== "function"
+    ) {
+      throw new EgoChatError(
+        "attachment_consumer_acknowledgement_authority_unavailable",
+        "The A3K acknowledgement authority is unavailable; evidence remains reserved.",
+      )
+    }
+    const acknowledgement = await this.#attachmentReceiptAuthority
+      .verifyConsumerAcknowledgement(params.acknowledgement_envelope)
+    const released = await this.#store.releaseAttachmentEvidence({
+      acknowledgement,
+      envelope: params.acknowledgement_envelope,
+      workflowId: params.source_workflow_id,
+    })
+    return {
+      acknowledgement_envelope_sha256: sha256Hex(
+        canonicalJsonBytes(released.envelope),
+      ),
+      consumer_state: released.acknowledgement.consumer_state,
+      created: released.created,
+      evidence_tombstone: released.tombstone,
+      schema: "ego-chat-attachment-evidence-release-result/v1",
+      source_workflow_id: params.source_workflow_id,
     }
   }
 

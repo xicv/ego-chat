@@ -5,6 +5,7 @@ import { MAX_WAIT_MS } from "../src/constants.mjs"
 import {
   AttachmentCaptureRequestSchema,
   AttachmentEvidenceRequestSchema,
+  AttachmentEvidenceReleaseRequestSchema,
   EgoExchangeSchema,
   StartConvergenceSchema,
   parse,
@@ -98,4 +99,30 @@ test("attachment evidence retrieval accepts only its source workflow identity", 
       (error) => error.code === "invalid_input",
     )
   }
+})
+
+test("attachment evidence release has one closed signed acknowledgement input", () => {
+  const acknowledgementEnvelope = {
+    authority_domain: "attachment-evidence-retention-release-only",
+    media_type: "application/vnd.a3k.attachment-disposition-consumer-acknowledgement.v1+jcs",
+    payload_base64url: "e30",
+    payload_sha256: "a".repeat(64),
+    schema: "a3k-signed-attachment-disposition-consumer-acknowledgement-envelope/v1",
+    signature_base64url: "YQ",
+    signature_input_domain: "A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1",
+    signer_key_id: "a3k-human-approval-root-v1",
+  }
+  const input = {
+    acknowledgement_envelope: acknowledgementEnvelope,
+    schema: "ego-chat-attachment-evidence-release-request/v1",
+    source_workflow_id: "4559c675-14a9-4ec0-b5f9-0bb3ec3b73b5",
+  }
+  assert.deepEqual(parse(AttachmentEvidenceReleaseRequestSchema, input), input)
+  assert.throws(
+    () => parse(AttachmentEvidenceReleaseRequestSchema, {
+      ...input,
+      acknowledgement_envelope: { ...acknowledgementEnvelope, grants_source_approval: true },
+    }),
+    (error) => error.code === "invalid_input",
+  )
 })

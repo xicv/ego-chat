@@ -12,6 +12,7 @@ import {
   RECEIPT_RELEVANT_RUNTIME_PATHS,
   writeReceiptBuildManifest,
 } from "../src/attachment-receipt-authority.mjs"
+import { ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT } from "../src/attachment-consumer-ack.mjs"
 import {
   canonicalJsonBytes,
   sha256Hex,
@@ -191,6 +192,49 @@ test("receipt signer enrollment is create-once and qualification verifies human 
       Buffer.from(envelope.signature_base64url, "base64url"),
     ),
     true,
+  )
+  const acknowledgement = {
+    authority_domain: "attachment-evidence-retention-release-only",
+    authority_key_id: "a3k-human-approval-root-v1",
+    authorized_action: "release-attachment-evidence-reservation",
+    confirmed_send_identity_sha256: "1".repeat(64),
+    consumer_profile: "a3k-manual-canary-v1",
+    consumer_state: "RECOVERY_REQUIRED",
+    consumer_state_record_sha256: "2".repeat(64),
+    disposition_envelope_sha256: "3".repeat(64),
+    does_not_grant: ATTACHMENT_CONSUMER_ACKNOWLEDGEMENT_DOES_NOT_GRANT,
+    external_binding_sha256: "4".repeat(64),
+    idempotency_key_sha256: "5".repeat(64),
+    media_type: "application/vnd.a3k.attachment-disposition-consumer-acknowledgement.v1+jcs",
+    recovery_policy_sha256: "6".repeat(64),
+    schema: "a3k-attachment-disposition-consumer-acknowledgement/v1",
+    signature_input_domain: "A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1",
+    terminal_evidence_digest: "7".repeat(64),
+    terminal_evidence_kind: "attachment-execution-disposition",
+    terminal_outcome: "UNKNOWN",
+    work_order_id: "CANARY-IMAGE-002",
+  }
+  const acknowledgementBytes = canonicalJsonBytes(acknowledgement)
+  const acknowledgementEnvelope = {
+    authority_domain: acknowledgement.authority_domain,
+    media_type: acknowledgement.media_type,
+    payload_base64url: acknowledgementBytes.toString("base64url"),
+    payload_sha256: sha256Hex(acknowledgementBytes),
+    schema: "a3k-signed-attachment-disposition-consumer-acknowledgement-envelope/v1",
+    signature_base64url: sign(
+      "RSA-SHA256",
+      Buffer.concat([
+        Buffer.from("A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1\0", "ascii"),
+        acknowledgementBytes,
+      ]),
+      humanKeyPair.privateKey,
+    ).toString("base64url"),
+    signature_input_domain: acknowledgement.signature_input_domain,
+    signer_key_id: acknowledgement.authority_key_id,
+  }
+  assert.deepEqual(
+    await authority.verifyConsumerAcknowledgement(acknowledgementEnvelope),
+    acknowledgement,
   )
   await assert.rejects(
     authority.signAttachmentDisposition({
