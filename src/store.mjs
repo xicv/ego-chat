@@ -284,14 +284,56 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
     "confirmedSendEvents",
     "confirmedSendIdentities",
   ]
-  const workflowIds = new Set(
-    ledgers.flatMap((ledger) => Object.keys(state[ledger] ?? {})),
-  )
+  const workflowIds = new Set(ledgers.flatMap((ledger) => (
+    sourceSchemaVersion < 8
+      ? Object.keys(state[ledger] ?? {})
+      : Object.keys(state[ledger] ?? {}).filter(
+          (workflowId) => state.legacyAttachmentEvidence[workflowId],
+        )
+  )))
+  const externalBindingsByWorkflow = new Map()
+  for (const [ledgerKey, binding] of Object.entries(
+    state.attachmentExternalBindings,
+  )) {
+    const workflowId = binding?.source_workflow_id
+    const expectedLedgerKey = `${binding?.profile}:${binding?.external_binding_sha256}`
+    if (
+      typeof workflowId !== "string"
+      || !workflowId
+      || binding.ledger_key !== ledgerKey
+      || expectedLedgerKey !== ledgerKey
+      || !state.workflows[workflowId]
+      || externalBindingsByWorkflow.has(workflowId)
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "A legacy attachment external binding has an inconsistent workflow association.",
+      )
+    }
+    externalBindingsByWorkflow.set(workflowId, binding)
+    if (
+      sourceSchemaVersion < 8
+      || binding.state === "CONSUMED_LEGACY_RECOVERY_REQUIRED"
+      || state.legacyAttachmentEvidence[workflowId]
+    ) {
+      workflowIds.add(workflowId)
+    }
+  }
   for (const workflowId of workflowIds) {
     const intent = state.attachmentIntents[workflowId]
     const bindingKey = intent
       ? `${intent.profile}:${intent.external_binding_sha256}`
       : null
+    const externalBinding = externalBindingsByWorkflow.get(workflowId) ?? null
+    if (
+      (intent && !externalBinding)
+      || (intent && externalBinding.ledger_key !== bindingKey)
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "Legacy attachment intent and external binding associations disagree.",
+      )
+    }
     const sourceRecords = {
       attachment_consumer_acknowledgement:
         state.attachmentConsumerAcknowledgements[workflowId] ?? null,
@@ -302,22 +344,37 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
       attachment_intent: intent ?? null,
       confirmed_send_event: state.confirmedSendEvents[workflowId] ?? null,
       confirmed_send_identity: state.confirmedSendIdentities[workflowId] ?? null,
-      external_binding: bindingKey
-        ? state.attachmentExternalBindings[bindingKey] ?? null
-        : null,
+      external_binding: externalBinding,
     }
+    const existing = state.legacyAttachmentEvidence[workflowId]
+    const mergedRecords = Object.fromEntries(
+      LEGACY_ATTACHMENT_SOURCE_RECORD_KEYS.map((key) => {
+        const prior = existing?.source_records?.[key] ?? null
+        const incoming = sourceRecords[key]
+        if (prior && incoming && !isDeepStrictEqual(prior, incoming)) {
+          throw new EgoChatError(
+            "corrupt_attachment_evidence_state",
+            "Legacy attachment evidence replay conflicts with its immutable quarantine.",
+          )
+        }
+        return [key, prior ?? incoming]
+      }),
+    )
     state.legacyAttachmentEvidence[workflowId] = {
       reason: "LEGACY_CONTRACT_RECOVERY_ONLY",
       schema: "ego-chat-legacy-attachment-evidence-quarantine/v1",
-      source_records: sourceRecords,
-      source_records_sha256: sha256Hex(canonicalJsonBytes(sourceRecords)),
-      source_schema_version: sourceSchemaVersion,
+      source_records: mergedRecords,
+      source_records_sha256: sha256Hex(canonicalJsonBytes(mergedRecords)),
+      source_schema_version: Math.min(
+        sourceSchemaVersion,
+        existing?.source_schema_version ?? sourceSchemaVersion,
+      ),
       source_workflow_id: workflowId,
     }
     for (const ledger of ledgers) delete state[ledger][workflowId]
-    if (bindingKey && state.attachmentExternalBindings[bindingKey]) {
-      state.attachmentExternalBindings[bindingKey] = {
-        ...state.attachmentExternalBindings[bindingKey],
+    if (externalBinding) {
+      state.attachmentExternalBindings[externalBinding.ledger_key] = {
+        ...externalBinding,
         state: "CONSUMED_LEGACY_RECOVERY_REQUIRED",
       }
     }
@@ -337,8 +394,12 @@ function quarantineLegacyAttachmentEvidence(state, sourceSchemaVersion) {
     }
   }
   state.attachmentCapacity = {
-    liveIntentCount: 0,
-    liveReservedBytes: 0,
+    liveIntentCount: Object.keys(state.attachmentIntents).filter(
+      (workflowId) => !state.attachmentEvidenceTombstones[workflowId],
+    ).length,
+    liveReservedBytes: Object.keys(state.attachmentIntents).filter(
+      (workflowId) => !state.attachmentEvidenceTombstones[workflowId],
+    ).length * ATTACHMENT_EVIDENCE_RESERVATION_BYTES,
     permanentEntryCount: Object.keys(state.attachmentExternalBindings).length,
     permanentReservedBytes: Object.keys(state.attachmentExternalBindings).length
       * ATTACHMENT_PERMANENT_RESERVATION_BYTES,
@@ -357,13 +418,22 @@ function hasLegacyAttachmentEvidenceShape(state) {
     || capture.candidate_observations.some(
       (observation) => !Object.hasOwn(observation, "save_association_candidates"),
     )
+  )) || [
+    "attachmentConsumerAcknowledgements",
+    "attachmentCaptures",
+    "attachmentDispositions",
+    "attachmentEvidenceTombstones",
+    "attachmentIntents",
+    "confirmedSendEvents",
+    "confirmedSendIdentities",
+  ].some((ledger) => Object.keys(state[ledger] ?? {}).some(
+    (workflowId) => state.legacyAttachmentEvidence?.[workflowId],
   ))
 }
 
-function migrateState(value) {
+function normalizeStateForReplay(value) {
   validateCheckpoint(value)
   const state = clone(value)
-  const sourceSchemaVersion = state.schemaVersion
   state.attachmentCapacity ??= clone(EMPTY_STATE.attachmentCapacity)
   state.attachmentConsumerAcknowledgements ??= {}
   state.attachmentExternalBindings ??= {}
@@ -375,6 +445,12 @@ function migrateState(value) {
   state.confirmedSendEvents ??= {}
   state.confirmedSendIdentities ??= {}
   state.operations ??= {}
+  return state
+}
+
+function migrateState(value) {
+  const state = normalizeStateForReplay(value)
+  const sourceSchemaVersion = state.schemaVersion
   if (sourceSchemaVersion < 8 || hasLegacyAttachmentEvidenceShape(state)) {
     quarantineLegacyAttachmentEvidence(
       state,
@@ -499,9 +575,10 @@ function validateAttachmentEvidenceState(state) {
   for (const [workflowId, quarantine] of Object.entries(legacyEvidence)) {
     const records = quarantine?.source_records
     const intent = records?.attachment_intent
-    const bindingKey = intent
+    const sourceBinding = records?.external_binding
+    const bindingKey = sourceBinding?.ledger_key ?? (intent
       ? `${intent.profile}:${intent.external_binding_sha256}`
-      : null
+      : null)
     const binding = bindingKey ? bindings[bindingKey] : null
     if (
       !hasExactKeys(quarantine, [
@@ -525,10 +602,16 @@ function validateAttachmentEvidenceState(state) {
       || quarantine.source_records_sha256
         !== sha256Hex(canonicalJsonBytes(records))
       || (intent && intent.source_workflow_id !== workflowId)
-      || (intent && binding?.source_workflow_id !== workflowId)
+      || (sourceBinding && sourceBinding.source_workflow_id !== workflowId)
+      || (sourceBinding && binding?.source_workflow_id !== workflowId)
+      || (sourceBinding && sourceBinding.ledger_key !== bindingKey)
+      || (sourceBinding && binding?.state !== "CONSUMED_LEGACY_RECOVERY_REQUIRED")
+      || (intent && sourceBinding?.ledger_key
+        !== `${intent.profile}:${intent.external_binding_sha256}`)
       || (intent && binding?.state !== "CONSUMED_LEGACY_RECOVERY_REQUIRED")
       || (intent && records.external_binding?.intent_sha256
         !== sha256Hex(canonicalJsonBytes(intent)))
+      || (!state.workflows[workflowId])
       || state.workflows[workflowId]?.phase
         !== "attachment_legacy_recovery_required"
       || state.workflows[workflowId]?.status !== "failed"
@@ -829,7 +912,7 @@ async function listFiles(directory) {
   return files
 }
 
-function applyEvent(state, event) {
+function applyEvent(state, event, { validateAttachmentEvidence = true } = {}) {
   if (
     !event
     || event.schemaVersion !== 1
@@ -912,7 +995,7 @@ function applyEvent(state, event) {
   } else {
     throw new EgoChatError("corrupt_event_log", "The event ledger contains an invalid record.")
   }
-  validateAttachmentEvidenceState(state)
+  if (validateAttachmentEvidence) validateAttachmentEvidenceState(state)
   state.nextSeq += 1
 }
 
@@ -1015,6 +1098,7 @@ export class EventStore {
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
 
+    let legacyReplay = false
     try {
       const [checkpointText, manifestText] = await Promise.all([
         fs.readFile(this.#checkpointPath, "utf8"),
@@ -1029,7 +1113,9 @@ export class EventStore {
       ) {
         throw new EgoChatError("corrupt_checkpoint", "The durable state checkpoint digest does not match its manifest.")
       }
-      this.#state = migrateState(checkpoint)
+      this.#state = normalizeStateForReplay(checkpoint)
+      legacyReplay = this.#state.schemaVersion < 8
+        || hasLegacyAttachmentEvidenceShape(this.#state)
     } catch (error) {
       const checkpointMissing = error.code === "ENOENT"
       const checkpointError = error instanceof SyntaxError
@@ -1042,7 +1128,11 @@ export class EventStore {
         throw checkpointError
       }
       try {
-        this.#state = migrateState(JSON.parse(await fs.readFile(this.#statePath, "utf8")))
+        this.#state = normalizeStateForReplay(
+          JSON.parse(await fs.readFile(this.#statePath, "utf8")),
+        )
+        legacyReplay = this.#state.schemaVersion < 8
+          || hasLegacyAttachmentEvidenceShape(this.#state)
       } catch (_recoveryError) {
         if (!checkpointMissing) {
           throw checkpointError
@@ -1072,7 +1162,9 @@ export class EventStore {
         if (event.seq < this.#state.nextSeq) {
           continue
         }
-        applyEvent(this.#state, event)
+        applyEvent(this.#state, event, {
+          validateAttachmentEvidence: !legacyReplay,
+        })
         this.#eventsSinceCheckpoint += 1
       } catch (error) {
         if (error instanceof SyntaxError) {

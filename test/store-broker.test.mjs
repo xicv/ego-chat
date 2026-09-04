@@ -1,9 +1,11 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
+import { pathToFileURL } from "node:url"
 
 import { Broker } from "../src/broker.mjs"
 import {
@@ -1380,6 +1382,277 @@ test("terminal attachment evidence is retrieved as one exact immutable chain", a
       - Date.parse(freshIntent.created_at),
     10 * 60 * 1_000,
   )
+})
+
+test("legacy attachment quarantine is stable across a stale checkpoint and ledger tail", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const workflowId = "a9f6b990-7475-43f1-b0dd-c04325b90010"
+  const externalBindingDigest = "9".repeat(64)
+  const profile = "a3k-manual-canary-v1"
+  const ledgerKey = `${profile}:${externalBindingDigest}`
+  const operationKey = "exchange:a3k-legacy:EGO_CHAT_A3K_LEGACY_TAIL_12345678"
+  const intent = {
+    consumer_signer_authorization_sha256: "8".repeat(64),
+    created_at: "2026-09-03T01:00:00.000Z",
+    external_binding_sha256: externalBindingDigest,
+    profile,
+    schema: "ego-chat-attachment-capture-intent/v1",
+    source_workflow_id: workflowId,
+    state: "RESERVED",
+  }
+  const externalBinding = {
+    external_binding_sha256: externalBindingDigest,
+    intent_sha256: sha256Hex(canonicalJsonBytes(intent)),
+    ledger_key: ledgerKey,
+    profile,
+    schema: "ego-chat-attachment-external-binding-entry/v1",
+    source_workflow_id: workflowId,
+    state: "CONSUMED_RELEASED",
+  }
+  const workflow = {
+    bindingKey: "a3k-legacy",
+    createdAt: "2026-09-03T01:00:00.000Z",
+    id: workflowId,
+    inputDigest: "7".repeat(64),
+    kind: "ego_exchange",
+    operationKey,
+    phase: "attachment_evidence_released",
+    status: "succeeded",
+    updatedAt: "2026-09-03T01:00:08.000Z",
+  }
+  const checkpoint = {
+    attachmentCapacity: {
+      liveIntentCount: 1,
+      liveReservedBytes: 1024 * 1024,
+      permanentEntryCount: 1,
+      permanentReservedBytes: 32 * 1024,
+    },
+    attachmentConsumerAcknowledgements: {},
+    attachmentExternalBindings: { [ledgerKey]: externalBinding },
+    attachmentCaptures: {
+      [workflowId]: { schema: "legacy-capture/v1", source_workflow_id: workflowId },
+    },
+    attachmentDispositions: {},
+    attachmentIntents: { [workflowId]: intent },
+    attachmentEvidenceTombstones: {},
+    bindings: {},
+    confirmedSendEvents: {
+      [workflowId]: { schema: "legacy-send-event/v1", workflow_id: workflowId },
+    },
+    confirmedSendIdentities: {
+      [workflowId]: { schema: "legacy-send-identity/v1", source_workflow_id: workflowId },
+    },
+    modelPolicies: {},
+    nextSeq: 2,
+    operations: {
+      [operationKey]: {
+        createdAt: workflow.createdAt,
+        inputDigest: workflow.inputDigest,
+        key: operationKey,
+        workflowId,
+      },
+    },
+    schemaVersion: 7,
+    workflows: { [workflowId]: workflow },
+  }
+  const disposition = { schema: "legacy-disposition/v1", source_workflow_id: workflowId }
+  const acknowledgement = { schema: "legacy-acknowledgement/v1", source_workflow_id: workflowId }
+  const tombstone = { schema: "legacy-tombstone/v1", source_workflow_id: workflowId }
+  const tailEvent = {
+    at: "2026-09-03T01:00:08.000Z",
+    attachmentCapacity: {
+      liveIntentCount: 0,
+      liveReservedBytes: 0,
+      permanentEntryCount: 1,
+      permanentReservedBytes: 32 * 1024,
+    },
+    attachmentConsumerAcknowledgement: {
+      envelope: acknowledgement,
+      source_workflow_id: workflowId,
+    },
+    attachmentDisposition: {
+      envelope: disposition,
+      source_workflow_id: workflowId,
+    },
+    attachmentEvidenceTombstone: tombstone,
+    attachmentExternalBinding: externalBinding,
+    schemaVersion: 1,
+    seq: 2,
+    type: "attachment.evidence_released",
+    workflow,
+  }
+  await fs.writeFile(
+    path.join(dataDir, "checkpoint.json"),
+    `${JSON.stringify(checkpoint, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  await fs.writeFile(
+    path.join(dataDir, "checkpoint.manifest.json"),
+    `${JSON.stringify({
+      createdAt: "2026-09-03T01:00:07.000Z",
+      digest: digest(JSON.stringify(checkpoint)),
+      nextSeq: checkpoint.nextSeq,
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  await fs.writeFile(
+    path.join(dataDir, "events.jsonl"),
+    `${JSON.stringify(tailEvent)}\n`,
+    { mode: 0o600 },
+  )
+
+  const first = new EventStore(dataDir)
+  await first.initialize()
+  const firstQuarantine = first.getLegacyAttachmentEvidence(workflowId)
+  assert.deepEqual(firstQuarantine.source_records, {
+    attachment_consumer_acknowledgement: acknowledgement,
+    attachment_capture: checkpoint.attachmentCaptures[workflowId],
+    attachment_disposition: disposition,
+    attachment_evidence_tombstone: tombstone,
+    attachment_intent: intent,
+    confirmed_send_event: checkpoint.confirmedSendEvents[workflowId],
+    confirmed_send_identity: checkpoint.confirmedSendIdentities[workflowId],
+    external_binding: externalBinding,
+  })
+  assert.equal(first.getAttachmentIntent(workflowId), undefined)
+  assert.equal(
+    first.getAttachmentExternalBinding(profile, externalBindingDigest).state,
+    "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+  )
+
+  const second = new EventStore(dataDir)
+  await second.initialize()
+  assert.deepEqual(second.getLegacyAttachmentEvidence(workflowId), firstQuarantine)
+  assert.equal(second.getAttachmentIntent(workflowId), undefined)
+})
+
+test("binding-only legacy authority remains permanently consumed without mutation", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const workflowId = "80edb351-60d3-476c-af45-e7b7c836ad9a"
+  const profile = "a3k-manual-canary-v1"
+  const externalBindingDigest = "9".repeat(64)
+  const ledgerKey = `${profile}:${externalBindingDigest}`
+  const operationKey = "exchange:a3k-old:EGO_CHAT_A3K_BINDING_ONLY_12345678"
+  const externalBinding = {
+    external_binding_sha256: externalBindingDigest,
+    ledger_key: ledgerKey,
+    profile,
+    schema: "ego-chat-attachment-external-binding-entry/v1",
+    source_workflow_id: workflowId,
+    state: "CONSUMED_RELEASED",
+  }
+  const legacyState = {
+    attachmentCapacity: {
+      liveIntentCount: 0,
+      liveReservedBytes: 0,
+      permanentEntryCount: 1,
+      permanentReservedBytes: 32 * 1024,
+    },
+    attachmentConsumerAcknowledgements: {},
+    attachmentExternalBindings: { [ledgerKey]: externalBinding },
+    attachmentCaptures: {},
+    attachmentDispositions: {},
+    attachmentIntents: {},
+    attachmentEvidenceTombstones: {},
+    bindings: {},
+    confirmedSendEvents: {},
+    confirmedSendIdentities: {},
+    modelPolicies: {},
+    nextSeq: 1,
+    operations: {},
+    schemaVersion: 7,
+    workflows: {
+      [workflowId]: {
+        bindingKey: "a3k-old",
+        createdAt: "2026-09-03T01:00:00.000Z",
+        id: workflowId,
+        inputDigest: "7".repeat(64),
+        kind: "ego_exchange",
+        operationKey,
+        status: "succeeded",
+        updatedAt: "2026-09-03T01:00:01.000Z",
+      },
+    },
+  }
+  await fs.writeFile(
+    path.join(dataDir, "state.json"),
+    `${JSON.stringify(legacyState, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const quarantine = store.getLegacyAttachmentEvidence(workflowId)
+  assert.equal(quarantine.source_records.attachment_intent, null)
+  assert.deepEqual(quarantine.source_records.external_binding, externalBinding)
+  assert.equal(
+    store.getAttachmentExternalBinding(profile, externalBindingDigest).state,
+    "CONSUMED_LEGACY_RECOVERY_REQUIRED",
+  )
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/a3k-binding-only",
+    headContentDigest: "c".repeat(64),
+    headFingerprint: "d".repeat(64),
+    headFingerprintVersion: "tail-v1",
+    headMessageId: "assistant-before",
+    headRole: "assistant",
+    key: "a3k-binding-only",
+    messageCount: 2,
+    revision: 1,
+    state: "bound",
+    targetId: "tab-binding-only",
+    taskSpaceId: 3,
+  })
+  const broker = new Broker({
+    attachmentReceiptAuthority: {
+      qualify: async (request) => ({
+        consumerSignerAuthorizationDigest:
+          request.consumer_signer_authorization_sha256,
+        runtimeIdentity: {
+          executable_sha256: "1".repeat(64),
+          implementation_git_sha: "2".repeat(40),
+          package_inventory_sha256: "3".repeat(64),
+        },
+        signerEnrollmentDigest: "e".repeat(64),
+        signerKeyId: `ed25519-spki-sha256:${"f".repeat(64)}`,
+      }),
+    },
+    egoAdapter: unusedEgoAdapter,
+    store,
+  })
+  t.after(() => broker.close())
+  const before = {
+    events: await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+    externalBinding: store.getAttachmentExternalBinding(profile, externalBindingDigest),
+    metrics: store.getMetrics(),
+    state: await fs.readFile(path.join(dataDir, "state.json"), "utf8"),
+    workflows: store.listWorkflows(),
+  }
+  await assert.rejects(
+    broker.startEgoExchange({
+      bindingKey: "a3k-binding-only",
+      expectedTerminalMarker: "EGO_CHAT_A3K_BINDING_ONLY_RESULT",
+      prompt: "EGO_CHAT_A3K_BINDING_ONLY_FRESH_12345678\nprepare",
+      receiptCapture: {
+        consumer_signer_authorization_sha256: "8".repeat(64),
+        external_binding_sha256: externalBindingDigest,
+        profile,
+        receipt_capture_requested: true,
+        schema: "ego-chat-receipt-enabled-exchange-request/v1",
+      },
+      timeoutMs: 30_000,
+      turnMarker: "EGO_CHAT_A3K_BINDING_ONLY_FRESH_12345678",
+    }),
+    (error) => error.code === "attachment_external_binding_consumed",
+  )
+  assert.deepEqual({
+    events: await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"),
+    externalBinding: store.getAttachmentExternalBinding(profile, externalBindingDigest),
+    metrics: store.getMetrics(),
+    state: await fs.readFile(path.join(dataDir, "state.json"), "utf8"),
+    workflows: store.listWorkflows(),
+  }, before)
 })
 
 test("broker recovers a driver failure then signs one quiet terminal disposition", async (t) => {
@@ -8899,4 +9172,64 @@ test("running convergence resumes confirmed ChatGPT capture after broker restart
   assert.equal(secondClient.turns, 0)
   assert.equal(sends, 1)
   assert.equal(captures, 2)
+})
+
+test("committed v3-v7 store provenance remains reproducible and migratable", async (t) => {
+  const fixturePath = path.join(
+    import.meta.dirname,
+    "fixtures",
+    "a3k-legacy-attachment-state-provenance-v1.json",
+  )
+  const fixture = JSON.parse(await fs.readFile(fixturePath, "utf8"))
+
+  assert.equal(fixture.schema, "EgoA3KLegacyAttachmentStateProvenance.v1")
+  assert.deepEqual(
+    fixture.versions.map((entry) => entry.schema_version),
+    [3, 4, 5, 6, 7],
+  )
+
+  for (const entry of fixture.versions) {
+    const producerRoot = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-historical-store-"))
+    const producerDataDir = await createDataDir()
+    const storeSource = execFileSync(
+      "git",
+      ["show", `${entry.producer_commit}:src/store.mjs`],
+      { cwd: path.join(import.meta.dirname, "..") },
+    )
+    assert.equal(sha256Hex(storeSource), entry.store_source_sha256)
+    assert.match(storeSource.toString("utf8"), new RegExp(`schemaVersion: ${entry.schema_version}`))
+    try {
+      const archive = execFileSync("git", ["archive", entry.producer_commit], {
+        cwd: path.join(import.meta.dirname, ".."),
+        maxBuffer: 64 * 1024 * 1024,
+      })
+      execFileSync("tar", ["-x", "-C", producerRoot], { input: archive })
+      const historicalModule = await import(
+        pathToFileURL(path.join(producerRoot, "src", "store.mjs"))
+      )
+      const historicalStore = new historicalModule.EventStore(producerDataDir)
+      await historicalStore.initialize()
+      const persistedState = JSON.parse(
+        await fs.readFile(path.join(producerDataDir, "state.json"), "utf8"),
+      )
+      assert.deepEqual(persistedState, entry.persisted_state)
+      assert.deepEqual(Object.keys(persistedState).sort(), entry.empty_state_keys)
+    } finally {
+      await fs.rm(producerRoot, { force: true, recursive: true })
+      await fs.rm(producerDataDir, { force: true, recursive: true })
+    }
+
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+    await fs.writeFile(
+      path.join(dataDir, "state.json"),
+      canonicalJsonBytes(entry.persisted_state),
+      { mode: 0o600 },
+    )
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const migratedState = JSON.parse(await fs.readFile(path.join(dataDir, "state.json"), "utf8"))
+    assert.equal(migratedState.schemaVersion, 8)
+    assert.deepEqual(migratedState.legacyAttachmentEvidence, {})
+  }
 })

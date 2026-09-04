@@ -1,0 +1,28 @@
+{
+  "a3k_schema_files": [
+    {
+      "path": "tools/generator/schemas/art_pipeline/ego-attachment-evidence-bundle-v1.schema.json",
+      "sha256": "3444c93a78c601c930b90bd57b39e08710ce391cc9eb2a804416a22084ce7129"
+    },
+    {
+      "path": "tools/generator/schemas/art_pipeline/ego-ambiguous-send-evidence-bundle-v1.schema.json",
+      "sha256": "4caad5650b1532083fe873013346946a3b9c189fe38f39700ede2ada071b4b17"
+    },
+    {
+      "path": "tools/generator/schemas/art_pipeline/ego-confirmed-send-absence-evidence-bundle-v1.schema.json",
+      "sha256": "3f128fa24e10c2a42e97bface9c66faec6aea2dac3d28b7127c1570a0f29c10c"
+    },
+    {
+      "path": "tools/generator/schemas/art_pipeline/ego-attachment-signer-enrollment-v1.schema.json",
+      "sha256": "740e3a6e9750050e87b8f80a3c4b6c5d4e95ca7edd8a9729a268dc25c7f15c1d"
+    },
+    {
+      "path": "tools/generator/schemas/art_pipeline/a3k-attachment-transport-signer-authorization-v1.schema.json",
+      "sha256": "8248121c1fd320e1868b3f00f4ef4f96f14c9c7d0e3f0a3fba6bb51d8b439d55"
+    }
+  ],
+  "fixture_filename": "a3k-attachment-public-boundary-v1.json",
+  "fixture_sha256": "db80cfd272650cbf6af0eada11aa221388da6e733fcc8e1b000e566e4be207f6",
+  "producer_contract_sha256": "b385b899d2d562069f1c4205a3cf40cc8641825925b171a0d0a4627efa3e9f71",
+  "schema": "ego-chat-a3k-public-boundary-interoperability-manifest/v1"
+}

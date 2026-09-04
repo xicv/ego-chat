@@ -79,6 +79,21 @@ const SIGNED_ATTACHMENT_ENVELOPE_KEYS = [
   "signature_input_domain",
   "signer_key_id",
 ].sort()
+const TERMINAL_EVIDENCE_DOES_NOT_GRANT = Object.freeze([
+  "send",
+  "send-retry",
+  "image-generation",
+  "image-editing",
+  "attachment-capture",
+  "save-or-download",
+  "binary-measurement",
+  "source-approval",
+  "runtime-approval",
+  "repository-write",
+  "scheduler-activation",
+  "production-queue-activation",
+  "shipping",
+])
 
 function hasLoneSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -784,6 +799,205 @@ export function buildAttachmentCaptureIntent({
   return {
     digest: sha256Hex(canonicalJsonBytes(intent)),
     intent,
+  }
+}
+
+function terminalEvidenceLineage(intent) {
+  if (
+    !intent
+    || typeof intent !== "object"
+    || Array.isArray(intent)
+    || !isBoundedOpaqueId(intent.profile)
+    || !isBoundedOpaqueId(intent.source_workflow_id)
+    || !SHA256_PATTERN.test(intent.source_operation_key_sha256)
+    || !SHA256_PATTERN.test(intent.external_binding_sha256)
+    || !SHA256_PATTERN.test(intent.consumer_signer_authorization_sha256)
+    || !SHA256_PATTERN.test(intent.signer_enrollment_sha256)
+    || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(intent.signer_key_id)
+    || !intent.qualified_runtime_identity
+  ) {
+    throw new EgoChatError(
+      "invalid_terminal_evidence_disposition",
+      "Terminal evidence intent lineage is invalid.",
+    )
+  }
+  return {
+    capture_intent_sha256: sha256Hex(canonicalJsonBytes(intent)),
+    consumer_signer_authorization_sha256:
+      intent.consumer_signer_authorization_sha256,
+    does_not_grant: TERMINAL_EVIDENCE_DOES_NOT_GRANT,
+    external_binding_sha256: intent.external_binding_sha256,
+    profile: intent.profile,
+    qualified_runtime_identity: intent.qualified_runtime_identity,
+    signer_enrollment_sha256: intent.signer_enrollment_sha256,
+    signer_key_id: intent.signer_key_id,
+    source_operation_key_sha256: intent.source_operation_key_sha256,
+    source_workflow_id: intent.source_workflow_id,
+  }
+}
+
+export function buildAmbiguousSendDisposition({
+  brokerEpoch,
+  browserFencingGeneration,
+  firstObservationAt,
+  intent,
+  lastObservationAt,
+  preDispatchTurnMarker,
+  terminalAt,
+}) {
+  if (
+    !Number.isSafeInteger(brokerEpoch)
+    || brokerEpoch < 0
+    || !Number.isSafeInteger(browserFencingGeneration)
+    || browserFencingGeneration < 0
+    || !isBoundedOpaqueId(preDispatchTurnMarker)
+    || ![firstObservationAt, lastObservationAt, terminalAt].every(
+      (value) => parseObservationTimestamp(value) !== null,
+    )
+  ) {
+    throw new EgoChatError(
+      "invalid_terminal_evidence_disposition",
+      "Ambiguous Send evidence is invalid.",
+    )
+  }
+  return {
+    authority_domain: "send-ambiguity-observation-only",
+    broker_epoch: brokerEpoch,
+    browser_fencing_generation: browserFencingGeneration,
+    ...terminalEvidenceLineage(intent),
+    first_observation_at: firstObservationAt,
+    last_observation_at: lastObservationAt,
+    media_type: "application/vnd.ego-chat.ambiguous-send-disposition.v1+jcs",
+    outcome: "SEND_OUTCOME_UNKNOWN",
+    pre_dispatch_turn_marker: preDispatchTurnMarker,
+    reason: "SEND_CONFIRMATION_AMBIGUOUS",
+    schema: "ego-chat-ambiguous-send-disposition/v1",
+    signature_input_domain: "EGO_CHAT_AMBIGUOUS_SEND_DISPOSITION_V1",
+    terminal_at: terminalAt,
+  }
+}
+
+export function buildConfirmedSendAbsenceDisposition({
+  browserFencingGeneration,
+  dispatchAttempts,
+  intent,
+  observedAt,
+  terminalAt,
+}) {
+  if (
+    !Number.isSafeInteger(browserFencingGeneration)
+    || browserFencingGeneration < 0
+    || !Array.isArray(dispatchAttempts)
+    || dispatchAttempts.length > 32
+    || ![observedAt, terminalAt].every(
+      (value) => parseObservationTimestamp(value) !== null,
+    )
+    || dispatchAttempts.some((attempt, index) => (
+      !attempt
+      || typeof attempt !== "object"
+      || Array.isArray(attempt)
+      || !isDeepStrictKeySet(attempt, [
+        "attempt_number",
+        "browser_fencing_generation",
+        "observed_at",
+        "outcome",
+      ])
+      || attempt.attempt_number !== index + 1
+      || attempt.browser_fencing_generation !== browserFencingGeneration
+      || parseObservationTimestamp(attempt.observed_at) === null
+      || attempt.outcome !== "ABSENT"
+    ))
+  ) {
+    throw new EgoChatError(
+      "invalid_terminal_evidence_disposition",
+      "Confirmed Send absence evidence is invalid.",
+    )
+  }
+  return {
+    ambiguous_provider_outcome_observed: false,
+    authority_domain: "send-absence-observation-only",
+    browser_fencing_generation: browserFencingGeneration,
+    ...terminalEvidenceLineage(intent),
+    confirmed_provider_outcome_observed: false,
+    dispatch_attempts: structuredClone(dispatchAttempts),
+    media_type: "application/vnd.ego-chat.confirmed-send-absence.v1+jcs",
+    observed_at: observedAt,
+    outcome: "CONFIRMED_NOT_SENT",
+    reason: dispatchAttempts.length === 0
+      ? "NO_DISPATCH_ATTEMPT_OCCURRED"
+      : "ALL_DISPATCH_ATTEMPTS_PROVEN_ABSENT",
+    schema: "ego-chat-confirmed-send-absence/v1",
+    signature_input_domain: "EGO_CHAT_CONFIRMED_SEND_ABSENCE_V1",
+    terminal_at: terminalAt,
+  }
+}
+
+export function buildTerminalEvidenceBundle({
+  dispositionEnvelope,
+  externalBinding,
+  intent,
+  schema,
+  sourceOperationKey,
+  sourceWorkflowId,
+}) {
+  if (
+    ![
+      "ego-chat-ambiguous-send-evidence-bundle/v1",
+      "ego-chat-confirmed-send-absence-evidence-bundle/v1",
+    ].includes(schema)
+    || sourceWorkflowId !== intent?.source_workflow_id
+    || !isBoundedOpaqueId(sourceOperationKey)
+  ) {
+    throw new EgoChatError(
+      "invalid_terminal_evidence_bundle",
+      "Terminal evidence bundle lineage is invalid.",
+    )
+  }
+  return {
+    disposition_envelope: structuredClone(dispositionEnvelope),
+    external_binding: structuredClone(externalBinding),
+    intent: structuredClone(intent),
+    schema,
+    source_operation_key: sourceOperationKey,
+    source_workflow_id: sourceWorkflowId,
+  }
+}
+
+export function buildAttachmentEvidenceBundle({
+  capture,
+  confirmedSendEvent,
+  confirmedSendIdentity,
+  dispositionEnvelope,
+  exactPrompt,
+  externalBinding,
+  intent,
+  sourceOperationKey,
+  sourceWorkflowId,
+}) {
+  if (
+    sourceWorkflowId !== intent?.source_workflow_id
+    || sourceWorkflowId !== capture?.source_workflow_id
+    || sourceWorkflowId !== confirmedSendIdentity?.source_workflow_id
+    || sourceWorkflowId !== confirmedSendEvent?.workflow_id
+    || !isBoundedOpaqueId(sourceOperationKey)
+    || !(exactPrompt instanceof Uint8Array)
+  ) {
+    throw new EgoChatError(
+      "invalid_terminal_evidence_bundle",
+      "Attachment evidence bundle lineage is invalid.",
+    )
+  }
+  return {
+    capture: structuredClone(capture),
+    confirmed_send_event: structuredClone(confirmedSendEvent),
+    confirmed_send_identity: structuredClone(confirmedSendIdentity),
+    disposition_envelope: structuredClone(dispositionEnvelope),
+    exact_prompt_utf8_base64url: Buffer.from(exactPrompt).toString("base64url"),
+    external_binding: structuredClone(externalBinding),
+    intent: structuredClone(intent),
+    schema: "ego-chat-attachment-evidence-bundle/v1",
+    source_operation_key: sourceOperationKey,
+    source_workflow_id: sourceWorkflowId,
   }
 }
 

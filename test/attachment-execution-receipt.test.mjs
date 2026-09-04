@@ -5,13 +5,21 @@ import test from "node:test"
 import {
   assertValidAttachmentExecutionDisposition,
   buildAttachmentEvidenceCapture,
+  buildAmbiguousSendDisposition,
   attachmentCaptureOperationKeyDigest,
+  buildConfirmedSendAbsenceDisposition,
+  buildTerminalEvidenceBundle,
   buildAttachmentExecutionDisposition,
   canonicalJsonBytes,
   classifyAttachmentExecutionObservations,
   sha256Hex,
 } from "../src/attachment-execution-receipt.mjs"
 import { buildA3kAttachmentInteroperabilityVectors } from "./fixtures/build-a3k-attachment-interoperability-v1.mjs"
+import {
+  buildA3kPublicBoundaryFixture,
+  fixtureManifest,
+  serializeFixture,
+} from "./fixtures/build-a3k-public-boundary-v1.mjs"
 
 function imageArtifact(id = "image-1") {
   return {
@@ -398,6 +406,89 @@ test("committed A3K interoperability vectors are exact producer output", () => {
     "utf8",
   ))
   assert.deepEqual(fixture, buildA3kAttachmentInteroperabilityVectors())
+})
+
+test("committed public-boundary fixture is exact signed producer output", () => {
+  const fixtureBytes = fs.readFileSync(
+    new URL("./fixtures/a3k-attachment-public-boundary-v1.json", import.meta.url),
+  )
+  const manifest = JSON.parse(fs.readFileSync(
+    new URL(
+      "./fixtures/a3k-attachment-public-boundary-v1.manifest.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ))
+  const generated = buildA3kPublicBoundaryFixture()
+  assert.deepEqual(JSON.parse(fixtureBytes), generated)
+  assert.deepEqual(manifest, fixtureManifest(serializeFixture(generated), generated))
+})
+
+test("terminal evidence builders retain complete public lineage", () => {
+  const intent = {
+    consumer_signer_authorization_sha256: "a".repeat(64),
+    external_binding_sha256: "b".repeat(64),
+    profile: "a3k-manual-canary-v1",
+    qualified_runtime_identity: {
+      executable_sha256: "1".repeat(64),
+      implementation_git_sha: "2".repeat(40),
+      package_inventory_sha256: "3".repeat(64),
+      runtime_identity_sha256: "4".repeat(64),
+    },
+    signer_enrollment_sha256: "c".repeat(64),
+    signer_key_id: `ed25519-spki-sha256:${"d".repeat(64)}`,
+    source_operation_key_sha256: "e".repeat(64),
+    source_workflow_id: "workflow-terminal-vector",
+  }
+  const ambiguous = buildAmbiguousSendDisposition({
+    brokerEpoch: 7,
+    browserFencingGeneration: 11,
+    firstObservationAt: "2026-09-04T05:00:00.000Z",
+    intent,
+    lastObservationAt: "2026-09-04T05:00:01.000Z",
+    preDispatchTurnMarker: "EGO_CHAT_A3K_TERMINAL_VECTOR_12345678",
+    terminalAt: "2026-09-04T05:00:02.000Z",
+  })
+  assert.equal(ambiguous.reason, "SEND_CONFIRMATION_AMBIGUOUS")
+  assert.equal(ambiguous.capture_intent_sha256, sha256Hex(canonicalJsonBytes(intent)))
+  const absence = buildConfirmedSendAbsenceDisposition({
+    browserFencingGeneration: 11,
+    dispatchAttempts: [{
+      attempt_number: 1,
+      browser_fencing_generation: 11,
+      observed_at: "2026-09-04T05:00:00.500Z",
+      outcome: "ABSENT",
+    }],
+    intent,
+    observedAt: "2026-09-04T05:00:01.000Z",
+    terminalAt: "2026-09-04T05:00:02.000Z",
+  })
+  assert.equal(absence.reason, "ALL_DISPATCH_ATTEMPTS_PROVEN_ABSENT")
+  const envelope = {
+    authority_domain: ambiguous.authority_domain,
+    media_type: ambiguous.media_type,
+    payload_base64url: canonicalJsonBytes(ambiguous).toString("base64url"),
+    payload_sha256: sha256Hex(canonicalJsonBytes(ambiguous)),
+    schema: "ego-chat-signed-attachment-evidence-envelope/v1",
+    signature_base64url: "x".repeat(86),
+    signature_input_domain: ambiguous.signature_input_domain,
+    signer_key_id: ambiguous.signer_key_id,
+  }
+  assert.deepEqual(buildTerminalEvidenceBundle({
+    dispositionEnvelope: envelope,
+    externalBinding: { state: "CONSUMED_AMBIGUOUS_PENDING_ACK" },
+    intent,
+    schema: "ego-chat-ambiguous-send-evidence-bundle/v1",
+    sourceOperationKey: "exchange:a3k:EGO_CHAT_A3K_TERMINAL_VECTOR_12345678",
+    sourceWorkflowId: intent.source_workflow_id,
+  }), {
+    disposition_envelope: envelope,
+    external_binding: { state: "CONSUMED_AMBIGUOUS_PENDING_ACK" },
+    intent,
+    schema: "ego-chat-ambiguous-send-evidence-bundle/v1",
+    source_operation_key: "exchange:a3k:EGO_CHAT_A3K_TERMINAL_VECTOR_12345678",
+    source_workflow_id: intent.source_workflow_id,
+  })
 })
 
 test("stable-pair identity includes action, wrapper, control, and pointer evidence", () => {
