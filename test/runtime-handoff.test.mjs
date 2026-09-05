@@ -161,6 +161,26 @@ test("the real daemon atomically accepts a future-runtime drain and exits cleanl
   await waitForMissing(config.socketPath)
 })
 
+test("Step 7's previous same-version generation is stale and drains through the guarded upgrade", async (t) => {
+  const { config, env } = await createTestConfig()
+  await loadOrCreateBrokerToken(config.dataDir)
+  const child = await startFakeStaleBroker(t, config, env, "same-version-atomic-idle")
+
+  const inspected = await execFileAsync(process.execPath, [CLI_PATH, "broker-runtime-status"], { env })
+  const status = JSON.parse(inspected.stdout)
+  assert.equal(status.status, "stale")
+  assert.equal(status.runtime.appVersion, RUNTIME_IDENTITY.appVersion)
+  assert.equal(status.runtime.runtimeGeneration, "2026-09-05.2")
+
+  const { stdout } = await execFileAsync(process.execPath, [CLI_PATH, "broker-handoff"], { env })
+  const result = JSON.parse(stdout)
+  assert.equal(result.status, "stopped")
+  assert.equal(result.previousRuntime.runtimeGeneration, "2026-09-05.2")
+  assert.equal(await waitForExit(child), 0)
+  await assert.rejects(fs.lstat(path.join(config.dataDir, "broker.lock")), { code: "ENOENT" })
+  await assert.rejects(fs.lstat(config.socketPath), { code: "ENOENT" })
+})
+
 test("legacy broker handoff restores its socket when work starts after the idle snapshot", async (t) => {
   const { config, env } = await createTestConfig()
   await loadOrCreateBrokerToken(config.dataDir)
