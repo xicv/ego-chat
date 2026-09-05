@@ -7,7 +7,16 @@ const socketPath = process.env.EGO_CHAT_SOCKET_PATH
 const aliasPath = process.env.EGO_CHAT_FAKE_STALE_ALIAS_PATH
 const mode = process.env.EGO_CHAT_FAKE_STALE_MODE ?? "idle"
 const token = (await fs.readFile(path.join(dataDir, "broker-token"), "utf8")).trim()
-const runtimeIdentity = {
+const runtimeIdentity = mode === "same-version-atomic-idle" ? {
+  appVersion: "0.2.19",
+  browserContractRevision: 14,
+  ipcVersion: 1,
+  mcpSchemaRevision: 10,
+  runtimeGeneration: "2026-09-05.2",
+  storeSchemaRevision: 7,
+  taskStoreSchemaRevision: 1,
+  contractDigest: "9a35f79a3fef024e2e99a9652e626fe0740c7aed392e5e296f1270ed95c16d28",
+} : {
   appVersion: "0.2.0",
   browserContractRevision: 6,
   contractDigest: "stale-runtime-contract",
@@ -50,7 +59,7 @@ const server = net.createServer((socket) => {
       socket.end(`${JSON.stringify({ id: request.id, ok: false, error: { code: "unauthorized" } })}\n`)
       return
     }
-    if (request.method === "broker.prepare_upgrade" && mode === "atomic-idle") {
+    if (request.method === "broker.prepare_upgrade" && ["atomic-idle", "same-version-atomic-idle"].includes(mode)) {
       socket.end(`${JSON.stringify({
         id: request.id,
         ok: true,
