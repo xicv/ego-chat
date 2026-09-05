@@ -247,7 +247,7 @@ globalThis.js = async (source) => {
   if (source.includes('composer.contains(active)')) {
     return { blurred: false, ok: true }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return []
   }
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) {
@@ -586,7 +586,7 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     return taskSpaceOwnership === null ? [] : beforeEntries
   }
   if (source.trimStart().startsWith('Boolean(')) return false
@@ -840,7 +840,7 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (source.includes("const messageNodes = [")) {
     const snapshot = entrySnapshots[Math.min(entryReads, entrySnapshots.length - 1)]
     entryReads += 1
     return snapshot
@@ -1134,7 +1134,10 @@ globalThis.js = async (source) => {
   if (source.includes('composer.contains(active)')) {
     return { blurred: false, ok: true }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
+  if (
+    source.includes("const messageNodes = [")
+    || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
+  ) {
     const result = messages()
     if (
       (${JSON.stringify(driftAtFinalResult)} || ${JSON.stringify(redirectAtFinalResult)})
@@ -1259,8 +1262,11 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
 }
 
 async function runTaskSpaceReconciliationCase({
+  adoptedTaskSpaceOwnership = null,
+  attachmentObservation = null,
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
+  bindingState = "bound",
   bindingKey = "ego-chat-main",
   brokerFenceChangesDuringReclaimRelist = false,
   captureContinuationAllowed = false,
@@ -1271,19 +1277,24 @@ async function runTaskSpaceReconciliationCase({
   duplicateFallback = false,
   duplicateFallbackAfterCreation = false,
   duplicateIdentity = false,
+  driftAfterAttachmentObservation = null,
   driftAfterConversationRead = false,
   fallbackTaskSpaceOwnership = null,
   fallbackTaskId = null,
   generationRunning = false,
+  imageOnlyResponse = false,
   identityTaskSpaceLiveIdentity = null,
   identityTaskSpaceOwnership = null,
   mode = "reconcile_bound",
   ownershipAfterSelection = null,
   postSelectionConflictingIdentity = null,
   promptIdentityMatches = true,
+  renderedPromptText = undefined,
   postReclaimIdentity = null,
   recycleBeforeReclaim = false,
   requestedTaskSpaceOwnership = null,
+  responseText = "Partial review",
+  sentCanonicalUrl = null,
   createdTaskSpaceTaskId = null,
   recycleIdentityAfterSelection = false,
   selectorIdentityOverride = null,
@@ -1294,7 +1305,20 @@ async function runTaskSpaceReconciliationCase({
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const fallbackName = `ego-chat-bound-${createHash("sha256").update(`canonical-conversation\0${canonicalUrl}`, "utf8").digest("hex").slice(0, 32)}`
+  const effectiveTaskSpaceIdentity = taskSpaceIdentity ?? (
+    adoptedTaskSpaceOwnership
+      ? { name: "adoption-driver-space", taskId: "adoption-driver-space" }
+      : bindingState === "unbound"
+        ? { name: "create-once-driver-space", taskId: "create-once-driver-space" }
+        : null
+  )
   const listedTaskSpaces = [
+    ...(adoptedTaskSpaceOwnership
+      ? [{ id: 10, name: "adoption-driver-space", ownership: adoptedTaskSpaceOwnership, taskId: "adoption-driver-space" }]
+      : []),
+    ...(bindingState === "unbound"
+      ? [{ id: 10, ...effectiveTaskSpaceIdentity, ownership: "agent" }]
+      : []),
     ...(requestedTaskSpaceOwnership
       ? [{ id: 10, name: "unrelated-agent-space", ownership: requestedTaskSpaceOwnership, taskId: "unrelated-agent-space" }]
       : []),
@@ -1312,25 +1336,37 @@ async function runTaskSpaceReconciliationCase({
           { id: 16, name: fallbackName, ownership: "agent", taskId: fallbackName },
         ]
       : []),
-    ...(identityTaskSpaceOwnership && taskSpaceIdentity
-      ? [{ id: 13, ...(identityTaskSpaceLiveIdentity || taskSpaceIdentity), ownership: identityTaskSpaceOwnership }]
+    ...(identityTaskSpaceOwnership && effectiveTaskSpaceIdentity
+      ? [{ id: 13, ...(identityTaskSpaceLiveIdentity || effectiveTaskSpaceIdentity), ownership: identityTaskSpaceOwnership }]
       : []),
-    ...(duplicateIdentity && taskSpaceIdentity
-      ? [{ id: 14, ...taskSpaceIdentity, ownership: "agent" }]
+    ...(duplicateIdentity && effectiveTaskSpaceIdentity
+      ? [{ id: 14, ...effectiveTaskSpaceIdentity, ownership: "agent" }]
       : []),
   ]
   const previousText = "Prior assistant response."
   const previousDigest = createHash("sha256").update(previousText, "utf8").digest("hex")
-  const promptText = "EGO_CHAT_RECONCILE_TEST_MARKER\nReview this candidate."
+  const turnMarker = "EGO_CHAT_RECONCILE_TEST_MARKER"
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST"
+  const promptText = `${turnMarker}\nReview this candidate.`
   const promptMessageId = "reconcile-user"
   const captureEntries = [
-    { messageId: "previous-assistant", role: "assistant", text: previousText },
+    ...(bindingState === "bound"
+      ? [{ messageId: "previous-assistant", role: "assistant", text: previousText }]
+      : []),
     {
       messageId: promptIdentityMatches ? promptMessageId : "different-user",
       role: "user",
-      text: promptText,
+      text: renderedPromptText ?? promptText,
     },
-    { messageId: "partial-assistant", role: "assistant", text: "Partial review" },
+    imageOnlyResponse
+      ? {
+          attachmentCount: 1,
+          imageOnly: true,
+          messageId: "image-only-assistant",
+          role: "assistant",
+          text: "",
+        }
+      : { messageId: "partial-assistant", role: "assistant", text: responseText },
   ]
   const input = {
     allowDeliveryAbsent: true,
@@ -1338,13 +1374,14 @@ async function runTaskSpaceReconciliationCase({
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     ...(captureContinuationAllowed ? { captureContinuationAllowed: true } : {}),
     binding: {
-      canonicalUrl,
-      headRole: "assistant",
+      canonicalUrl: bindingState === "bound" ? canonicalUrl : null,
+      headRole: bindingState === "bound" ? "assistant" : null,
       key: bindingKey,
-      messageCount: 2,
-      state: "bound",
-      targetId: "stale-bound-tab",
-      ...(taskSpaceIdentity ? { taskSpaceIdentity } : {}),
+      messageCount: bindingState === "bound" ? 2 : 0,
+      startUrl: bindingState === "bound" ? canonicalUrl : "https://chatgpt.com/",
+      state: bindingState,
+      targetId: bindingState === "bound" ? "stale-bound-tab" : "recovered-bound-tab",
+      ...(effectiveTaskSpaceIdentity ? { taskSpaceIdentity: effectiveTaskSpaceIdentity } : {}),
       taskSpaceId: 10,
     },
     brokerLease: {
@@ -1354,20 +1391,28 @@ async function runTaskSpaceReconciliationCase({
       pid: process.pid,
     },
     browserContractRevision: 14,
-    canonicalUrl,
-    expectedPreviousContentDigest: previousDigest,
-    expectedPreviousMessageId: "previous-assistant",
-    expectedTerminalMarker: "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    canonicalUrl: sentCanonicalUrl ?? canonicalUrl,
+    ...(mode === "capture_attachment_execution"
+      ? {
+          captureOperationKeySha256: "a".repeat(64),
+          observationSequence: 7,
+          providerPromptMessageId: promptMessageId,
+          sourceConfirmedSendIdentitySha256: "b".repeat(64),
+        }
+      : {}),
+    expectedPreviousContentDigest: bindingState === "bound" ? previousDigest : null,
+    expectedPreviousMessageId: bindingState === "bound" ? "previous-assistant" : null,
+    expectedTerminalMarker: terminalMarker,
     inputDigest: createHash("sha256").update(promptText, "utf8").digest("hex"),
     mode,
     promptMessageId,
     timeoutMs: mode === "capture_exchange" ? 1 : 1_000,
     taskSpaceGuard: completeTaskSpaceGuard(
-      completeTaskSpaceIdentity(taskSpaceIdentity)
-        ? { identity: taskSpaceIdentity, kind: "stable_identity" }
+      completeTaskSpaceIdentity(effectiveTaskSpaceIdentity)
+        ? { identity: effectiveTaskSpaceIdentity, kind: "stable_identity" }
         : { kind: "name", value: fallbackName },
     ),
-    turnMarker: "EGO_CHAT_RECONCILE_TEST_MARKER",
+    turnMarker,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
   await fs.writeFile(ownerPath, JSON.stringify({
@@ -1380,9 +1425,10 @@ async function runTaskSpaceReconciliationCase({
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
 const fs = await import('node:fs/promises')
-let opened = false
+let opened = ${JSON.stringify(bindingState === "unbound")}
 let composerDraft = ${JSON.stringify(composerDraft)}
 let driftTaskSpace = false
+let observedCanonicalUrl = ${JSON.stringify(canonicalUrl)}
 let listTaskSpaceCalls = 0
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
@@ -1485,7 +1531,7 @@ globalThis.openOrReuseTab = async () => {
   opened = true
   return { active: true, targetId: 'recovered-bound-tab' }
 }
-globalThis.pageInfo = async () => ({ url: ${JSON.stringify(canonicalUrl)} })
+globalThis.pageInfo = async () => ({ url: observedCanonicalUrl })
 globalThis.snapshotText = async () => ''
 globalThis.wait = async () => {}
 globalThis.click = async () => { counters.click += 1 }
@@ -1510,12 +1556,29 @@ globalThis.js = async (source) => {
       hasLoginAction: false,
     }
   }
-  if (source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")) {
-    const result = ${JSON.stringify(mode === "capture_exchange"
+  if (
+    source.includes("const messageNodes = [")
+    || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
+  ) {
+    const result = ${JSON.stringify(["capture_exchange", "reconcile"].includes(mode)
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
     if (${JSON.stringify(driftAfterConversationRead)}) driftTaskSpace = true
     return result
+  }
+  if (source.includes('ego-chat-attachment-graph-observation/v1')) {
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'task-space') driftTaskSpace = true
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'canonical-url') {
+      observedCanonicalUrl = 'https://chatgpt.com/c/attachment-drifted-conversation'
+    }
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'broker-fence') {
+      await fs.writeFile(${JSON.stringify(ownerPath)}, JSON.stringify({
+        brokerId: 'replacement-broker',
+        epoch: 2,
+        pid: process.pid,
+      }))
+    }
+    return ${JSON.stringify(attachmentObservation)}
   }
   if (source.trimStart().startsWith('Boolean(')) return ${JSON.stringify(generationRunning)}
   throw new Error('Unexpected page script: ' + source.slice(0, 100))
@@ -1615,6 +1678,43 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& committed\[0\]\?\.contentDigest === sha256\(input\.prompt\)/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /&& prompt\?\.contentDigest === input\.inputDigest/)
   assert.doesNotMatch(EGO_DRIVER_SOURCE, /finishedHead\.messageCount !== beforeHead\.messageCount/)
+
+  const attachmentCaptureStart = EGO_DRIVER_SOURCE.indexOf("async function captureAttachmentExecution()")
+  const attachmentCaptureEnd = EGO_DRIVER_SOURCE.indexOf("\n  async function ", attachmentCaptureStart + 1)
+  assert.ok(attachmentCaptureStart > 0)
+  assert.ok(attachmentCaptureEnd > attachmentCaptureStart)
+  const attachmentCaptureSource = EGO_DRIVER_SOURCE.slice(
+    attachmentCaptureStart,
+    attachmentCaptureEnd,
+  )
+  for (const forbidden of [
+    "composePrompt(",
+    "click(",
+    "fillInput(",
+    "typeText(",
+    "pressKey(",
+    "dispatchMouseEvent",
+    "insertText",
+    "captureScreenshot",
+    "browserFetch",
+    "serverFetch",
+    "navigator.clipboard",
+    "handOffTaskSpace",
+    "hover(",
+    "doubleClick(",
+    ".click(",
+    ".focus(",
+    ".dispatchEvent(",
+    "gotoUrl(",
+    "gotoAndWait(",
+    "uploadFile(",
+  ]) {
+    assert.equal(
+      attachmentCaptureSource.includes(forbidden),
+      false,
+      `attachment capture must exclude ${forbidden}`,
+    )
+  }
 
   const composed = EGO_DRIVER_SOURCE.indexOf('await composePrompt(input.prompt)')
   const reclaimFence = EGO_DRIVER_SOURCE.indexOf('assertBrokerAuthority("before_task_space_reclaim")')
@@ -3184,6 +3284,10 @@ test("conversation adoption reclaims only its explicitly selected task space", a
   })
   assert.equal(adopted.error, undefined)
   assert.equal(adopted.result.taskSpaceId, 10)
+  assert.deepEqual(adopted.result.taskSpaceIdentity, {
+    name: "adoption-driver-space",
+    taskId: "adoption-driver-space",
+  })
   assert.deepEqual(adopted.taskSpaceRequests, [10])
   assert.equal(adopted.counters.sendClick, 0)
 })
@@ -3265,6 +3369,29 @@ test("bound recovery ignores a recycled user-controlled numeric task space", asy
   assert.equal(reconciled.result.taskSpaceId, 11)
   assert.match(reconciled.taskSpaceRequests[0], /^ego-chat-bound-[a-f0-9]{32}$/)
   assert.equal(reconciled.taskSpaceRequests.length, 1)
+})
+
+test("bound recovery preserves an adopted task-space identity instead of creating a fallback", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    adoptedTaskSpaceOwnership: "agent",
+  })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 10)
+  assert.deepEqual(reconciled.taskSpaceRequests, [10])
+})
+
+test("bound recovery reclaims the adopted task-space identity before reuse", async () => {
+  const reconciled = await runTaskSpaceReconciliationCase({
+    adoptedTaskSpaceOwnership: "agentDelegatedToUser",
+    allowTaskSpaceReclaim: true,
+  })
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.result.deliveryState, "absent")
+  assert.equal(reconciled.result.taskSpaceId, 10)
+  assert.equal(reconciled.counters.claimTaskSpace, 0)
+  assert.equal(reconciled.counters.takeOverTaskSpace, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [10])
 })
 
 test("different canonical chats never share a deterministic recovery task space", async () => {
@@ -3658,6 +3785,48 @@ test("bounded capture yields only with the exact confirmed prompt identity", asy
   })
 })
 
+test("bounded capture promotes a confirmed create-once send to its canonical conversation", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    sentCanonicalUrl: "https://chatgpt.com/c/WEB:create-once-provisional",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.canonicalUrl, "https://chatgpt.com/c/reconcile-driver-test")
+  assert.equal(captured.result.responseText, "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST")
+  assert.equal(captured.result.head.lastMessageId, "partial-assistant")
+})
+
+test("create-once reconciliation rejects a copied prompt with a different provider message ID", async () => {
+  const result = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    mode: "reconcile",
+    promptIdentityMatches: false,
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+  })
+  assert.equal(result.result, undefined)
+  assert.equal(result.error?.details?.reason, "reconciliation_prompt_mismatch")
+  assert.equal(result.counters.click, 0)
+  assert.equal(result.counters.typeText, 0)
+})
+
+test("create-once reconciliation uses the confirmed provider ID when rendered prompt text differs", async () => {
+  const result = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    mode: "reconcile",
+    renderedPromptText: "EGO_CHAT_RECONCILE_TEST_MARKER\nRendered checkpoint text. Show more",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+  })
+  assert.equal(result.error, undefined)
+  assert.equal(result.result.head.lastMessageId, "partial-assistant")
+  assert.equal(result.counters.click, 0)
+  assert.equal(result.counters.typeText, 0)
+})
+
 test("bounded capture tolerates a transient missing generation control", async () => {
   const captured = await runTaskSpaceReconciliationCase({
     captureContinuationAllowed: true,
@@ -3670,6 +3839,24 @@ test("bounded capture tolerates a transient missing generation control", async (
   assert.equal(captured.result.captureState, "pending")
   assert.equal(captured.result.generationRunning, false)
   assert.equal(captured.result.promptMessageId, "reconcile-user")
+})
+
+test("bounded capture fails closed for a completed image-only assistant turn without the terminal marker", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    imageOnlyResponse: true,
+    mode: "capture_exchange",
+  })
+
+  assert.equal(captured.result, undefined)
+  assert.equal(captured.error?.code, "human_required")
+  assert.equal(
+    captured.error?.details?.reason,
+    "image_only_response_without_terminal_marker",
+  )
+  assert.equal(captured.error?.details?.evidence?.attachmentCount, 1)
+  assert.equal(captured.error?.details?.evidence?.responseMessageIdPresent, true)
 })
 
 test("strict bounded capture commits a stable markerless review for automatic protocol repair", async () => {
@@ -3688,6 +3875,21 @@ test("strict bounded capture commits a stable markerless review for automatic pr
   )
   assert.equal(captured.result.head.lastMessageId, "partial-assistant")
   assert.equal(captured.result.head.lastRole, "assistant")
+})
+
+test("bound capture accepts an exact assistant response that repeats the user turn marker", async () => {
+  const turnMarker = "EGO_CHAT_RECONCILE_TEST_MARKER"
+  const terminalMarker = "EGO_CHAT_REVIEW_DONE_RECONCILE_TEST"
+  const responseText = `Checked ${turnMarker}.\n${terminalMarker}`
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    mode: "capture_exchange",
+    responseText,
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.responseText, responseText)
 })
 
 test("final live identity fences reject cached self-attestation for every capture outcome", async () => {
@@ -3724,6 +3926,156 @@ test("bounded capture fails closed when the confirmed prompt identity changes", 
   assert.equal(captured.result, undefined)
   assert.equal(captured.error?.code, "human_required")
   assert.equal(captured.error?.details?.reason, "capture_pending_identity_mismatch")
+})
+
+test("attachment capture emits only one closed read-only observation for the confirmed prompt", async (t) => {
+  const attachmentObservation = {
+    artifacts: [{
+      artifact_id: "generation-image-1",
+      artifact_kind: "GENERATED_IMAGE",
+      dom_wrapper_id: "image-message-image-1",
+      file_id: "file_image_1",
+      generation_id: "generation-image-1",
+      graph_attachment_id: "message-image-1:part:0",
+      image_message_id: "message-image-1",
+    }],
+    asset_pointer_state: "PRESENT_NON_CONTROL",
+    continuation_cursor_present: false,
+    direct_branch_ids: ["response-1"],
+    direct_response_branch_count: 1,
+    generated_image_artifact_count: 1,
+    generation_terminal: true,
+    graph_complete: true,
+    graph_truncated: false,
+    hydration_pending: false,
+    non_image_artifact_count: 0,
+    normal_download_control_count: 0,
+    normal_save_control_count: 0,
+    provider_nodes: [{
+      message_id: "response-1",
+      parent_id: "reconcile-user",
+      provider_status: "COMPLETE",
+      terminal: true,
+      turn_exchange_id: "exchange-1",
+    }, {
+      message_id: "message-image-1",
+      parent_id: null,
+      provider_status: "COMPLETE",
+      terminal: true,
+      turn_exchange_id: "exchange-1",
+    }],
+    react_save_download_prop_count: 0,
+    response_message_id: "response-1",
+    save_association_candidates: [],
+    save_association_id: null,
+    selected_branch_id: "response-1",
+    total_artifact_count: 1,
+    ui_action_surface_complete: true,
+    unclassified_artifact_count: 0,
+    visible_attachment_actions: ["EDIT_IMAGE", "SHARE_IMAGE"],
+  }
+  const captured = await runTaskSpaceReconciliationCase({
+    attachmentObservation,
+    mode: "capture_attachment_execution",
+  })
+
+  assert.equal(captured.error, undefined)
+  assert.deepEqual(captured.result, {
+    ...attachmentObservation,
+    canonical_conversation_locator_sha256: createHash("sha256")
+      .update("https://chatgpt.com/c/reconcile-driver-test", "utf8")
+      .digest("hex"),
+    capture_operation_key_sha256: "a".repeat(64),
+    observation_sequence: 7,
+    observed_at: captured.result.observed_at,
+    provider_prompt_message_id: "reconcile-user",
+    schema: "ego-chat-attachment-graph-observation/v1",
+    source_confirmed_send_identity_sha256: "b".repeat(64),
+  })
+  assert.match(captured.result.observed_at, /^2026-|^20[2-9][0-9]-/)
+  assert.deepEqual(captured.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+  for (const [drift, reason] of [
+    ["task-space", "bound_task_space_identity_changed"],
+    ["canonical-url", "canonical_conversation_changed"],
+    ["broker-fence", "broker_fence_lost"],
+  ]) {
+    await t.test(`rejects ${drift} drift after attachment observation`, async () => {
+      const stopped = await runTaskSpaceReconciliationCase({
+        attachmentObservation,
+        driftAfterAttachmentObservation: drift,
+        mode: "capture_attachment_execution",
+      })
+      assert.equal(stopped.result, undefined)
+      assert.equal(stopped.error?.details?.reason, reason)
+      assert.deepEqual(stopped.counters, captured.counters)
+    })
+  }
+})
+
+test("Ego adapter exposes the attachment capture route without Send authority", () => {
+  assert.equal(typeof EgoAdapter.prototype.captureAttachmentExecution, "function")
+})
+
+test("attachment capture forwards fresh in-lane admission and result callbacks", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-attachment-admission-test-"))
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from "node:fs"
+let source = ""
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => { source += chunk })
+process.stdin.on("end", () => {
+  const invocation = source.trim()
+  const argumentStart = invocation.lastIndexOf(")(")
+  const argumentEnd = invocation.indexOf(",", argumentStart + 2)
+  const inputPath = JSON.parse(invocation.slice(argumentStart + 2, argumentEnd))
+  const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))
+  fs.unlinkSync(inputPath)
+  const envelope = Buffer.from(JSON.stringify({
+    ok: true,
+    result: { mode: input.mode, taskSpaceGuard: input.taskSpaceGuard },
+  }), "utf8").toString("base64url")
+  process.stdout.write("${EGO_DRIVER_RESULT_PREFIX}" + envelope + "\\n")
+})
+`, { mode: 0o700 })
+  const adapter = new EgoAdapter({
+    command,
+    mailboxDirectory: path.join(fixtureDirectory, "mailbox"),
+  })
+  const guard = completeTaskSpaceGuard({
+    kind: "stable_identity",
+    identity: { name: "attachment-owner", taskId: "opaque-attachment-owner" },
+  })
+  const observed = []
+  const first = adapter.captureAttachmentExecution(
+    { taskSpaceGuard: { stale: true } },
+    undefined,
+    (result) => observed.push(result),
+    () => ({ taskSpaceGuard: guard }),
+  )
+  const second = adapter.captureAttachmentExecution(
+    { taskSpaceGuard: { stale: true } },
+    undefined,
+    (result) => observed.push(result),
+    () => {
+      assert.equal(observed.length, 1)
+      return { taskSpaceGuard: guard }
+    },
+  )
+  const results = await Promise.all([first, second])
+  assert.deepEqual(results, Array.from({ length: 2 }, () => ({
+    mode: "capture_attachment_execution",
+    taskSpaceGuard: guard,
+  })))
+  assert.deepEqual(observed, results)
 })
 
 test("conversation adoption fails closed when another message interleaves", async () => {

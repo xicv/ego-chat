@@ -1,0 +1,108 @@
+{
+  "schema": "EgoA3KLegacyAttachmentStateProvenance.v1",
+  "versions": [
+    {
+      "empty_state_keys": ["bindings", "modelPolicies", "nextSeq", "schemaVersion", "workflows"],
+      "persisted_state": {
+        "bindings": {},
+        "modelPolicies": {},
+        "nextSeq": 1,
+        "schemaVersion": 3,
+        "workflows": {}
+      },
+      "producer_commit": "7312fbfdee2a04f0da6b8e8e7dc0cf485ccae332",
+      "schema_version": 3,
+      "store_source_sha256": "5145f8dac447ff30658a3ec1d4161c86837f42ce9f8e29cbc750af4459589242"
+    },
+    {
+      "empty_state_keys": ["bindings", "modelPolicies", "nextSeq", "operations", "schemaVersion", "workflows"],
+      "persisted_state": {
+        "bindings": {},
+        "modelPolicies": {},
+        "nextSeq": 1,
+        "operations": {},
+        "schemaVersion": 4,
+        "workflows": {}
+      },
+      "producer_commit": "d72f379f1b2697f486b3e8cc633a8360d6838d01",
+      "schema_version": 4,
+      "store_source_sha256": "daa08da770884b652a22c61dacba62a9dec89149436ae084aaa525633c06fc61"
+    },
+    {
+      "empty_state_keys": ["attachmentCapacity", "attachmentExternalBindings", "attachmentIntents", "bindings", "modelPolicies", "nextSeq", "operations", "schemaVersion", "workflows"],
+      "persisted_state": {
+        "attachmentCapacity": {
+          "liveIntentCount": 0,
+          "liveReservedBytes": 0,
+          "permanentEntryCount": 0,
+          "permanentReservedBytes": 0
+        },
+        "attachmentExternalBindings": {},
+        "attachmentIntents": {},
+        "bindings": {},
+        "modelPolicies": {},
+        "nextSeq": 1,
+        "operations": {},
+        "schemaVersion": 5,
+        "workflows": {}
+      },
+      "producer_commit": "6e129a8b4fa49871f9a7c2664d8e29cc9805b0f2",
+      "schema_version": 5,
+      "store_source_sha256": "98cae0077b831b756f4235b639bfc4bb5935737da001489cc52baa9b442fe6d2"
+    },
+    {
+      "empty_state_keys": ["attachmentCapacity", "attachmentCaptures", "attachmentDispositions", "attachmentExternalBindings", "attachmentIntents", "bindings", "confirmedSendEvents", "confirmedSendIdentities", "modelPolicies", "nextSeq", "operations", "schemaVersion", "workflows"],
+      "persisted_state": {
+        "attachmentCapacity": {
+          "liveIntentCount": 0,
+          "liveReservedBytes": 0,
+          "permanentEntryCount": 0,
+          "permanentReservedBytes": 0
+        },
+        "attachmentCaptures": {},
+        "attachmentDispositions": {},
+        "attachmentExternalBindings": {},
+        "attachmentIntents": {},
+        "bindings": {},
+        "confirmedSendEvents": {},
+        "confirmedSendIdentities": {},
+        "modelPolicies": {},
+        "nextSeq": 1,
+        "operations": {},
+        "schemaVersion": 6,
+        "workflows": {}
+      },
+      "producer_commit": "1db80aa9a646de1a16bbb7b92108deb19cd0c1bf",
+      "schema_version": 6,
+      "store_source_sha256": "dc2f52ce36d73f951d91bfe4b71599169ca62757d92aa350cc6b9eb7b873e4f8"
+    },
+    {
+      "empty_state_keys": ["attachmentCapacity", "attachmentCaptures", "attachmentConsumerAcknowledgements", "attachmentDispositions", "attachmentEvidenceTombstones", "attachmentExternalBindings", "attachmentIntents", "bindings", "confirmedSendEvents", "confirmedSendIdentities", "modelPolicies", "nextSeq", "operations", "schemaVersion", "workflows"],
+      "persisted_state": {
+        "attachmentCapacity": {
+          "liveIntentCount": 0,
+          "liveReservedBytes": 0,
+          "permanentEntryCount": 0,
+          "permanentReservedBytes": 0
+        },
+        "attachmentCaptures": {},
+        "attachmentConsumerAcknowledgements": {},
+        "attachmentDispositions": {},
+        "attachmentEvidenceTombstones": {},
+        "attachmentExternalBindings": {},
+        "attachmentIntents": {},
+        "bindings": {},
+        "confirmedSendEvents": {},
+        "confirmedSendIdentities": {},
+        "modelPolicies": {},
+        "nextSeq": 1,
+        "operations": {},
+        "schemaVersion": 7,
+        "workflows": {}
+      },
+      "producer_commit": "3cfabcb5fbd67c6bcc004ac8ee581308724c0ed8",
+      "schema_version": 7,
+      "store_source_sha256": "114b95c4cc665f330975e413ef9662b878536573a7ca5e10e4f64602d341a413"
+    }
+  ]
+}

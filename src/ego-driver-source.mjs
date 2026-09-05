@@ -441,15 +441,40 @@ async function egoDriverMain(
 
   async function readConversationEntries() {
     const messages = await js(String.raw`(() => {
-      return [...document.querySelectorAll('[data-message-author-role]')].map((message) => {
-        const role = message.getAttribute('data-message-author-role')
-        const content = role === 'user'
+      const messageNodes = [
+        ...document.querySelectorAll('[data-message-author-role]'),
+        ...[...document.querySelectorAll('section[data-turn="assistant"][data-turn-id]')]
+          .filter((turn) => (
+            !turn.querySelector('[data-message-author-role]')
+            && turn.querySelector('[id^="image-"] img')
+          )),
+      ]
+      messageNodes.sort((left, right) => (
+        left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      ))
+      return messageNodes.map((message) => {
+        const imageOnly = !message.hasAttribute('data-message-author-role')
+        const role = imageOnly
+          ? message.getAttribute('data-turn')
+          : message.getAttribute('data-message-author-role')
+        const content = imageOnly
+          ? ''
+          : role === 'user'
           ? (message.querySelector('[data-testid="collapsible-user-message-content"]')?.textContent
               ?? message.querySelector('.whitespace-pre-wrap')?.textContent
               ?? message.innerText)
           : (message.querySelector('.markdown')?.innerText ?? message.innerText)
+        const attachmentIds = imageOnly
+          ? [...message.querySelectorAll('[id^="image-"]')]
+              .map((image) => image.id)
+              .filter(Boolean)
+          : []
         return {
-          messageId: message.getAttribute('data-message-id'),
+          attachmentCount: new Set(attachmentIds).size,
+          imageOnly,
+          messageId: imageOnly
+            ? message.getAttribute('data-turn-id')
+            : message.getAttribute('data-message-id'),
           role,
           text: String(content || ''),
         }
@@ -457,6 +482,14 @@ async function egoDriverMain(
     })()`)
     return messages.map((message) => ({
       contentDigest: sha256(message.text),
+      ...(message.imageOnly === true
+        ? {
+            attachmentCount: Number.isSafeInteger(message.attachmentCount)
+              ? message.attachmentCount
+              : 0,
+            imageOnly: true,
+          }
+        : {}),
       messageId: message.messageId,
       role: message.role,
       text: message.text,
@@ -2533,6 +2566,353 @@ async function egoDriverMain(
     return selected
   }
 
+  async function captureAttachmentExecution() {
+    if (input.browserContractRevision !== expectedBrowserContractRevision) {
+      humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
+      return
+    }
+    if (
+      !/^[a-f0-9]{64}$/.test(input.captureOperationKeySha256)
+      || !/^[a-f0-9]{64}$/.test(input.sourceConfirmedSendIdentitySha256)
+      || typeof input.providerPromptMessageId !== "string"
+      || input.providerPromptMessageId.length < 1
+      || input.providerPromptMessageId.length > 200
+      || !Number.isSafeInteger(input.observationSequence)
+      || input.observationSequence < 1
+    ) {
+      humanRequired("attachment_capture_metadata_invalid", "Attachment capture metadata is incomplete or invalid.")
+      return
+    }
+    const selected = await selectConversation(input.binding)
+    if (!selected) {
+      return
+    }
+    if (!await assertBrokerAuthority("before_attachment_observation")) {
+      return
+    }
+    const info = await pageInfo()
+    const canonicalUrl = normalizeUrl(info.url)
+    if (canonicalUrl !== normalizeUrl(input.binding.canonicalUrl)) {
+      humanRequired("canonical_conversation_changed", "The attachment response moved away from its bound canonical conversation.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+
+    const surface = await js(String.raw`(() => {
+      const observationSchema = 'ego-chat-attachment-graph-observation/v1'
+      const expectedPromptMessageId = ` + JSON.stringify(input.providerPromptMessageId) + String.raw`
+      const maximumItems = 64
+      const terminalStatuses = new Set([
+        'finished_successfully',
+        'finished',
+        'complete',
+        'completed',
+      ])
+      const statusOf = (message) => {
+        const status = String(message?.status || '').toLowerCase()
+        if (terminalStatuses.has(status)) return 'COMPLETE'
+        if (status.includes('fail') || status.includes('error')) return 'FAILED'
+        if (status.includes('progress') || status.includes('running')) return 'IN_PROGRESS'
+        return 'UNKNOWN'
+      }
+      const turnFromNode = (node) => {
+        const property = Object.getOwnPropertyNames(node)
+          .find((key) => key.startsWith('__reactFiber$'))
+        let fiber = property ? node[property] : null
+        for (let depth = 0; fiber && depth < 40; depth += 1, fiber = fiber.return) {
+          const props = fiber.memoizedProps || fiber.pendingProps
+          if (props?.turn?.messages && Array.isArray(props.turn.messages)) {
+            return props.turn
+          }
+        }
+        return null
+      }
+      const turnNodes = [...document.querySelectorAll('section[data-turn="assistant"][data-turn-id]')]
+      const turns = turnNodes.map((node) => ({ node, turn: turnFromNode(node) }))
+      const directTurns = turns.filter(({ turn }) => (
+        turn
+        && turn.messages.some((message) => message?.metadata?.parent_id === expectedPromptMessageId)
+      ))
+      const selectedTurn = directTurns.at(-1) || null
+      const artifacts = []
+      const artifactMessageIds = new Set()
+      let pointerPresent = false
+      let graphTruncated = directTurns.length > maximumItems
+      let hydrationPending = selectedTurn === null
+      let normalSaveControlCount = 0
+      let normalDownloadControlCount = 0
+      let reactSaveDownloadPropCount = 0
+      let reactSurfaceOverflow = false
+      const visibleActions = new Set()
+      const saveAssociations = []
+
+      const scanReactSurface = (wrapper) => {
+        const roots = [wrapper, ...wrapper.querySelectorAll('*')]
+          .flatMap((node) => Object.getOwnPropertyNames(node)
+            .filter((key) => key.startsWith('__reactProps$'))
+            .map((key) => node[key]))
+        const pending = roots.map((value) => ({ depth: 0, value }))
+        const seen = new WeakSet()
+        let visited = 0
+        while (pending.length > 0) {
+          const { depth, value } = pending.shift()
+          if (!value || typeof value !== 'object' || seen.has(value)) continue
+          seen.add(value)
+          visited += 1
+          if (visited > 2048) {
+            reactSurfaceOverflow = true
+            return
+          }
+          const keys = Object.keys(value)
+          if (keys.length > 100) {
+            reactSurfaceOverflow = true
+            return
+          }
+          for (const key of keys) {
+            if (/^(?:on)?(?:save|download)(?:image)?$/i.test(key)) {
+              reactSaveDownloadPropCount += 1
+            }
+            const nested = value[key]
+            if (depth < 8 && nested && typeof nested === 'object') {
+              pending.push({ depth: depth + 1, value: nested })
+            }
+          }
+        }
+      }
+
+      const observeControls = (wrapper, artifact) => {
+        const controls = [...wrapper.querySelectorAll('button, [role="button"], a')]
+        for (const control of controls) {
+          const label = String(
+            control.getAttribute('aria-label')
+              || control.getAttribute('title')
+              || control.innerText
+              || control.textContent
+              || '',
+          ).trim().replace(/\s+/g, ' ')
+          if (!label && control.querySelector('img')) continue
+          if (/^edit(?: this)? image$/i.test(label) || /^edit$/i.test(label)) {
+            visibleActions.add('EDIT_IMAGE')
+          } else if (/^share(?: this)? image$/i.test(label) || /^share$/i.test(label)) {
+            visibleActions.add('SHARE_IMAGE')
+          } else if (/^save(?: this)? image$/i.test(label) || /^save$/i.test(label)) {
+            visibleActions.add('SAVE_IMAGE')
+            normalSaveControlCount += 1
+            const controlId = control.id
+              || artifact.dom_wrapper_id + ':save-control:' + saveAssociations.length
+            saveAssociations.push({
+              association_id: controlId,
+              control_id: controlId,
+              dom_attachment_id: artifact.dom_wrapper_id,
+              graph_attachment_id: artifact.graph_attachment_id,
+            })
+          } else if (/^download(?: this)? image$/i.test(label) || /^download$/i.test(label)) {
+            visibleActions.add('DOWNLOAD_IMAGE')
+            normalDownloadControlCount += 1
+          } else {
+            visibleActions.add('UNKNOWN')
+          }
+        }
+        scanReactSurface(wrapper)
+      }
+
+      for (const { node, turn } of directTurns.slice(0, maximumItems)) {
+        for (const message of turn.messages) {
+          const parts = Array.isArray(message?.content?.parts) ? message.content.parts : []
+          parts.forEach((part, partIndex) => {
+            if (!part || typeof part !== 'object' || typeof part.asset_pointer !== 'string') {
+              return
+            }
+            pointerPresent = pointerPresent || part.asset_pointer.length > 0
+            const contentType = String(part.content_type || '')
+            const graphAttachmentId = message.id + ':part:' + partIndex
+            if (contentType === 'image_asset_pointer') {
+              const fileIds = part.asset_pointer.match(/file[_-][A-Za-z0-9_-]{8,200}/g) || []
+              const fileId = [...new Set(fileIds)].length === 1 ? fileIds[0] : null
+              const generationIds = [
+                part.metadata?.generation?.gen_id,
+                part.metadata?.dalle?.gen_id,
+              ].filter((value) => typeof value === 'string' && value.length > 0)
+              const generationId = [...new Set(generationIds)].length === 1
+                ? generationIds[0]
+                : null
+              const wrapper = document.getElementById('image-' + message.id)
+              const artifact = {
+                artifact_id: generationId || fileId || graphAttachmentId,
+                artifact_kind: 'GENERATED_IMAGE',
+                dom_wrapper_id: wrapper?.id || null,
+                file_id: fileId,
+                generation_id: generationId,
+                graph_attachment_id: graphAttachmentId,
+                image_message_id: message.id,
+              }
+              artifacts.push(artifact)
+              artifactMessageIds.add(message.id)
+              if (!wrapper || !wrapper.querySelector('img')) {
+                hydrationPending = true
+              } else {
+                observeControls(wrapper, artifact)
+              }
+            } else if (/^(?:audio|video|file)_asset_pointer$/.test(contentType)) {
+              artifacts.push({
+                artifact_id: graphAttachmentId,
+                artifact_kind: 'NON_IMAGE',
+                dom_wrapper_id: null,
+                file_id: null,
+                generation_id: null,
+                graph_attachment_id: null,
+                image_message_id: null,
+              })
+              artifactMessageIds.add(message.id)
+            } else {
+              artifacts.push({
+                artifact_id: graphAttachmentId,
+                artifact_kind: 'UNCLASSIFIED',
+                dom_wrapper_id: null,
+                file_id: null,
+                generation_id: null,
+                graph_attachment_id: null,
+                image_message_id: null,
+              })
+              artifactMessageIds.add(message.id)
+            }
+          })
+        }
+        if (artifacts.length > maximumItems) graphTruncated = true
+        if (node.getAttribute('data-turn-id') !== turn.id) hydrationPending = true
+      }
+
+      const selectedMessages = selectedTurn?.turn?.messages || []
+      const relevantMessages = selectedMessages.filter((message) => (
+        message?.id === selectedTurn?.turn?.id
+        || message?.metadata?.parent_id === expectedPromptMessageId
+        || artifactMessageIds.has(message?.id)
+        || (message?.author?.role === 'assistant' && message?.end_turn === true)
+      ))
+      if (relevantMessages.length > maximumItems) graphTruncated = true
+      const providerNodes = [...new Map(relevantMessages.slice(0, maximumItems).map((message) => [
+        message.id,
+        {
+          message_id: message.id,
+          parent_id: typeof message?.metadata?.parent_id === 'string'
+            ? message.metadata.parent_id
+            : null,
+          provider_status: statusOf(message),
+          terminal: statusOf(message) === 'COMPLETE',
+          turn_exchange_id: typeof message?.metadata?.turn_exchange_id === 'string'
+            ? message.metadata.turn_exchange_id
+            : null,
+        },
+      ])).values()]
+      const directBranchIds = [...new Set(directTurns
+        .map(({ turn }) => turn?.id)
+        .filter((value) => typeof value === 'string' && value.length > 0))]
+        .sort()
+      const continuationCursorPresent = directTurns.some(({ turn }) => (
+        turn.userContinuationRootTurnId !== null
+        || turn.userContinuationParentTurnId !== null
+        || turn.userContinuationSuccessorTurnId !== null
+      ))
+      const generatedImageCount = artifacts.filter(
+        (artifact) => artifact.artifact_kind === 'GENERATED_IMAGE',
+      ).length
+      const nonImageCount = artifacts.filter(
+        (artifact) => artifact.artifact_kind === 'NON_IMAGE',
+      ).length
+      const unclassifiedCount = artifacts.filter(
+        (artifact) => artifact.artifact_kind === 'UNCLASSIFIED',
+      ).length
+      const generationTerminal = (
+        !document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')
+        && providerNodes.every((node) => node.terminal)
+      )
+      const saveAssociationId = (
+        artifacts.length === 1
+        && generatedImageCount === 1
+        && normalSaveControlCount === 1
+        && saveAssociations.length === 1
+      ) ? saveAssociations[0].association_id : null
+      return {
+        artifacts: artifacts.slice(0, maximumItems),
+        asset_pointer_state: pointerPresent ? 'PRESENT_NON_CONTROL' : 'ABSENT',
+        continuation_cursor_present: continuationCursorPresent,
+        direct_branch_ids: directBranchIds.slice(0, maximumItems),
+        direct_response_branch_count: directBranchIds.length <= maximumItems
+          ? directBranchIds.length
+          : null,
+        generated_image_artifact_count: artifacts.length <= maximumItems
+          ? generatedImageCount
+          : null,
+        generation_terminal: generationTerminal,
+        graph_complete: directTurns.length > 0 && !graphTruncated,
+        graph_truncated: graphTruncated,
+        hydration_pending: hydrationPending,
+        non_image_artifact_count: artifacts.length <= maximumItems ? nonImageCount : null,
+        normal_download_control_count: normalDownloadControlCount <= maximumItems
+          ? normalDownloadControlCount
+          : null,
+        normal_save_control_count: normalSaveControlCount <= maximumItems
+          ? normalSaveControlCount
+          : null,
+        provider_nodes: providerNodes,
+        react_save_download_prop_count: reactSurfaceOverflow
+          || reactSaveDownloadPropCount > maximumItems
+          ? null
+          : reactSaveDownloadPropCount,
+        response_message_id: selectedTurn?.turn?.id || null,
+        save_association_candidates: saveAssociations.slice(0, maximumItems),
+        save_association_id: saveAssociationId,
+        selected_branch_id: selectedTurn?.turn?.id || null,
+        total_artifact_count: artifacts.length <= maximumItems ? artifacts.length : null,
+        ui_action_surface_complete: !reactSurfaceOverflow && !hydrationPending,
+        unclassified_artifact_count: artifacts.length <= maximumItems
+          ? unclassifiedCount
+          : null,
+        visible_attachment_actions: [...visibleActions].sort(),
+      }
+    })()`)
+    if (!surface || typeof surface !== "object" || Array.isArray(surface)) {
+      humanRequired("attachment_observation_unavailable", "The bound response did not expose a closed attachment observation.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+    if (!await assertBrokerAuthority("after_attachment_observation")) {
+      return
+    }
+    const finalInfo = await pageInfo()
+    if (normalizeUrl(finalInfo.url) !== canonicalUrl) {
+      humanRequired("canonical_conversation_changed", "The attachment conversation changed before its observation was emitted.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+    const live = await revalidateSelectedTaskSpace({
+      taskSpaceId: selected.task.id,
+      taskSpaceIdentity: taskSpaceIdentity(selected.task),
+    }, "after_attachment_observation")
+    if (!live || !assertBrokerAuthoritySync("after_attachment_observation")) {
+      return
+    }
+    emit({
+      ok: true,
+      result: {
+        ...surface,
+        canonical_conversation_locator_sha256: sha256(canonicalUrl),
+        capture_operation_key_sha256: input.captureOperationKeySha256,
+        observation_sequence: input.observationSequence,
+        observed_at: new Date().toISOString(),
+        provider_prompt_message_id: input.providerPromptMessageId,
+        schema: "ego-chat-attachment-graph-observation/v1",
+        source_confirmed_send_identity_sha256: input.sourceConfirmedSendIdentitySha256,
+      },
+    })
+  }
+
   async function preflight() {
     const task = await selectObservedTaskSpace(input.taskSpace)
     if (!task) {
@@ -2953,7 +3333,9 @@ async function egoDriverMain(
       && Boolean(prompt?.messageId)
       && Boolean(response?.messageId)
       && prompt.messageId !== response.messageId
-      && prompt.contentDigest === input.inputDigest
+      && (input.promptMessageId
+        ? prompt.messageId === input.promptMessageId
+        : prompt.contentDigest === input.inputDigest)
       && promptMarkerCount === 1
       && renderedMarkerCount === 1
       && terminalCount === 1
@@ -3008,11 +3390,39 @@ async function egoDriverMain(
       humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")
       return
     }
-    const expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
-    const selected = await selectConversation({
-      ...input.binding,
-      canonicalUrl: expectedCanonicalUrl,
-    })
+    let expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
+    let selected
+    if (input.binding.state === "unbound") {
+      if (!isCanonicalConversationUrl(expectedCanonicalUrl)) {
+        humanRequired("confirmed_send_canonical_url_invalid", "The confirmed create-once send has no canonical conversation locator.", {
+          targetId: input.binding.targetId,
+          taskSpaceId: input.binding.taskSpaceId,
+        })
+        return
+      }
+      selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
+      if (!selected) {
+        return
+      }
+      const inspection = await waitForReadyInspection()
+      if (!assertReady(inspection, selected)) {
+        return
+      }
+      if (!isCanonicalConversationUrl(inspection.info.url)) {
+        humanRequired("confirmed_send_conversation_missing", "The confirmed create-once send no longer has a canonical conversation page.", {
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        })
+        return
+      }
+      expectedCanonicalUrl = normalizeUrl(inspection.info.url)
+      selected = { ...selected, inspection }
+    } else {
+      selected = await selectConversation({
+        ...input.binding,
+        canonicalUrl: expectedCanonicalUrl,
+      })
+    }
     if (!selected) {
       return
     }
@@ -3180,6 +3590,35 @@ async function egoDriverMain(
       && prompt.messageId !== response.messageId
       && (exactTerminalResponse || protocolRepairResponse)
     )
+    const imageOnlyResponseReady = (
+      (input.expectedPreviousMessageId ? anchorIndexes.length === 1 : anchorIndexes.length === 0)
+      && anchorDigestMatches
+      && anchorRoleMatches
+      && committed.length === 2
+      && prompt?.messageId === input.promptMessageId
+      && prompt?.role === "user"
+      && promptDigestMatches
+      && promptMarkerCount === 1
+      && response?.role === "assistant"
+      && response?.imageOnly === true
+      && Boolean(response.messageId)
+      && response.messageId !== prompt.messageId
+      && !exactTerminalResponse
+    )
+    if (imageOnlyResponseReady) {
+      humanRequired(
+        "image_only_response_without_terminal_marker",
+        "The confirmed prompt produced an image-only assistant turn without the expected terminal marker.",
+        {
+          attachmentCount: response.attachmentCount,
+          promptMessageIdMatches,
+          responseMessageIdPresent: Boolean(response.messageId),
+          targetId: selected.targetId,
+          taskSpaceId: selected.task.id,
+        },
+      )
+      return
+    }
     const incompleteCaptureCanContinue = (
       input.mode === "capture_exchange"
       && input.captureContinuationAllowed === true
@@ -3191,7 +3630,6 @@ async function egoDriverMain(
       && prompt?.messageId === input.promptMessageId
       && prompt?.role === "user"
       && promptMarkerCount === 1
-      && renderedMarkerCount === 1
       && (!response || (
         response.role === "assistant"
         && (!response.messageId || response.messageId !== prompt.messageId)
@@ -3282,7 +3720,6 @@ async function egoDriverMain(
       && promptMessageIdMatches
       && prompt.messageId !== response.messageId
       && promptMarkerCount === 1
-      && renderedMarkerCount === 1
       && (exactTerminalResponse || protocolRepairResponse)
     )
     if (!attributablePair) {
@@ -3952,6 +4389,8 @@ async function egoDriverMain(
       await reconcile()
     } else if (input.mode === "capture_exchange" || input.mode === "reconcile_bound") {
       await reconcileBound()
+    } else if (input.mode === "capture_attachment_execution") {
+      await captureAttachmentExecution()
     } else if (input.mode === "reanchor") {
       if (input.browserContractRevision !== expectedBrowserContractRevision) {
         humanRequired("browser_contract_mismatch", "The browser driver and broker capability contracts do not match.")

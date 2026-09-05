@@ -1,6 +1,6 @@
 [package]
 name = "ego-chat"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2024"
 rust-version = "1.85"
 description = "Portable launcher for durable Codex, ZCode, and ChatGPT review loops through Ego Browser"
@@ -10,6 +10,7 @@ repository = "https://github.com/xicv/ego-chat"
 keywords = ["codex", "zcode", "chatgpt", "mcp", "browser"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
+  "/build.rs",
   "/Cargo.toml",
   "/Cargo.lock",
   "/LICENSE",

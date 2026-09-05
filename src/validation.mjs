@@ -191,6 +191,47 @@ const ConversationHeadAnchorSchema = z.object({
   role: z.enum(["assistant", "user"]).nullable(),
 }).strict()
 
+export const ReceiptEnabledExchangeRequestSchema = z.object({
+  consumer_signer_authorization_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  external_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  profile: z.literal("a3k-manual-canary-v1"),
+  receipt_capture_requested: z.literal(true),
+  schema: z.literal("ego-chat-receipt-enabled-exchange-request/v1"),
+}).strict()
+
+export const AttachmentCaptureRequestSchema = z.object({
+  schema: z.literal("ego-chat-attachment-capture-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
+export const AttachmentEvidenceRequestSchema = z.object({
+  schema: z.literal("ego-chat-attachment-evidence-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
+const AttachmentConsumerAcknowledgementEnvelopeSchema = z.object({
+  authority_domain: z.literal("attachment-evidence-retention-release-only"),
+  media_type: z.literal(
+    "application/vnd.a3k.attachment-disposition-consumer-acknowledgement.v1+jcs",
+  ),
+  payload_base64url: z.string().regex(/^[A-Za-z0-9_-]+$/).max(24 * 1024),
+  payload_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  schema: z.literal(
+    "a3k-signed-attachment-disposition-consumer-acknowledgement-envelope/v1",
+  ),
+  signature_base64url: z.string().regex(/^[A-Za-z0-9_-]+$/).max(2 * 1024),
+  signature_input_domain: z.literal(
+    "A3K_ATTACHMENT_DISPOSITION_CONSUMER_ACKNOWLEDGEMENT_V1",
+  ),
+  signer_key_id: z.literal("a3k-human-approval-root-v1"),
+}).strict()
+
+export const AttachmentEvidenceReleaseRequestSchema = z.object({
+  acknowledgement_envelope: AttachmentConsumerAcknowledgementEnvelopeSchema,
+  schema: z.literal("ego-chat-attachment-evidence-release-request/v1"),
+  source_workflow_id: WorkflowIdSchema,
+}).strict()
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),
@@ -198,6 +239,7 @@ export const EgoExchangeSchema = z.object({
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: SafeTextSchema,
+  receiptCapture: ReceiptEnabledExchangeRequestSchema.optional(),
   timeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS),
   turnMarker: z.string().regex(/^EGO_CHAT_[A-Z0-9_-]{8,160}$/),
 })

@@ -16,6 +16,8 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 const MINIMUM_NODE_MAJOR: u64 = 24;
 const RUNTIME_MARKER: &str = ".ego-chat-runtime-version";
+const RECEIPT_BUILD_MANIFEST: &str = "receipt-build-manifest.json";
+const IMPLEMENTATION_GIT_SHA: &str = env!("EGO_CHAT_IMPLEMENTATION_GIT_SHA");
 const MCP_SERVER_NAME: &str = "ego_chat";
 const MAX_CONVERGENCE_ATTACHMENT_SECONDS: i64 = 8 * 60 * 60;
 const MCP_TOOL_TIMEOUT_GRACE_SECONDS: i64 = 5 * 60;
@@ -23,6 +25,13 @@ const MCP_TOOL_TIMEOUT_SECONDS: i64 =
     MAX_CONVERGENCE_ATTACHMENT_SECONDS + MCP_TOOL_TIMEOUT_GRACE_SECONDS;
 const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = MCP_TOOL_TIMEOUT_SECONDS as u64 * 1_000;
 const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
+const NPM_CI_ARGS: &[&str] = &[
+    "ci",
+    "--omit=dev",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+];
 
 struct EmbeddedFile {
     path: &'static str,
@@ -61,6 +70,18 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
         path: "src/app-server-client.mjs",
         bytes: include_bytes!("../src/app-server-client.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/attachment-consumer-ack.mjs",
+        bytes: include_bytes!("../src/attachment-consumer-ack.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/attachment-execution-receipt.mjs",
+        bytes: include_bytes!("../src/attachment-execution-receipt.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/attachment-receipt-authority.mjs",
+        bytes: include_bytes!("../src/attachment-receipt-authority.mjs"),
     },
     EmbeddedFile {
         path: "src/auth-token.mjs",
@@ -342,6 +363,7 @@ Usage:\n  \
   ego-chat install-zcode-skill [--force]\n  \
   ego-chat doctor\n  \
   ego-chat doctor-zcode\n  \
+  ego-chat receipt-signer-enroll\n  \
   ego-chat broker-status\n  \
   ego-chat mcp\n  \
   ego-chat <broker-cli-command> [args...]\n\n\
@@ -687,6 +709,7 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
         .is_file()
         && runtime_dir.join("node_modules/zod/package.json").is_file();
     let embedded_files_match = managed_files_match(runtime_dir, RUNTIME_FILES);
+    let receipt_manifest_present = runtime_dir.join(RECEIPT_BUILD_MANIFEST).is_file();
     if runtime_dir.exists() && !version_matches && !force {
         return Err(format!(
             "{} contains an unmanaged or incomplete runtime; inspect it and rerun setup with --force to repair managed files",
@@ -695,7 +718,12 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
     }
 
     write_runtime_tool_paths(runtime_dir, tools)?;
-    if version_matches && dependencies_present && embedded_files_match && !force {
+    if version_matches
+        && dependencies_present
+        && embedded_files_match
+        && receipt_manifest_present
+        && !force
+    {
         return Ok(());
     }
 
@@ -704,14 +732,33 @@ fn install_runtime(runtime_dir: &Path, tools: &Toolchain, force: bool) -> Result
         write_atomic(&destination, file.bytes)?;
     }
     let mut npm = Command::new(&tools.npm);
-    npm.args(["ci", "--omit=dev", "--ignore-scripts"])
-        .current_dir(runtime_dir);
+    npm.args(NPM_CI_ARGS).current_dir(runtime_dir);
     tools.prepend_path(&mut npm)?;
     let status = npm
         .status()
         .map_err(|error| format!("could not run npm ci: {error}"))?;
     if !status.success() {
         return Err(format!("npm ci failed with status {status}"));
+    }
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the fixed Ego Chat executable: {error}"))?;
+    let mut manifest = Command::new(&tools.node);
+    manifest
+        .arg(runtime_dir.join("bin/ego-chat.mjs"))
+        .arg("receipt-build-manifest")
+        .arg(&executable)
+        .arg(IMPLEMENTATION_GIT_SHA)
+        .current_dir(runtime_dir);
+    tools.prepend_path(&mut manifest)?;
+    let output = manifest
+        .output()
+        .map_err(|error| format!("could not create receipt build manifest: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "receipt build manifest failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     write_atomic(
         &marker,
@@ -1224,6 +1271,7 @@ fn runtime_ready(runtime_dir: &Path) -> bool {
             .join("node_modules/@modelcontextprotocol/sdk/package.json")
             .is_file()
         && runtime_dir.join("node_modules/zod/package.json").is_file()
+        && runtime_dir.join(RECEIPT_BUILD_MANIFEST).is_file()
         && managed_files_match(runtime_dir, RUNTIME_FILES)
 }
 
@@ -1731,6 +1779,20 @@ mod tests {
         assert_eq!(MAX_CONVERGENCE_ATTACHMENT_SECONDS, 28_800);
         assert_eq!(MCP_TOOL_TIMEOUT_SECONDS, 29_100);
         assert_eq!(MCP_TOOL_TIMEOUT_MILLISECONDS, 29_100_000);
+    }
+
+    #[test]
+    fn runtime_install_does_not_wait_for_npm_audit_or_funding_network_calls() {
+        assert_eq!(
+            NPM_CI_ARGS,
+            [
+                "ci",
+                "--omit=dev",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund"
+            ]
+        );
     }
 
     #[test]

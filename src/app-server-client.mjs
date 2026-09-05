@@ -13,6 +13,7 @@ const WORKSPACE_ACTIVITY_ITEM_TYPES = new Set([
   "imageView",
   "mcpToolCall",
 ])
+const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"])
 
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
@@ -85,6 +86,7 @@ function withTurnIdentity(error, turnId) {
 export class AppServerClient {
   #args
   #command
+  #completionPollIntervalMs
   #nextId = 1
   #notifications = []
   #pending = new Map()
@@ -92,9 +94,17 @@ export class AppServerClient {
   #stderr = ""
   #waiters = new Set()
 
-  constructor({ args = ["app-server"], command = "codex" } = {}) {
+  constructor({
+    args = ["app-server"],
+    command = "codex",
+    completionPollIntervalMs = 5_000,
+  } = {}) {
+    if (!Number.isSafeInteger(completionPollIntervalMs) || completionPollIntervalMs < 1) {
+      throw new TypeError("completionPollIntervalMs must be a positive safe integer")
+    }
     this.#args = args
     this.#command = command
+    this.#completionPollIntervalMs = completionPollIntervalMs
   }
 
   async connect() {
@@ -299,11 +309,7 @@ export class AppServerClient {
     }
     let completed
     try {
-      completed = await this.waitForNotification(
-        "turn/completed",
-        (params) => params?.threadId === threadId && params?.turn?.id === turnId,
-        Math.max(1, deadline - Date.now()),
-      )
+      completed = await this.#waitForCompletedTurn(threadId, turnId, deadline)
     } catch (error) {
       throw withTurnIdentity(error, turnId)
     }
@@ -313,6 +319,7 @@ export class AppServerClient {
     if (completed.turn.status !== "completed") {
       throw new EgoChatError("app_server_turn_failed", "The App Server turn did not complete successfully.", {
         status: completed.turn.status,
+        turnId,
       })
     }
 
@@ -386,6 +393,45 @@ export class AppServerClient {
         resolve()
       })
     })
+  }
+
+  async #waitForCompletedTurn(threadId, turnId, deadline) {
+    while (Date.now() < deadline) {
+      const remainingMs = Math.max(1, deadline - Date.now())
+      try {
+        const completed = await this.waitForNotification(
+          "turn/completed",
+          (params) => params?.threadId === threadId && params?.turn?.id === turnId,
+          Math.min(this.#completionPollIntervalMs, remainingMs),
+        )
+        return completed
+      } catch (error) {
+        if (
+          !(error instanceof EgoChatError)
+          || error.code !== "app_server_event_timeout"
+          || Date.now() >= deadline
+        ) {
+          throw error
+        }
+      }
+
+      const thread = await this.readThread(threadId, true, Math.max(1, deadline - Date.now()))
+      const matchingTurns = thread.turns?.filter((turn) => turn.id === turnId) ?? []
+      if (matchingTurns.length > 1) {
+        throw new EgoChatError(
+          "turn_identity_mismatch",
+          "The App Server thread contained duplicate exact turn identities.",
+        )
+      }
+      const turn = matchingTurns[0]
+      if (turn && TERMINAL_TURN_STATUSES.has(turn.status)) {
+        return { threadId, turn }
+      }
+    }
+    throw new EgoChatError(
+      "app_server_event_timeout",
+      "The App Server turn did not become terminal before the deadline.",
+    )
   }
 
   async #waitForThreadIdle(threadId, deadline) {

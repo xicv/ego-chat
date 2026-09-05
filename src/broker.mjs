@@ -4,6 +4,18 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
+import {
+  assertValidSignedAttachmentDispositionEnvelope,
+  buildAmbiguousSendDisposition,
+  buildAttachmentCaptureIntent,
+  buildAttachmentEvidenceCapture,
+  buildAttachmentExecutionDisposition,
+  buildConfirmedSendAbsenceDisposition,
+  buildTerminalEvidenceBundle,
+  canonicalJsonBytes,
+  classifyAttachmentExecutionObservations,
+  sha256Hex,
+} from "./attachment-execution-receipt.mjs"
 import { projectEagleSemanticCheckpoint } from "./eagle-monitor-semantic.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
 import {
@@ -28,6 +40,9 @@ import {
 } from "./convergence.mjs"
 import {
   AbandonWorkflowSchema,
+  AttachmentCaptureRequestSchema,
+  AttachmentEvidenceRequestSchema,
+  AttachmentEvidenceReleaseRequestSchema,
   AwaitWorkflowSchema,
   ConversationAdoptionSchema,
   ConversationBindSchema,
@@ -49,6 +64,20 @@ import {
 
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
+}
+
+function isCanonicalChatGptConversationUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === "https:"
+      && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
+      && parsed.username === ""
+      && parsed.password === ""
+      && parsed.port === ""
+      && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(parsed.pathname)
+  } catch {
+    return false
+  }
 }
 
 const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/
@@ -78,7 +107,38 @@ function compactHistoricalConvergenceCycle(record) {
         }
       : {}),
     cycle: record.cycle,
+    ...(record.livenessCheckpoint ? { livenessCheckpoint: record.livenessCheckpoint } : {}),
     ...(record.reviewSignature ? { reviewSignature: record.reviewSignature } : {}),
+  }
+}
+
+function requiresRepairedThreadRotation(workflow, cycle) {
+  return Number.isSafeInteger(workflow.codexThreadRotationPending?.afterCycle)
+    && workflow.codexThreadRotationPending.afterCycle < cycle
+}
+
+function continueAfterRepairedThreadRotation(review, cycle) {
+  if (!review || !Array.isArray(review.findings) || typeof review.summary !== "string") {
+    throw new EgoChatError(
+      "human_required",
+      "The old-thread review is incomplete and cannot be retained for fresh-thread recovery.",
+      { reason: "convergence_recovery_state_invalid" },
+    )
+  }
+  const findingId = "B-FRESH-CODEX-THREAD-REQUIRED"
+  return {
+    ...review,
+    decision: "continue",
+    findings: [
+      ...review.findings.filter((finding) => finding.id !== findingId),
+      {
+        action: `Continue after cycle ${cycle} in the fresh Codex thread required by the preceding liveness checkpoint.`,
+        id: findingId,
+        severity: "blocking",
+        title: "Fresh Codex thread required before settlement",
+      },
+    ],
+    summary: `${review.summary}\n\nBroker recovery note: this candidate reused the exhausted Codex thread after a liveness checkpoint. Its review is retained as untrusted context, but it cannot settle the workflow.`,
   }
 }
 
@@ -375,6 +435,7 @@ function effectiveWorkflowBinding(binding, workflow) {
       canonicalUrl: canonicalWorkflowEvidenceUrl(value?.canonicalUrl),
       identity,
       source,
+      targetId: value?.targetId,
       taskSpaceId: value?.taskSpaceId,
     }
   })
@@ -396,19 +457,32 @@ function effectiveWorkflowBinding(binding, workflow) {
     ...(binding?.canonicalUrl ? [canonicalWorkflowEvidenceUrl(binding.canonicalUrl)] : []),
     ...authoritative.map((value) => value.canonicalUrl),
   ]
-  for (let index = 1; index < canonicalUrls.length; index += 1) {
-    if (canonicalUrls[0] !== canonicalUrls[index]) {
+  const observed = authoritative.at(-1)
+  const canonicalUrlChanged = canonicalUrls.some((value) => value !== canonicalUrls[0])
+  const provisionalEvidence = authoritative.filter((value) => value.source !== "result")
+  const resultEvidence = authoritative.find((value) => value.source === "result")
+  const createOncePromotion = Boolean(
+    canonicalUrlChanged
+    && binding?.state === "unbound"
+    && resultEvidence
+    && provisionalEvidence.length > 0
+    && provisionalEvidence.every((value) => (
+      value.canonicalUrl === provisionalEvidence[0].canonicalUrl
+      && (!value.targetId || value.targetId === resultEvidence.targetId)
+      && value.taskSpaceId === resultEvidence.taskSpaceId
+      && isDeepStrictEqual(value.identity, resultEvidence.identity)
+    ))
+  )
+  if (canonicalUrlChanged && !createOncePromotion) {
       throw new EgoChatError(
         "human_required",
         "The confirmed-Send canonical conversation conflicts with the durable binding.",
         { reason: "canonical_conversation_changed" },
       )
-    }
   }
-  const observed = authoritative.at(-1)
   return {
     ...binding,
-    canonicalUrl: canonicalUrls[0],
+    canonicalUrl: createOncePromotion ? resultEvidence.canonicalUrl : canonicalUrls[0],
     taskSpaceId: observed.taskSpaceId ?? binding.taskSpaceId,
     taskSpaceIdentity: observed.identity,
   }
@@ -487,7 +561,7 @@ function bindingsShareTaskSpace(first, second) {
   return false
 }
 
-function validatePendingCapture(value, workflow) {
+function validatePendingCapture(value, workflow, binding) {
   if (value?.captureState !== "pending") {
     return false
   }
@@ -501,8 +575,15 @@ function validatePendingCapture(value, workflow) {
     value.captureReason === "response_not_terminal"
     && value.generationRunning === false
   )
+  const canonicalIdentity = value.canonicalUrl === sent?.canonicalUrl || (
+    binding?.state === "unbound"
+    && value.targetId === sent?.targetId
+    && value.taskSpaceId === sent?.taskSpaceId
+    && isCanonicalChatGptConversationUrl(sent?.canonicalUrl)
+    && isCanonicalChatGptConversationUrl(value.canonicalUrl)
+  )
   const exactIdentity = sent
-    && value.canonicalUrl === sent.canonicalUrl
+    && canonicalIdentity
     && validPendingReason
     && value.promptMessageId === sent.promptMessageId
     && typeof value.targetId === "string"
@@ -521,6 +602,47 @@ function validatePendingCapture(value, workflow) {
     )
   }
   return true
+}
+
+const BROWSER_RECOVERY_BOOLEAN_EVIDENCE = [
+  "anchorDigestMatches",
+  "anchorRoleMatches",
+  "promptDigestMatches",
+  "promptMessageIdMatches",
+  "responseMessageIdPresent",
+  "responseEndsWithTerminal",
+]
+const BROWSER_RECOVERY_COUNT_EVIDENCE = [
+  "anchorCount",
+  "attachmentCount",
+  "committedCount",
+  "promptMarkerCount",
+  "renderedMarkerCount",
+  "terminalCount",
+]
+
+function boundedBrowserRecoveryEvidence(error) {
+  const source = error?.details?.evidence
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return undefined
+  }
+  const evidence = {}
+  for (const field of BROWSER_RECOVERY_BOOLEAN_EVIDENCE) {
+    if (typeof source[field] === "boolean") {
+      evidence[field] = source[field]
+    }
+  }
+  for (const field of BROWSER_RECOVERY_COUNT_EVIDENCE) {
+    if (Number.isSafeInteger(source[field]) && source[field] >= 0) {
+      evidence[field] = source[field]
+    }
+  }
+  for (const field of ["promptRole", "responseRole"]) {
+    if (["assistant", "user"].includes(source[field])) {
+      evidence[field] = source[field]
+    }
+  }
+  return Object.keys(evidence).length > 0 ? evidence : undefined
 }
 
 function responseExcerpt(value, maximumBytes = 4 * 1024) {
@@ -708,6 +830,7 @@ const HUMAN_ONLY_BROWSER_REASONS = new Set([
   "canonical_conversation_changed",
   "canonical_conversation_evidence_invalid",
   "canonical_conversation_missing",
+  "image_only_response_without_terminal_marker",
   "model_policy_unsupported",
   "task_space_identity_ambiguous",
   "task_space_identity_changed",
@@ -865,11 +988,27 @@ function isRetryableAppServerError(error) {
     || ["thread_identity_mismatch", "turn_identity_mismatch"].includes(error.code)
 }
 
+const ATTACHMENT_CAPTURE_QUIET_INTERVAL_MS = 750
+const RETRYABLE_ATTACHMENT_OBSERVATION_REASONS = new Set([
+  "GENERATION_ACTIVE",
+  "HYDRATION_PENDING",
+  "INCOMPLETE_GRAPH",
+  "UNSTABLE_EVIDENCE",
+])
+
+function monotonicMilliseconds() {
+  return Number(process.hrtime.bigint() / 1_000_000n)
+}
+
 export class Broker {
   #activeBindings = new Set()
   #activeConversationUrls = new Map()
   #adoptionTaskSpaces = new Map()
   #appServerFactory
+  #attachmentReceiptAuthority
+  #attachmentCaptureBindings = new Map()
+  #attachmentCaptureControllers = new Map()
+  #attachmentCaptureWorkflows = new Set()
   #brokerIdentity
   #brokerLease
   #convergenceBindings = new Map()
@@ -889,6 +1028,7 @@ export class Broker {
 
   constructor({
     appServerFactory,
+    attachmentReceiptAuthority = undefined,
     brokerIdentity = undefined,
     brokerLease = undefined,
     convergenceChildWaitSliceMs = DEFAULT_CONVERGENCE_CHILD_WAIT_SLICE_MS,
@@ -908,6 +1048,7 @@ export class Broker {
       throw new TypeError("convergenceChildWaitSliceMs must be a positive safe integer")
     }
     this.#appServerFactory = appServerFactory
+    this.#attachmentReceiptAuthority = attachmentReceiptAuthority
     this.#brokerIdentity = brokerIdentity ?? {
       brokerId: `in-process-${process.pid}`,
       epoch: 0,
@@ -1058,11 +1199,37 @@ export class Broker {
         }
       } else if (
         workflow.kind === "ego_exchange"
+        && workflow.private?.request?.receiptCapture
+        && this.#store.getConfirmedSendIdentity(workflow.id)
+        && (
+          (
+            workflow.phase === "awaiting_attachment_capture"
+            && !this.#store.getAttachmentCapture(workflow.id)
+          )
+          || (
+            workflow.phase === "attachment_capture_started"
+            && this.#store.getAttachmentCapture(workflow.id)
+          )
+        )
+      ) {
+        if (
+          workflow.phase === "attachment_capture_started"
+          && this.#canRunAttachmentCapture()
+        ) {
+          this.#scheduleAttachmentCapture(workflow.id, { restarted: true })
+        }
+        continue
+      } else if (
+        workflow.kind === "ego_exchange"
         && (
           workflow.phase === "response_captured"
           || (workflow.phase === "send_confirmed" && workflow.private?.send)
           || (
-            ["browser_owned", "restart_reconciling"].includes(workflow.phase)
+            [
+              "browser_owned",
+              "receipt_dispatch_armed",
+              "restart_reconciling",
+            ].includes(workflow.phase)
             && workflow.reconciliation?.beforeHead?.messageId
             && workflow.reconciliation?.expectedTerminalMarker
             && workflow.reconciliation?.turnMarker
@@ -1116,7 +1283,9 @@ export class Broker {
             result: recoveredBinding,
           })
         }
-        const resumable = workflow.phase === "browser_owned"
+        const resumable = ["browser_owned", "receipt_dispatch_armed"].includes(
+          workflow.phase,
+        )
           ? await this.#transition(workflow, "exchange.restart_reconciliation_started", {
               phase: "restart_reconciling",
               private: workflow.private,
@@ -1759,10 +1928,20 @@ export class Broker {
       && workflow.phase === "response_captured"
       && workflow.result?.reconciled === true
     )
+    const recoveryCode = workflow.humanRequired?.code ?? workflow.error?.code
+    const cancelledConfirmedCreateOnce = binding.state === "unbound"
+      && workflow.status === "human_required"
+      && recoveryCode === "cancelled_during_browser_operation"
+      && workflow.phase === "send_confirmed"
+      && !workflow.private?.request?.receiptCapture
+      && workflow.reconciliation?.beforeHead?.messageId === null
+      && typeof workflow.reconciliation?.promptMessageId === "string"
+      && workflow.reconciliation.promptMessageId.length > 0
+      && workflow.private?.send?.promptMessageId === workflow.reconciliation.promptMessageId
+      && workflow.private.send.targetId === binding.targetId
     const unboundRecovery = binding.state === "unbound"
       && workflow.status === "human_required"
-      && workflow.humanRequired?.code === "canonical_conversation_missing"
-    const recoveryCode = workflow.humanRequired?.code ?? workflow.error?.code
+      && (recoveryCode === "canonical_conversation_missing" || cancelledConfirmedCreateOnce)
     const browserInterruption = workflow.reconciliation?.browserInterruption
     const boundRecovery = binding.state === "bound"
       && (
@@ -1837,10 +2016,12 @@ export class Broker {
                 binding: identityBinding,
                 expectedTerminalMarker,
                 inputDigest: workflow.inputDigest,
+                promptMessageId: workflow.reconciliation.promptMessageId,
                 turnMarker,
               },
               undefined,
               (result) => this.#reserveBrowserTaskSpaceIdentity({
+                allowCanonicalPromotion: cancelledConfirmedCreateOnce,
                 expectedCanonicalUrl: identityBinding.canonicalUrl,
                 key: identityBinding.key,
                 owner: admissionOwner,
@@ -1871,6 +2052,7 @@ export class Broker {
               () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
             )
         this.#reserveBrowserTaskSpaceIdentity({
+          allowCanonicalPromotion: cancelledConfirmedCreateOnce,
           expectedCanonicalUrl: identityBinding.canonicalUrl,
           key: identityBinding.key,
           owner: admissionOwner,
@@ -2132,6 +2314,457 @@ export class Broker {
     return this.#startEgoExchange(input)
   }
 
+  async startAttachmentCapture(input) {
+    const params = parse(AttachmentCaptureRequestSchema, input)
+    const workflow = this.#store.getWorkflow(params.source_workflow_id)
+    if (!workflow) {
+      throw new EgoChatError("workflow_not_found", "No workflow exists with that ID.")
+    }
+    if (
+      workflow.kind !== "ego_exchange"
+      || workflow.status !== "running"
+      || !["awaiting_attachment_capture", "attachment_capture_started"].includes(
+        workflow.phase,
+      )
+      || !workflow.private?.request?.receiptCapture
+      || !this.#store.getConfirmedSendIdentity(workflow.id)
+    ) {
+      throw new EgoChatError(
+        "attachment_capture_not_ready",
+        "The source workflow has no eligible confirmed attachment Send.",
+      )
+    }
+    const existing = this.#store.getAttachmentCapture(workflow.id)
+    if (existing) {
+      if (workflow.phase !== "attachment_capture_started") {
+        throw new EgoChatError(
+          "corrupt_attachment_evidence_state",
+          "The attachment capture operation and source workflow phase do not match.",
+        )
+      }
+      if (this.#canRunAttachmentCapture()) {
+        this.#scheduleAttachmentCapture(workflow.id)
+      }
+      return publicWorkflow(workflow)
+    }
+    const started = await this.#store.beginAttachmentCapture(
+      workflow,
+      new Date().toISOString(),
+    )
+    if (this.#canRunAttachmentCapture()) {
+      this.#scheduleAttachmentCapture(workflow.id)
+    }
+    return publicWorkflow(started.workflow)
+  }
+
+  getAttachmentEvidence(input) {
+    const params = parse(AttachmentEvidenceRequestSchema, input)
+    const workflow = this.#store.getWorkflow(params.source_workflow_id)
+    if (!workflow) {
+      throw new EgoChatError("workflow_not_found", "No workflow exists with that ID.")
+    }
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    const confirmedSendEvent = this.#store.getConfirmedSendEvent(workflow.id)
+    const confirmedSendIdentity = this.#store.getConfirmedSendIdentity(workflow.id)
+    const capture = this.#store.getAttachmentCapture(workflow.id)
+    const dispositionEnvelope = this.#store.getAttachmentDisposition(workflow.id)
+    const terminalDisposition = dispositionEnvelope
+      ? assertValidSignedAttachmentDispositionEnvelope(dispositionEnvelope).disposition
+      : undefined
+    const externalBinding = intent && this.#store.getAttachmentExternalBinding(
+      intent.profile,
+      intent.external_binding_sha256,
+    )
+    const prompt = workflow.private?.request?.prompt
+    const promptBytes = typeof prompt === "string" ? Buffer.from(prompt, "utf8") : undefined
+    const confirmedSendEventProjection = confirmedSendEvent && {
+      event_type: confirmedSendEvent.event_type,
+      operation_key_sha256: confirmedSendEvent.operation_key_sha256,
+      prompt_message_id: confirmedSendEvent.prompt_message_id,
+      schema: confirmedSendEvent.schema,
+      sent_at: confirmedSendEvent.sent_at,
+      sequence: confirmedSendEvent.sequence,
+      workflow_id: confirmedSendEvent.workflow_id,
+    }
+    if (
+      [
+        "ego-chat-ambiguous-send-disposition/v1",
+        "ego-chat-confirmed-send-absence/v1",
+      ].includes(terminalDisposition?.schema)
+    ) {
+      const schema = terminalDisposition.schema === "ego-chat-ambiguous-send-disposition/v1"
+        ? "ego-chat-ambiguous-send-evidence-bundle/v1"
+        : "ego-chat-confirmed-send-absence-evidence-bundle/v1"
+      if (
+        workflow.kind !== "ego_exchange"
+        || ![
+          "attachment_disposition_terminal",
+          "attachment_evidence_released",
+        ].includes(workflow.phase)
+        || workflow.status !== "succeeded"
+        || !intent
+        || confirmedSendEvent !== undefined
+        || confirmedSendIdentity !== undefined
+        || capture !== undefined
+        || !dispositionEnvelope
+        || !externalBinding
+        || externalBinding.source_workflow_id !== workflow.id
+        || externalBinding.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
+      ) {
+        throw new EgoChatError(
+          "attachment_evidence_not_terminal",
+          "The source workflow has no complete immutable terminal Send evidence chain.",
+        )
+      }
+      return {
+        ...(this.#store.getAttachmentConsumerAcknowledgement(workflow.id)
+          ? {
+              consumer_acknowledgement_envelope:
+                this.#store.getAttachmentConsumerAcknowledgement(workflow.id),
+              evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
+            }
+          : {}),
+        ...buildTerminalEvidenceBundle({
+          dispositionEnvelope,
+          externalBinding,
+          intent,
+          schema,
+          sourceOperationKey: workflow.operationKey,
+          sourceWorkflowId: workflow.id,
+        }),
+      }
+    }
+    if (
+      workflow.kind !== "ego_exchange"
+      || ![
+        "attachment_disposition_terminal",
+        "attachment_evidence_released",
+      ].includes(workflow.phase)
+      || workflow.status !== "succeeded"
+      || !intent
+      || !confirmedSendEvent
+      || !confirmedSendIdentity
+      || capture?.state !== "TERMINAL"
+      || !dispositionEnvelope
+      || !externalBinding
+      || !promptBytes
+      || confirmedSendIdentity.exact_prompt_utf8_sha256 !== sha256Hex(promptBytes)
+      || confirmedSendIdentity.exact_prompt_utf8_byte_length !== promptBytes.length
+      || confirmedSendIdentity.send_event_sha256
+        !== sha256Hex(canonicalJsonBytes(confirmedSendEventProjection))
+      || confirmedSendEvent.confirmed_send_identity_sha256
+        !== sha256Hex(canonicalJsonBytes(confirmedSendIdentity))
+      || capture.terminal_disposition_sha256 !== dispositionEnvelope.payload_sha256
+      || capture.terminal_envelope_sha256
+        !== sha256Hex(canonicalJsonBytes(dispositionEnvelope))
+      || externalBinding.source_workflow_id !== workflow.id
+      || externalBinding.intent_sha256 !== sha256Hex(canonicalJsonBytes(intent))
+    ) {
+      throw new EgoChatError(
+        "attachment_evidence_not_terminal",
+        "The source workflow has no complete immutable terminal attachment evidence chain.",
+      )
+    }
+    return {
+      ...(this.#store.getAttachmentConsumerAcknowledgement(workflow.id)
+        ? {
+            consumer_acknowledgement_envelope:
+              this.#store.getAttachmentConsumerAcknowledgement(workflow.id),
+            evidence_tombstone: this.#store.getAttachmentEvidenceTombstone(workflow.id),
+          }
+        : {}),
+      capture: buildAttachmentEvidenceCapture(capture, {
+        outcome: terminalDisposition.outcome,
+        reason: terminalDisposition.reason,
+      }),
+      confirmed_send_event: confirmedSendEvent,
+      confirmed_send_identity: confirmedSendIdentity,
+      disposition_envelope: dispositionEnvelope,
+      exact_prompt_utf8_base64url: promptBytes.toString("base64url"),
+      external_binding: externalBinding,
+      intent,
+      schema: "ego-chat-attachment-evidence-bundle/v1",
+      source_operation_key: workflow.operationKey,
+      source_workflow_id: workflow.id,
+    }
+  }
+
+  async releaseAttachmentEvidence(input) {
+    const params = parse(AttachmentEvidenceReleaseRequestSchema, input)
+    if (
+      typeof this.#attachmentReceiptAuthority?.verifyConsumerAcknowledgement
+        !== "function"
+    ) {
+      throw new EgoChatError(
+        "attachment_consumer_acknowledgement_authority_unavailable",
+        "The A3K acknowledgement authority is unavailable; evidence remains reserved.",
+      )
+    }
+    const acknowledgement = await this.#attachmentReceiptAuthority
+      .verifyConsumerAcknowledgement(params.acknowledgement_envelope)
+    const released = await this.#store.releaseAttachmentEvidence({
+      acknowledgement,
+      envelope: params.acknowledgement_envelope,
+      workflowId: params.source_workflow_id,
+    })
+    return {
+      acknowledgement_envelope_sha256: sha256Hex(
+        canonicalJsonBytes(released.envelope),
+      ),
+      consumer_state: released.acknowledgement.consumer_state,
+      created: released.created,
+      evidence_tombstone: released.tombstone,
+      schema: "ego-chat-attachment-evidence-release-result/v1",
+      source_workflow_id: params.source_workflow_id,
+    }
+  }
+
+  #canRunAttachmentCapture() {
+    return typeof this.#egoAdapter?.captureAttachmentExecution === "function"
+      && typeof this.#attachmentReceiptAuthority?.signAttachmentDisposition === "function"
+  }
+
+  #scheduleAttachmentCapture(workflowId, { restarted = false } = {}) {
+    if (this.#attachmentCaptureWorkflows.has(workflowId)) return
+    const workflow = this.#store.getWorkflow(workflowId)
+    if (!workflow || workflow.status !== "running") return
+    const existingOwner = this.#attachmentCaptureBindings.get(workflow.bindingKey)
+    if (existingOwner && existingOwner !== workflowId) {
+      throw new EgoChatError(
+        "conversation_reserved",
+        "That conversation is reserved by another attachment capture.",
+        { workflowId: existingOwner },
+      )
+    }
+    this.#attachmentCaptureWorkflows.add(workflowId)
+    this.#attachmentCaptureBindings.set(workflow.bindingKey, workflowId)
+    this.#runAttachmentCapture(workflowId, { restarted }).catch((error) => {
+      console.error("Attachment capture runner failed:", error)
+    })
+  }
+
+  async #terminalizeAttachmentCapture(capture, terminalReason = undefined) {
+    const workflow = this.#store.getWorkflow(capture.source_workflow_id)
+    const identity = this.#store.getConfirmedSendIdentity(capture.source_workflow_id)
+    const identityDigest = sha256Hex(canonicalJsonBytes(identity))
+    const finalObservedAt = capture.candidate_observations.at(-1)?.observed_at
+    const observedTerminalMs = Math.max(
+      Date.now(),
+      finalObservedAt ? Date.parse(finalObservedAt) : Date.parse(capture.capture_started_at),
+    )
+    const terminalAt = new Date(
+      terminalReason === "CAPTURE_DEADLINE_EXPIRED"
+        ? Math.min(Date.parse(capture.capture_deadline_at), observedTerminalMs)
+        : observedTerminalMs,
+    ).toISOString()
+    const disposition = buildAttachmentExecutionDisposition({
+      captureOperation: capture,
+      confirmedSendIdentity: identity,
+      confirmedSendIdentityDigest: identityDigest,
+      observations: capture.candidate_observations,
+      terminalReason,
+      terminalAt,
+    })
+    const envelope = await this.#attachmentReceiptAuthority.signAttachmentDisposition({
+      authoritySnapshot: workflow?.private?.receiptAuthoritySnapshot,
+      authoritySnapshotDigest: workflow?.private?.receiptAuthoritySnapshotSha256,
+      consumerSignerAuthorizationDigest:
+        identity.consumer_signer_authorization_sha256,
+      disposition,
+    })
+    await this.#assertBrokerAuthority("before_attachment_disposition_commit")
+    const persisted = await this.#store.persistAttachmentDisposition({
+      capture,
+      envelope,
+    })
+    if (isTerminal(persisted.workflow)) {
+      for (const waiter of [...(this.#waiters.get(persisted.workflow.id) ?? [])]) {
+        waiter.resolve(publicWorkflow(persisted.workflow))
+      }
+    }
+    return persisted
+  }
+
+  async #runAttachmentCapture(workflowId, { restarted }) {
+    const controller = new AbortController()
+    this.#attachmentCaptureControllers.set(workflowId, controller)
+    try {
+      let capture = this.#store.getAttachmentCapture(workflowId)
+      if (!capture || capture.state !== "CAPTURING") return
+      const sourceWorkflow = this.#store.getWorkflow(workflowId)
+      const sourceBinding = this.#store.getBinding(sourceWorkflow?.bindingKey)
+      if (!sourceWorkflow || !sourceBinding) {
+        throw new EgoChatError(
+          "corrupt_attachment_evidence_state",
+          "Attachment capture cannot restore its owner-scoped task-space admission.",
+        )
+      }
+      const captureBinding = effectiveWorkflowBinding(sourceBinding, sourceWorkflow)
+      this.#reserveTaskSpaceAdmission(workflowId, {
+        canonicalUrl: captureBinding.canonicalUrl,
+        key: sourceWorkflow.bindingKey,
+        selector: taskSpaceSelectorForBinding(captureBinding),
+        taskSpaceIdentity: captureBinding.taskSpaceIdentity,
+      })
+      if (restarted) {
+        const restartedAt = new Date().toISOString()
+        if (
+          Date.parse(restartedAt) < Date.parse(capture.capture_deadline_at)
+          && capture.attempt_journal.length < 32
+        ) {
+          capture = await this.#store.recordAttachmentCaptureRecovery({
+            attemptedAt: restartedAt,
+            capture,
+            elapsedMonotonicMs: 0,
+            reason: "BROKER_RESTART",
+          })
+        }
+      }
+
+      while (!controller.signal.aborted) {
+        capture = this.#store.getAttachmentCapture(workflowId)
+        if (!capture || capture.state !== "CAPTURING") return
+        const deadlineExpired = Date.now() >= Date.parse(capture.capture_deadline_at)
+          || capture.accumulated_monotonic_ms >= 10 * 60 * 1_000
+        if (deadlineExpired) {
+          await this.#terminalizeAttachmentCapture(capture, "CAPTURE_DEADLINE_EXPIRED")
+          return
+        }
+        if (
+          capture.attempt_journal.length >= 32
+          || capture.candidate_pair_count >= 8
+        ) {
+          await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+          return
+        }
+        const workflow = this.#store.getWorkflow(workflowId)
+        const identity = this.#store.getConfirmedSendIdentity(workflowId)
+        if (!workflow || workflow.status !== "running" || !identity) {
+          throw new EgoChatError(
+            "corrupt_attachment_evidence_state",
+            "Attachment capture lost its durable workflow, binding, or confirmed Send.",
+          )
+        }
+        const binding = this.#store.getBinding(workflow.bindingKey)
+        if (!binding) {
+          throw new EgoChatError(
+            "corrupt_attachment_evidence_state",
+            "Attachment capture lost its durable conversation binding.",
+          )
+        }
+        const attemptStarted = monotonicMilliseconds()
+        let observation
+        try {
+          observation = await this.#egoAdapter.captureAttachmentExecution({
+            binding: effectiveWorkflowBinding(binding, workflow),
+            captureOperationKeySha256: capture.capture_operation_key_sha256,
+            observationSequence: capture.attempt_journal.length + 1,
+            providerPromptMessageId: identity.provider_prompt_message_id,
+            sourceConfirmedSendIdentitySha256: sha256Hex(canonicalJsonBytes(identity)),
+          }, controller.signal, undefined,
+          () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflowId) }))
+        } catch (_error) {
+          if (controller.signal.aborted) return
+          const elapsedMonotonicMs = Math.max(
+            0,
+            monotonicMilliseconds() - attemptStarted,
+          )
+          capture = this.#store.getAttachmentCapture(workflowId)
+          const recoveryAt = new Date().toISOString()
+          if (
+            Date.parse(recoveryAt) >= Date.parse(capture.capture_deadline_at)
+            || capture.accumulated_monotonic_ms + elapsedMonotonicMs
+              >= 10 * 60 * 1_000
+          ) {
+            await this.#terminalizeAttachmentCapture(
+              capture,
+              "CAPTURE_DEADLINE_EXPIRED",
+            )
+            return
+          }
+          if (capture.attempt_journal.length >= 31) {
+            await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+            return
+          }
+          capture = await this.#store.recordAttachmentCaptureRecovery({
+            attemptedAt: recoveryAt,
+            capture,
+            elapsedMonotonicMs,
+            reason: "DRIVER_RECOVERY",
+          })
+          await sleep(
+            Math.min(
+              250,
+              Math.max(1, Date.parse(capture.capture_deadline_at) - Date.now()),
+            ),
+            undefined,
+            { signal: controller.signal },
+          )
+          continue
+        }
+        const elapsedMonotonicMs = Math.max(
+          0,
+          monotonicMilliseconds() - attemptStarted,
+        )
+        capture = await this.#store.recordAttachmentCaptureAttempt({
+          capture,
+          elapsedMonotonicMs,
+          observation,
+        })
+        if (capture.candidate_observations.length < 2) {
+          const quietDelayMs = Math.max(
+            1,
+            Date.parse(observation.observed_at)
+              + ATTACHMENT_CAPTURE_QUIET_INTERVAL_MS
+              - Date.now(),
+          )
+          if (Date.now() + quietDelayMs >= Date.parse(capture.capture_deadline_at)) {
+            await this.#terminalizeAttachmentCapture(
+              capture,
+              "CAPTURE_DEADLINE_EXPIRED",
+            )
+            return
+          }
+          await sleep(quietDelayMs, undefined, { signal: controller.signal })
+          continue
+        }
+        const classification = classifyAttachmentExecutionObservations(
+          capture.candidate_observations,
+        )
+        if (RETRYABLE_ATTACHMENT_OBSERVATION_REASONS.has(classification.reason)) {
+          if (capture.candidate_pair_count >= 8) {
+            await this.#terminalizeAttachmentCapture(capture, "CAPTURE_ATTEMPT_LIMIT")
+            return
+          }
+          continue
+        }
+        await this.#terminalizeAttachmentCapture(capture)
+        return
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const workflow = this.#store.getWorkflow(workflowId)
+      if (workflow && !isTerminal(workflow)) {
+        await this.#transition(workflow, "workflow.human_required", {
+          humanRequired: {
+            code: "attachment_capture_runner_failed",
+            message: "The attachment capture runner stopped before terminal evidence was committed.",
+          },
+          status: "human_required",
+        })
+      }
+      throw error
+    } finally {
+      this.#attachmentCaptureControllers.delete(workflowId)
+      this.#attachmentCaptureWorkflows.delete(workflowId)
+      this.#releaseTaskSpaceAdmission(workflowId)
+      const workflow = this.#store.getWorkflow(workflowId)
+      if (workflow && this.#attachmentCaptureBindings.get(workflow.bindingKey) === workflowId) {
+        this.#attachmentCaptureBindings.delete(workflow.bindingKey)
+      }
+    }
+  }
+
   async #startEgoExchange(input, convergenceId = undefined) {
     const params = parse(EgoExchangeSchema, input)
     const markerCount = params.prompt.split(params.turnMarker).length - 1
@@ -2179,6 +2812,72 @@ export class Broker {
     }
     const modelPolicy = this.#resolveModelPolicy()
     const generationTimeoutMs = Math.max(params.timeoutMs, DEFAULT_CHATGPT_GENERATION_MS)
+    const workflowId = randomUUID()
+    let receiptAdmission
+    if (params.receiptCapture) {
+      if (typeof this.#attachmentReceiptAuthority?.qualify !== "function") {
+        throw new EgoChatError(
+          "attachment_receipt_authority_unavailable",
+          "Receipt evidence authority is not enrolled; no browser work was started.",
+        )
+      }
+      const qualification = await this.#attachmentReceiptAuthority.qualify(
+        params.receiptCapture,
+      )
+      if (
+        !qualification
+        || !qualification.authoritySnapshot
+        || typeof qualification.authoritySnapshot !== "object"
+        || Array.isArray(qualification.authoritySnapshot)
+        || qualification.authoritySnapshot.schema
+          !== "ego-chat-attachment-receipt-authorization-snapshot/v1"
+        || !/^[a-f0-9]{64}$/.test(qualification.authoritySnapshotDigest)
+        || qualification.authoritySnapshotDigest
+          !== sha256Hex(canonicalJsonBytes(qualification.authoritySnapshot))
+        || qualification.consumerSignerAuthorizationDigest
+          !== params.receiptCapture.consumer_signer_authorization_sha256
+        || typeof qualification.signerEnrollmentDigest !== "string"
+        || !/^[a-f0-9]{64}$/.test(qualification.signerEnrollmentDigest)
+        || typeof qualification.signerKeyId !== "string"
+        || !/^ed25519-spki-sha256:[a-f0-9]{64}$/.test(qualification.signerKeyId)
+        || !qualification.runtimeIdentity
+        || typeof qualification.runtimeIdentity !== "object"
+        || Array.isArray(qualification.runtimeIdentity)
+        || !isDeepStrictEqual(
+          Object.keys(qualification.runtimeIdentity).sort(),
+          [
+            "executable_sha256",
+            "implementation_git_sha",
+            "package_inventory_sha256",
+          ],
+        )
+        || !/^[a-f0-9]{64}$/.test(qualification.runtimeIdentity.executable_sha256)
+        || !/^[a-f0-9]{40,64}$/.test(qualification.runtimeIdentity.implementation_git_sha)
+        || !/^[a-f0-9]{64}$/.test(qualification.runtimeIdentity.package_inventory_sha256)
+      ) {
+        throw new EgoChatError(
+          "attachment_receipt_authority_invalid",
+          "Receipt evidence authority qualification is invalid; no browser work was started.",
+        )
+      }
+      const built = buildAttachmentCaptureIntent({
+        authorizationDigest: qualification.consumerSignerAuthorizationDigest,
+        createdAt: new Date().toISOString(),
+        externalBindingDigest: params.receiptCapture.external_binding_sha256,
+        operationKey,
+        profile: params.receiptCapture.profile,
+        runtimeIdentity: qualification.runtimeIdentity,
+        signerEnrollmentDigest: qualification.signerEnrollmentDigest,
+        signerKeyId: qualification.signerKeyId,
+        workflowId,
+      })
+      receiptAdmission = {
+        authoritySnapshot: qualification.authoritySnapshot,
+        authoritySnapshotDigest: qualification.authoritySnapshotDigest,
+        intent: built.intent,
+        intentDigest: built.digest,
+      }
+    }
 
     this.#activeBindings.add(params.bindingKey)
     const startedAt = new Date()
@@ -2187,13 +2886,19 @@ export class Broker {
       bindingKey: params.bindingKey,
       createdAt: now,
       deadlineAt: new Date(startedAt.getTime() + generationTimeoutMs).toISOString(),
-      id: randomUUID(),
+      id: workflowId,
       inputDigest,
       kind: "ego_exchange",
       operationKey,
       phase: "browser_owned",
       private: {
         modelPolicy,
+        ...(receiptAdmission
+          ? {
+              receiptAuthoritySnapshot: receiptAdmission.authoritySnapshot,
+              receiptAuthoritySnapshotSha256: receiptAdmission.authoritySnapshotDigest,
+            }
+          : {}),
         request: {
           ...params,
           requestedTimeoutMs: params.timeoutMs,
@@ -2224,7 +2929,11 @@ export class Broker {
         selector: taskSpaceSelectorForBinding(binding),
         taskSpaceIdentity: binding.taskSpaceIdentity,
       })
-      const persisted = await this.#store.persistStarted("workflow.started", workflow)
+      const persisted = await this.#store.persistStarted(
+        "workflow.started",
+        workflow,
+        receiptAdmission,
+      )
       if (!persisted.created) {
         this.#activeBindings.delete(params.bindingKey)
         this.#releaseTaskSpaceAdmission(workflow.id)
@@ -2436,6 +3145,8 @@ export class Broker {
 
     this.#controllers.get(workflowId)?.abort()
     this.#controllers.delete(workflowId)
+    this.#attachmentCaptureControllers.get(workflowId)?.abort()
+    this.#attachmentCaptureControllers.delete(workflowId)
 
     if (workflow.kind === "ego_exchange") {
       return this.#transition(workflow, "workflow.human_required", {
@@ -2498,12 +3209,18 @@ export class Broker {
       controller.abort()
     }
     this.#controllers.clear()
+    for (const controller of this.#attachmentCaptureControllers.values()) {
+      controller.abort()
+    }
+    this.#attachmentCaptureControllers.clear()
     for (const client of this.#convergenceClients.values()) {
       client.close().catch(() => {})
     }
     this.#convergenceClients.clear()
     this.#convergenceChildren.clear()
     this.#convergenceBindings.clear()
+    this.#attachmentCaptureBindings.clear()
+    this.#attachmentCaptureWorkflows.clear()
     this.#activeConversationUrls.clear()
     this.#adoptionTaskSpaces.clear()
     this.#activeBindings.clear()
@@ -2817,6 +3534,7 @@ export class Broker {
   }
 
   #recoveryRecord(error, attempt) {
+    const evidence = boundedBrowserRecoveryEvidence(error)
     return {
       at: new Date().toISOString(),
       attempt,
@@ -2829,10 +3547,156 @@ export class Broker {
       ...(DURABLE_DRIVER_STAGES.has(error?.details?.driverStage)
         ? { driverStage: error.details.driverStage }
         : {}),
+      ...(evidence ? { evidence } : {}),
       ...(MODEL_POLICY_UI_REASONS.has(error?.details?.evidence?.uiReason)
         ? { uiReason: error.details.evidence.uiReason }
         : {}),
     }
+  }
+
+  #receiptFailureIsProvenPreClick(error) {
+    const reason = error instanceof EgoChatError
+      ? (error.details?.reason ?? error.code)
+      : undefined
+    if (
+      error instanceof EgoChatError
+      && error.code === "human_required"
+      && RETRYABLE_PRE_SEND_REASONS.has(reason)
+    ) {
+      return true
+    }
+    return error?.details?.draftCleared === true
+      && PRECLICK_DRIVER_STAGES.has(error?.details?.driverStage)
+  }
+
+  async #armReceiptDispatch(workflow, binding) {
+    if (workflow.private?.receiptDispatch) {
+      return workflow
+    }
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    if (!intent) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The receipt-enabled exchange lost its immutable capture intent before dispatch.",
+      )
+    }
+    const armedAt = new Date(Math.max(
+      Date.parse(intent.created_at),
+      Math.min(Date.now(), Date.parse(intent.send_resolution_deadline_at)),
+    )).toISOString()
+    await this.#transition(workflow, "exchange.receipt_dispatch_armed", {
+      phase: "receipt_dispatch_armed",
+      private: {
+        ...workflow.private,
+        receiptDispatch: {
+          armed_at: armedAt,
+          attempt_number: 1,
+          broker_epoch: this.#brokerIdentity.epoch,
+          browser_fencing_generation: binding.revision,
+          observations: [],
+          schema: "ego-chat-receipt-dispatch-state/v1",
+          state: "ARMED",
+        },
+      },
+    })
+    return this.#store.getWorkflow(workflow.id)
+  }
+
+  async #terminalizeReceiptDispatch(workflow, {
+    error = undefined,
+    provenAbsentAfterDispatch = false,
+    provenNotDispatched = false,
+  } = {}) {
+    let current = this.#store.getWorkflow(workflow.id)
+    const intent = this.#store.getAttachmentIntent(workflow.id)
+    const dispatch = current?.private?.receiptDispatch
+    if (
+      !current
+      || current.status !== "running"
+      || !intent
+      || !dispatch
+      || dispatch.schema !== "ego-chat-receipt-dispatch-state/v1"
+    ) {
+      throw new EgoChatError(
+        "corrupt_attachment_evidence_state",
+        "The receipt dispatch cannot be terminalized without its durable admission and arming state.",
+      )
+    }
+    const deadlineMs = Date.parse(intent.send_resolution_deadline_at)
+    const terminalMs = Math.max(
+      Date.parse(intent.created_at),
+      Math.min(Date.now(), deadlineMs),
+    )
+    const terminalAt = new Date(terminalMs).toISOString()
+    const provenPreClick = !provenAbsentAfterDispatch
+      && (provenNotDispatched || this.#receiptFailureIsProvenPreClick(error))
+    const disposition = (provenPreClick || provenAbsentAfterDispatch)
+      ? buildConfirmedSendAbsenceDisposition({
+          browserFencingGeneration: dispatch.browser_fencing_generation,
+          dispatchAttempts: provenAbsentAfterDispatch
+            ? [{
+                attempt_number: 1,
+                browser_fencing_generation: dispatch.browser_fencing_generation,
+                observed_at: terminalAt,
+                outcome: "ABSENT",
+              }]
+            : [],
+          intent,
+          observedAt: terminalAt,
+          terminalAt,
+        })
+      : buildAmbiguousSendDisposition({
+          brokerEpoch: dispatch.broker_epoch,
+          browserFencingGeneration: dispatch.browser_fencing_generation,
+          firstObservationAt: dispatch.armed_at,
+          intent,
+          lastObservationAt: terminalAt,
+          preDispatchTurnMarker: current.reconciliation.turnMarker,
+          terminalAt,
+        })
+    const resolvedDispatch = {
+      ...dispatch,
+      observations: [{
+        at: terminalAt,
+        outcome: provenPreClick
+          ? "NOT_DISPATCHED"
+          : provenAbsentAfterDispatch
+            ? "ABSENT"
+            : "AMBIGUOUS",
+      }],
+      state: provenPreClick
+        ? "PROVEN_NOT_DISPATCHED"
+        : provenAbsentAfterDispatch
+          ? "PROVEN_ABSENT"
+          : "AMBIGUOUS",
+    }
+    current = await this.#transition(current, "exchange.receipt_dispatch_resolved", {
+      phase: "receipt_dispatch_resolved",
+      private: {
+        ...current.private,
+        receiptDispatch: resolvedDispatch,
+      },
+    })
+    current = this.#store.getWorkflow(workflow.id)
+    const envelope = await this.#attachmentReceiptAuthority.signAttachmentDisposition({
+      authoritySnapshot: current.private.receiptAuthoritySnapshot,
+      authoritySnapshotDigest: current.private.receiptAuthoritySnapshotSha256,
+      consumerSignerAuthorizationDigest:
+        intent.consumer_signer_authorization_sha256,
+      disposition,
+    })
+    await this.#assertBrokerAuthority("before_terminal_send_disposition_commit")
+    const persisted = await this.#store.persistTerminalEvidenceDisposition({
+      envelope,
+      workflowId: current.id,
+    })
+    this.#activeBindings.delete(current.bindingKey)
+    if (isTerminal(persisted.workflow)) {
+      for (const waiter of [...(this.#waiters.get(current.id) ?? [])]) {
+        waiter.resolve(publicWorkflow(persisted.workflow))
+      }
+    }
+    return persisted
   }
 
   async #autoReanchorRunningExchange(workflow, error, signal) {
@@ -2972,6 +3836,15 @@ export class Broker {
               { reason: "delivery_absence_proof_invalid" },
             )
           }
+          if (workflow.private?.request?.receiptCapture) {
+            if (workflow.private.receiptDispatch) {
+              await this.#terminalizeReceiptDispatch(workflow, {
+                provenAbsentAfterDispatch: true,
+              })
+              return { binding, result: undefined, terminal: true }
+            }
+            return { binding, result: undefined, terminal: false }
+          }
           const current = this.#store.getWorkflow(workflow.id)
           if (current?.status === "running") {
             await this.#transition(current, "exchange.restart_delivery_absent", {
@@ -2989,6 +3862,13 @@ export class Broker {
             })
           }
           return { binding, result: undefined }
+        }
+        if (
+          workflow.private?.request?.receiptCapture
+          && workflow.private.receiptDispatch
+        ) {
+          await this.#terminalizeReceiptDispatch(workflow)
+          return { binding, result: undefined, terminal: true }
         }
         const responseText = verified.responseText
         const responseDigest = typeof responseText === "string" ? digest(responseText) : null
@@ -3023,8 +3903,22 @@ export class Broker {
           },
         }
       } catch (error) {
-        if (signal.aborted || this.#isHumanOnlyBrowserError(error)) {
+        if (signal.aborted) {
           throw error
+        }
+        if (
+          workflow.private?.request?.receiptCapture
+          && workflow.private.receiptDispatch
+          && (
+            this.#isHumanOnlyBrowserError(error)
+            || Date.now() >= Date.parse(
+              this.#store.getAttachmentIntent(workflow.id)
+                ?.send_resolution_deadline_at ?? 0,
+            )
+          )
+        ) {
+          await this.#terminalizeReceiptDispatch(workflow, { error })
+          return { binding, result: undefined, terminal: true }
         }
         const current = this.#store.getWorkflow(workflow.id)
         if (!current || current.status !== "running") {
@@ -3067,6 +3961,9 @@ export class Broker {
         )
         binding = recovered.binding
         result = recovered.result
+        if (recovered.terminal) {
+          return
+        }
         current = this.#store.getWorkflow(workflow.id)
         if (!current || current.status !== "running") {
           return
@@ -3079,6 +3976,19 @@ export class Broker {
         )
         if (stagedAdapter) {
           if (current.phase !== "send_confirmed") {
+            if (current.private.request.receiptCapture) {
+              current = await this.#armReceiptDispatch(current, binding)
+              const receiptIntent = this.#store.getAttachmentIntent(current.id)
+              if (
+                Date.now()
+                  >= Date.parse(receiptIntent.send_resolution_deadline_at)
+              ) {
+                await this.#terminalizeReceiptDispatch(current, {
+                  provenNotDispatched: true,
+                })
+                return
+              }
+            }
             let sendRecoveryCount = current.recoveryCount ?? 0
             let sent
             while (!sent) {
@@ -3099,7 +4009,14 @@ export class Broker {
                   () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
                 )
               } catch (error) {
-                if (controller.signal.aborted || !this.#canRetryPreSend(error)) {
+                if (current.private.request.receiptCapture) {
+                  await this.#terminalizeReceiptDispatch(current, { error })
+                  return
+                }
+                if (
+                  controller.signal.aborted
+                  || !this.#canRetryPreSend(error)
+                ) {
                   throw error
                 }
                 if (error.details?.reason === "conversation_head_changed") {
@@ -3142,14 +4059,28 @@ export class Broker {
             if (!current || current.status !== "running") {
               return
             }
-            await this.#transition(current, "exchange.send_confirmed", {
+            const sendConfirmedPatch = {
               deadlineAt: new Date(
                 Date.now() + current.private.request.timeoutMs,
               ).toISOString(),
-              phase: "send_confirmed",
+              phase: current.private.request.receiptCapture
+                ? "awaiting_attachment_capture"
+                : "send_confirmed",
               private: {
                 ...current.private,
                 captureAttempts: 0,
+                ...(current.private.request.receiptCapture
+                  ? {
+                      receiptDispatch: {
+                        ...current.private.receiptDispatch,
+                        observations: [{
+                          at: new Date().toISOString(),
+                          outcome: "CONFIRMED",
+                        }],
+                        state: "CONFIRMED",
+                      },
+                    }
+                  : {}),
                 send: {
                   ...sent,
                   ...sendIdentity,
@@ -3168,8 +4099,19 @@ export class Broker {
                 promptMessageId: sent.promptMessageId,
                 sentAt: sent.sentAt,
               },
-            })
-            current = this.#store.getWorkflow(workflow.id)
+            }
+            if (current.private.request.receiptCapture) {
+              current = await this.#store.persistConfirmedAttachmentSend(
+                "exchange.send_confirmed",
+                current,
+                sendConfirmedPatch,
+                sent,
+              )
+              return
+            } else {
+              await this.#transition(current, "exchange.send_confirmed", sendConfirmedPatch)
+              current = this.#store.getWorkflow(workflow.id)
+            }
           }
 
           let captureFailures = current.private.captureAttempts ?? 0
@@ -3208,6 +4150,7 @@ export class Broker {
                 },
                 controller.signal,
                 (result) => this.#reserveBrowserTaskSpaceIdentity({
+                  allowCanonicalPromotion: binding.state === "unbound",
                   expectedCanonicalUrl: captureBinding.canonicalUrl,
                   key: captureBinding.key,
                   owner: workflow.id,
@@ -3216,12 +4159,32 @@ export class Broker {
                 () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
               )
               this.#reserveBrowserTaskSpaceIdentity({
+                allowCanonicalPromotion: binding.state === "unbound",
                 expectedCanonicalUrl: captureBinding.canonicalUrl,
                 key: captureBinding.key,
                 owner: workflow.id,
                 result: captured,
               })
-              if (validatePendingCapture(captured, current)) {
+              if (validatePendingCapture(captured, current, binding)) {
+                const capturePending = {
+                  generationRunning: captured.generationRunning,
+                  observedAt: new Date().toISOString(),
+                  reason: captured.captureReason,
+                }
+                if (
+                  current.capturePending?.reason !== capturePending.reason
+                  || current.capturePending?.generationRunning !== capturePending.generationRunning
+                ) {
+                  await this.#transition(current, "exchange.response_pending", {
+                    capturePending,
+                    phase: "send_confirmed",
+                    private: current.private,
+                  })
+                  current = this.#store.getWorkflow(workflow.id)
+                  if (!current || current.status !== "running") {
+                    return
+                  }
+                }
                 const requeueDelayMs = captured.captureReason === "response_not_terminal"
                   ? 2_000
                   : 250
@@ -3260,6 +4223,7 @@ export class Broker {
                 return
               }
               await this.#transition(current, "exchange.capture_failed", {
+                capturePending: undefined,
                 captureRecoveryCount: captureFailures,
                 lastCaptureRecovery: this.#recoveryRecord(error, captureFailures),
                 phase: "send_confirmed",
@@ -3341,6 +4305,7 @@ export class Broker {
           return
         }
         await this.#transition(current, "exchange.response_captured", {
+          capturePending: undefined,
           phase: "response_captured",
           private: current.private,
           result: capturedResult,
@@ -3448,7 +4413,9 @@ export class Broker {
       await this.#assertBrokerAuthority("before_exchange_completion_commit")
       await this.#transition(current, "workflow.succeeded", {
         phase: "head_committed",
-        private: undefined,
+        private: current.private?.request?.receiptCapture
+          ? current.private
+          : undefined,
         result: {
           ...normalizedResult,
           digest: digest(JSON.stringify(normalizedResult)),
@@ -3466,6 +4433,9 @@ export class Broker {
       }
 
       const isHumanRequired = error instanceof EgoChatError && error.code === "human_required"
+      const humanRequiredEvidence = isHumanRequired
+        ? boundedBrowserRecoveryEvidence(error)
+        : undefined
       const headChange = current.phase === "browser_owned"
         && error.details?.reason === "conversation_head_changed"
         ? safeHeadChangeEvidence(error)
@@ -3561,6 +4531,7 @@ export class Broker {
                 code: browserInterrupted
                   ? "browser_operation_interrupted_before_send_confirmation"
                   : (error.details?.reason ?? "browser_intervention_required"),
+                ...(humanRequiredEvidence ? { evidence: humanRequiredEvidence } : {}),
                 ...(browserInterruption ? { diagnostic: browserInterruption } : {}),
                 ...(headChange ? { headChange } : {}),
                 ...(reanchorableHeadChange
@@ -3633,6 +4604,7 @@ export class Broker {
 
     try {
       let current = this.#requireRunningConvergence(workflowId, controller.signal)
+      current = await this.#repairMissingConvergenceThreadRotation(current)
       const { request } = current.private
       let setupRecoveryCount = 0
       const durableThreadRotationPending = Boolean(current.codexThreadRotationPending)
@@ -3946,6 +4918,7 @@ export class Broker {
         }
         if (
           capturedCycle.candidate.status !== "blocked"
+          && !requiresRepairedThreadRotation(current, current.cycle)
           && evaluateReview(capturedCycle.review).settled
         ) {
           await this.#completeConvergenceSettlement({
@@ -4120,7 +5093,45 @@ export class Broker {
                 current = this.#requireRunningConvergence(workflowId, controller.signal)
                 const turnId = current.activeCodexTurn?.turnId
                 if (typeof turnId !== "string" || turnId.length === 0) {
-                  throw error
+                  if (!isRetryableAppServerError(error)) {
+                    throw error
+                  }
+                  let setupError = error
+                  while (true) {
+                    setupRecoveryCount += 1
+                    current = this.#requireRunningConvergence(workflowId, controller.signal)
+                    await this.#transition(current, "convergence.codex_setup_recovery_scheduled", {
+                      appServerSetupRecoveryCount: (current.appServerSetupRecoveryCount ?? 0) + 1,
+                      lastAppServerSetupRecovery: {
+                        ...appServerDiagnostic(setupError),
+                        action: "pre_turn_reconnect",
+                        at: new Date().toISOString(),
+                        code: setupError.code,
+                      },
+                      pendingCodexContinuation: codexContinuation,
+                      phase: "codex_ready",
+                      private: current.private,
+                    })
+                    await client?.close().catch(() => {})
+                    await this.#waitForRecovery(setupRecoveryCount, controller.signal)
+                    try {
+                      client = this.#createAppServerClient()
+                      this.#convergenceClients.set(workflowId, client)
+                      await client.connect()
+                      await client.resumeThread(threadId, {
+                        cwd: request.cwd,
+                        developerInstructions: CONVERGENCE_DEVELOPER_INSTRUCTIONS,
+                        sandbox: request.codexSandbox,
+                      })
+                      break
+                    } catch (nextError) {
+                      if (controller.signal.aborted || !isRetryableAppServerError(nextError)) {
+                        throw nextError
+                      }
+                      setupError = nextError
+                    }
+                  }
+                  continue
                 }
 
                 let recoveryError = error
@@ -4531,6 +5542,10 @@ export class Broker {
           }
           evaluation = { settled: false }
         }
+        if (requiresRepairedThreadRotation(current, cycle)) {
+          review = continueAfterRepairedThreadRotation(review, cycle)
+          evaluation = { settled: false }
+        }
         const signature = reviewSignature(review)
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
@@ -4694,7 +5709,7 @@ export class Broker {
             },
           }
         : {}
-    const threadRotationPatch = livenessCheckpoint?.kind === "app_server"
+    const threadRotationPatch = livenessCheckpoint
       ? {
           codexThreadRotationPending: {
             afterCycle: cycle,
@@ -4715,6 +5730,14 @@ export class Broker {
       candidateDigest,
       consecutiveAppServerExitCount: 0,
       cycle,
+      ...(livenessCheckpoint
+        ? {
+            lastCodexLivenessCheckpoint: {
+              ...livenessCheckpoint,
+              cycle,
+            },
+          }
+        : {}),
       phase: "codex_captured",
       pendingCodexContinuation: undefined,
       private: {
@@ -4726,6 +5749,136 @@ export class Broker {
       },
     })
     return { candidateDigest }
+  }
+
+  async #repairMissingConvergenceThreadRotation(current) {
+    if (current.codexThreadRotationPending) {
+      return current
+    }
+    const checkpointCounts = [
+      current.codexInspectionLivenessCheckpointCount ?? 0,
+      current.codexAppServerLivenessCheckpointCount ?? 0,
+      current.codexThreadRotationCount ?? 0,
+    ]
+    if (checkpointCounts.some((count) => !Number.isSafeInteger(count) || count < 0)) {
+      throw new EgoChatError(
+        "human_required",
+        "The durable liveness or Codex thread-rotation count is invalid.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const livenessCheckpointCount = checkpointCounts[0] + checkpointCounts[1]
+    const threadRotationCount = checkpointCounts[2]
+    if (livenessCheckpointCount === threadRotationCount) {
+      return current
+    }
+    const recordedCheckpointCycle = current.private?.cycles?.findLast(
+      (cycle) => cycle?.livenessCheckpoint,
+    )
+    const checkpoint = recordedCheckpointCycle
+      ? {
+          ...recordedCheckpointCycle.livenessCheckpoint,
+          cycle: recordedCheckpointCycle.cycle,
+        }
+      : current.lastCodexLivenessCheckpoint
+    if (
+      livenessCheckpointCount !== threadRotationCount + 1
+      || !checkpoint
+      || !Number.isSafeInteger(checkpoint.cycle)
+      || !["inspection", "app_server"].includes(checkpoint.kind)
+      || typeof checkpoint.sourceTurnId !== "string"
+      || checkpoint.sourceTurnId.length === 0
+      || typeof current.codexThreadId !== "string"
+      || current.codexThreadId.length === 0
+    ) {
+      throw new EgoChatError(
+        "human_required",
+        "The durable liveness checkpoint count cannot be reconciled with its Codex thread rotations.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const pending = {
+      afterCycle: checkpoint.cycle,
+      abandonedThreadId: current.codexThreadId,
+      createdAt: new Date().toISOString(),
+      nextGeneration: (current.codexThreadGeneration ?? 1) + 1,
+      sourceTurnId: checkpoint.sourceTurnId,
+    }
+    const capturedCheckpointState = (
+      current.cycle === checkpoint.cycle
+      && ["codex_captured", "chatgpt_running", "review_captured"].includes(current.phase)
+      && !current.activeCodexTurn
+    )
+    if (capturedCheckpointState) {
+      await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+        codexThreadRotationPending: pending,
+        phase: current.phase,
+        private: current.private,
+      })
+      return this.#requireRunningConvergence(current.id)
+    }
+    const carriedCandidateState = (
+      current.cycle === checkpoint.cycle + 1
+      && ["codex_captured", "chatgpt_running", "review_captured"].includes(current.phase)
+      && !current.activeCodexTurn
+    )
+    if (carriedCandidateState) {
+      const capturedCycle = current.private.cycles.at(-1)
+      const repairedReview = current.phase === "review_captured"
+        ? continueAfterRepairedThreadRotation(capturedCycle.review, current.cycle)
+        : undefined
+      await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+        codexThreadRotationPending: pending,
+        phase: current.phase,
+        private: repairedReview
+          ? {
+              ...current.private,
+              cycles: [
+                ...current.private.cycles.slice(0, -1),
+                {
+                  ...capturedCycle,
+                  review: repairedReview,
+                  reviewSignature: reviewSignature(repairedReview),
+                },
+              ],
+              priorReview: repairedReview,
+            }
+          : current.private,
+      })
+      return this.#requireRunningConvergence(current.id)
+    }
+    const reusedThreadState = (
+      current.cycle === checkpoint.cycle + 1
+      && ["codex_ready", "codex_running", "codex_recovering"].includes(current.phase)
+    )
+    if (!reusedThreadState) {
+      throw new EgoChatError(
+        "human_required",
+        "The missing Codex thread rotation is not in a safely repairable convergence phase.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    const continuation = current.activeCodexTurn?.continuation
+      ?? current.pendingCodexContinuation
+      ?? { cycle: current.cycle, kind: "cycle" }
+    if (continuation.cycle !== current.cycle) {
+      throw new EgoChatError(
+        "human_required",
+        "The reused Codex turn continuation does not match the repair cycle.",
+        { reason: "convergence_recovery_state_invalid" },
+      )
+    }
+    await this.#transition(current, "convergence.codex_thread_rotation_repaired", {
+      activeCodexInspectionRetryCount: undefined,
+      activeCodexTurn: undefined,
+      activeCodexWorkspaceActivity: undefined,
+      codexThreadRotationPending: pending,
+      consecutiveAppServerExitCount: 0,
+      pendingCodexContinuation: continuation,
+      phase: "codex_ready",
+      private: withoutPendingCodexResult(current.private),
+    })
+    return this.#requireRunningConvergence(current.id)
   }
 
   async #rotateConvergenceThread({ client, controller, current, request }) {
@@ -5121,12 +6274,36 @@ export class Broker {
       } catch (_error) {
         // Corrupt binding evidence cannot establish exact transfer.
       }
+      let transferredCanonicalUrl = canonicalUrl
+      const recovered = workflow.result
+      if (
+        workflow.kind === "ego_exchange"
+        && workflow.status === "succeeded"
+        && workflow.phase === "head_committed"
+        && recovered?.reconciled === true
+        && recovered.recoveryMode === "unbound"
+        && typeof recovered.targetId === "string"
+        && recovered.targetId.length > 0
+        && recovered.targetId === binding?.targetId
+      ) {
+        try {
+          const recoveredIdentity = validateTaskSpaceIdentity(recovered.taskSpaceIdentity)
+          if (identity && recoveredIdentity && isDeepStrictEqual(identity, recoveredIdentity)) {
+            // A completed create-once recovery may promote the provisional URL.
+            // Preserve the original Send evidence; transfer its claim only through
+            // the committed result in the same tab and complete stable space.
+            transferredCanonicalUrl = canonicalWorkflowEvidenceUrl(recovered.canonicalUrl)
+          }
+        } catch (_error) {
+          // Invalid recovery evidence must retain the original durable claim.
+        }
+      }
       const transferred = Boolean(
         binding
         && identity
         && bindingIdentity
-        && canonicalUrl
-        && binding.canonicalUrl === canonicalUrl
+        && transferredCanonicalUrl
+        && binding.canonicalUrl === transferredCanonicalUrl
         && isDeepStrictEqual(bindingIdentity, identity)
         && (
           (workflow.kind === "conversation_adoption"
@@ -5424,6 +6601,7 @@ export class Broker {
   }
 
   #reserveBrowserTaskSpaceIdentity({
+    allowCanonicalPromotion = false,
     allowMissingCanonicalUrl = false,
     expectedCanonicalUrl = null,
     key,
@@ -5454,7 +6632,33 @@ export class Broker {
     const admissionCanonicalUrl = admission.canonicalUrl
       ? canonicalWorkflowEvidenceUrl(admission.canonicalUrl)
       : null
-    if (expectedUrl && admissionCanonicalUrl && expectedUrl !== admissionCanonicalUrl) {
+    const candidateTaskSpaceIdentity = validateTaskSpaceIdentity(result?.taskSpaceIdentity)
+    const admissionTaskSpaceIdentity = validateTaskSpaceIdentity(admission.taskSpaceIdentity)
+    const canonicalPromotion = Boolean(
+      allowCanonicalPromotion
+      && expectedUrl
+      && admissionCanonicalUrl
+      && candidateCanonicalUrl
+      && candidateTaskSpaceIdentity
+      && admissionTaskSpaceIdentity
+      && isDeepStrictEqual(candidateTaskSpaceIdentity, admissionTaskSpaceIdentity)
+      && (
+        (
+          expectedUrl === admissionCanonicalUrl
+          && candidateCanonicalUrl !== expectedUrl
+        )
+        || (
+          expectedUrl !== admissionCanonicalUrl
+          && candidateCanonicalUrl === admissionCanonicalUrl
+        )
+      )
+    )
+    if (
+      expectedUrl
+      && admissionCanonicalUrl
+      && expectedUrl !== admissionCanonicalUrl
+      && !canonicalPromotion
+    ) {
       throw new EgoChatError(
         "human_required",
         "The browser expectation changed its owner-scoped canonical conversation.",
@@ -5465,6 +6669,7 @@ export class Broker {
       (expectedUrl || admissionCanonicalUrl)
       && candidateCanonicalUrl
       && (expectedUrl ?? admissionCanonicalUrl) !== candidateCanonicalUrl
+      && !canonicalPromotion
     ) {
       throw new EgoChatError(
         "human_required",
@@ -5482,7 +6687,7 @@ export class Broker {
     const candidate = {
       canonicalUrl: candidateCanonicalUrl ?? expectedUrl ?? admissionCanonicalUrl,
       key: admission.key ?? key,
-      taskSpaceIdentity: validateTaskSpaceIdentity(result?.taskSpaceIdentity),
+      taskSpaceIdentity: candidateTaskSpaceIdentity,
     }
     this.#assertTaskSpaceIdentityAvailable(candidate, owner)
     if (
@@ -5511,6 +6716,12 @@ export class Broker {
       }
     }
     this.#taskSpaceIdentityReservations.set(owner, candidate)
+    if (canonicalPromotion) {
+      const previousUrlDigest = digest(admissionCanonicalUrl)
+      if (this.#activeConversationUrls.get(previousUrlDigest) === owner) {
+        this.#activeConversationUrls.delete(previousUrlDigest)
+      }
+    }
     if (candidate.canonicalUrl) {
       const urlDigest = digest(candidate.canonicalUrl)
       this.#activeConversationUrls.set(urlDigest, owner)
@@ -5631,6 +6842,14 @@ export class Broker {
   }
 
   #assertBindingAvailable(bindingKey, convergenceId = undefined) {
+    const attachmentCaptureOwner = this.#attachmentCaptureBindings.get(bindingKey)
+    if (attachmentCaptureOwner) {
+      throw new EgoChatError(
+        "conversation_reserved",
+        "That conversation is reserved by an active attachment capture.",
+        { workflowId: attachmentCaptureOwner },
+      )
+    }
     const owner = this.#convergenceBindings.get(bindingKey)
     if (owner && owner !== convergenceId) {
       throw new EgoChatError(
@@ -5675,6 +6894,17 @@ export class Broker {
         throw new EgoChatError(
           "task_space_reserved",
           "That Ego task space is reserved by another active convergence workflow.",
+          { workflowId },
+        )
+      }
+    }
+    for (const [reservedBindingKey, workflowId] of this.#attachmentCaptureBindings) {
+      if (reservedBindingKey === bindingKey) continue
+      const reservedBinding = this.#store.getBinding(reservedBindingKey)
+      if (reservedBinding && String(reservedBinding.taskSpaceId) === String(binding.taskSpaceId)) {
+        throw new EgoChatError(
+          "task_space_reserved",
+          "That Ego task space is reserved by an active attachment capture.",
           { workflowId },
         )
       }

@@ -31,7 +31,15 @@ function chatGptDelivery(workflow, childWorkflow) {
   if (["head_committed", "response_captured"].includes(childWorkflow.phase)) {
     return "response_captured"
   }
-  if (childWorkflow.phase === "send_confirmed") return "sent_waiting_response"
+  if (childWorkflow.phase === "send_confirmed") {
+    if (childWorkflow.capturePending?.reason === "generation_running") {
+      return "sent_generating"
+    }
+    if (childWorkflow.capturePending?.reason === "response_not_terminal") {
+      return "sent_response_incomplete"
+    }
+    return "sent_waiting_response"
+  }
   if (childWorkflow.phase === "restart_reconciling") return "reconciling_delivery"
   return "not_confirmed"
 }
@@ -56,6 +64,8 @@ function deliveryMessage(delivery) {
     queued: "the candidate is captured and ChatGPT delivery is queued",
     reconciling_delivery: "the broker is reconciling whether ChatGPT received the marked prompt",
     response_captured: "the ChatGPT response is durably captured",
+    sent_generating: "the ChatGPT prompt is durably sent and the response is actively generating",
+    sent_response_incomplete: "the ChatGPT prompt is durably sent and a response is present but not terminal",
     sent_waiting_response: "the ChatGPT prompt is durably sent and awaiting its response",
     workflow_stopped: "the convergence workflow is durably stopped",
   }
@@ -118,6 +128,7 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
       childPhase: childWorkflow?.phase ?? null,
       childStatus: childWorkflow?.status ?? null,
       delivery,
+      pendingReason: childWorkflow?.capturePending?.reason ?? null,
     },
     codex: {
       appServerRecoveryCount,

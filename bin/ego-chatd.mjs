@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+
+import { createInstalledAttachmentReceiptAuthority } from "../src/attachment-receipt-authority.mjs"
 import { Broker } from "../src/broker.mjs"
 import { AppServerClient } from "../src/app-server-client.mjs"
 import { EventStore } from "../src/store.mjs"
@@ -15,6 +19,7 @@ import { RUNTIME_IDENTITY } from "../src/constants.mjs"
 import { createUpgradeAwareDispatch } from "../src/upgrade-dispatch.mjs"
 
 const config = loadConfig()
+const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const lease = await acquireBrokerLease({
   dataDir: config.dataDir,
   runtimeIdentity: RUNTIME_IDENTITY,
@@ -48,6 +53,10 @@ const egoAdapter = new EgoAdapter({
 })
 const broker = new Broker({
   appServerFactory: () => new AppServerClient(),
+  attachmentReceiptAuthority: createInstalledAttachmentReceiptAuthority({
+    dataDir: config.dataDir,
+    runtimeRoot,
+  }),
   brokerIdentity: lease.identity,
   brokerLease,
   egoAdapter,
@@ -66,6 +75,9 @@ try {
 }
 
 const methods = new Map([
+  ["attachment.capture", (params) => broker.startAttachmentCapture(params)],
+  ["attachment.evidence", (params) => broker.getAttachmentEvidence(params)],
+  ["attachment.release", (params) => broker.releaseAttachmentEvidence(params)],
   ["broker.status", () => broker.getStatus()],
   ["conversation.start_adoption", (params) => broker.startConversationAdoption(params)],
   ["conversation.bind", (params) => broker.bindConversation(params)],
