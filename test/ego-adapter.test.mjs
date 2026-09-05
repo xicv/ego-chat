@@ -1261,6 +1261,7 @@ async function runTaskSpaceReconciliationCase({
   ownershipAfterSelection = null,
   postSelectionConflictingIdentity = null,
   promptIdentityMatches = true,
+  renderedPromptText = undefined,
   postReclaimIdentity = null,
   recycleBeforeReclaim = false,
   requestedTaskSpaceOwnership = null,
@@ -1327,7 +1328,7 @@ async function runTaskSpaceReconciliationCase({
     {
       messageId: promptIdentityMatches ? promptMessageId : "different-user",
       role: "user",
-      text: promptText,
+      text: renderedPromptText ?? promptText,
     },
     imageOnlyResponse
       ? {
@@ -3683,6 +3684,19 @@ test("create-once reconciliation rejects a copied prompt with a different provid
   })
   assert.equal(result.result, undefined)
   assert.equal(result.error?.details?.reason, "reconciliation_prompt_mismatch")
+  assert.equal(result.counters.click, 0)
+  assert.equal(result.counters.typeText, 0)
+})
+
+test("create-once reconciliation uses the confirmed provider ID when rendered prompt text differs", async () => {
+  const result = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    mode: "reconcile",
+    renderedPromptText: "EGO_CHAT_RECONCILE_TEST_MARKER\nRendered checkpoint text. Show more",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+  })
+  assert.equal(result.error, undefined)
+  assert.equal(result.result.head.lastMessageId, "partial-assistant")
   assert.equal(result.counters.click, 0)
   assert.equal(result.counters.typeText, 0)
 })
