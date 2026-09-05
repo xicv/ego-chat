@@ -3795,6 +3795,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
   const promptMessageId = "capture-slice-user"
   let captures = 0
   let sends = 0
+  const captureObservationTimes = []
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async () => ({
@@ -3813,6 +3814,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
     }),
     captureExchange: async () => {
       captures += 1
+      captureObservationTimes.push(new Date().toISOString())
       if (captures <= 2) {
         return {
           canonicalUrl,
@@ -3892,11 +3894,15 @@ test("confirmed exchanges resume after a bounded pending capture without another
     .map((line) => JSON.parse(line))
   const pendingEvents = events.filter((event) => event.type === "exchange.response_pending")
   assert.equal(pendingEvents.length, 1)
-  assert.deepEqual(pendingEvents[0].workflow.capturePending, {
+  const { observedAt, ...pendingState } = pendingEvents[0].workflow.capturePending
+  assert.deepEqual(pendingState, {
     generationRunning: false,
-    observedAt: pendingEvents[0].at,
     reason: "response_not_terminal",
   })
+  // Capture observation and durable event append sample the clock separately.
+  assert.equal(new Date(observedAt).toISOString(), observedAt)
+  assert.ok(Date.parse(captureObservationTimes[0]) <= Date.parse(observedAt))
+  assert.ok(Date.parse(observedAt) <= Date.parse(pendingEvents[0].at))
 })
 
 test("confirmed create-once capture promotes a provisional locator without another Send", async (t) => {
@@ -3995,98 +4001,151 @@ test("confirmed create-once capture promotes a provisional locator without anoth
   assert.equal(binding.canonicalUrl, canonicalUrl)
 })
 
-test("recoverable maximum-model UI uncertainty stays in the same exchange until Send succeeds", async (t) => {
-  const dataDir = await createDataDir()
-  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
-  const canonicalUrl = "https://chatgpt.com/c/model-policy-recovery"
-  const terminalMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_DONE"
-  const turnMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_TEST"
-  let sends = 0
-  const egoAdapter = {
-    ...unusedEgoAdapter,
-    bind: async () => ({
-      canonicalUrl,
-      head: {
-        fingerprint: "model-policy-before",
-        fingerprintVersion: "tail-v1",
-        lastContentDigest: "a".repeat(64),
-        lastMessageId: "model-policy-assistant-before",
-        lastRole: "assistant",
-        messageCount: 2,
-      },
-      targetId: "model-policy-tab",
-      taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
-      taskSpaceId: 21,
-    }),
-    captureExchange: async () => {
-      const responseText = terminalMarker
-      return {
+for (const {
+  diagnosticDigest,
+  driverStage,
+  expectedDiagnosticDigest,
+  expectedDriverStage,
+  expectedUiReason,
+  name,
+  uiReason,
+} of [
+  { name: "activation", uiReason: "policy_model_choice_activation", expectedUiReason: "policy_model_choice_activation" },
+  { name: "structure", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { name: "identifier-shaped content", uiReason: "private_model_menu_text" },
+  { name: "raw menu text", uiReason: "Latest\nPrivate model description" },
+  { name: "overlong", uiReason: "x".repeat(81) },
+  { name: "non-string", uiReason: { label: "Synthetic private menu" } },
+  {
+    driverStage: "verifying_model_policy",
+    expectedDriverStage: "verifying_model_policy",
+    expectedUiReason: "policy_model_structure",
+    name: "recognized driver stage",
+    uiReason: "policy_model_structure",
+  },
+  { driverStage: "private_driver_stage", name: "identifier-shaped driver stage", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { driverStage: "Latest\nPrivate model description", name: "multiline driver stage", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { driverStage: "x".repeat(512), name: "oversized driver stage", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  {
+    diagnosticDigest: "d".repeat(64),
+    expectedDiagnosticDigest: "d".repeat(64),
+    name: "canonical diagnostic digest",
+    uiReason: "policy_model_structure",
+    expectedUiReason: "policy_model_structure",
+  },
+  { diagnosticDigest: "private_diagnostic_digest", name: "identifier-shaped diagnostic digest", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { diagnosticDigest: "Latest\nPrivate conversation text", name: "multiline diagnostic digest", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { diagnosticDigest: OPENAI_LIKE_TEST_TOKEN, name: "credential-shaped diagnostic digest", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { diagnosticDigest: "x".repeat(65_536), name: "oversized diagnostic digest", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+  { diagnosticDigest: { private: "Synthetic private diagnostic" }, name: "non-string diagnostic digest", uiReason: "policy_model_structure", expectedUiReason: "policy_model_structure" },
+]) {
+  test(`recoverable maximum-model UI uncertainty retains only allowlisted subreasons: ${name}`, async (t) => {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const canonicalUrl = "https://chatgpt.com/c/model-policy-recovery"
+    const terminalMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_DONE"
+    const turnMarker = "EGO_CHAT_MODEL_POLICY_RECOVERY_TEST"
+    let sends = 0
+    const egoAdapter = {
+      ...unusedEgoAdapter,
+      bind: async () => ({
         canonicalUrl,
         head: {
-          fingerprint: "model-policy-after",
+          fingerprint: "model-policy-before",
           fingerprintVersion: "tail-v1",
-          lastContentDigest: digest(responseText),
-          lastMessageId: "model-policy-assistant-after",
+          lastContentDigest: "a".repeat(64),
+          lastMessageId: "model-policy-assistant-before",
           lastRole: "assistant",
-          messageCount: 4,
+          messageCount: 2,
         },
-        responseDigest: digest(responseText),
-        responseText,
         targetId: "model-policy-tab",
         taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
         taskSpaceId: 21,
-        turnMarker,
-      }
-    },
-    sendExchange: async () => {
-      sends += 1
-      if (sends < 3) {
-        throw new EgoChatError(
-          "human_required",
-          "The maximum-power control could not be read during this observation.",
-          { reason: "model_policy_ui_unknown" },
-        )
-      }
-      return {
-        canonicalUrl,
-        modelPolicy: modelPolicyObservation(),
-        promptMessageId: "model-policy-user",
-        sentAt: new Date().toISOString(),
-        targetId: "model-policy-tab",
-        taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
-        taskSpaceId: 21,
-        turnMarker,
-      }
-    },
-  }
-  const broker = new Broker({
-    egoAdapter,
-    recoveryDelaysMs: [1],
-    store: new EventStore(dataDir),
-  })
-  await broker.initialize()
-  t.after(() => broker.close())
-  await broker.bindConversation({
-    bindingKey: "model-policy-recovery",
-    canonicalUrl,
-    mode: "existing",
-    taskSpace: 21,
-  })
+      }),
+      captureExchange: async () => {
+        const responseText = terminalMarker
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "model-policy-after",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "model-policy-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "model-policy-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
+          taskSpaceId: 21,
+          turnMarker,
+        }
+      },
+      sendExchange: async () => {
+        sends += 1
+        if (sends < 3) {
+          throw new EgoChatError(
+            "human_required",
+            "Synthetic private UI diagnostic must not be retained.",
+            {
+              ...(diagnosticDigest === undefined ? {} : { diagnosticDigest }),
+              ...(driverStage === undefined ? {} : { driverStage }),
+              evidence: { uiReason, menuText: "Synthetic private model menu", conversationText: "Synthetic private conversation text", secret: OPENAI_LIKE_TEST_TOKEN },
+              reason: "model_policy_ui_unknown",
+            },
+          )
+        }
+        return {
+          canonicalUrl,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "model-policy-user",
+          sentAt: new Date().toISOString(),
+          targetId: "model-policy-tab",
+          taskSpaceIdentity: browserTaskSpaceIdentity(String(21)),
+          taskSpaceId: 21,
+          turnMarker,
+        }
+      },
+    }
+    const broker = new Broker({
+      egoAdapter,
+      recoveryDelaysMs: [1],
+      store: new EventStore(dataDir),
+    })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: "model-policy-recovery",
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: 21,
+    })
 
-  const started = await broker.startEgoExchange({
-    bindingKey: "model-policy-recovery",
-    expectedTerminalMarker: terminalMarker,
-    prompt: `${turnMarker}\nContinue after transient model-policy UI uncertainty.`,
-    timeoutMs: 30_000,
-    turnMarker,
-  })
-  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+    const started = await broker.startEgoExchange({
+      bindingKey: "model-policy-recovery",
+      expectedTerminalMarker: terminalMarker,
+      prompt: `${turnMarker}\nContinue after transient model-policy UI uncertainty.`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
 
-  assert.equal(completed.status, "succeeded")
-  assert.equal(completed.recoveryCount, 2)
-  assert.equal(completed.lastRecovery.code, "model_policy_ui_unknown")
-  assert.equal(sends, 3)
-})
+    assert.equal(completed.status, "succeeded")
+    assert.equal(completed.recoveryCount, 2)
+    assert.equal(completed.lastRecovery.code, "model_policy_ui_unknown")
+    assert.equal(completed.lastRecovery.diagnosticDigest, expectedDiagnosticDigest)
+    assert.equal(completed.lastRecovery.uiReason, expectedUiReason)
+    assert.equal(completed.lastRecovery.driverStage, expectedDriverStage)
+    const persisted = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+    assert.equal(persisted.includes("Synthetic private"), false)
+    assert.equal(persisted.includes(OPENAI_LIKE_TEST_TOKEN), false)
+    if (!expectedUiReason && typeof uiReason === "string") assert.equal(persisted.includes(uiReason), false)
+    if (!expectedDriverStage && typeof driverStage === "string") assert.equal(persisted.includes(driverStage), false)
+    if (!expectedDiagnosticDigest && typeof diagnosticDigest === "string") assert.equal(persisted.includes(diagnosticDigest), false)
+    assert.equal(sends, 3)
+  })
+}
 
 test("a stable external assistant turn is automatically re-anchored before the same fresh Send", async (t) => {
   const dataDir = await createDataDir()
@@ -5235,7 +5294,7 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
           messageCount: 4,
           renderedMessageCount: 4,
         },
-        modelPolicy: modelPolicyObservation(),
+        modelPolicy: modelPolicyObservation({ modelLabel: "Latest", effortLabel: "6 Pro", pillLabel: "6 Pro" }),
         responseDigest,
         responseText,
         targetId: "adopted-tab",
@@ -5280,6 +5339,7 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(completed.result.adoptedWhileGenerating, true)
   assert.equal(completed.result.responseText, "The long review is complete.")
   assert.equal(completed.result.responseDigest, responseDigest)
+  assert.equal(completed.result.modelPolicy.policyRevision, 1)
   assert.equal(received.canonicalUrl, canonicalUrl)
   assert.equal(received.modelPolicy.modelSelection, "strongest_available")
   assert.equal(received.modelPolicy.thinkingEffort, "maximum_available")
@@ -5297,6 +5357,15 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
     name: "adopted-review-space",
     taskId: "adopted-review-space",
   })
+  const modelPolicy = broker.getModelPolicy()
+  assert.equal(modelPolicy.state, "verified")
+  assert.equal(modelPolicy.revision, 1)
+  assert.equal(modelPolicy.lastObserved.modelLabel, "Latest")
+  assert.equal(modelPolicy.lastObserved.effortLabel, "6 Pro")
+  assert.equal(modelPolicy.lastObserved.pillLabel, "6 Pro")
+  assert.equal(modelPolicy.lastObserved.powerLevel, 5)
+  assert.equal(modelPolicy.lastObserved.powerMax, 5)
+  assert.equal(modelPolicy.lastObserved.sourceWorkflowId, started.id)
   await assert.rejects(
     broker.startConversationAdoption({
       canonicalUrl,
@@ -5309,6 +5378,14 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
     ),
   )
   assert.equal(adoptionCalls, 1)
+  await broker.close()
+  const replayedBroker = new Broker({ egoAdapter: unusedEgoAdapter, store: new EventStore(dataDir) })
+  await replayedBroker.initialize()
+  t.after(() => replayedBroker.close())
+  assert.deepEqual(replayedBroker.getModelPolicy(), modelPolicy)
+  const replayedWorkflow = await replayedBroker.awaitWorkflow({ timeoutMs: 1_000, workflowId: started.id })
+  assert.equal(replayedWorkflow.result.modelPolicy.policyRevision, 1)
+  assert.equal(replayedWorkflow.result.modelPolicy.sourceWorkflowId, started.id)
 })
 
 test("conversation adoption rejects a complete capture without stable task-space identity", async (t) => {
@@ -10861,6 +10938,103 @@ test("re-anchoring rejects an ambiguous possible send before browser work", asyn
   assert.equal(reanchorCalls, 0)
 })
 
+for (const {
+  compositionMethod,
+  errorCode = "ego_driver_error",
+  expectedCompositionMethod,
+  expectedErrorCode = "ego_driver_error",
+  name,
+} of [
+  { compositionMethod: "private_composition_method", name: "identifier-shaped composition method" },
+  { compositionMethod: "Latest\nPrivate conversation text", name: "multiline composition method" },
+  { compositionMethod: OPENAI_LIKE_TEST_TOKEN, name: "credential-shaped composition method" },
+  { compositionMethod: "x".repeat(65_536), name: "oversized composition method" },
+  { compositionMethod: { private: "Synthetic private composition method" }, name: "non-string composition method" },
+  {
+    compositionMethod: "dom_paragraph_input",
+    errorCode: "private_browser_error_code",
+    expectedCompositionMethod: "dom_paragraph_input",
+    expectedErrorCode: "browser_operation_failed",
+    name: "unknown browser error code",
+  },
+]) {
+  test(`a pre-click driver interruption omits unrecognized durable diagnostics: ${name}`, async (t) => {
+    const dataDir = await createDataDir()
+    t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+    const canonicalUrl = "https://chatgpt.com/c/driver-interruption-diagnostics"
+    const turnMarker = "EGO_CHAT_DRIVER_DIAGNOSTICS123"
+    const terminalMarker = "EGO_CHAT_DRIVER_DIAGNOSTICS_DONE123"
+    const beforeHead = {
+      fingerprint: "driver-diagnostics-tail",
+      fingerprintVersion: "tail-v1",
+      lastContentDigest: "c".repeat(64),
+      lastMessageId: "driver-diagnostics-assistant",
+      lastRole: "assistant",
+      messageCount: 8,
+    }
+    const egoAdapter = {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: beforeHead,
+        targetId: "driver-diagnostics-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(10)),
+        taskSpaceId: 10,
+      }),
+      exchange: async () => {
+        throw new EgoChatError(
+          errorCode,
+          "The fixed Ego Browser driver failed.",
+          {
+            compositionMethod,
+            diagnosticDigest: "d".repeat(64),
+            draftCleared: true,
+            driverStage: "composing_prompt",
+          },
+        )
+      },
+    }
+    const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+    await broker.initialize()
+    t.after(() => broker.close())
+    await broker.bindConversation({
+      bindingKey: "ego-chat-main",
+      canonicalUrl,
+      mode: "existing",
+      taskSpace: 10,
+    })
+    const started = await broker.startEgoExchange({
+      bindingKey: "ego-chat-main",
+      expectedTerminalMarker: terminalMarker,
+      prompt: `${turnMarker}\nreview`,
+      timeoutMs: 30_000,
+      turnMarker,
+    })
+    const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+    assert.equal(stopped.status, "human_required")
+    assert.equal(stopped.humanRequired.diagnostic.compositionMethod, expectedCompositionMethod)
+    assert.equal(stopped.humanRequired.diagnostic.diagnosticDigest, "d".repeat(64))
+    assert.equal(stopped.humanRequired.diagnostic.driverStage, "composing_prompt")
+    assert.equal(stopped.humanRequired.diagnostic.errorCode, expectedErrorCode)
+    const eventsText = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")
+    const events = eventsText.trim().split("\n").map((line) => JSON.parse(line))
+    const durableDiagnostics = events
+      .filter((event) => event.workflow?.id === started.id)
+      .map((event) => event.workflow?.humanRequired?.diagnostic)
+      .filter(Boolean)
+    assert.ok(durableDiagnostics.length > 0)
+    assert.ok(durableDiagnostics.every((diagnostic) => diagnostic.compositionMethod === expectedCompositionMethod))
+    assert.ok(durableDiagnostics.every((diagnostic) => diagnostic.errorCode === expectedErrorCode))
+    if (!expectedCompositionMethod && typeof compositionMethod === "string") {
+      assert.ok(durableDiagnostics.every((diagnostic) => diagnostic.compositionMethod !== compositionMethod))
+    }
+    if (errorCode !== expectedErrorCode) {
+      assert.equal(eventsText.includes(errorCode), false)
+    }
+  })
+}
+
 test("a pre-click driver interruption preserves safe proof and can reconcile delivery absence", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -10891,6 +11065,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
         "ego_driver_error",
         "The fixed Ego Browser driver failed.",
         {
+          compositionMethod: "dom_paragraph_input",
           diagnosticDigest: "d".repeat(64),
           draftCleared: true,
           driverStage: "composing_prompt",
@@ -10958,6 +11133,7 @@ test("a pre-click driver interruption preserves safe proof and can reconcile del
     "browser_operation_interrupted_before_send_confirmation",
   )
   assert.deepEqual(stopped.humanRequired.diagnostic, {
+    compositionMethod: "dom_paragraph_input",
     diagnosticDigest: "d".repeat(64),
     draftCleared: true,
     driverStage: "composing_prompt",

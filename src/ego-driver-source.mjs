@@ -1645,13 +1645,14 @@ async function egoDriverMain(
     return js(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
-      const composer = document.querySelector('#prompt-textarea')
-      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
-      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
         .filter(visible)
       const semanticPills = classPills.length > 0
         ? classPills
-        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
             .filter(visible)
             .filter((element) => (
               element.getAttribute('data-testid') !== 'composer-plus-btn'
@@ -1670,13 +1671,14 @@ async function egoDriverMain(
     const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
-      const composer = document.querySelector('#prompt-textarea')
-      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
-      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
         .filter(visible)
       const pills = classPills.length > 0
         ? classPills
-        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
             .filter(visible)
             .filter((element) => (
               element.getAttribute('data-testid') !== 'composer-plus-btn'
@@ -1693,7 +1695,8 @@ async function egoDriverMain(
 
   async function settleComposerFocusForPolicyMenu() {
     const mutation = await fencedJsMutation(String.raw`(() => {
-      const composer = document.querySelector('#prompt-textarea')
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
       if (!composer) {
         return { blurred: false, ok: false }
       }
@@ -1721,13 +1724,14 @@ async function egoDriverMain(
     return js(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
       const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
-      const composer = document.querySelector('#prompt-textarea')
-      const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
-      const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
         .filter(visible)
       const pills = classPills.length > 0
         ? classPills
-        : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
             .filter(visible)
             .filter((element) => (
               element.getAttribute('data-testid') !== 'composer-plus-btn'
@@ -1739,13 +1743,14 @@ async function egoDriverMain(
 
       const pill = pills[0]
       const menuId = pill.getAttribute('aria-controls')
-      const controlledMenu = menuId ? document.getElementById(menuId) : null
       const policyMenus = [...document.querySelectorAll('[role="menu"]')]
-        .filter(visible)
-        .filter((menu) => menu.querySelector('[role="menuitem"][aria-label="Power"]'))
-      const menu = visible(controlledMenu) && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
+        .filter((menu) => menuId && menu.id === menuId)
+      const controlledMenu = policyMenus.length === 1 ? policyMenus[0] : null
+      const menu = pills[0].getAttribute('aria-expanded') === 'true'
+        && visible(controlledMenu)
+        && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
         ? controlledMenu
-        : policyMenus.length === 1 ? policyMenus[0] : null
+        : null
       if (pill.getAttribute('aria-expanded') !== 'true' || !visible(menu)) {
         return {
           ok: false,
@@ -1915,32 +1920,31 @@ async function egoDriverMain(
       const state = await js(String.raw`(() => {
         const visible = (element) => Boolean(element && element.getClientRects().length > 0)
         const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
-        const composer = document.querySelector('#prompt-textarea')
-        const root = composer?.closest('form') || composer?.parentElement?.parentElement?.parentElement || document
-        const classPills = [...root.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]')]
+        const composers = [...document.querySelectorAll('#prompt-textarea')]
+        const composer = composers.length === 1 ? composers[0] : null
+        const root = composer?.closest('form') || null
+        const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
           .filter(visible)
         const pills = classPills.length > 0
           ? classPills
-          : [...root.querySelectorAll('button[aria-haspopup="menu"]')]
+          : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
               .filter(visible)
               .filter((element) => (
                 element.getAttribute('data-testid') !== 'composer-plus-btn'
                 && clean(element.innerText || element.textContent).length > 0
               ))
+        const menuId = pills.length === 1 ? pills[0].getAttribute('aria-controls') : null
         const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+          .filter((menu) => menuId && menu.id === menuId)
           .filter(visible)
-          .filter((menu) => (
-            menu.querySelector('[role="menuitem"][aria-label="Power"]')
-            || menu.querySelector('[role="menuitemradio"]')
-          ))
         return {
           composerCount: document.querySelectorAll('#prompt-textarea').length,
           count: pills.length,
           expanded: pills[0]?.getAttribute('aria-expanded'),
           policyMenuCount: policyMenus.length,
           selectorKind: classPills.length === 1 ? 'composer_pill' : 'semantic_menu_button',
-          visibleModelChoiceCount: [...document.querySelectorAll('[role="menuitemradio"]')]
-            .filter(visible).length,
+          visibleModelChoiceCount: policyMenus.flatMap((menu) =>
+            [...menu.querySelectorAll('[role="menuitemradio"]')].filter(visible)).length,
         }
       })()`)
       if (
@@ -1993,7 +1997,36 @@ async function egoDriverMain(
     const labelLiteral = JSON.stringify(ariaLabel)
     const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
-      const items = [...document.querySelectorAll('[role="menuitem"]')]
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
+        .filter(visible)
+      const pills = classPills.length > 0
+        ? classPills
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
+      if (pills.length !== 1) {
+        return false
+      }
+      const menuId = pills[0].getAttribute('aria-controls')
+      const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+        .filter((menu) => menuId && menu.id === menuId)
+      const controlledMenu = policyMenus.length === 1 ? policyMenus[0] : null
+      const menu = pills[0].getAttribute('aria-expanded') === 'true'
+        && visible(controlledMenu)
+        && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
+        ? controlledMenu
+        : null
+      if (!menu) {
+        return false
+      }
+      const items = [...menu.querySelectorAll('[role="menuitem"]')]
         .filter(visible)
         .filter((element) => element.getAttribute('aria-label') === ${labelLiteral})
       if (items.length !== 1) {
@@ -2012,17 +2045,117 @@ async function egoDriverMain(
     const indexLiteral = JSON.stringify(index)
     const focused = await fencedJsMutation(String.raw`(() => {
       const visible = (element) => Boolean(element && element.getClientRects().length > 0)
-      const choices = [...document.querySelectorAll('[role="menuitemradio"]')]
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
+        .filter(visible)
+      const pills = classPills.length > 0
+        ? classPills
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
+      if (pills.length !== 1) {
+        return false
+      }
+      const menuId = pills[0].getAttribute('aria-controls')
+      const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+        .filter((menu) => menuId && menu.id === menuId)
+      const controlledMenu = policyMenus.length === 1 ? policyMenus[0] : null
+      const menu = pills[0].getAttribute('aria-expanded') === 'true'
+        && visible(controlledMenu)
+        && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
+        ? controlledMenu
+        : null
+      if (!menu) {
+        return false
+      }
+      const choices = [...menu.querySelectorAll('[role="menuitemradio"]')]
         .filter(visible)
         .filter((element) => element.getAttribute('aria-disabled') !== 'true')
       const choiceIndex = ${indexLiteral}
       if (choices.length < 1 || choices.length > 20 || choiceIndex >= choices.length) {
         return false
       }
+      const choice = choices[choiceIndex]
       choices[choiceIndex].focus()
-      return document.activeElement === choices[choiceIndex]
+      if (document.activeElement === choice || choice.contains(document.activeElement)) {
+        return true
+      }
+      const focusableDescendants = [...choice.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]',
+      )]
+        .filter(visible)
+        .filter((element) => (
+          element.getAttribute('aria-disabled') !== 'true'
+          && !element.hasAttribute('disabled')
+        ))
+      for (const target of focusableDescendants) {
+        target.focus()
+        if (document.activeElement === target || choice.contains(document.activeElement)) {
+          return true
+        }
+      }
+      return false
     })()`, "before_policy_model_choice_focus")
     return focused.performed && focused.value
+  }
+
+  async function clickModelChoice(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= 20) {
+      return false
+    }
+    const indexLiteral = JSON.stringify(index)
+    const clicked = await fencedJsMutation(String.raw`(() => {
+      const visible = (element) => Boolean(element && element.getClientRects().length > 0)
+      const clean = (value) => String(value || '').trim().replace(/\s+/g, ' ')
+      const composers = [...document.querySelectorAll('#prompt-textarea')]
+      const composer = composers.length === 1 ? composers[0] : null
+      const root = composer?.closest('form') || null
+      const classPills = [...(root?.querySelectorAll('button.__composer-pill[aria-haspopup="menu"]') ?? [])]
+        .filter(visible)
+      const pills = classPills.length > 0
+        ? classPills
+        : [...(root?.querySelectorAll('button[aria-haspopup="menu"]') ?? [])]
+            .filter(visible)
+            .filter((element) => (
+              element.getAttribute('data-testid') !== 'composer-plus-btn'
+              && clean(element.innerText || element.textContent).length > 0
+            ))
+      if (pills.length !== 1) {
+        return false
+      }
+      const menuId = pills[0].getAttribute('aria-controls')
+      const policyMenus = [...document.querySelectorAll('[role="menu"]')]
+        .filter((menu) => menuId && menu.id === menuId)
+      const controlledMenu = policyMenus.length === 1 ? policyMenus[0] : null
+      const menu = pills[0].getAttribute('aria-expanded') === 'true'
+        && visible(controlledMenu)
+        && controlledMenu.querySelector('[role="menuitem"][aria-label="Power"]')
+        ? controlledMenu
+        : null
+      if (!menu) {
+        return false
+      }
+      const choices = [...menu.querySelectorAll('[role="menuitemradio"]')]
+        .filter(visible)
+        .filter((element) => element.getAttribute('aria-disabled') !== 'true')
+      const choiceIndex = ${indexLiteral}
+      if (choices.length < 1 || choices.length > 20 || choiceIndex >= choices.length) {
+        return false
+      }
+      const choice = choices[choiceIndex]
+      if (!(choice instanceof HTMLElement)) {
+        return false
+      }
+      choice.click()
+      return true
+    })()`, "before_policy_model_choice_click")
+    return clicked.performed && clicked.value
   }
 
   async function openModelPolicyState(requireModelChoices = true) {
@@ -2122,9 +2255,9 @@ async function egoDriverMain(
     if (!opened.ok) {
       await closeModelPolicyMenu()
       humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power menu did not expose a safe semantic policy control.", {
-        reason: opened.reason,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        uiReason: opened.reason,
       })
       return null
     }
@@ -2135,15 +2268,17 @@ async function egoDriverMain(
       && before.selectedModelIndex !== before.strongestModelIndex
     ) {
       const focused = await focusModelChoice(before.strongestModelIndex)
-      if (!focused) {
+      if (focused) {
+        if (!await fencedPressKey("ENTER", "before_policy_model_selection_key")) {
+          return null
+        }
+      } else if (!await clickModelChoice(before.strongestModelIndex)) {
         await closeModelPolicyMenu()
-        humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not receive safe keyboard input.", {
+        humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not receive safe input.", {
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
+          uiReason: "policy_model_choice_activation",
         })
-        return null
-      }
-      if (!await fencedPressKey("ENTER", "before_policy_model_selection_key")) {
         return null
       }
       adjusted = true
@@ -2152,6 +2287,7 @@ async function egoDriverMain(
         humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close after selecting the strongest model.", {
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
+          uiReason: "policy_menu_close_after_model_selection",
         })
         return null
       }
@@ -2159,9 +2295,9 @@ async function egoDriverMain(
       if (!opened.ok) {
         await closeModelPolicyMenu()
         humanRequired("model_policy_ui_unknown", "The strongest ChatGPT model choice could not be verified after selection.", {
-          reason: opened.reason,
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
+          uiReason: opened.reason,
         })
         return null
       }
@@ -2175,6 +2311,7 @@ async function egoDriverMain(
         humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control could not receive safe keyboard input.", {
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
+          uiReason: "policy_power_focus",
         })
         return null
       }
@@ -2191,6 +2328,7 @@ async function egoDriverMain(
       humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close cleanly before final verification.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        uiReason: "policy_menu_close_before_verification",
       })
       return null
     }
@@ -2224,6 +2362,7 @@ async function egoDriverMain(
       humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close cleanly before composition.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        uiReason: "policy_menu_close_before_composition",
       })
       return null
     }
@@ -2236,6 +2375,7 @@ async function egoDriverMain(
       humanRequired("model_policy_ui_unknown", "The closed ChatGPT model policy control could not be read safely.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        uiReason: "policy_closed_trigger_read",
       })
       return null
     }
@@ -2280,9 +2420,9 @@ async function egoDriverMain(
       && safePolicyLabel(pillLabel)
     if (!labelsValid || !closed) {
       humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power policy could not be read safely immediately before Send.", {
-        reason: opened.reason ?? null,
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
+        uiReason: opened.reason ?? "policy_observation_invalid",
       })
       return null
     }

@@ -80,6 +80,12 @@ function isCanonicalChatGptConversationUrl(value) {
   }
 }
 
+const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/
+
+function isSha256Digest(value) {
+  return typeof value === "string" && SHA256_DIGEST_PATTERN.test(value)
+}
+
 function compactHistoricalConvergenceCycle(record) {
   return {
     candidateDigest: record.candidateDigest,
@@ -788,6 +794,27 @@ const DEFAULT_RECOVERY_DELAYS_MS = Object.freeze([
   10_000,
   30_000,
 ])
+// Only fixed driver subreasons may cross into the durable recovery ledger.
+const MODEL_POLICY_UI_REASONS = new Set([
+  "policy_closed_trigger_read",
+  "policy_composer_blur",
+  "policy_menu_close_after_model_selection",
+  "policy_menu_close_before_composition",
+  "policy_menu_close_before_verification",
+  "policy_menu_not_open",
+  "policy_menu_recovery_close",
+  "policy_menu_structure",
+  "policy_model_choice_activation",
+  "policy_model_choices",
+  "policy_model_choices_closed",
+  "policy_model_structure",
+  "policy_model_trigger_focus",
+  "policy_observation_invalid",
+  "policy_power_focus",
+  "policy_trigger_changed",
+  "policy_trigger_count",
+  "policy_trigger_focus",
+])
 const HUMAN_ONLY_BROWSER_REASONS = new Set([
   "authentication_required",
   "bound_task_space_identity_ambiguous",
@@ -863,6 +890,17 @@ const LEGACY_BROWSER_RECOVERY_CODES = new Set([
   "ego_driver_timeout",
   "invalid_driver_output",
 ])
+const DURABLE_BROWSER_ERROR_CODES = new Set([
+  ...LEGACY_BROWSER_RECOVERY_CODES,
+  "browser_operation_failed",
+  "driver_mailbox_reservation_lost",
+  "invalid_browser_admission",
+  "invalid_browser_pid",
+  "unsafe_driver_mailbox",
+])
+const DURABLE_COMPOSITION_METHODS = new Set([
+  "dom_paragraph_input",
+])
 const PRECLICK_DRIVER_STAGES = new Set([
   "anchoring_prompt_chunk",
   "checking_browser_contract",
@@ -884,6 +922,24 @@ const PRECLICK_DRIVER_STAGES = new Set([
   "verifying_presend_model_policy",
   "verifying_preclick_prompt",
   "verifying_precompose_head",
+])
+const DURABLE_DRIVER_STAGES = new Set([
+  ...PRECLICK_DRIVER_STAGES,
+  "capturing_response",
+  "confirming_send",
+  "dispatching_adopt",
+  "dispatching_bind",
+  "dispatching_capture_exchange",
+  "dispatching_model_policy",
+  "dispatching_preflight",
+  "dispatching_reanchor",
+  "dispatching_reconcile",
+  "dispatching_reconcile_bound",
+  "dispatching_send_click",
+  "dispatching_verify",
+  "initializing",
+  "resolving_canonical_conversation",
+  "verifying_sent_identity",
 ])
 const CONVERGENCE_DEVELOPER_INSTRUCTIONS = [
   "This thread is owned by the Ego Chat durable convergence broker.",
@@ -911,7 +967,7 @@ function appServerDiagnostic(error) {
   const details = error.details ?? {}
   return {
     code: error.code,
-    ...(typeof details.diagnosticDigest === "string" ? { diagnosticDigest: details.diagnosticDigest } : {}),
+    ...(isSha256Digest(details.diagnosticDigest) ? { diagnosticDigest: details.diagnosticDigest } : {}),
     ...(Number.isInteger(details.exitCode) ? { exitCode: details.exitCode } : {}),
     ...(Number.isInteger(details.consecutiveExitCount) ? { consecutiveExitCount: details.consecutiveExitCount } : {}),
     ...(Number.isInteger(details.lifetimeMs) ? { lifetimeMs: details.lifetimeMs } : {}),
@@ -3363,6 +3419,11 @@ export class Broker {
       if (!current || current.status !== "running") {
         return
       }
+      const modelPolicy = await this.#recordModelPolicyObservation(
+        this.#validateModelPolicyObservation(capture.modelPolicy),
+        current.bindingKey,
+        current.id,
+      )
       const responseRef = await this.#store.putBlob(capture.responseText, {
         mediaType: "text/markdown; charset=utf-8",
       })
@@ -3373,7 +3434,10 @@ export class Broker {
         canonicalUrl: capture.canonicalUrl,
         durationMs: capture.durationMs,
         head: capture.head,
-        modelPolicy: capture.modelPolicy,
+        modelPolicy: {
+          ...modelPolicy.lastObserved,
+          policyRevision: modelPolicy.revision,
+        },
         responseDigest: capture.responseDigest,
         responseRef,
         responseText: capture.responseText,
@@ -3477,13 +3541,16 @@ export class Broker {
       code: error instanceof EgoChatError
         ? (error.details?.reason ?? error.code)
         : "browser_operation_failed",
-      ...(typeof error?.details?.diagnosticDigest === "string"
+      ...(isSha256Digest(error?.details?.diagnosticDigest)
         ? { diagnosticDigest: error.details.diagnosticDigest }
         : {}),
-      ...(typeof error?.details?.driverStage === "string"
+      ...(DURABLE_DRIVER_STAGES.has(error?.details?.driverStage)
         ? { driverStage: error.details.driverStage }
         : {}),
       ...(evidence ? { evidence } : {}),
+      ...(MODEL_POLICY_UI_REASONS.has(error?.details?.evidence?.uiReason)
+        ? { uiReason: error.details.evidence.uiReason }
+        : {}),
     }
   }
 
@@ -4376,7 +4443,10 @@ export class Broker {
       const reanchorableHeadChange = headChange?.observedRole === "assistant"
         ? headChange
         : undefined
-      const errorCode = error instanceof EgoChatError ? error.code : "browser_operation_failed"
+      const observedErrorCode = error instanceof EgoChatError ? error.code : "browser_operation_failed"
+      const errorCode = DURABLE_BROWSER_ERROR_CODES.has(observedErrorCode)
+        ? observedErrorCode
+        : "browser_operation_failed"
       const browserInterrupted = !isHumanRequired && current.phase === "browser_owned"
       const requiresHuman = isHumanRequired || browserInterrupted
       let reconciliation = current.reconciliation
@@ -4394,16 +4464,16 @@ export class Broker {
       const browserInterruption = browserInterrupted
         ? {
             errorCode,
-            ...(typeof error?.details?.compositionMethod === "string"
+            ...(DURABLE_COMPOSITION_METHODS.has(error?.details?.compositionMethod)
               ? { compositionMethod: error.details.compositionMethod }
               : {}),
-            ...(typeof error?.details?.diagnosticDigest === "string"
+            ...(isSha256Digest(error?.details?.diagnosticDigest)
               ? { diagnosticDigest: error.details.diagnosticDigest }
               : {}),
             ...(typeof error?.details?.draftCleared === "boolean"
               ? { draftCleared: error.details.draftCleared }
               : {}),
-            ...(typeof error?.details?.driverStage === "string"
+            ...(DURABLE_DRIVER_STAGES.has(error?.details?.driverStage)
               ? { driverStage: error.details.driverStage }
               : {}),
             ...(Number.isSafeInteger(error?.details?.promptBytes)
@@ -4483,7 +4553,7 @@ export class Broker {
           : {
               error: {
                 code: errorCode,
-                ...(typeof error?.details?.diagnosticDigest === "string"
+                ...(isSha256Digest(error?.details?.diagnosticDigest)
                   ? { diagnosticDigest: error.details.diagnosticDigest }
                   : {}),
                 message: error instanceof EgoChatError

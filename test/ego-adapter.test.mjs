@@ -12,6 +12,7 @@ import {
   EGO_DRIVER_SOURCE,
   egoDriverSourceForInput,
 } from "../src/ego-driver-source.mjs"
+import { createModelPolicyDom } from "./fixtures/model-policy-dom.mjs"
 
 function envelope(value) {
   return `${EGO_DRIVER_RESULT_PREFIX}${Buffer.from(JSON.stringify(value)).toString("base64url")}\n`
@@ -177,6 +178,7 @@ const modelChoices = (currentModelLabels || []).map((label, index) => ({
 }))
 const menu = {
   ...visible,
+  id: 'policy-menu',
   querySelector(selector) {
     return selector === '[role="menuitem"][aria-label="Power"]' ? powerItem : null
   },
@@ -315,6 +317,7 @@ async function runPreSendDriverCase({
   driftBetweenFocusAndInsert = false,
   fenceAtRecheck = false,
   omitUnboundTaskSpaceIdentity = false,
+  policyDomOptions = null,
   policyUiVariant = "legacy",
   prompt = null,
   recycleUnboundTaskSpace = false,
@@ -419,6 +422,7 @@ const beforeEntries = ${JSON.stringify([
     priorAssistant,
   ])}
 const ownerPath = ${JSON.stringify(ownerPath)}
+const policyDom = ${JSON.stringify(policyDomOptions)} && (${createModelPolicyDom.toString()})(${JSON.stringify(policyDomOptions)})
 let policyMenuOpen = false
 let modelChoicesOpen = false
 let composerHasDraft = false
@@ -514,6 +518,7 @@ globalThis.wait = async () => {
   }
 }
 globalThis.click = async (target) => {
+  if (policyDom) return policyDom.click(target)
   if (String(target).includes('__composer-pill')) {
     if (
       ${JSON.stringify(deferFirstPolicyOpenWithDraft)}
@@ -543,6 +548,7 @@ globalThis.click = async (target) => {
 globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
 globalThis.typeText = async () => { throw new Error('unexpected typeText') }
 globalThis.pressKey = async (key) => {
+  if (policyDom) return policyDom.pressKey(key)
   if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') modelChoicesOpen = true
   if (key === 'ENTER' && focusedPolicyControl === 'model_choice') {
     selectedModelIndex = focusedModelIndex
@@ -556,10 +562,21 @@ globalThis.pressKey = async (key) => {
   }
 }
 globalThis.cdp = async (method) => {
-  if (method === 'Input.insertText') counters.insertText += 1
+  if (method === 'Input.insertText') {
+    counters.insertText += 1
+    policyDom?.afterComposition()
+  }
   if (method === 'Input.dispatchMouseEvent') counters.mouseEvents += 1
 }
 globalThis.js = async (source) => {
+  if (policyDom && source.includes('const classPills')) {
+    counters.policyDomEvents = policyDom.events
+    const value = policyDom.evaluate(source)
+    if (${JSON.stringify(policyDomOptions?.fenceBeforeClick ?? false)} && source.includes('choices[choiceIndex].focus()')) {
+      await fs.writeFile(ownerPath, JSON.stringify({ ...input.brokerLease, brokerId: 'new-broker' }))
+    }
+    return value
+  }
   if (source.includes('hasLoginAction')) {
     return {
       composerCount: 1,
@@ -654,6 +671,7 @@ globalThis.js = async (source) => {
     const injectedPrompt = JSON.parse(source.slice(valueStart + prefix.length, valueEnd).trim())
     if (injectedPrompt !== input.prompt) throw new Error('The injected prompt changed in transit.')
     counters.composerMutations += 1
+    policyDom?.afterComposition()
     counters.injectedPromptLength = injectedPrompt.length
     composerHasDraft = true
     composerFocused = true
@@ -863,6 +881,7 @@ async function runAdoptionDriverCase({
   pageUrl = null,
   pageUrls = null,
   policyInspectionFailures = 0,
+  policyDomOptions = null,
   policyUiVariant = "legacy",
   policyInitiallyMaximum = true,
   redirectAtFinalResult = false,
@@ -938,6 +957,7 @@ let selectedModelIndex = ${JSON.stringify(currentSelectedModelIndex)}
 let focusedModelIndex = null
 let focusedPolicyControl = null
 let policyInspections = 0
+const policyDom = ${JSON.stringify(policyDomOptions)} && (${createModelPolicyDom.toString()})(${JSON.stringify(policyDomOptions)})
 let policyCurrent = ${JSON.stringify(policyInitiallyMaximum ? 4 : 3)}
 let pageInspection = 0
 let pageInfoRead = 0
@@ -1041,12 +1061,14 @@ globalThis.wait = async () => {
 globalThis.click = async (target) => {
   counters.click += 1
   if (String(target).includes('send-button')) counters.sendClick += 1
+  if (policyDom) return policyDom.click(target)
   if (String(target).includes('__composer-pill')) policyMenuOpen = !policyMenuOpen
   if (target === '#prompt-textarea') policyMenuOpen = false
 }
 globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
 globalThis.pressKey = async (key) => {
+  if (policyDom) return policyDom.pressKey(key)
   if (key === 'ARROWRIGHT') {
     counters.pressKey += 1
     policyCurrent = 4
@@ -1067,6 +1089,10 @@ globalThis.pressKey = async (key) => {
 }
 globalThis.cdp = async () => {}
 globalThis.js = async (source) => {
+  if (policyDom && source.includes('const classPills')) {
+    counters.policyDomEvents = policyDom.events
+    return policyDom.evaluate(source)
+  }
   if (source.includes('hasLoginAction')) {
     const state = pageStates[Math.min(pageInspection, pageStates.length - 1)]
     pageInspection += 1
@@ -1179,6 +1205,7 @@ globalThis.js = async (source) => {
     focusedPolicyControl = 'model_choice'
     return true
   }
+
   if (source.includes("composerCount: document.querySelectorAll('#prompt-textarea').length")) {
     return {
       composerCount: 1,
@@ -3129,6 +3156,92 @@ test("conversation adoption selects and verifies the strongest current model", a
   assert.equal(adopted.counters.fillInput, 0)
   assert.equal(adopted.counters.pressKey, 0)
   assert.equal(adopted.counters.typeText, 0)
+})
+
+test("conversation adoption selects the GPT-6 Pro route and maximum effort when model rows are not focusable", async () => {
+  const adopted = await runAdoptionDriverCase({
+    policyDomOptions: {},
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.modelLabel, "Latest")
+  assert.equal(adopted.result.modelPolicy.effortLabel, "6 Pro")
+  assert.equal(adopted.result.modelPolicy.pillLabel, "6 Pro")
+  assert.equal(adopted.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.result.modelPolicy.powerMax, 5)
+  const events = adopted.counters.policyDomEvents
+  const activation = events.findIndex((event) => event.kind === "model_activation")
+  assert.deepEqual(events[activation], { index: 0, kind: "model_activation", method: "dom" })
+  assert.ok(events.slice(activation + 1).some((event) => event.kind === "open"))
+  assert.ok(events.slice(activation + 1).some((event) => event.kind === "read" && event.selected === 0))
+  assert.equal(events.filter((event) => event.kind === "power_step").length, 2)
+  assert.equal(events.some((event) => event.kind.startsWith("unrelated_") || event.kind === "escape"), false)
+  assert.equal(adopted.counters.sendClick, 0)
+})
+
+test("composer-owned model policy rejects missing, wrong, broad, or ambiguous menu ownership", async (t) => {
+  for (const option of ["missingControls", "wrongControls", "duplicateMenu", "duplicateSelection", "missingComposer", "duplicateComposer", "missingComposerRoot", "broadComposerRoot"]) {
+    await t.test(option, async () => {
+      const stopped = await runPreSendDriverCase({ policyDomOptions: { [option]: true, unrelatedPower: false } })
+      assert.equal(stopped.error?.details?.reason, "model_policy_ui_unknown")
+      assert.equal(stopped.counters.composerMutations, 0)
+      assert.equal(stopped.counters.mouseEvents, 0)
+      assert.equal(stopped.counters.policyDomEvents.some((event) =>
+        ["model_activation", "power_step", "unrelated_click", "unrelated_focus"].includes(event.kind)), false)
+    })
+  }
+})
+
+test("an ineffective exact-row activation fails selected-state readback before Send", async () => {
+  const stopped = await runPreSendDriverCase({ policyDomOptions: { ignoreActivation: true } })
+  assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+})
+
+test("loss of broker authority fences the non-focusable model DOM click", async () => {
+  const stopped = await runPreSendDriverCase({ policyDomOptions: { fenceBeforeClick: true } })
+  assert.equal(stopped.error?.details?.reason, "broker_fence_lost")
+  assert.equal(stopped.counters.composerMutations, 0)
+  assert.equal(stopped.counters.mouseEvents, 0)
+  assert.equal(stopped.counters.policyDomEvents.some((event) => event.kind === "model_activation"), false)
+})
+
+test("the GPT-6 route is read at maximum immediately before Send and a late downgrade stops delivery", async (t) => {
+  for (const downgradeAfterComposition of [false, true]) {
+    await t.test(downgradeAfterComposition ? "downgrade" : "maximum", async () => {
+      const stopped = await runPreSendDriverCase({
+        changeSendControlAtRecheck: !downgradeAfterComposition,
+        policyDomOptions: { downgradeAfterComposition },
+      })
+      assert.equal(stopped.counters.composerMutations, 1)
+      assert.equal(stopped.counters.mouseEvents, 0)
+      const events = stopped.counters.policyDomEvents
+      const presend = events.slice(events.findIndex((event) => event.kind === "composition") + 1)
+      const read = presend.filter((event) => event.kind === "read").at(-1)
+      assert.equal(read.selected, 0)
+      assert.equal(read.maximum, 4)
+      assert.equal(read.current, downgradeAfterComposition ? 3 : 4)
+      assert.equal(presend.some((event) => ["model_activation", "power_step"].includes(event.kind)), false)
+      if (downgradeAfterComposition) {
+        assert.equal(stopped.error?.details?.reason, "model_policy_mismatch")
+      } else {
+        assert.equal(stopped.counters.sendTargetReads, 2)
+      }
+    })
+  }
+})
+
+test("composer-owned model policy retains keyboard and descendant focus activation", async (t) => {
+  for (const option of ["focusableRows", "focusableChild"]) {
+    await t.test(option, async () => {
+      const adopted = await runAdoptionDriverCase({ policyDomOptions: { [option]: true } })
+      assert.equal(adopted.error, undefined)
+      assert.equal(adopted.result.modelPolicy.modelLabel, "Latest")
+      assert.deepEqual(adopted.counters.policyDomEvents.filter((event) => event.kind === "model_activation"), [
+        { index: 0, kind: "model_activation", method: "keyboard" },
+      ])
+    })
+  }
 })
 
 test("conversation adoption replaces a leading automatic router with the strongest model", async () => {
