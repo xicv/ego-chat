@@ -338,12 +338,12 @@ export class EgoAdapter {
     }, timeoutMs + 60_000, signal, onResult, beforeRun)
   }
 
-  async captureAttachmentExecution(params, signal = undefined) {
+  async captureAttachmentExecution(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
     return this.#run({
       brokerLease: this.#brokerLease,
       ...params,
       mode: "capture_attachment_execution",
-    }, 60_000, signal)
+    }, 60_000, signal, onResult, beforeRun)
   }
 
   async ensureModelPolicy(params, signal = undefined, onResult = undefined, beforeRun = undefined) {

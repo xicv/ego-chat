@@ -1530,7 +1530,7 @@ globalThis.js = async (source) => {
     source.includes("const messageNodes = [")
     || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
   ) {
-    const result = ${JSON.stringify(mode === "capture_exchange"
+    const result = ${JSON.stringify(["capture_exchange", "reconcile"].includes(mode)
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
     if (${JSON.stringify(driftAfterConversationRead)}) driftTaskSpace = true
@@ -3674,6 +3674,19 @@ test("bounded capture promotes a confirmed create-once send to its canonical con
   assert.equal(captured.result.head.lastMessageId, "partial-assistant")
 })
 
+test("create-once reconciliation rejects a copied prompt with a different provider message ID", async () => {
+  const result = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    mode: "reconcile",
+    promptIdentityMatches: false,
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+  })
+  assert.equal(result.result, undefined)
+  assert.equal(result.error?.details?.reason, "reconciliation_prompt_mismatch")
+  assert.equal(result.counters.click, 0)
+  assert.equal(result.counters.typeText, 0)
+})
+
 test("bounded capture tolerates a transient missing generation control", async () => {
   const captured = await runTaskSpaceReconciliationCase({
     captureContinuationAllowed: true,
@@ -3852,6 +3865,61 @@ test("attachment capture emits only one closed read-only observation for the con
 
 test("Ego adapter exposes the attachment capture route without Send authority", () => {
   assert.equal(typeof EgoAdapter.prototype.captureAttachmentExecution, "function")
+})
+
+test("attachment capture forwards fresh in-lane admission and result callbacks", async (t) => {
+  const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-attachment-admission-test-"))
+  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from "node:fs"
+let source = ""
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => { source += chunk })
+process.stdin.on("end", () => {
+  const invocation = source.trim()
+  const argumentStart = invocation.lastIndexOf(")(")
+  const argumentEnd = invocation.indexOf(",", argumentStart + 2)
+  const inputPath = JSON.parse(invocation.slice(argumentStart + 2, argumentEnd))
+  const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))
+  fs.unlinkSync(inputPath)
+  const envelope = Buffer.from(JSON.stringify({
+    ok: true,
+    result: { mode: input.mode, taskSpaceGuard: input.taskSpaceGuard },
+  }), "utf8").toString("base64url")
+  process.stdout.write("${EGO_DRIVER_RESULT_PREFIX}" + envelope + "\\n")
+})
+`, { mode: 0o700 })
+  const adapter = new EgoAdapter({
+    command,
+    mailboxDirectory: path.join(fixtureDirectory, "mailbox"),
+  })
+  const guard = completeTaskSpaceGuard({
+    kind: "stable_identity",
+    identity: { name: "attachment-owner", taskId: "opaque-attachment-owner" },
+  })
+  const observed = []
+  const first = adapter.captureAttachmentExecution(
+    { taskSpaceGuard: { stale: true } },
+    undefined,
+    (result) => observed.push(result),
+    () => ({ taskSpaceGuard: guard }),
+  )
+  const second = adapter.captureAttachmentExecution(
+    { taskSpaceGuard: { stale: true } },
+    undefined,
+    (result) => observed.push(result),
+    () => {
+      assert.equal(observed.length, 1)
+      return { taskSpaceGuard: guard }
+    },
+  )
+  const results = await Promise.all([first, second])
+  assert.deepEqual(results, Array.from({ length: 2 }, () => ({
+    mode: "capture_attachment_execution",
+    taskSpaceGuard: guard,
+  })))
+  assert.deepEqual(observed, results)
 })
 
 test("conversation adoption fails closed when another message interleaves", async () => {

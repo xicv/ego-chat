@@ -3177,6 +3177,7 @@ async function egoDriverMain(
       && response?.role === "assistant"
       && Boolean(prompt?.messageId)
       && Boolean(response?.messageId)
+      && (!input.promptMessageId || prompt.messageId === input.promptMessageId)
       && prompt.messageId !== response.messageId
       && prompt.contentDigest === input.inputDigest
       && promptMarkerCount === 1

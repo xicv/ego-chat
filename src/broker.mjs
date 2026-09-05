@@ -1872,10 +1872,20 @@ export class Broker {
       && workflow.phase === "response_captured"
       && workflow.result?.reconciled === true
     )
+    const recoveryCode = workflow.humanRequired?.code ?? workflow.error?.code
+    const cancelledConfirmedCreateOnce = binding.state === "unbound"
+      && workflow.status === "human_required"
+      && recoveryCode === "cancelled_during_browser_operation"
+      && workflow.phase === "send_confirmed"
+      && !workflow.private?.request?.receiptCapture
+      && workflow.reconciliation?.beforeHead?.messageId === null
+      && typeof workflow.reconciliation?.promptMessageId === "string"
+      && workflow.reconciliation.promptMessageId.length > 0
+      && workflow.private?.send?.promptMessageId === workflow.reconciliation.promptMessageId
+      && workflow.private.send.targetId === binding.targetId
     const unboundRecovery = binding.state === "unbound"
       && workflow.status === "human_required"
-      && workflow.humanRequired?.code === "canonical_conversation_missing"
-    const recoveryCode = workflow.humanRequired?.code ?? workflow.error?.code
+      && (recoveryCode === "canonical_conversation_missing" || cancelledConfirmedCreateOnce)
     const browserInterruption = workflow.reconciliation?.browserInterruption
     const boundRecovery = binding.state === "bound"
       && (
@@ -1950,10 +1960,12 @@ export class Broker {
                 binding: identityBinding,
                 expectedTerminalMarker,
                 inputDigest: workflow.inputDigest,
+                promptMessageId: workflow.reconciliation.promptMessageId,
                 turnMarker,
               },
               undefined,
               (result) => this.#reserveBrowserTaskSpaceIdentity({
+                allowCanonicalPromotion: cancelledConfirmedCreateOnce,
                 expectedCanonicalUrl: identityBinding.canonicalUrl,
                 key: identityBinding.key,
                 owner: admissionOwner,
@@ -1984,6 +1996,7 @@ export class Broker {
               () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
             )
         this.#reserveBrowserTaskSpaceIdentity({
+          allowCanonicalPromotion: cancelledConfirmedCreateOnce,
           expectedCanonicalUrl: identityBinding.canonicalUrl,
           key: identityBinding.key,
           owner: admissionOwner,
@@ -2522,6 +2535,21 @@ export class Broker {
     try {
       let capture = this.#store.getAttachmentCapture(workflowId)
       if (!capture || capture.state !== "CAPTURING") return
+      const sourceWorkflow = this.#store.getWorkflow(workflowId)
+      const sourceBinding = this.#store.getBinding(sourceWorkflow?.bindingKey)
+      if (!sourceWorkflow || !sourceBinding) {
+        throw new EgoChatError(
+          "corrupt_attachment_evidence_state",
+          "Attachment capture cannot restore its owner-scoped task-space admission.",
+        )
+      }
+      const captureBinding = effectiveWorkflowBinding(sourceBinding, sourceWorkflow)
+      this.#reserveTaskSpaceAdmission(workflowId, {
+        canonicalUrl: captureBinding.canonicalUrl,
+        key: sourceWorkflow.bindingKey,
+        selector: taskSpaceSelectorForBinding(captureBinding),
+        taskSpaceIdentity: captureBinding.taskSpaceIdentity,
+      })
       if (restarted) {
         const restartedAt = new Date().toISOString()
         if (
@@ -2572,12 +2600,13 @@ export class Broker {
         let observation
         try {
           observation = await this.#egoAdapter.captureAttachmentExecution({
-            binding,
+            binding: effectiveWorkflowBinding(binding, workflow),
             captureOperationKeySha256: capture.capture_operation_key_sha256,
             observationSequence: capture.attempt_journal.length + 1,
             providerPromptMessageId: identity.provider_prompt_message_id,
             sourceConfirmedSendIdentitySha256: sha256Hex(canonicalJsonBytes(identity)),
-          }, controller.signal)
+          }, controller.signal, undefined,
+          () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflowId) }))
         } catch (_error) {
           if (controller.signal.aborted) return
           const elapsedMonotonicMs = Math.max(
@@ -2672,6 +2701,7 @@ export class Broker {
     } finally {
       this.#attachmentCaptureControllers.delete(workflowId)
       this.#attachmentCaptureWorkflows.delete(workflowId)
+      this.#releaseTaskSpaceAdmission(workflowId)
       const workflow = this.#store.getWorkflow(workflowId)
       if (workflow && this.#attachmentCaptureBindings.get(workflow.bindingKey) === workflowId) {
         this.#attachmentCaptureBindings.delete(workflow.bindingKey)

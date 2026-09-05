@@ -2321,6 +2321,16 @@ test("broker recovers a driver failure then signs one quiet terminal disposition
   let captureCalls = 0
   let sendCalls = 0
   let signCalls = 0
+  const captureGuards = []
+  await store.persistBinding("binding.created", {
+    canonicalUrl: "https://chatgpt.com/c/foreign-attachment-owner",
+    key: "foreign-attachment-owner",
+    revision: 1,
+    state: "bound",
+    targetId: "foreign-tab",
+    taskSpaceIdentity: browserTaskSpaceIdentity("foreign"),
+    taskSpaceId: 16,
+  })
   const broker = new Broker({
     attachmentReceiptAuthority: {
       qualify: async (request) => fakeReceiptQualification(request, {
@@ -2339,7 +2349,8 @@ test("broker recovers a driver failure then signs one quiet terminal disposition
     },
     egoAdapter: {
       ...unusedEgoAdapter,
-      captureAttachmentExecution: async (input) => {
+      captureAttachmentExecution: async (input, _signal, _onResult, beforeRun) => {
+        captureGuards.push(await beforeRun?.())
         captureCalls += 1
         if (captureCalls === 1) {
           throw new EgoChatError("ego_driver_failed", "transient read-only capture failure")
@@ -2404,6 +2415,14 @@ test("broker recovers a driver failure then signs one quiet terminal disposition
   assert.equal(sendCalls, 1)
   assert.equal(captureCalls, 3)
   assert.equal(signCalls, 1)
+  assert.deepEqual(captureGuards, Array.from({ length: 3 }, () => ({
+    taskSpaceGuard: {
+      deniedIdentities: [browserTaskSpaceIdentity("foreign")],
+      deniedSelectors: [],
+      ownerSelector: { kind: "stable_identity", identity: browserTaskSpaceIdentity("6") },
+      revision: 1,
+    },
+  })))
   assert.equal(store.getAttachmentCapture(started.id).attempt_journal.length, 3)
   assert.equal(
     store.getAttachmentCapture(started.id).attempt_journal[0].reason,
@@ -2508,6 +2527,7 @@ test("broker restart resumes the same capture lineage without another Send", asy
 
   const restartedStore = new EventStore(dataDir)
   let restartedCaptureCalls = 0
+  const restartedGuards = []
   const restartedBroker = new Broker({
     attachmentReceiptAuthority: {
       qualify: qualification,
@@ -2517,7 +2537,8 @@ test("broker restart resumes the same capture lineage without another Send", asy
     },
     egoAdapter: {
       ...unusedEgoAdapter,
-      captureAttachmentExecution: async (input) => {
+      captureAttachmentExecution: async (input, _signal, _onResult, beforeRun) => {
+        restartedGuards.push(await beforeRun?.())
         restartedCaptureCalls += 1
         return attachmentGraphObservation({
           canonicalConversationLocatorSha256: sha256Hex(Buffer.from(canonicalUrl)),
@@ -2540,6 +2561,14 @@ test("broker restart resumes the same capture lineage without another Send", asy
   assert.equal(completed.result.reason, "UNSUPPORTED_SAVE_ASSOCIATION")
   assert.equal(sendCalls, 1)
   assert.equal(restartedCaptureCalls, 2)
+  assert.deepEqual(restartedGuards, Array.from({ length: 2 }, () => ({
+    taskSpaceGuard: {
+      deniedIdentities: [],
+      deniedSelectors: [],
+      ownerSelector: { kind: "stable_identity", identity: browserTaskSpaceIdentity("7") },
+      revision: 1,
+    },
+  })))
   const terminalCapture = restartedStore.getAttachmentCapture(started.id)
   assert.equal(terminalCapture.attempt_journal.length, 4)
   assert.equal(terminalCapture.attempt_journal[1].reason, "BROKER_RESTART")
@@ -10089,6 +10118,115 @@ test("confirmed first send can reconcile an unbound lease by exact workflow dige
   assert.equal(reconciled.recovery.responseText, responseText)
   assert.equal(broker.getWorkflow({ workflowId: stopped.id }).status, "succeeded")
   assert.equal(reconciliationCalls, 3)
+})
+
+test("cancelled confirmed create-once capture reconciles its exact first Send without resending", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const taskSpaceIdentity = browserTaskSpaceIdentity("cancelled-create-once")
+  const canonicalUrl = "https://chatgpt.com/c/cancelled-create-once-recovered"
+  const terminalMarker = "DONE_CANCELLED_CREATE_ONCE"
+  const responseText = `Recovered acknowledgement.\n${terminalMarker}`
+  let sendCalls = 0
+  let reconcileCalls = 0
+  let captureEntered
+  const entered = new Promise((resolve) => { captureEntered = resolve })
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: null,
+        targetId: input.targetId,
+        taskSpaceIdentity,
+        taskSpaceId: 73,
+      }),
+      sendExchange: async (input) => {
+        sendCalls += 1
+        return {
+          canonicalUrl: "https://chatgpt.com/c/WEB:cancelled-create-once",
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: "cancelled-create-once-prompt",
+          sentAt: new Date().toISOString(),
+          targetId: "cancelled-create-once-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 73,
+          turnMarker: input.turnMarker,
+        }
+      },
+      captureExchange: async (_input, signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("cancelled capture")), { once: true })
+        captureEntered()
+      }),
+      reconcile: async (input) => {
+        reconcileCalls += 1
+        assert.equal(input.promptMessageId, "cancelled-create-once-prompt")
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "cancelled-create-once-after",
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "cancelled-create-once-assistant",
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "cancelled-create-once-tab",
+          taskSpaceIdentity,
+          taskSpaceId: 73,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "cancelled-create-once",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "cancelled-create-once-tab",
+    taskSpace: 73,
+  })
+  const turnMarker = "EGO_CHAT_CANCELLED_CREATE_ONCE"
+  const started = await broker.startEgoExchange({
+    bindingKey: "cancelled-create-once",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nReview the checkpoint.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  await entered
+  await broker.cancelWorkflow({ workflowId: started.id })
+  await new Promise((resolve) => globalThis.setImmediate(resolve))
+  const cancelled = store.getWorkflow(started.id)
+  for (const privatePatch of [
+    { ...cancelled.private, send: undefined },
+    { ...cancelled.private, send: { ...cancelled.private.send, promptMessageId: "wrong-prompt" } },
+    { ...cancelled.private, send: { ...cancelled.private.send, targetId: "wrong-tab" } },
+    { ...cancelled.private, request: { ...cancelled.private.request, receiptCapture: {} } },
+  ]) {
+    await store.persist("workflow.human_required", { ...cancelled, private: privatePatch })
+    await assert.rejects(
+      broker.reconcileConversation({ bindingKey: "cancelled-create-once", workflowId: started.id }),
+      (error) => error.code === "workflow_not_reconcilable",
+    )
+    assert.equal(reconcileCalls, 0)
+  }
+  await store.persist("workflow.human_required", cancelled)
+  const recovered = await broker.reconcileConversation({
+    bindingKey: "cancelled-create-once",
+    workflowId: started.id,
+  })
+  assert.equal(recovered.canonicalUrl, canonicalUrl)
+  assert.equal(recovered.state, "bound")
+  assert.equal(recovered.recovery.responseText, responseText)
+  assert.equal(broker.getWorkflow({ workflowId: started.id }).status, "succeeded")
+  assert.equal(sendCalls, 1)
+  assert.equal(reconcileCalls, 1)
 })
 
 test("reconciliation rejects canonical retargeting before blob or binding persistence", async (t) => {
