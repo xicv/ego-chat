@@ -2743,6 +2743,21 @@ async function egoDriverMain(
     if (!await assertBrokerAuthority("after_attachment_observation")) {
       return
     }
+    const finalInfo = await pageInfo()
+    if (normalizeUrl(finalInfo.url) !== canonicalUrl) {
+      humanRequired("canonical_conversation_changed", "The attachment conversation changed before its observation was emitted.", {
+        targetId: selected.targetId,
+        taskSpaceId: selected.task.id,
+      })
+      return
+    }
+    const live = await revalidateSelectedTaskSpace({
+      taskSpaceId: selected.task.id,
+      taskSpaceIdentity: taskSpaceIdentity(selected.task),
+    }, "after_attachment_observation")
+    if (!live || !assertBrokerAuthoritySync("after_attachment_observation")) {
+      return
+    }
     emit({
       ok: true,
       result: {

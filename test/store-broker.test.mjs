@@ -10141,6 +10141,7 @@ test("cancelled confirmed create-once capture reconciles its exact first Send wi
         taskSpaceIdentity,
         taskSpaceId: 73,
       }),
+      ensureModelPolicy: async () => modelPolicyObservation(),
       sendExchange: async (input) => {
         sendCalls += 1
         return {
@@ -10227,6 +10228,31 @@ test("cancelled confirmed create-once capture reconciles its exact first Send wi
   assert.equal(broker.getWorkflow({ workflowId: started.id }).status, "succeeded")
   assert.equal(sendCalls, 1)
   assert.equal(reconcileCalls, 1)
+  await broker.ensureModelPolicy({ bindingKey: "cancelled-create-once" })
+  const completed = store.getWorkflow(started.id)
+  for (const resultPatch of [
+    { ...completed.result, canonicalUrl: "https://chatgpt.com/c/conflicting-recovered-url" },
+    { ...completed.result, canonicalUrl: null },
+    { ...completed.result, taskSpaceIdentity: browserTaskSpaceIdentity("foreign-recovered-space") },
+    { ...completed.result, targetId: "conflicting-recovered-tab" },
+    { ...completed.result, reconciled: false },
+    { ...completed.result, recoveryMode: "bound" },
+  ]) {
+    await store.persist("workflow.succeeded", { ...completed, result: resultPatch })
+    await assert.rejects(
+      broker.ensureModelPolicy({ bindingKey: "cancelled-create-once" }),
+      (error) => error.details?.reason === "binding_key_reserved",
+    )
+  }
+  await store.persist("workflow.succeeded", completed)
+  await broker.close()
+  const restarted = new Broker({
+    egoAdapter: { ...unusedEgoAdapter, ensureModelPolicy: async () => modelPolicyObservation() },
+    store: new EventStore(dataDir),
+  })
+  await restarted.initialize()
+  t.after(() => restarted.close())
+  await restarted.ensureModelPolicy({ bindingKey: "cancelled-create-once" })
 })
 
 test("reconciliation rejects canonical retargeting before blob or binding persistence", async (t) => {

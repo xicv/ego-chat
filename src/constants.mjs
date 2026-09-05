@@ -10,7 +10,7 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 10,
-  runtimeGeneration: "2026-09-05.1",
+  runtimeGeneration: "2026-09-05.2",
   storeSchemaRevision: 7,
   taskStoreSchemaRevision: 1,
 }

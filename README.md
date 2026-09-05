@@ -178,6 +178,8 @@ For a bound conversation, the stored numeric Ego task-space ID is a recoverable 
 
 An ordinary create-once exchange stopped during confirmed-Send capture can be recovered with `ego_reconcile_conversation` after cancellation. This is read-only recovery of the same workflow, never another Send: it requires an empty prior head, the exact durable provider prompt ID, the original tab and complete stable task-space identity, and an attributable two-message response with the original markers. The durable Send record binds the exact outbound prompt digest; the provider message ID anchors the rendered prompt, whose presentation need not preserve those bytes. Older recovery without a provider message ID still requires the exact rendered prompt digest. Missing or conflicting Send evidence and receipt-enabled asset exchanges are not eligible for this cancellation recovery path.
 
+A completed create-once recovery transfers its provisional-URL reservation through the committed canonical result only when the original stable space and bound target still match. The original Send evidence is preserved. A conflicting or malformed result retains the reservation; a valid transfer remains usable after broker restart.
+
 ### Accept an intentional external continuation
 
 If a person or another client appends to a bound ChatGPT conversation, the next Ego Chat send still stops with `conversation_head_changed`; it never silently skips the ownership check. Before reporting that stop, the browser now reads the tail twice. A transient hydration mismatch that returns to the durable head is accepted, while an unstable or persistently changed tail remains fail-closed.

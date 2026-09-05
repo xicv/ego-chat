@@ -1250,6 +1250,7 @@ async function runTaskSpaceReconciliationCase({
   duplicateFallback = false,
   duplicateFallbackAfterCreation = false,
   duplicateIdentity = false,
+  driftAfterAttachmentObservation = null,
   driftAfterConversationRead = false,
   fallbackTaskSpaceOwnership = null,
   fallbackTaskId = null,
@@ -1400,6 +1401,7 @@ const fs = await import('node:fs/promises')
 let opened = ${JSON.stringify(bindingState === "unbound")}
 let composerDraft = ${JSON.stringify(composerDraft)}
 let driftTaskSpace = false
+let observedCanonicalUrl = ${JSON.stringify(canonicalUrl)}
 let listTaskSpaceCalls = 0
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
@@ -1502,7 +1504,7 @@ globalThis.openOrReuseTab = async () => {
   opened = true
   return { active: true, targetId: 'recovered-bound-tab' }
 }
-globalThis.pageInfo = async () => ({ url: ${JSON.stringify(canonicalUrl)} })
+globalThis.pageInfo = async () => ({ url: observedCanonicalUrl })
 globalThis.snapshotText = async () => ''
 globalThis.wait = async () => {}
 globalThis.click = async () => { counters.click += 1 }
@@ -1538,6 +1540,17 @@ globalThis.js = async (source) => {
     return result
   }
   if (source.includes('ego-chat-attachment-graph-observation/v1')) {
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'task-space') driftTaskSpace = true
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'canonical-url') {
+      observedCanonicalUrl = 'https://chatgpt.com/c/attachment-drifted-conversation'
+    }
+    if (${JSON.stringify(driftAfterAttachmentObservation)} === 'broker-fence') {
+      await fs.writeFile(${JSON.stringify(ownerPath)}, JSON.stringify({
+        brokerId: 'replacement-broker',
+        epoch: 2,
+        pid: process.pid,
+      }))
+    }
     return ${JSON.stringify(attachmentObservation)}
   }
   if (source.trimStart().startsWith('Boolean(')) return ${JSON.stringify(generationRunning)}
@@ -3802,7 +3815,7 @@ test("bounded capture fails closed when the confirmed prompt identity changes", 
   assert.equal(captured.error?.details?.reason, "capture_pending_identity_mismatch")
 })
 
-test("attachment capture emits only one closed read-only observation for the confirmed prompt", async () => {
+test("attachment capture emits only one closed read-only observation for the confirmed prompt", async (t) => {
   const attachmentObservation = {
     artifacts: [{
       artifact_id: "generation-image-1",
@@ -3875,6 +3888,22 @@ test("attachment capture emits only one closed read-only observation for the con
     takeOverTaskSpace: 0,
     typeText: 0,
   })
+  for (const [drift, reason] of [
+    ["task-space", "bound_task_space_identity_changed"],
+    ["canonical-url", "canonical_conversation_changed"],
+    ["broker-fence", "broker_fence_lost"],
+  ]) {
+    await t.test(`rejects ${drift} drift after attachment observation`, async () => {
+      const stopped = await runTaskSpaceReconciliationCase({
+        attachmentObservation,
+        driftAfterAttachmentObservation: drift,
+        mode: "capture_attachment_execution",
+      })
+      assert.equal(stopped.result, undefined)
+      assert.equal(stopped.error?.details?.reason, reason)
+      assert.deepEqual(stopped.counters, captured.counters)
+    })
+  }
 })
 
 test("Ego adapter exposes the attachment capture route without Send authority", () => {

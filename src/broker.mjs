@@ -6204,12 +6204,36 @@ export class Broker {
       } catch (_error) {
         // Corrupt binding evidence cannot establish exact transfer.
       }
+      let transferredCanonicalUrl = canonicalUrl
+      const recovered = workflow.result
+      if (
+        workflow.kind === "ego_exchange"
+        && workflow.status === "succeeded"
+        && workflow.phase === "head_committed"
+        && recovered?.reconciled === true
+        && recovered.recoveryMode === "unbound"
+        && typeof recovered.targetId === "string"
+        && recovered.targetId.length > 0
+        && recovered.targetId === binding?.targetId
+      ) {
+        try {
+          const recoveredIdentity = validateTaskSpaceIdentity(recovered.taskSpaceIdentity)
+          if (identity && recoveredIdentity && isDeepStrictEqual(identity, recoveredIdentity)) {
+            // A completed create-once recovery may promote the provisional URL.
+            // Preserve the original Send evidence; transfer its claim only through
+            // the committed result in the same tab and complete stable space.
+            transferredCanonicalUrl = canonicalWorkflowEvidenceUrl(recovered.canonicalUrl)
+          }
+        } catch (_error) {
+          // Invalid recovery evidence must retain the original durable claim.
+        }
+      }
       const transferred = Boolean(
         binding
         && identity
         && bindingIdentity
-        && canonicalUrl
-        && binding.canonicalUrl === canonicalUrl
+        && transferredCanonicalUrl
+        && binding.canonicalUrl === transferredCanonicalUrl
         && isDeepStrictEqual(bindingIdentity, identity)
         && (
           (workflow.kind === "conversation_adoption"
