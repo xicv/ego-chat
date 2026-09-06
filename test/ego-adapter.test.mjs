@@ -19,14 +19,14 @@ function envelope(value) {
   return `${EGO_DRIVER_RESULT_PREFIX}${Buffer.from(JSON.stringify(value)).toString("base64url")}\n`
 }
 
-async function waitForFixtureDescendantPid(file) {
+async function waitForFixturePid(file) {
   const deadline = performance.now() + 10_000
   while (performance.now() < deadline) {
     try {
       const text = (await fs.readFile(file, "utf8")).trim()
       if (text) {
         const pid = Number(text)
-        assert.ok(/^[1-9]\d*$/.test(text) && Number.isSafeInteger(pid), "fixture must publish a positive descendant PID")
+        assert.ok(/^[1-9]\d*$/.test(text) && Number.isSafeInteger(pid), "fixture must publish a positive PID")
         return pid
       }
     } catch (error) {
@@ -36,7 +36,7 @@ async function waitForFixtureDescendantPid(file) {
     }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
-  assert.fail(`fixture descendant PID was not ready within 10 seconds: ${file}`)
+  assert.fail(`fixture PID was not ready within 10 seconds: ${file}`)
 }
 
 function conversationTailFingerprint(entry) {
@@ -2026,6 +2026,8 @@ test("child-read acknowledgement removes the prompt-bearing path before long bro
   await fs.writeFile(ownerPath, JSON.stringify(brokerLease), { mode: 0o600 })
   await fs.writeFile(command, `#!/usr/bin/env node
 import fs from "node:fs/promises"
+// Exercise startup beyond the former two-second test readiness allowance.
+await new Promise((resolve) => setTimeout(resolve, 2500))
 let source = ""
 process.stdin.setEncoding("utf8")
 process.stdin.on("data", (chunk) => { source += chunk })
@@ -2069,27 +2071,27 @@ process.stdin.on("end", async () => {
     },
     command,
   })
-  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
-  const running = preflightWithGuard(adapter, 10)
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  const running = preflightWithGuard(adapter, 10).then(
+    (result) => ({ result }),
+    (error) => ({ error }),
+  )
+  t.after(async () => {
     try {
-      await fs.access(consumedPath)
-      break
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error
-      }
+      await adapter.drain(2_000)
+    } finally {
+      await running
+      await fs.rm(fixtureDirectory, { force: true, recursive: true })
     }
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  await fs.access(consumedPath)
-  const childPid = Number(await fs.readFile(consumedPath, "utf8"))
+  })
+  const childPid = await waitForFixturePid(consumedPath)
   const mailboxDirectory = `/tmp/egc-driver-${process.getuid()}`
   assert.equal(
     (await fs.readdir(mailboxDirectory)).some((entry) => entry.startsWith(`input-${childPid}-`)),
     false,
   )
-  assert.equal((await running).browserContract.safe, true)
+  const completed = await running
+  assert.ifError(completed.error)
+  assert.equal(completed.result.browserContract.safe, true)
 })
 
 test("Ego adapter registers its click-capable child before supplying driver source", async (t) => {
@@ -2293,7 +2295,7 @@ setInterval(() => {}, 1000)
     brokerLease: {
       registerChild: async (pid) => {
         registeredPid = pid
-        descendantPid = await waitForFixtureDescendantPid(descendantPath)
+        descendantPid = await waitForFixturePid(descendantPath)
         throw new Error("simulated durable child registration failure")
       },
       unregisterChild: async () => {
@@ -2373,7 +2375,7 @@ setInterval(() => {}, 1000)
     (error) => ({ error }),
   )
   await registered
-  const descendantPid = await waitForFixtureDescendantPid(descendantPath)
+  const descendantPid = await waitForFixturePid(descendantPath)
   let retainedInput
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const entries = await fs.readdir(mailboxDirectory)

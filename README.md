@@ -518,6 +518,19 @@ See [GATE0.md](https://github.com/xicv/ego-chat/blob/main/GATE0.md) for the orig
 
 ## Release verification
 
+v0.2.20 is a maintenance release of the qualified v0.2.19 implementation. It advances the package and runtime identity without adding conversation rollover, a BYOK advisor, or other new recovery behavior. The runtime-contract digest changes with the application version, so upgrade the installed MCP runtime and restart connected hosts together:
+
+```sh
+cargo install --registry crates-io --version 0.2.20 --locked --force ego-chat
+ego-chat setup
+# For ZCode users:
+ego-chat setup-zcode
+ego-chat doctor
+ego-chat doctor-zcode
+```
+
+Run setup and doctor only for the hosts you use. Inspect any conflicting skill or MCP entry before explicitly using setup's `--force`; unrelated customization must be preserved. Fully quit and reopen connected hosts after setup. A stale facade may still read status, but new mutations must wait for a matching runtime rather than retrying under `restart_required`.
+
 The crate carries the MIT license and canonical repository metadata needed for publication. Before every release, inspect the exact archive with `cargo package --list` and run `cargo publish --dry-run --locked`. A crates.io version is permanent and cannot be overwritten, so publishing always requires explicit authorization for that exact version.
 
 ## Not yet supported
