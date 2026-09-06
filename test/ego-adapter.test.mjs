@@ -4,6 +4,7 @@ import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { performance } from "node:perf_hooks"
 import test from "node:test"
 
 import { EgoAdapter, decodeDriverResult } from "../src/ego-adapter.mjs"
@@ -16,6 +17,26 @@ import { createModelPolicyDom } from "./fixtures/model-policy-dom.mjs"
 
 function envelope(value) {
   return `${EGO_DRIVER_RESULT_PREFIX}${Buffer.from(JSON.stringify(value)).toString("base64url")}\n`
+}
+
+async function waitForFixtureDescendantPid(file) {
+  const deadline = performance.now() + 10_000
+  while (performance.now() < deadline) {
+    try {
+      const text = (await fs.readFile(file, "utf8")).trim()
+      if (text) {
+        const pid = Number(text)
+        assert.ok(/^[1-9]\d*$/.test(text) && Number.isSafeInteger(pid), "fixture must publish a positive descendant PID")
+        return pid
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.fail(`fixture descendant PID was not ready within 10 seconds: ${file}`)
 }
 
 function conversationTailFingerprint(entry) {
@@ -2245,13 +2266,22 @@ test("failed child registration drains the unregistered browser process group", 
     return
   }
   const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-adapter-register-failure-test-"))
-  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  let adapter = null
+  t.after(async () => {
+    try {
+      await adapter?.drain(2_000)
+    } finally {
+      await fs.rm(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
   const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
   const descendantPath = path.join(fixtureDirectory, "descendant.pid")
   const mailboxDirectory = path.join(fixtureDirectory, "mailbox")
+  // Keep startup beyond the former one-second assumption; cleanup budgets stay unchanged.
   await fs.writeFile(command, `#!/usr/bin/env node
 import { spawn } from "node:child_process"
 import fs from "node:fs"
+await new Promise((resolve) => setTimeout(resolve, 1250))
 const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
 fs.writeFileSync(${JSON.stringify(descendantPath)}, String(child.pid))
 process.stdin.resume()
@@ -2259,22 +2289,11 @@ setInterval(() => {}, 1000)
 `, { mode: 0o700 })
   let registeredPid
   let descendantPid
-  const adapter = new EgoAdapter({
+  adapter = new EgoAdapter({
     brokerLease: {
       registerChild: async (pid) => {
         registeredPid = pid
-        for (let attempt = 0; attempt < 40; attempt += 1) {
-          try {
-            descendantPid = Number(await fs.readFile(descendantPath, "utf8"))
-            break
-          } catch (error) {
-            if (error.code !== "ENOENT") {
-              throw error
-            }
-          }
-          await new Promise((resolve) => setTimeout(resolve, 25))
-        }
-        assert.ok(Number.isSafeInteger(descendantPid))
+        descendantPid = await waitForFixtureDescendantPid(descendantPath)
         throw new Error("simulated durable child registration failure")
       },
       unregisterChild: async () => {
@@ -2300,13 +2319,22 @@ test("Ego adapter shutdown drains the owned browser process group before unregis
     return
   }
   const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-adapter-drain-test-"))
-  t.after(() => fs.rm(fixtureDirectory, { force: true, recursive: true }))
+  let adapter = null
+  t.after(async () => {
+    try {
+      await adapter?.drain(2_000)
+    } finally {
+      await fs.rm(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
   const command = path.join(fixtureDirectory, "fake-ego-browser.mjs")
   const descendantPath = path.join(fixtureDirectory, "descendant.pid")
   const mailboxDirectory = path.join(fixtureDirectory, "mailbox")
+  // Delay only fixture readiness, never the production drain deadline.
   await fs.writeFile(command, `#!/usr/bin/env node
 import { spawn } from "node:child_process"
 import fs from "node:fs"
+await new Promise((resolve) => setTimeout(resolve, 1250))
 const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
 fs.writeFileSync(${JSON.stringify(descendantPath)}, String(child.pid))
 let stopping = false
@@ -2325,7 +2353,7 @@ setInterval(() => {}, 1000)
     registrationObserved = resolve
   })
   const lifecycle = []
-  const adapter = new EgoAdapter({
+  adapter = new EgoAdapter({
     brokerLease: {
       registerChild: async (pid, options) => {
         registeredPid = pid
@@ -2345,19 +2373,7 @@ setInterval(() => {}, 1000)
     (error) => ({ error }),
   )
   await registered
-  let descendantPid
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      descendantPid = Number(await fs.readFile(descendantPath, "utf8"))
-      break
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  assert.ok(Number.isSafeInteger(descendantPid))
+  const descendantPid = await waitForFixtureDescendantPid(descendantPath)
   let retainedInput
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const entries = await fs.readdir(mailboxDirectory)
