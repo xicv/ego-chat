@@ -1,13 +1,22 @@
 import fs from "node:fs/promises"
 import net from "node:net"
 import path from "node:path"
+import { createHash } from "node:crypto"
+
+import { RUNTIME_IDENTITY } from "../../src/constants.mjs"
 
 const dataDir = process.env.EGO_CHAT_DATA_DIR
 const socketPath = process.env.EGO_CHAT_SOCKET_PATH
 const aliasPath = process.env.EGO_CHAT_FAKE_STALE_ALIAS_PATH
 const mode = process.env.EGO_CHAT_FAKE_STALE_MODE ?? "idle"
 const token = (await fs.readFile(path.join(dataDir, "broker-token"), "utf8")).trim()
+const sameVersionContract = { ...RUNTIME_IDENTITY }
+delete sameVersionContract.contractDigest
+sameVersionContract.runtimeGeneration = `${RUNTIME_IDENTITY.runtimeGeneration}-previous-fixture`
 const runtimeIdentity = mode === "same-version-atomic-idle" ? {
+  ...sameVersionContract,
+  contractDigest: createHash("sha256").update(JSON.stringify(sameVersionContract)).digest("hex"),
+} : mode === "receipt-generation-atomic-idle" ? {
   appVersion: "0.2.19",
   browserContractRevision: 14,
   ipcVersion: 1,
@@ -59,7 +68,7 @@ const server = net.createServer((socket) => {
       socket.end(`${JSON.stringify({ id: request.id, ok: false, error: { code: "unauthorized" } })}\n`)
       return
     }
-    if (request.method === "broker.prepare_upgrade" && ["atomic-idle", "same-version-atomic-idle"].includes(mode)) {
+    if (request.method === "broker.prepare_upgrade" && ["atomic-idle", "same-version-atomic-idle", "receipt-generation-atomic-idle"].includes(mode)) {
       socket.end(`${JSON.stringify({
         id: request.id,
         ok: true,
@@ -133,7 +142,7 @@ async function stop(exitCode = 0) {
 }
 
 process.on("SIGTERM", () => {
-  stop(mode === "atomic-idle" ? 42 : 0).catch((error) => {
+  stop(["atomic-idle", "same-version-atomic-idle", "receipt-generation-atomic-idle"].includes(mode) ? 42 : 0).catch((error) => {
     process.stderr.write(`${error.stack ?? error}\n`)
     process.exit(1)
   })

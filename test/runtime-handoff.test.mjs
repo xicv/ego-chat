@@ -161,7 +161,7 @@ test("the real daemon atomically accepts a future-runtime drain and exits cleanl
   await waitForMissing(config.socketPath)
 })
 
-test("Step 7's previous same-version generation is stale and drains through the guarded upgrade", async (t) => {
+test("a previous generation of the current version drains through the guarded upgrade", async (t) => {
   const { config, env } = await createTestConfig()
   await loadOrCreateBrokerToken(config.dataDir)
   const child = await startFakeStaleBroker(t, config, env, "same-version-atomic-idle")
@@ -170,11 +170,34 @@ test("Step 7's previous same-version generation is stale and drains through the 
   const status = JSON.parse(inspected.stdout)
   assert.equal(status.status, "stale")
   assert.equal(status.runtime.appVersion, RUNTIME_IDENTITY.appVersion)
-  assert.equal(status.runtime.runtimeGeneration, "2026-09-05.2")
+  assert.equal(status.runtime.runtimeGeneration, `${RUNTIME_IDENTITY.runtimeGeneration}-previous-fixture`)
+  assert.notEqual(status.runtime.contractDigest, RUNTIME_IDENTITY.contractDigest)
 
   const { stdout } = await execFileAsync(process.execPath, [CLI_PATH, "broker-handoff"], { env })
   const result = JSON.parse(stdout)
   assert.equal(result.status, "stopped")
+  assert.deepEqual(result.previousRuntime, status.runtime)
+  assert.equal(await waitForExit(child), 0)
+  await assert.rejects(fs.lstat(path.join(config.dataDir, "broker.lock")), { code: "ENOENT" })
+  await assert.rejects(fs.lstat(config.socketPath), { code: "ENOENT" })
+})
+
+test("Step 7's historical v0.2.19 receipt generation drains through the guarded upgrade", async (t) => {
+  const { config, env } = await createTestConfig()
+  await loadOrCreateBrokerToken(config.dataDir)
+  const child = await startFakeStaleBroker(t, config, env, "receipt-generation-atomic-idle")
+
+  const inspected = await execFileAsync(process.execPath, [CLI_PATH, "broker-runtime-status"], { env })
+  const status = JSON.parse(inspected.stdout)
+  assert.equal(status.status, "stale")
+  assert.equal(status.runtime.appVersion, "0.2.19")
+  assert.equal(status.runtime.runtimeGeneration, "2026-09-05.2")
+  assert.equal(status.runtime.contractDigest, "9a35f79a3fef024e2e99a9652e626fe0740c7aed392e5e296f1270ed95c16d28")
+
+  const { stdout } = await execFileAsync(process.execPath, [CLI_PATH, "broker-handoff"], { env })
+  const result = JSON.parse(stdout)
+  assert.equal(result.status, "stopped")
+  assert.deepEqual(result.previousRuntime, status.runtime)
   assert.equal(result.previousRuntime.runtimeGeneration, "2026-09-05.2")
   assert.equal(await waitForExit(child), 0)
   await assert.rejects(fs.lstat(path.join(config.dataDir, "broker.lock")), { code: "ENOENT" })
