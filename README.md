@@ -92,7 +92,7 @@ npm ci
 
 The Rust binary is a distribution and launch wrapper around the qualified Node broker; it does not reimplement the browser protocol. This keeps one proven core while giving other Macs a stable command, embedded host skills, and automatic Codex or ZCode MCP configuration.
 
-The receiving Mac still needs Ego Lite with ChatGPT logged in, Node.js 24 or newer, npm, Rust 1.85 or newer for `cargo install`, and at least one supported coding client. From a local checkout, configure either or both clients:
+The receiving Mac still needs Ego Lite with ChatGPT logged in, Node.js 24 or newer, npm, Rust 1.88 or newer for `cargo install`, and at least one supported coding client. From a local checkout, configure either or both clients:
 
 ```sh
 cargo install --path /absolute/path/to/ego-chat --locked
