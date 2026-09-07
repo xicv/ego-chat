@@ -516,12 +516,22 @@ npm run gate0:app-server
 
 See [GATE0.md](https://github.com/xicv/ego-chat/blob/main/GATE0.md) for the original component qualification, [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for the convergence contract and evidence, and [RESEARCH.md](https://github.com/xicv/ego-chat/blob/main/RESEARCH.md) for the research and architectural decision record.
 
+## Wait expiry and early delivery tracking
+
+`await_workflow` bounds one attachment, not the lifetime of the workflow. If its window expires while the workflow is running, MCP returns a **non-error** result with `waitStatus: "pending"`, `nextAction: "await_workflow"`, and `continuation: { tool, arguments }`. Call that exact continuation on the same workflow; do not submit another request or reconcile a still-running workflow. If completion raced with expiry, the final snapshot returns the terminal result instead. Snapshot/transport failures remain errors with the durable workflow ID. Older initial `*_and_wait` calls may still return `wait_timeout` with `details.workflowId`; recover through `await_workflow`.
+
+Token-Saver still performs no periodic status reads or progress notifications. A wait expiry adds one bounded final status read, with no model call and no new browser work. This does not wake a host task that has already exited; use broker-owned convergence for an until-settled job.
+
+After Send, `workflow.delivery` exposes confirmation time and a permanent `canonicalUrl` as soon as the exact prompt, target, and task-space evidence prove it—even while ChatGPT is generating. Until then the public URL is null and `locatorState` is `pending`. Temporary `/c/WEB:...` URLs are recoverable confirmed-Send evidence, but cannot be adopted, advertised as permanent URLs, or committed as a final conversation head. Promotion to a permanent URL is pinned durably once; a different permanent conversation is rejected. The binding stays unbound and its head unchanged until the final attributable response is captured. Consumers should save the workflow ID immediately, then the verified delivery permalink when available.
+
+`capturePending.observedAt` records the pending-state transition. `captureObservation.observedAt` records the latest successful browser observation, durably refreshed at most once per minute while the reason is unchanged. An observation-only update does not advance `updatedAt`, the semantic checkpoint, or its useful-progress deadline. Status describes generation as **last observed**, not guaranteed current progress. None of these signals proves an implementation or MR exists.
+
 ## Release verification
 
-v0.2.20 is a maintenance release of the qualified v0.2.19 implementation. It advances the package and runtime identity without adding conversation rollover, a BYOK advisor, or other new recovery behavior. The runtime-contract digest changes with the application version, so upgrade the installed MCP runtime and restart connected hosts together:
+v0.2.21 adds resumable MCP attachment expiry, bounded truthful capture observations, and early permanent-URL tracking with one-way create-once locator promotion. It does not add automatic resends, conversation rollover, or new MR authority. The browser and MCP contract revisions change; upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.20 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.21 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode

@@ -89,10 +89,28 @@ test("supervision distinguishes active generation from a markerless completed re
 
   assert.equal(generating.chatGpt.delivery, "sent_generating")
   assert.equal(generating.chatGpt.pendingReason, "generation_running")
-  assert.match(generating.message, /actively generating/)
+  assert.match(generating.message, /last browser observation found active generation/)
   assert.equal(markerless.chatGpt.delivery, "sent_response_incomplete")
   assert.equal(markerless.chatGpt.pendingReason, "response_not_terminal")
-  assert.match(markerless.message, /response is present but not terminal/)
+  assert.match(markerless.message, /response present but not terminal/)
+})
+
+test("direct exchange observations stay separate from semantic transitions", () => {
+  const supervision = superviseWorkflow({
+    id: "exchange-1",
+    kind: "ego_exchange",
+    status: "running",
+    phase: "send_confirmed",
+    updatedAt: "2026-09-07T01:00:00.000Z",
+    capturePending: { generationRunning: true, reason: "generation_running", observedAt: "2026-09-07T01:00:00.000Z" },
+    captureObservation: { generationRunning: true, reason: "generation_running", observedAt: "2026-09-07T01:05:00.000Z" },
+    delivery: { canonicalUrl: "https://chatgpt.com/c/confirmed" },
+  })
+  assert.equal(supervision.lastTransitionAt, "2026-09-07T01:00:00.000Z")
+  assert.equal(supervision.chatGpt.lastObservationAt, "2026-09-07T01:05:00.000Z")
+  assert.equal(supervision.chatGpt.canonicalUrl, "https://chatgpt.com/c/confirmed")
+  assert.equal(supervision.chatGpt.delivery, "sent_generating")
+  assert.match(supervision.message, /not proof of task progress/)
 })
 
 test("supervision reports a captured response without inspecting private workflow data", () => {

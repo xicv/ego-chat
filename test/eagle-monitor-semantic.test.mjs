@@ -20,6 +20,24 @@ import {
 const WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
 const START_MS = Date.parse("2026-09-04T00:00:00.000Z")
 
+test("browser observation refresh alone cannot create semantic novelty or move its deadline", () => {
+  const workflow = {
+    id: WORKFLOW_ID,
+    kind: "ego_exchange",
+    status: "running",
+    phase: "send_confirmed",
+    createdAt: "2026-09-07T01:00:00.000Z",
+    updatedAt: "2026-09-07T01:01:00.000Z",
+    capturePending: { generationRunning: true, reason: "generation_running", observedAt: "2026-09-07T01:01:00.000Z" },
+  }
+  const before = projectEagleSemanticCheckpoint(workflow)
+  const after = projectEagleSemanticCheckpoint({
+    ...workflow,
+    captureObservation: { generationRunning: true, reason: "generation_running", observedAt: "2026-09-07T01:05:00.000Z" },
+  })
+  assert.deepEqual(after, before)
+})
+
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }

@@ -22,6 +22,10 @@ function chatGptDelivery(workflow, childWorkflow) {
     return "not_started"
   }
   if (!childWorkflow) return "child_unavailable"
+  return exchangeDelivery(childWorkflow)
+}
+
+function exchangeDelivery(childWorkflow) {
   if (childWorkflow.status === "succeeded") {
     return "response_captured"
   }
@@ -64,12 +68,22 @@ function deliveryMessage(delivery) {
     queued: "the candidate is captured and ChatGPT delivery is queued",
     reconciling_delivery: "the broker is reconciling whether ChatGPT received the marked prompt",
     response_captured: "the ChatGPT response is durably captured",
-    sent_generating: "the ChatGPT prompt is durably sent and the response is actively generating",
-    sent_response_incomplete: "the ChatGPT prompt is durably sent and a response is present but not terminal",
+    sent_generating: "the ChatGPT prompt is durably sent; the last browser observation found active generation (not proof of task progress)",
+    sent_response_incomplete: "the ChatGPT prompt is durably sent; the last browser observation found a response present but not terminal",
     sent_waiting_response: "the ChatGPT prompt is durably sent and awaiting its response",
     workflow_stopped: "the convergence workflow is durably stopped",
   }
   return messages[delivery] ?? "ChatGPT delivery state is unknown"
+}
+
+function deliveryObservation(workflow, delivery) {
+  return {
+    canonicalUrl: workflow?.delivery?.canonicalUrl ?? null,
+    delivery,
+    lastObservationAt: workflow?.captureObservation?.observedAt
+      ?? workflow?.capturePending?.observedAt ?? null,
+    pendingReason: workflow?.capturePending?.reason ?? null,
+  }
 }
 
 export function superviseWorkflow(workflow, childWorkflow = undefined) {
@@ -77,9 +91,11 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
     throw new TypeError("workflow is required")
   }
   if (workflow.kind !== "convergence") {
+    const delivery = workflow.kind === "ego_exchange" ? exchangeDelivery(workflow) : null
     return {
+      ...(delivery ? { chatGpt: deliveryObservation(workflow, delivery) } : {}),
       lastTransitionAt: workflow.updatedAt ?? workflow.createdAt ?? null,
-      message: `${workflow.kind ?? "workflow"} is ${workflow.status ?? "unknown"} in phase ${workflow.phase ?? "unknown"}.`,
+      message: `${workflow.kind ?? "workflow"} is ${workflow.status ?? "unknown"} in phase ${workflow.phase ?? "unknown"}${delivery ? `; ${deliveryMessage(delivery)}` : ""}.`,
       phase: workflow.phase ?? null,
       stage: workflow.status === "running" ? "working" : "stopped",
       status: workflow.status ?? "unknown",
@@ -125,10 +141,9 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
 
   return {
     chatGpt: {
+      ...deliveryObservation(childWorkflow, delivery),
       childPhase: childWorkflow?.phase ?? null,
       childStatus: childWorkflow?.status ?? null,
-      delivery,
-      pendingReason: childWorkflow?.capturePending?.reason ?? null,
     },
     codex: {
       appServerRecoveryCount,

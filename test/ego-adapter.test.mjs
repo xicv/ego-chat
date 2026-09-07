@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks"
 import test from "node:test"
 
 import { EgoAdapter, decodeDriverResult } from "../src/ego-adapter.mjs"
+import { BROWSER_CONTRACT_REVISION } from "../src/constants.mjs"
 import {
   EGO_DRIVER_RESULT_PREFIX,
   EGO_DRIVER_SOURCE,
@@ -103,7 +104,7 @@ async function runMalformedModelPolicyCase(attributes, {
   const mailboxDirectory = `/tmp/egc-driver-${driverUid}`
   const ownerPath = `${mailboxDirectory}/owner.json`
   const input = {
-    browserContractRevision: 14,
+    browserContractRevision: BROWSER_CONTRACT_REVISION,
     binding: {
       startUrl: "https://chatgpt.com/",
       state: "unbound",
@@ -362,7 +363,7 @@ async function runPreSendDriverCase({
   }
   const input = {
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
-    browserContractRevision: 14,
+    browserContractRevision: BROWSER_CONTRACT_REVISION,
     binding: boundTaskSpaceOwnership === null
       ? {
           messageCount: 0,
@@ -784,7 +785,7 @@ async function runBoundHeadDriverCase({
     ? [observedEntries, initialEntries]
     : [observedEntries, observedEntries]
   const input = {
-    browserContractRevision: 14,
+    browserContractRevision: BROWSER_CONTRACT_REVISION,
     binding: {
       canonicalUrl,
       headContentDigest: createHash("sha256").update(initialEntry.text, "utf8").digest("hex"),
@@ -1411,7 +1412,7 @@ async function runTaskSpaceReconciliationCase({
       ownerPath,
       pid: process.pid,
     },
-    browserContractRevision: 14,
+    browserContractRevision: BROWSER_CONTRACT_REVISION,
     canonicalUrl: sentCanonicalUrl ?? canonicalUrl,
     ...(mode === "capture_attachment_execution"
       ? {
@@ -3830,6 +3831,42 @@ test("create-once reconciliation rejects a copied prompt with a different provid
   assert.equal(result.error?.details?.reason, "reconciliation_prompt_mismatch")
   assert.equal(result.counters.click, 0)
   assert.equal(result.counters.typeText, 0)
+})
+
+test("create-once capture cannot promote one permanent conversation to another", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    bindingState: "unbound",
+    captureContinuationAllowed: true,
+    generationRunning: true,
+    mode: "capture_exchange",
+    sentCanonicalUrl: "https://chatgpt.com/c/a-different-permanent-chat",
+  })
+  assert.equal(captured.result, undefined)
+  assert.equal(captured.error?.details?.reason, "canonical_conversation_changed")
+  assert.equal(captured.counters.click, 0)
+  assert.equal(captured.counters.typeText, 0)
+})
+
+test("confirmed provisional locators remain recoverable but cannot commit a final head", async () => {
+  const provisionalUrl = "https://chatgpt.com/c/WEB:still-generating"
+  const options = {
+    bindingState: "unbound",
+    canonicalUrl: provisionalUrl,
+    sentCanonicalUrl: provisionalUrl,
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+  }
+  const pending = await runTaskSpaceReconciliationCase({ ...options, generationRunning: true })
+  assert.equal(pending.error, undefined)
+  assert.equal(pending.result.captureState, "pending")
+  const completed = await runTaskSpaceReconciliationCase({
+    ...options,
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+  })
+  assert.equal(completed.result, undefined)
+  assert.equal(completed.error?.details?.reason, "confirmed_send_canonical_url_pending")
+  assert.equal(completed.counters.click, 0)
+  assert.equal(completed.counters.typeText, 0)
 })
 
 test("create-once reconciliation uses the confirmed provider ID when rendered prompt text differs", async () => {
