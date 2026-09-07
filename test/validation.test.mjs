@@ -6,10 +6,25 @@ import {
   AttachmentCaptureRequestSchema,
   AttachmentEvidenceRequestSchema,
   AttachmentEvidenceReleaseRequestSchema,
+  CanonicalConversationUrlSchema,
   EgoExchangeSchema,
   StartConvergenceSchema,
   parse,
 } from "../src/validation.mjs"
+
+test("canonical conversation inputs reject provisional and malformed locators", () => {
+  for (const url of [
+    "https://chatgpt.com/c/example",
+    "https://chatgpt.com/g/g-p-example/c/6a9e06c4-9860-83ec-8dc7-68af8bbac4bd",
+  ]) assert.equal(parse(CanonicalConversationUrlSchema, url), url)
+  for (const url of [
+    "https://chatgpt.com/c/WEB:temporary",
+    "https://chatgpt.com/c/WEB%3Atemporary",
+    "https://chatgpt.com/c/example/another-page",
+    "https://chatgpt.com/not-a-chat/c/example",
+    "https://other.example/c/example",
+  ]) assert.throws(() => parse(CanonicalConversationUrlSchema, url), (error) => error.code === "invalid_input", url)
+})
 
 function convergenceInput(wallClockTimeoutMs) {
   return {

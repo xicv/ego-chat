@@ -3905,7 +3905,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
   assert.ok(Date.parse(observedAt) <= Date.parse(pendingEvents[0].at))
 })
 
-test("confirmed create-once capture promotes a provisional locator without another Send", async (t) => {
+test("confirmed create-once capture pins a permalink and survives restart without another Send", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   const canonicalUrl = "https://chatgpt.com/c/create-once-promoted"
@@ -3913,8 +3913,14 @@ test("confirmed create-once capture promotes a provisional locator without anoth
   const terminalMarker = "EGO_CHAT_CREATE_ONCE_PROMOTED_DONE"
   const turnMarker = "EGO_CHAT_CREATE_ONCE_PROMOTED_TEST"
   const promptMessageId = "create-once-promoted-user"
+  const pendingCaptured = Promise.withResolvers()
+  const finish = Promise.withResolvers()
+  t.after(() => finish.resolve())
   let captures = 0
   let sends = 0
+  const captureInputs = []
+  let provisionalDelivery
+  let firstTransitionAt
   const egoAdapter = {
     ...unusedEgoAdapter,
     bind: async (input) => ({
@@ -3923,14 +3929,17 @@ test("confirmed create-once capture promotes a provisional locator without anoth
       taskSpaceIdentity: browserTaskSpaceIdentity("19"),
       taskSpaceId: 19,
     }),
-    captureExchange: async () => {
+    captureExchange: async (input, signal) => {
       captures += 1
-      if (captures === 1) {
+      captureInputs.push(input)
+      if (captures === 1) provisionalDelivery = broker.getWorkflow({ workflowId: started.id }).delivery
+      if (captures === 2) firstTransitionAt = broker.getWorkflow({ workflowId: started.id }).updatedAt
+      if (captures <= 2) {
         return {
           canonicalUrl,
-          captureReason: "response_not_terminal",
+          captureReason: "generation_running",
           captureState: "pending",
-          generationRunning: false,
+          generationRunning: true,
           promptMessageId,
           targetId: "create-once-promoted-tab",
           taskSpaceIdentity: browserTaskSpaceIdentity("19"),
@@ -3938,6 +3947,11 @@ test("confirmed create-once capture promotes a provisional locator without anoth
           turnMarker,
         }
       }
+      pendingCaptured.resolve()
+      await new Promise((resolve, reject) => {
+        finish.promise.then(resolve)
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+      })
       const responseText = terminalMarker
       return {
         canonicalUrl,
@@ -3971,7 +3985,8 @@ test("confirmed create-once capture promotes a provisional locator without anoth
       }
     },
   }
-  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  const store = new EventStore(dataDir)
+  const broker = new Broker({ captureObservationIntervalMs: 1, egoAdapter, store })
   await broker.initialize()
   t.after(() => broker.close())
   await broker.bindConversation({
@@ -3989,14 +4004,56 @@ test("confirmed create-once capture promotes a provisional locator without anoth
     timeoutMs: 30_000,
     turnMarker,
   })
-  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+  await pendingCaptured.promise
+  const pending = broker.getWorkflow({ workflowId: started.id })
+  assert.equal(pending.status, "running")
+  assert.equal(pending.phase, "send_confirmed")
+  assert.equal(provisionalDelivery.canonicalUrl, null)
+  assert.equal(provisionalDelivery.locatorState, "pending")
+  assert.deepEqual(pending.delivery, {
+    canonicalUrl,
+    locatorState: "permanent",
+    sentAt: store.getWorkflow(started.id).private.send.sentAt,
+    state: "confirmed",
+  })
+  assert.equal(pending.private, undefined)
+  assert.equal(pending.updatedAt, firstTransitionAt)
+  assert.equal(pending.captureObservation.generationRunning, true)
+  assert.ok(pending.captureObservation.observedAt > pending.capturePending.observedAt)
+  assert.ok(pending.updatedAt >= pending.capturePending.observedAt)
+  assert.equal(captureInputs[1].canonicalUrl, canonicalUrl)
+  assert.equal(captureInputs[1].binding.canonicalUrl, canonicalUrl)
+  assert.equal(store.getWorkflow(started.id).reconciliation.confirmedTaskSpace.canonicalUrl, canonicalUrl)
+  const beforeCompletion = broker.getConversationBinding({ bindingKey: "create-once-promoted" })
+  assert.equal(beforeCompletion.state, "unbound")
+  assert.equal(beforeCompletion.canonicalUrl, null)
+  assert.equal(beforeCompletion.messageCount, null)
+  const observationEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line))
+    .filter((event) => event.type === "exchange.capture_observed")
+  assert.equal(observationEvents.length, 1)
+  assert.equal(observationEvents[0].workflow.updatedAt, pending.updatedAt)
+  broker.close()
+  const restarted = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await restarted.initialize()
+  t.after(() => restarted.close())
+  assert.equal(restarted.getWorkflow({ workflowId: started.id }).delivery.canonicalUrl, canonicalUrl)
+  await assert.rejects(restarted.bindConversation({
+    bindingKey: "permalink-competitor",
+    mode: "existing",
+    canonicalUrl,
+    taskSpace: 20,
+  }), (error) => error.code === "conversation_reserved")
+  finish.resolve()
+  const completed = await restarted.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
 
   assert.equal(completed.status, "succeeded")
   assert.equal(completed.captureRecoveryCount ?? 0, 0)
   assert.equal(completed.result.canonicalUrl, canonicalUrl)
   assert.equal(sends, 1)
-  assert.equal(captures, 2)
-  const binding = broker.getConversationBinding({ bindingKey: "create-once-promoted" })
+  assert.equal(captures, 4)
+  assert.equal(captureInputs[3].canonicalUrl, canonicalUrl)
+  const binding = restarted.getConversationBinding({ bindingKey: "create-once-promoted" })
   assert.equal(binding.state, "bound")
   assert.equal(binding.canonicalUrl, canonicalUrl)
 })

@@ -10,6 +10,7 @@ import {
   MAX_REVIEW_PACKET_BYTES,
   MAX_RESULT_BYTES,
   MAX_WAIT_MS,
+  TERMINAL_STATUSES,
 } from "./constants.mjs"
 import { loadConfig } from "./config.mjs"
 import { requestBroker } from "./ipc-client.mjs"
@@ -19,6 +20,7 @@ import {
 } from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
+import { isCanonicalConversationUrl } from "./validation.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
 const PROGRESS_HEARTBEAT_MS = 60 * 1_000
@@ -42,19 +44,7 @@ const CONVERSATION_ADOPTION_INPUT_SCHEMA = {
   allowTaskSpaceReclaim: z.literal(true).default(true)
     .describe("Read-only adoption automatically reclaims only its dedicated Ego task space."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/).optional(),
-  canonicalUrl: z.string().url().refine((value) => {
-    try {
-      const parsed = new URL(value)
-      return parsed.protocol === "https:"
-        && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
-        && parsed.username === ""
-        && parsed.password === ""
-        && parsed.port === ""
-        && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(parsed.pathname)
-    } catch (_error) {
-      return false
-    }
-  }, "URL must identify a canonical HTTPS ChatGPT conversation"),
+  canonicalUrl: z.string().url().refine(isCanonicalConversationUrl, "URL must identify a permanent canonical HTTPS ChatGPT conversation"),
   projectUrl: z.string().url().optional(),
   targetId: z.string().min(1).max(200).optional(),
   taskSpace: z.union([z.string().min(1).max(120), z.number().int().positive()])
@@ -137,6 +127,8 @@ const MCP_INSTRUCTIONS = [
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never duplicate an ambiguous send. Keep its durable workflow alive and reconcile it; retry delivery only after exact evidence proves the prior marked prompt absent.",
+  "An await_workflow attachment-window expiry returns waitStatus pending with the exact continuation for that same workflow, not a failure. Keep this task alive and reattach; never start again or call ego_reconcile_conversation on a still-running workflow. Older initial wait_timeout errors also carry details.workflowId for reattachment. A bounded final snapshot is allowed even in token_saver mode to resolve the terminal race; there is no periodic supervision in that mode.",
+  "For create-once delivery, workflow.delivery.canonicalUrl exposes only a verified permanent URL, or null while the locator is pending. Never treat /c/WEB: as a permalink. The binding head remains uncommitted until final capture. captureObservation.observedAt is the last successful browser observation, not proof of useful progress, a completed implementation, or an MR.",
   "A stable assistant-only conversation-head advance before composition is re-anchored automatically. Unstable, generating, or possibly sent states remain inside durable reconciliation and must not become a human relay ceremony.",
 ].join(" ")
 
@@ -173,6 +165,9 @@ function waitedToolResult(value, waitMode) {
     ...(result.responseRef ? { responseRef: result.responseRef } : {}),
     ...(structured.settled !== undefined ? { settled: structured.settled } : {}),
     ...(structured.nextAction ? { nextAction: structured.nextAction } : {}),
+    ...(structured.waitStatus ? { waitStatus: structured.waitStatus } : {}),
+    ...(structured.continuation ? { continuation: structured.continuation } : {}),
+    ...(structured.delivery ? { delivery: structured.delivery } : {}),
     ...(Number.isInteger(structured.nextCycle) ? { nextCycle: structured.nextCycle } : {}),
     ...(structured.protocolNormalization?.applied
       ? { protocolNormalization: structured.protocolNormalization }
@@ -952,7 +947,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "await_workflow",
     {
-      description: "Attach to a durable workflow and wait for a terminal result. Safe to call again after an MCP facade or client restart.",
+      description: "Attach to a durable workflow. A wait-window expiry returns a non-error pending result with the exact await_workflow continuation; reattach to that same workflow, never resend or reconcile a still-running workflow. Safe after a facade or client restart.",
       inputSchema: {
         timeoutMs: z.number().int().min(1).max(MAX_WAIT_MS),
         waitMode: waitModeSchema(),
@@ -962,14 +957,36 @@ export function createMcpServer(config = loadConfig()) {
     async (input, extra) => {
       try {
         const { waitMode, ...request } = input
-        const result = await withWaitMode(extra, `Waiting for workflow ${request.workflowId}`, waitMode, () => requestBroker(
-          config,
-          "workflow.await",
-          request,
-          { signal: extra.signal, timeoutMs: Math.min(MAX_WAIT_MS + 5_000, request.timeoutMs + 5_000) },
-        ), { config, workflowId: request.workflowId })
+        const result = await withWaitMode(extra, `Waiting for workflow ${request.workflowId}`, waitMode, async () => {
+          try {
+            return await requestBroker(config, "workflow.await", request, {
+              signal: extra.signal,
+              timeoutMs: Math.min(MAX_WAIT_MS + 5_000, request.timeoutMs + 5_000),
+            })
+          } catch (error) {
+            if (!(error instanceof EgoChatError) || error.code !== "wait_timeout") throw error
+            // Expiry detaches this waiter, not the workflow. One bounded final
+            // snapshot handles the completion race without starting a poll loop.
+            const snapshot = await requestBroker(config, "workflow.get", {
+              workflowId: request.workflowId,
+            }, { signal: extra.signal, timeoutMs: 5_000 })
+            if (snapshot?.id !== request.workflowId || (
+              snapshot.status !== "running" && !TERMINAL_STATUSES.has(snapshot.status)
+            )) {
+              throw new EgoChatError("invalid_workflow_snapshot", "The final wait snapshot did not identify the requested workflow state.")
+            }
+            if (snapshot.status !== "running") return snapshot
+            return {
+              ...snapshot,
+              waitStatus: "pending",
+              nextAction: "await_workflow",
+              continuation: { tool: "await_workflow", arguments: { ...request, waitMode } },
+            }
+          }
+        }, { config, workflowId: request.workflowId })
         return waitedToolResult(result, waitMode)
       } catch (error) {
+        attachWaitRecovery(error, { id: input.workflowId }, input.waitMode)
         return toolError(error)
       }
     },

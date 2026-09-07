@@ -77,11 +77,18 @@ function isChatGptUrl(value) {
   }
 }
 
-function isCanonicalConversationUrl(value) {
+export function isCanonicalConversationUrl(value) {
   if (!isChatGptUrl(value)) {
     return false
   }
-  return /(?:^|\/)c\/[^/]+(?:\/|$)/.test(new URL(value).pathname)
+  return /^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/[A-Za-z0-9_-]+\/?$/.test(new URL(value).pathname)
+}
+
+// Legacy confirmed Sends can carry ChatGPT's temporary WEB locator. It is
+// recovery evidence only, never an adoptable or publicly advertised permalink.
+export function isProvisionalConversationUrl(value) {
+  return typeof value === "string" && value.length <= 2_048 && isChatGptUrl(value)
+    && /^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/WEB:[A-Za-z0-9_-]+\/?$/.test(new URL(value).pathname)
 }
 
 export const ChatGptUrlSchema = z.string().min(1).max(2_048)

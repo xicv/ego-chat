@@ -140,7 +140,12 @@ async function egoDriverMain(
 
   function isCanonicalConversationUrl(value) {
     return isChatGptOrigin(value)
-      && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(new URL(value).pathname)
+      && /^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/[A-Za-z0-9_-]+\/?$/.test(new URL(value).pathname)
+  }
+
+  function isProvisionalConversationUrl(value) {
+    return isChatGptOrigin(value)
+      && /^\/(?:g\/[A-Za-z0-9_-]+\/)?c\/WEB:[A-Za-z0-9_-]+\/?$/.test(new URL(value).pathname)
   }
 
   function humanRequired(reason, message, evidence) {
@@ -1027,8 +1032,11 @@ async function egoDriverMain(
         )
         return false
       }
+      const provisionalReceipt = input.binding?.state === "unbound"
+        && (result.captureState === "pending" || phase === "before_send_confirmation_result")
+        && isProvisionalConversationUrl(actualCanonicalUrl)
       if (
-        !isCanonicalConversationUrl(actualCanonicalUrl)
+        (!isCanonicalConversationUrl(actualCanonicalUrl) && !provisionalReceipt)
         || actualCanonicalUrl !== expectedCanonicalUrl
       ) {
         humanRequired(
@@ -3393,7 +3401,7 @@ async function egoDriverMain(
     let expectedCanonicalUrl = input.canonicalUrl ?? input.binding.canonicalUrl
     let selected
     if (input.binding.state === "unbound") {
-      if (!isCanonicalConversationUrl(expectedCanonicalUrl)) {
+      if (!isCanonicalConversationUrl(expectedCanonicalUrl) && !isProvisionalConversationUrl(expectedCanonicalUrl)) {
         humanRequired("confirmed_send_canonical_url_invalid", "The confirmed create-once send has no canonical conversation locator.", {
           targetId: input.binding.targetId,
           taskSpaceId: input.binding.taskSpaceId,
@@ -3408,14 +3416,21 @@ async function egoDriverMain(
       if (!assertReady(inspection, selected)) {
         return
       }
-      if (!isCanonicalConversationUrl(inspection.info.url)) {
+      const observedUrl = normalizeUrl(inspection.info.url)
+      if (!isCanonicalConversationUrl(observedUrl) && !isProvisionalConversationUrl(observedUrl)) {
         humanRequired("confirmed_send_conversation_missing", "The confirmed create-once send no longer has a canonical conversation page.", {
           targetId: selected.targetId,
           taskSpaceId: selected.task.id,
         })
         return
       }
-      expectedCanonicalUrl = normalizeUrl(inspection.info.url)
+      if (observedUrl !== normalizeUrl(expectedCanonicalUrl) && !(
+        isProvisionalConversationUrl(expectedCanonicalUrl) && isCanonicalConversationUrl(observedUrl)
+      )) {
+        humanRequired("canonical_conversation_changed", "The confirmed create-once conversation changed its pinned locator.")
+        return
+      }
+      expectedCanonicalUrl = observedUrl
       selected = { ...selected, inspection }
     } else {
       selected = await selectConversation({
@@ -3771,6 +3786,10 @@ async function egoDriverMain(
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,
       })
+      return
+    }
+    if (!isCanonicalConversationUrl(inspection.info.url)) {
+      humanRequired("confirmed_send_canonical_url_pending", "The confirmed prompt is still on a temporary locator; capture will resume without another Send.")
       return
     }
     if (!await assertBrokerAuthority("before_head_commit")) {
@@ -4144,11 +4163,15 @@ async function egoDriverMain(
     driverStage = "resolving_canonical_conversation"
     let postSendInfo = await pageInfo()
     const canonicalDeadline = Math.min(sentAt + input.timeoutMs, Date.now() + 30_000)
-    while (!isCanonicalConversationUrl(postSendInfo.url) && Date.now() < canonicalDeadline) {
+    const validSentLocator = (url) => isCanonicalConversationUrl(url) || (
+      input.binding.state === "unbound" && input.exchangeStage === "send_only"
+      && isProvisionalConversationUrl(url)
+    )
+    while (!validSentLocator(postSendInfo.url) && Date.now() < canonicalDeadline) {
       await wait(1)
       postSendInfo = await pageInfo()
     }
-    if (!isCanonicalConversationUrl(postSendInfo.url)) {
+    if (!validSentLocator(postSendInfo.url)) {
       humanRequired("canonical_conversation_missing", "The marked prompt appeared, but ChatGPT did not expose a canonical conversation URL.", {
         targetId: selected.targetId,
         taskSpaceId: selected.task.id,

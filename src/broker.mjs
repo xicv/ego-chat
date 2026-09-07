@@ -59,25 +59,14 @@ import {
   StartProbeSchema,
   WorkflowIdInputSchema,
   WorkflowReconcileObservationSchema,
+  isCanonicalConversationUrl,
+  isProvisionalConversationUrl,
+  normalizeChatGptUrl,
   parse,
 } from "./validation.mjs"
 
 function digest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex")
-}
-
-function isCanonicalChatGptConversationUrl(value) {
-  try {
-    const parsed = new URL(value)
-    return parsed.protocol === "https:"
-      && (parsed.hostname === "chatgpt.com" || parsed.hostname === "www.chatgpt.com")
-      && parsed.username === ""
-      && parsed.password === ""
-      && parsed.port === ""
-      && /(?:^|\/)c\/[^/]+(?:\/|$)/.test(parsed.pathname)
-  } catch {
-    return false
-  }
 }
 
 const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/
@@ -402,6 +391,7 @@ function taskSpaceSelectorForBinding(binding) {
 }
 
 function canonicalWorkflowEvidenceUrl(value) {
+  if (isProvisionalConversationUrl(value)) return normalizeChatGptUrl(value)
   const parsed = CanonicalConversationUrlSchema.safeParse(value)
   if (!parsed.success) {
     throw new EgoChatError(
@@ -423,6 +413,7 @@ function effectiveWorkflowBinding(binding, workflow) {
     return binding
   }
   const authoritative = evidence.map(([source, value]) => {
+    if (source === "result") parse(CanonicalConversationUrlSchema, value?.canonicalUrl)
     const identity = validateTaskSpaceIdentity(value?.taskSpaceIdentity)
     if (!identity) {
       throw new EgoChatError(
@@ -465,7 +456,9 @@ function effectiveWorkflowBinding(binding, workflow) {
     canonicalUrlChanged
     && binding?.state === "unbound"
     && resultEvidence
+    && isCanonicalConversationUrl(resultEvidence.canonicalUrl)
     && provisionalEvidence.length > 0
+    && isProvisionalConversationUrl(provisionalEvidence[0].canonicalUrl)
     && provisionalEvidence.every((value) => (
       value.canonicalUrl === provisionalEvidence[0].canonicalUrl
       && (!value.targetId || value.targetId === resultEvidence.targetId)
@@ -563,6 +556,9 @@ function bindingsShareTaskSpace(first, second) {
 
 function validatePendingCapture(value, workflow, binding) {
   if (value?.captureState !== "pending") {
+    if (!isCanonicalConversationUrl(value?.canonicalUrl)) {
+      throw new EgoChatError("capture_canonical_url_pending", "Final capture requires a permanent conversation URL; retain the confirmed Send and resume capture.")
+    }
     return false
   }
   const sent = workflow.private?.send
@@ -579,8 +575,8 @@ function validatePendingCapture(value, workflow, binding) {
     binding?.state === "unbound"
     && value.targetId === sent?.targetId
     && value.taskSpaceId === sent?.taskSpaceId
-    && isCanonicalChatGptConversationUrl(sent?.canonicalUrl)
-    && isCanonicalChatGptConversationUrl(value.canonicalUrl)
+    && isProvisionalConversationUrl(sent?.canonicalUrl)
+    && isCanonicalConversationUrl(value.canonicalUrl)
   )
   const exactIdentity = sent
     && canonicalIdentity
@@ -655,6 +651,16 @@ function responseExcerpt(value, maximumBytes = 4 * 1024) {
 
 function publicWorkflow(workflow) {
   const copy = structuredClone(workflow)
+  const sent = workflow.private?.send
+  if (sent) {
+    const permanent = isCanonicalConversationUrl(sent.canonicalUrl)
+    copy.delivery = {
+      canonicalUrl: permanent ? normalizeChatGptUrl(sent.canonicalUrl) : null,
+      locatorState: permanent ? "permanent" : "pending",
+      sentAt: sent.sentAt ?? null,
+      state: "confirmed",
+    }
+  }
   delete copy.private
   return copy
 }
@@ -1018,6 +1024,7 @@ export class Broker {
   #controllers = new Map()
   #egoAdapter
   #recoveryDelaysMs
+  #captureObservationIntervalMs
   #store
   #taskSpine
   #taskSpineInitializationError = null
@@ -1031,6 +1038,7 @@ export class Broker {
     attachmentReceiptAuthority = undefined,
     brokerIdentity = undefined,
     brokerLease = undefined,
+    captureObservationIntervalMs = 60_000,
     convergenceChildWaitSliceMs = DEFAULT_CONVERGENCE_CHILD_WAIT_SLICE_MS,
     egoAdapter,
     recoveryDelaysMs = DEFAULT_RECOVERY_DELAYS_MS,
@@ -1047,6 +1055,10 @@ export class Broker {
     if (!Number.isSafeInteger(convergenceChildWaitSliceMs) || convergenceChildWaitSliceMs < 1) {
       throw new TypeError("convergenceChildWaitSliceMs must be a positive safe integer")
     }
+    if (!Number.isSafeInteger(captureObservationIntervalMs) || captureObservationIntervalMs < 1) {
+      throw new TypeError("captureObservationIntervalMs must be a positive safe integer")
+    }
+    this.#captureObservationIntervalMs = captureObservationIntervalMs
     this.#appServerFactory = appServerFactory
     this.#attachmentReceiptAuthority = attachmentReceiptAuthority
     this.#brokerIdentity = brokerIdentity ?? {
@@ -4149,15 +4161,19 @@ export class Broker {
                   timeoutMs: remainingMs,
                 },
                 controller.signal,
-                (result) => this.#reserveBrowserTaskSpaceIdentity({
-                  allowCanonicalPromotion: binding.state === "unbound",
-                  expectedCanonicalUrl: captureBinding.canonicalUrl,
-                  key: captureBinding.key,
-                  owner: workflow.id,
-                  result,
-                }),
+                (result) => {
+                  validatePendingCapture(result, current, binding)
+                  return this.#reserveBrowserTaskSpaceIdentity({
+                    allowCanonicalPromotion: binding.state === "unbound",
+                    expectedCanonicalUrl: captureBinding.canonicalUrl,
+                    key: captureBinding.key,
+                    owner: workflow.id,
+                    result,
+                  })
+                },
                 () => ({ taskSpaceGuard: this.#taskSpaceGuard(workflow.id) }),
               )
+              const pendingCapture = validatePendingCapture(captured, current, binding)
               this.#reserveBrowserTaskSpaceIdentity({
                 allowCanonicalPromotion: binding.state === "unbound",
                 expectedCanonicalUrl: captureBinding.canonicalUrl,
@@ -4165,25 +4181,49 @@ export class Broker {
                 owner: workflow.id,
                 result: captured,
               })
-              if (validatePendingCapture(captured, current, binding)) {
+              if (pendingCapture) {
                 const capturePending = {
                   generationRunning: captured.generationRunning,
                   observedAt: new Date().toISOString(),
                   reason: captured.captureReason,
                 }
-                if (
+                const locatorPromoted = captured.canonicalUrl !== current.private.send.canonicalUrl
+                if (locatorPromoted ||
                   current.capturePending?.reason !== capturePending.reason
                   || current.capturePending?.generationRunning !== capturePending.generationRunning
                 ) {
                   await this.#transition(current, "exchange.response_pending", {
+                    captureObservation: capturePending,
                     capturePending,
                     phase: "send_confirmed",
-                    private: current.private,
+                    // Pin the verified permalink and its durable task-space claim
+                    // in one CAS append. The binding head remains uncommitted.
+                    ...(locatorPromoted ? {
+                      private: {
+                        ...current.private,
+                        send: { ...current.private.send, canonicalUrl: captured.canonicalUrl },
+                      },
+                      reconciliation: {
+                        ...current.reconciliation,
+                        confirmedTaskSpace: {
+                          ...current.reconciliation.confirmedTaskSpace,
+                          canonicalUrl: captured.canonicalUrl,
+                        },
+                      },
+                    } : {}),
                   })
                   current = this.#store.getWorkflow(workflow.id)
                   if (!current || current.status !== "running") {
                     return
                   }
+                } else if (Date.parse(capturePending.observedAt)
+                  - Date.parse(current.captureObservation?.observedAt ?? "1970-01-01T00:00:00.000Z")
+                  >= this.#captureObservationIntervalMs) {
+                  await this.#transition(current, "exchange.capture_observed", {
+                    captureObservation: capturePending,
+                  }, { touchUpdatedAt: false })
+                  current = this.#store.getWorkflow(workflow.id)
+                  if (!current || current.status !== "running") return
                 }
                 const requeueDelayMs = captured.captureReason === "response_not_terminal"
                   ? 2_000
@@ -6639,6 +6679,8 @@ export class Broker {
       && expectedUrl
       && admissionCanonicalUrl
       && candidateCanonicalUrl
+      && isProvisionalConversationUrl(expectedUrl)
+      && isCanonicalConversationUrl(candidateCanonicalUrl)
       && candidateTaskSpaceIdentity
       && admissionTaskSpaceIdentity
       && isDeepStrictEqual(candidateTaskSpaceIdentity, admissionTaskSpaceIdentity)
@@ -6911,13 +6953,13 @@ export class Broker {
     }
   }
 
-  async #transition(workflow, eventType, patch) {
+  async #transition(workflow, eventType, patch, { touchUpdatedAt = true } = {}) {
     let expected = workflow
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const next = {
         ...expected,
         ...patch,
-        updatedAt: new Date().toISOString(),
+        updatedAt: touchUpdatedAt ? new Date().toISOString() : expected.updatedAt,
       }
       for (const key of [
         "activeCodexInspectionRetryCount",

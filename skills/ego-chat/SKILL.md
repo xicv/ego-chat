@@ -28,6 +28,10 @@ Keep the default `waitMode: progress` for durable convergence so the user sees d
 
 Large responses may return `responseRef` and `responseExcerpt`. Read missing bytes with `ego_read_result` using the exact workflow ID and digest, following `nextOffset` without rereading earlier ranges.
 
+An `await_workflow` attachment-window expiry is not a workflow failure. It returns `waitStatus: pending` and an exact `continuation` for the same workflow; keep the current task alive and call that continuation, without a second start/Send. One bounded final status read resolves the expiry/completion race even in Token-Saver mode; it is not periodic supervision. Other errors retain `details.workflowId` and `waitMode` for reattachment. Older initial `*_and_wait` calls may still return `wait_timeout` with that handle: use `await_workflow`, not `ego_reconcile_conversation`, while the workflow is running. Reconciliation is for an eligible stopped or interrupted workflow, not an expired waiter.
+
+For a create-once handoff, `workflow.delivery.canonicalUrl` is the verified permanent URL as soon as an attributable pending capture observes it. Until then it is null with `locatorState: pending`; never record a temporary `/c/WEB:...` locator as a permalink. The binding remains unbound with its old head until final capture, so a null binding URL does not mean Send failed. Record the exact workflow ID first and the verified permanent URL when available. `captureObservation.observedAt` is the last successful browser observation, persisted at most once per minute while unchanged. It is separate from `capturePending.observedAt` and semantic transition time: an observed generation control, broker heartbeat, or Send confirmation proves neither useful implementation progress nor an MR.
+
 ## Choose the loop
 
 - For one free-form handoff, use `ego_exchange_and_wait` with unique turn and terminal markers.

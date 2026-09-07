@@ -609,6 +609,100 @@ test("Token-Saver wait errors preserve the durable workflow recovery handle", as
   assert.equal(error.details.workflowId, workflowId)
 })
 
+for (const waitMode of ["progress", "token_saver"]) {
+  test(`await expiry returns a resumable non-error result in ${waitMode} mode`, async (t) => {
+    const { config, env } = await createTestConfig()
+    const workflowId = "a2397352-b40f-428a-87d6-379abb262573"
+    const running = { id: workflowId, kind: "ego_exchange", phase: "send_confirmed", status: "running" }
+    const calls = []
+    let complete = false
+    const ipc = await startIpcServer({
+      dispatch: async (method, input) => {
+        calls.push(method)
+        assert.equal(input.workflowId, workflowId)
+        if (method === "workflow.get") return running
+        if (method === "workflow.await") {
+          if (complete) return { ...running, phase: "head_committed", status: "succeeded" }
+          throw new EgoChatError("wait_timeout", "Attachment window expired.")
+        }
+        throw new Error(`Unexpected mutation: ${method}`)
+      },
+      socketPath: config.socketPath,
+      token: await loadOrCreateBrokerToken(config.dataDir),
+    })
+    t.after(async () => { await ipc.close(); await removeTestConfig(config) })
+    const client = await connectClient(env)
+    t.after(() => client.close())
+    const result = await client.callTool({
+      name: "await_workflow",
+      arguments: { workflowId, timeoutMs: 100, waitMode },
+    })
+    assert.notEqual(result.isError, true)
+    assert.equal(result.structuredContent.status, "running")
+    assert.equal(result.structuredContent.waitStatus, "pending")
+    assert.deepEqual(result.structuredContent.continuation, {
+      tool: "await_workflow",
+      arguments: { workflowId, timeoutMs: 100, waitMode },
+    })
+    const text = JSON.parse(result.content[0].text)
+    assert.deepEqual(text.continuation, result.structuredContent.continuation)
+    assert.equal(text.waitStatus, "pending")
+    if (waitMode === "token_saver") assert.deepEqual(calls, ["workflow.await", "workflow.get"])
+    complete = true
+    const resumed = await client.callTool({
+      name: result.structuredContent.continuation.tool,
+      arguments: result.structuredContent.continuation.arguments,
+    })
+    assert.equal(resumed.structuredContent.status, "succeeded")
+    assert.equal(resumed.structuredContent.continuation, undefined)
+    assert.ok(calls.every((method) => ["workflow.await", "workflow.get"].includes(method)))
+  })
+}
+
+for (const scenario of ["terminal_race", "snapshot_failed", "invalid_snapshot", "other_error"]) {
+  test(`await expiry handles ${scenario} without inventing a running result`, async (t) => {
+    const { config, env } = await createTestConfig()
+    const workflowId = "a2397352-b40f-428a-87d6-379abb262573"
+    let reads = 0
+    const ipc = await startIpcServer({
+      dispatch: async (method) => {
+        if (method === "workflow.await") {
+          throw new EgoChatError(scenario === "other_error" ? "workflow_not_found" : "wait_timeout", "Controlled error.")
+        }
+        assert.equal(method, "workflow.get")
+        reads += 1
+        if (scenario === "snapshot_failed") throw new EgoChatError("transport_closed", "Snapshot unavailable.")
+        if (scenario === "invalid_snapshot") return null
+        return { id: workflowId, status: "succeeded", phase: "head_committed" }
+      },
+      socketPath: config.socketPath,
+      token: await loadOrCreateBrokerToken(config.dataDir),
+    })
+    t.after(async () => { await ipc.close(); await removeTestConfig(config) })
+    const client = await connectClient(env)
+    t.after(() => client.close())
+    const result = await client.callTool({
+      name: "await_workflow",
+      arguments: { workflowId, timeoutMs: 100, waitMode: "token_saver" },
+    })
+    if (scenario === "terminal_race") {
+      assert.notEqual(result.isError, true)
+      assert.equal(result.structuredContent.status, "succeeded")
+      assert.equal(result.structuredContent.continuation, undefined)
+    } else {
+      assert.equal(result.isError, true)
+      const error = JSON.parse(result.content[0].text)
+      assert.equal(error.code, {
+        other_error: "workflow_not_found",
+        snapshot_failed: "transport_closed",
+        invalid_snapshot: "invalid_workflow_snapshot",
+      }[scenario])
+      assert.equal(error.details.workflowId, workflowId)
+    }
+    assert.equal(reads, scenario === "other_error" ? 0 : 1)
+  })
+}
+
 test("candidate review crosses MCP, keeps retrying proven absence, and consumes prose without resending", async (t) => {
   const { config, env } = await createTestConfig()
   const canonicalUrl = "https://chatgpt.com/c/controlled-mcp-review"
