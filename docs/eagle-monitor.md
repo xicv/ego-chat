@@ -52,6 +52,22 @@ Safe mode requires the existing binding key so the broker can reconcile the exac
 | 70 | Software/lifecycle operation failed safely. |
 
 Error JSON contains a stable error code and bounded message. It does not echo command arguments.
+`status` and `doctor` also report `observationFreshness` independently of a live PID or
+loaded service. An observation overdue beyond the bounded next-observation schedule plus
+90 seconds, or a regressed observer clock, requires attention; cached healthy state is not
+current health proof. Startup has a bounded grace period. These checks are read-only and do
+not grant process-kill or restart authority.
+
+Failed macOS notification delivery is persisted separately from the real authentication or
+other operational condition, retried at the existing bounded backoff, and deduplicated after
+successful delivery. Sleep/wake revalidation can temporarily take operational precedence over
+an underlying authentication condition without contradicting semantic state; the next normal
+observation rediscovers that unchanged condition. Reporting failure must not crash reporting.
+
+The shared confirmed-delivery projection includes `sent_waiting_response`, `sent_generating`,
+and `sent_response_incomplete`. All three retain post-Send capture supervision; observations,
+heartbeats, and local `codex_launching` receipts are not evidence of useful task progress.
+
 `doctor`, `status`, `incidents`, and `stop` remain available when the configured Ego Browser
 executable is missing; `doctor` reports that dependency as unhealthy, while `start` still
 requires an existing executable before it can write or load a service definition.

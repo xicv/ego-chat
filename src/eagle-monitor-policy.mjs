@@ -1,6 +1,10 @@
 import { RUNTIME_IDENTITY, TERMINAL_STATUSES } from "./constants.mjs"
-import { EAGLE_MONITOR_POLICY } from "./eagle-monitor-constants.mjs"
+import {
+  EAGLE_MONITOR_OBSERVATION_GRACE_MS,
+  EAGLE_MONITOR_POLICY,
+} from "./eagle-monitor-constants.mjs"
 import { EgoChatError } from "./errors.mjs"
+import { isConfirmedPendingDelivery } from "./workflow-supervision.mjs"
 
 export const MonitorState = Object.freeze({
   AMBIGUOUS_UNCONFIRMED_DELIVERY: "ambiguous_unconfirmed_delivery",
@@ -81,10 +85,6 @@ const PRE_SEND_PHASES = new Set([
   "model_policy_verified",
   "preflight",
   "prompt_staged",
-])
-
-const SUPERVISED_SEND_CONFIRMED_DELIVERIES = new Set([
-  "sent_waiting_response",
 ])
 
 const SUPERVISED_PRE_SEND_DELIVERIES = new Set([
@@ -206,7 +206,7 @@ export function classifyMonitorState(observation) {
   }
   if (
     SEND_CONFIRMED_PHASES.has(workflow.phase)
-    || SUPERVISED_SEND_CONFIRMED_DELIVERIES.has(supervisedDelivery)
+    || isConfirmedPendingDelivery(supervisedDelivery)
   ) {
     const stalled = updatedAgeMs(workflow, observation.nowMs)
       >= EAGLE_MONITOR_POLICY.postSendStallMs
@@ -278,6 +278,32 @@ export function monitorBackoffMs(state, attempt = 0) {
   const schedule = BACKOFF_MS[state] ?? [30_000]
   const index = Math.min(Math.max(0, attempt), schedule.length - 1)
   return schedule[index]
+}
+
+/** Read-only monitor-health evidence; expiration never grants recovery authority. */
+export function monitorObservationFreshness(session, state, nowMs) {
+  if (!session?.active) {
+    return { expectedBy: null, fresh: null, observedAt: null, reasonCode: "monitor_not_started" }
+  }
+  const observedMs = Date.parse(state?.updatedAt ?? session.configuredAt ?? "")
+  const scheduledMs = Date.parse(state?.nextObservationAt ?? "")
+  const boundedNextMs = observedMs + (state ? monitorBackoffMs(state.state, state.backoffAttempt) : 0)
+  const expectedByMs = Math.min(
+    Number.isFinite(scheduledMs) ? scheduledMs : boundedNextMs,
+    boundedNextMs,
+  ) + EAGLE_MONITOR_OBSERVATION_GRACE_MS
+  const clockRegressed = Number.isFinite(observedMs) && nowMs < observedMs
+  const fresh = Number.isFinite(expectedByMs) && !clockRegressed && nowMs <= expectedByMs
+  return {
+    expectedBy: Number.isFinite(expectedByMs) ? new Date(expectedByMs).toISOString() : null,
+    fresh,
+    observedAt: state?.updatedAt ?? null,
+    reasonCode: clockRegressed
+      ? "monitor_observation_clock_regressed"
+      : !fresh
+        ? "monitor_observation_stale"
+        : state ? "monitor_observation_fresh" : "monitor_starting",
+  }
 }
 
 const missingPolicies = Object.values(MonitorState)

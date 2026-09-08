@@ -107,19 +107,6 @@ function semanticTransportHealth(observation) {
     : "healthy"
 }
 
-const GENUINE_HUMAN_BOUNDARY_CODES = new Set([
-  "authentication_required",
-  "captcha_required",
-  "human_verification_required",
-  "verification_challenge",
-])
-
-function genuineHumanBoundary(classification, workflow) {
-  if (classification.state === MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE) return true
-  const code = workflow?.humanRequired?.code ?? workflow?.error?.code
-  return GENUINE_HUMAN_BOUNDARY_CODES.has(code)
-}
-
 export class EagleMonitorEngine {
   #broker
   #clock
@@ -225,7 +212,7 @@ export class EagleMonitorEngine {
     const semantic = classifyEagleSemanticLiveness({
       brokerEpoch: broker.epoch ?? null,
       checkpoint: semanticCheckpoint,
-      humanRequired: genuineHumanBoundary(classification, broker.workflow),
+      humanRequired: classification.state === MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE,
       nowMs,
       previous: state.semantic,
       processHealth: semanticProcessHealth(broker),
@@ -303,7 +290,10 @@ export class EagleMonitorEngine {
           }
         } else if (action === MonitorAction.NOTIFY_USER) {
           const incidentKey = `${classification.state}:${classification.reasonCode}`
-          if (state.lastIncidentKey !== incidentKey) {
+          const alreadyReported = state.lastIncidentKey === incidentKey
+            && !(state.lastAction?.action === MonitorAction.NOTIFY_USER
+              && state.lastAction.outcome === "failed")
+          if (!alreadyReported) {
             await this.#lease.assertCurrent()
             await this.#notifier.notify(classification, this.#lease)
           }
@@ -311,15 +301,17 @@ export class EagleMonitorEngine {
             action,
             at: new Date(nowMs).toISOString(),
             monitorEpoch: this.#lease.identity.epoch,
-            outcome: state.lastIncidentKey === incidentKey ? "already_reported" : "succeeded",
+            outcome: alreadyReported ? "already_reported" : "succeeded",
           }
         }
       } catch (_error) {
         const failedAction = action
-        classification = {
-          humanRequired: true,
-          reasonCode: `${failedAction}_failed`,
-          state: MonitorState.HUMAN_REQUIRED_OTHER,
+        if (failedAction !== MonitorAction.NOTIFY_USER) {
+          classification = {
+            humanRequired: true,
+            reasonCode: `${failedAction}_failed`,
+            state: MonitorState.HUMAN_REQUIRED_OTHER,
+          }
         }
         state.lastAction = {
           action: failedAction,

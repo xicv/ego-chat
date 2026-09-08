@@ -9,7 +9,11 @@ import {
   MonitorAction,
   MonitorState,
   monitorBackoffMs,
+  monitorObservationFreshness,
 } from "../src/eagle-monitor-policy.mjs"
+import { EAGLE_MONITOR_OBSERVATION_GRACE_MS } from "../src/eagle-monitor-constants.mjs"
+import { projectEagleSemanticCheckpoint } from "../src/eagle-monitor-semantic.mjs"
+import { superviseWorkflow } from "../src/workflow-supervision.mjs"
 
 const NOW = Date.parse("2026-09-04T00:10:00.000Z")
 
@@ -268,6 +272,45 @@ test("policy skew and an exhausted confirmed-Send service budget notify without 
   assert.equal(chooseMonitorAction(stalledClassification, stalledCapture), MonitorAction.NOTIFY_USER)
 })
 
+test("every produced confirmed pending variant retains capture budgets and response semantics", () => {
+  const at = "2026-09-04T00:00:00.000Z"
+  const parent = {
+    id: "00000000-0000-4000-8000-000000000001",
+    kind: "convergence",
+    phase: "chatgpt_running",
+    status: "running",
+    createdAt: at,
+    updatedAt: at,
+    childWorkflowId: "00000000-0000-4000-8000-000000000002",
+  }
+  for (const reason of [null, "generation_running", "response_not_terminal"]) {
+    const child = {
+      id: parent.childWorkflowId, kind: "ego_exchange", phase: "send_confirmed",
+      status: "running", createdAt: at, updatedAt: at,
+      ...(reason ? { capturePending: { reason } } : {}),
+    }
+    const supervision = superviseWorkflow(parent, child)
+    const input = observation({
+      workflow: { ...parent, supervision },
+      nowMs: Date.parse(at) + 3 * 3_600_000,
+    })
+    const stalled = classifyMonitorState(input)
+    assert.equal(stalled.state, MonitorState.SEND_CONFIRMED_CAPTURE, reason)
+    assert.equal(stalled.reasonCode, "send_confirmed_capture_stalled", reason)
+    assert.equal(chooseMonitorAction(stalled, input), MonitorAction.NOTIFY_USER, reason)
+
+    const freshInput = { ...input, nowMs: Date.parse(at) + 60_000 }
+    const fresh = classifyMonitorState(freshInput)
+    assert.equal(fresh.state, MonitorState.SEND_CONFIRMED_CAPTURE, reason)
+    assert.equal(fresh.humanRequired, false, reason)
+    assert.equal(chooseMonitorAction(fresh, freshInput), MonitorAction.ATTACH_EXACT_WORKFLOW, reason)
+    const checkpoint = projectEagleSemanticCheckpoint(parent, child, supervision)
+    assert.equal(checkpoint.loop.actionClass, "response_wait", reason)
+    assert.equal(checkpoint.expectedWait.operation, "chatgpt_response", reason)
+    assert.equal(Date.parse(checkpoint.expectedWait.deadlineAt) - Date.parse(at), 15 * 60_000, reason)
+  }
+})
+
 test("a dead broker from an incompatible runtime fails closed before restart", () => {
   const staleRuntime = observation({
     broker: {
@@ -290,4 +333,28 @@ test("phase-aware backoff is bounded", () => {
   assert.equal(monitorBackoffMs(MonitorState.STARTUP, 99), 30_000)
   assert.equal(monitorBackoffMs(MonitorState.SEND_CONFIRMED_CAPTURE, 99), 60_000)
   assert.equal(monitorBackoffMs(MonitorState.CRASH_LOOP, 99), 5 * 60_000)
+})
+
+test("observation freshness honors bounded backoff, startup grace, and clock regression", () => {
+  const observedAt = "2026-09-04T00:00:00.000Z"
+  const observedMs = Date.parse(observedAt)
+  const session = { active: true, configuredAt: observedAt }
+  const state = {
+    state: MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE,
+    backoffAttempt: 9,
+    updatedAt: observedAt,
+    nextObservationAt: "2026-09-04T00:05:00.000Z",
+  }
+  const grace = EAGLE_MONITOR_OBSERVATION_GRACE_MS
+  const expectedMs = observedMs + 5 * 60_000 + grace
+  assert.equal(monitorObservationFreshness(session, state, expectedMs).fresh, true)
+  assert.equal(monitorObservationFreshness(session, state, expectedMs + 1).fresh, false)
+  assert.equal(monitorObservationFreshness(session, {
+    ...state, nextObservationAt: "2026-09-05T00:00:00.000Z",
+  }, expectedMs + 1).fresh, false, "a persisted future schedule cannot extend the bound")
+  assert.equal(monitorObservationFreshness(session, null, observedMs + grace).fresh, true)
+  assert.equal(monitorObservationFreshness(session, null, observedMs + grace + 1).fresh, false)
+  assert.equal(monitorObservationFreshness(session, state, observedMs - 1).reasonCode,
+    "monitor_observation_clock_regressed")
+  assert.equal(monitorObservationFreshness({ active: false }, state, expectedMs + 1).fresh, null)
 })

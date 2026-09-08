@@ -96,6 +96,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/broker.mjs"),
     },
     EmbeddedFile {
+        path: "src/browser-capture-policy.mjs",
+        bytes: include_bytes!("../src/browser-capture-policy.mjs"),
+    },
+    EmbeddedFile {
         path: "src/config.mjs",
         bytes: include_bytes!("../src/config.mjs"),
     },
@@ -106,6 +110,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
         path: "src/convergence.mjs",
         bytes: include_bytes!("../src/convergence.mjs"),
+    },
+    EmbeddedFile {
+        path: "src/conversation-continuation.mjs",
+        bytes: include_bytes!("../src/conversation-continuation.mjs"),
     },
     EmbeddedFile {
         path: "src/eagle-monitor-broker.mjs",

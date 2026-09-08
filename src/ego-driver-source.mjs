@@ -2,6 +2,7 @@ import {
   BROWSER_CONTRACT_REVISION,
   MAX_DRIVER_INPUT_BYTES,
 } from "./constants.mjs"
+import { chatgptProjectScope } from "./conversation-continuation.mjs"
 
 export const EGO_DRIVER_RESULT_PREFIX = "__EGO_CHAT_DRIVER_RESULT__"
 
@@ -9,6 +10,7 @@ async function egoDriverMain(
   inputPathOverride = undefined,
   expectedBrowserContractRevision = undefined,
   inputMaxBytes = undefined,
+  projectScope = undefined,
 ) {
   const fsSync = await import("node:fs")
   const fsConstants = fsSync.constants
@@ -499,6 +501,91 @@ async function egoDriverMain(
       role: message.role,
       text: message.text,
     }))
+  }
+
+  async function observeProviderTerminal(promptMessageId, responseMessageId) {
+    // Conservative semantic contract, not a claim that all current provider UI
+    // uses these selectors. Unscoped/unknown markup must remain unclassified.
+    const observation = await js(String.raw`(() => {
+      const schema = 'ego-chat-provider-terminal-observation/v1'
+      const expectedPromptId = ${JSON.stringify(promptMessageId)}
+      const expectedResponseId = ${JSON.stringify(responseMessageId ?? null)}
+      const visible = (node) => Boolean(node && node.getClientRects().length > 0
+        && !node.closest('[aria-hidden="true"], [hidden]'))
+      if (document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]')) return null
+      const turns = [...document.querySelectorAll('section[data-turn][data-turn-id]')].filter(visible)
+      const latest = turns.at(-1)
+      if (!latest || latest.getAttribute('data-turn') !== 'assistant') return null
+      const turnId = latest.getAttribute('data-turn-id')
+      if (!turnId || turnId.length > 200 || /[\u0000-\u001F\u007F]/.test(turnId)) return null
+      const messages = [...document.querySelectorAll('[data-message-author-role]')].filter(visible)
+      const prompts = messages.filter((node) => node.getAttribute('data-message-id') === expectedPromptId)
+      const lastUser = messages.filter((node) => node.getAttribute('data-message-author-role') === 'user').at(-1)
+      if (prompts.length !== 1 || prompts[0] !== lastUser || latest.contains(prompts[0])) return null
+      const promptTurn = prompts[0].closest('section[data-turn][data-turn-id]')
+      if (promptTurn?.getAttribute('data-turn') !== 'user' || turns.at(-2) !== promptTurn) return null
+      const assistants = [...latest.querySelectorAll('[data-message-author-role="assistant"]')]
+      if (assistants.length > 1 || (expectedResponseId
+        && assistants[0]?.getAttribute('data-message-id') !== expectedResponseId)) return null
+      const statuses = [...latest.querySelectorAll('[role="status"], [role="alert"], button')]
+        .filter(visible)
+        .filter((node) => !node.closest('[data-message-author-role], .markdown, pre, code, blockquote'))
+        .filter((node) => !node.querySelector('[data-message-author-role], .markdown, pre, code, blockquote'))
+      if (statuses.length > 16) return null
+      const signals = statuses.flatMap((node) => {
+        const label = String(node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
+        if (label.length > 400) return [{ kind: 'unknown', label: '' }]
+        if (/^Stopped thinking[.!]?$/i.test(label)) return [{ kind: 'stopped', label }]
+        if (!['status', 'alert'].includes(node.getAttribute('role'))) return []
+        if (/^This conversation is too long(?: to continue)?\. Please start a new chat\.?$/i.test(label)
+          || /^You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?$/i.test(label)) {
+          return [{ kind: 'conversation_exhausted', label }]
+        }
+        if (/^You've reached your message limit\. Please try again later\.?$/i.test(label)
+          || /^You have reached your usage limit\. Please try again later\.?$/i.test(label)) {
+          return [{ kind: 'quota_limited', label }]
+        }
+        if (/^Something went wrong\.(?: Please try again\.?)?$/i.test(label)
+          || /^An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?$/i.test(label)) {
+          return [{ kind: 'provider_error', label }]
+        }
+        return label ? [{ kind: 'unknown', label: '' }] : []
+      })
+      const kinds = [...new Set(signals.map((signal) => signal.kind))]
+      if (kinds.length !== 1 || kinds[0] === 'unknown') return null
+      return { schema, kind: kinds[0], labels: [...new Set(signals.map((signal) => signal.label))].sort(), turnId }
+    })()`)
+    if (!observation) return null
+    return {
+      kind: observation.kind,
+      schema: "ego-chat-provider-terminal/v1",
+      signalDigest: sha256(JSON.stringify(observation)),
+      source: "latest_turn_status",
+      stableObservations: 2,
+    }
+  }
+
+  async function captureProviderTerminal(selected, entries, prompt, response) {
+    const first = await observeProviderTerminal(prompt.messageId, response?.messageId)
+    if (!first) return false
+    await wait(1)
+    const second = await observeProviderTerminal(prompt.messageId, response?.messageId)
+    const stableEntries = await readConversationEntries()
+    if (first.signalDigest !== second?.signalDigest
+      || JSON.stringify(entries) !== JSON.stringify(stableEntries)) {
+      humanRequired("provider_terminal_observation_unstable", "The scoped provider terminal state did not remain stable.")
+      return true
+    }
+    await emitSelectedResult(selected, {
+      canonicalUrl: normalizeUrl(selected.inspection.info.url),
+      captureState: "provider_terminal",
+      generationRunning: false,
+      promptMessageId: prompt.messageId,
+      providerTerminal: second,
+      targetId: selected.targetId,
+      turnMarker: input.turnMarker,
+    }, "before_provider_terminal_result")
+    return true
   }
 
   function summarizeConversationHead(entries, logicalMessageCount = undefined) {
@@ -1092,6 +1179,8 @@ async function egoDriverMain(
   async function selectObservedTaskSpace(identifier, {
     expectedIdentity = null,
     expectedName = null,
+    allowCreate = true,
+    requireAbsent = false,
   } = {}) {
     if (typeof globalThis.listTaskSpaces !== "function") {
       humanRequired("task_space_identity_unavailable", "Ego Browser cannot report a live task-space identity.")
@@ -1127,6 +1216,10 @@ async function egoDriverMain(
     const preselectionMatches = beforeSelection.filter((candidate) => (
       selectorMatchesTaskSpace(guard.ownerSelector, candidate)
     ))
+    if (requireAbsent && preselectionMatches.length !== 0) {
+      humanRequired("successor_preparation_ambiguous", "The reserved new Space appeared before creation; it was not adopted.")
+      return null
+    }
     if (preselectionMatches.length > 1) {
       humanRequired(
         expectedIdentity || expectedName
@@ -1188,7 +1281,8 @@ async function egoDriverMain(
         return null
       }
       if (
-        numericSelector
+        !allowCreate
+        || numericSelector
         || guard.ownerSelector.kind === "stable_identity"
         || guard.ownerSelector.kind === "task_id"
         || guard.ownerSelector.kind === "legacy_string"
@@ -2958,6 +3052,97 @@ async function egoDriverMain(
     }, "before_preflight_result")
   }
 
+  async function prepareSuccessor() {
+    const guard = requireTaskSpaceGuard()
+    if (!guard) return
+    if (input.browserContractRevision !== expectedBrowserContractRevision
+      || !/^ego-chat-successor-[a-f0-9]{32}$/.test(input.taskSpaceName)
+      || projectScope(input.startUrl, true) === undefined
+      || typeof input.allowCreate !== "boolean"
+      || guard.ownerSelector.kind !== "name" || guard.ownerSelector.value !== input.taskSpaceName) {
+      humanRequired("successor_preparation_invalid", "The blank successor preparation contract is invalid.")
+      return
+    }
+    const spaces = await globalThis.listTaskSpaces()
+    const matches = spaces.filter(space => space.name === input.taskSpaceName || space.taskId === input.taskSpaceName)
+    if ((input.allowCreate && matches.length !== 0) || (!input.allowCreate && matches.length !== 1)) {
+      humanRequired("successor_preparation_ambiguous", "The reserved successor Space is not uniquely recoverable; no replacement was created.")
+      return
+    }
+    const expectedIdentity = input.allowCreate ? null : requireTaskSpaceIdentity(matches[0])
+    if (!input.allowCreate && !expectedIdentity) return
+    const task = await selectObservedTaskSpace(input.allowCreate ? input.taskSpaceName : matches[0].id, {
+      expectedName: input.taskSpaceName, expectedIdentity,
+      allowCreate: input.allowCreate, requireAbsent: input.allowCreate,
+    })
+    if (!task) return
+    let tabs = await listTabs()
+    let targetId
+    if (tabs.length === 1 && tabs[0].url === "chrome://newtab/") {
+        targetId = tabs[0].targetId
+        if (!await fencedSwitchTab(targetId, "before_successor_native_tab_selection")) return
+        const navigated = await runSelectedMutation("before_successor_native_tab_navigation", async () => {
+          const current = await globalThis.currentTab()
+          const freshTabs = await listTabs()
+          const info = await pageInfo()
+          if (current?.targetId !== targetId || freshTabs.length !== 1 || freshTabs[0].targetId !== targetId
+            || current.url !== "chrome://newtab/" || freshTabs[0].url !== "chrome://newtab/"
+            || !["chrome://newtab/", "chrome://new-tab-page/"].includes(info.url)) return false
+          await globalThis.gotoAndWait(input.startUrl, { timeout: 30 })
+          return true
+        })
+        if (!navigated.performed) return
+        if (!navigated.value) {
+          humanRequired("successor_preparation_ambiguous", "The native blank tab changed before navigation.")
+          return
+        }
+        tabs = await listTabs()
+    } else if (input.allowCreate) {
+      if (tabs.length !== 0) {
+        humanRequired("successor_preparation_ambiguous", "The newly reserved Space is not empty; no tab was overwritten.")
+        return
+      } else {
+        const opened = await fencedOpenOrReuseTab(input.startUrl, { timeout: 30, wait: true }, "before_successor_blank_tab_creation")
+        if (!opened.performed) return
+        targetId = opened.value?.targetId
+        tabs = await listTabs()
+      }
+    } else {
+      targetId = tabs.length === 1 ? tabs[0].targetId : null
+    }
+    if (typeof targetId !== "string" || tabs.length !== 1 || tabs[0].targetId !== targetId) {
+      humanRequired("successor_preparation_ambiguous", "Exactly one attributable blank successor tab is required.")
+      return
+    }
+    if (!await fencedSwitchTab(targetId, "before_successor_blank_tab_selection")) return
+    const selected = { task, targetId }
+    let head
+    let inspection
+    for (let observation = 0; observation < 2; observation += 1) {
+      inspection = await waitForReadyInspection()
+      if (!assertReady(inspection, selected)) return
+      head = await readConversationHead()
+      const generating = await js(String.raw`Boolean(document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]'))`)
+      if (projectScope(inspection.info.url, true) === undefined
+        || projectScope(inspection.info.url, true) !== projectScope(input.startUrl, true)
+        || head.renderedMessageCount !== 0 || generating) {
+        humanRequired("successor_not_blank", "The successor must remain an empty, inactive ChatGPT starting page.")
+        return
+      }
+      if (observation === 0) await wait(1)
+    }
+    const current = await globalThis.currentTab()
+    const finalTabs = await listTabs()
+    const finalInfo = await pageInfo()
+    if (current?.targetId !== targetId || finalTabs.length !== 1 || finalTabs[0].targetId !== targetId || finalInfo.url !== inspection.info.url) {
+      humanRequired("successor_preparation_ambiguous", "The exact blank successor target changed before its receipt.")
+      return
+    }
+    await emitSelectedResult(selected, {
+      canonicalUrl: null, startUrl: finalInfo.url, targetId, head, snapshotDigest: inspection.snapshotDigest,
+    }, "before_successor_preparation_result")
+  }
+
   async function bind() {
     if (input.bindingMode === "create_once") {
       const selected = await selectExactTarget(input.taskSpace, input.targetId)
@@ -3587,6 +3772,16 @@ async function egoDriverMain(
       0,
     )
     const terminalCount = response?.text.split(input.expectedTerminalMarker).length - 1
+    const providerTerminalAttributable = (
+      ["capture_exchange", "reconcile_bound"].includes(input.mode)
+      && (input.expectedPreviousMessageId ? anchorIndexes.length === 1 : anchorIndexes.length === 0)
+      && anchorDigestMatches && anchorRoleMatches
+      && committed.length >= 1 && committed.length <= 2
+      && prompt?.messageId === input.promptMessageId && prompt?.role === "user"
+      && promptMarkerCount === 1 && renderedMarkerCount === 1
+      && (!response || (response.role === "assistant" && response.messageId !== prompt.messageId))
+    )
+    if (providerTerminalAttributable && await captureProviderTerminal(selected, entries, prompt, response)) return
     const responseEndsWithTerminal = response?.text.trimEnd().endsWith(input.expectedTerminalMarker) ?? false
     const exactTerminalResponse = terminalCount === 1 && responseEndsWithTerminal
     const protocolRepairResponse = (
@@ -4378,6 +4573,8 @@ async function egoDriverMain(
       await adopt()
     } else if (input.mode === "bind") {
       await bind()
+    } else if (input.mode === "prepare_successor") {
+      await prepareSuccessor()
     } else if (input.mode === "exchange") {
       await exchange()
     } else if (input.mode === "model_policy") {
@@ -4584,7 +4781,7 @@ async function egoDriverMain(
 }
 
 export function egoDriverSourceForInput(inputPath) {
-  return `(${egoDriverMain.toString()})(${JSON.stringify(inputPath)}, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES})\n`
+  return `(${egoDriverMain.toString()})(${JSON.stringify(inputPath)}, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES}, ${chatgptProjectScope.toString()})\n`
 }
 
-export const EGO_DRIVER_SOURCE = `(${egoDriverMain.toString()})(undefined, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES})\n`
+export const EGO_DRIVER_SOURCE = `(${egoDriverMain.toString()})(undefined, ${BROWSER_CONTRACT_REVISION}, ${MAX_DRIVER_INPUT_BYTES}, ${chatgptProjectScope.toString()})\n`

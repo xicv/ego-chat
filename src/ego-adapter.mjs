@@ -304,6 +304,11 @@ export class EgoAdapter {
     )
   }
 
+  async prepareSuccessor(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
+    return this.#run({ brokerLease: this.#brokerLease, ...params, mode: "prepare_successor" },
+      60_000, signal, onResult, beforeRun)
+  }
+
   async adopt(params, signal = undefined, onResult = undefined, beforeRun = undefined) {
     return this.#run(
       { brokerLease: this.#brokerLease, ...params, mode: "adopt" },

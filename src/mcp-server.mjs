@@ -20,7 +20,7 @@ import {
 } from "./convergence.mjs"
 import { EgoChatError, asPublicError } from "./errors.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
-import { isCanonicalConversationUrl } from "./validation.mjs"
+import { isCanonicalConversationUrl, PrepareSuccessorSchema, ResumeConvergenceSchema } from "./validation.mjs"
 
 const WAIT_MODES = ["progress", "token_saver"]
 const PROGRESS_HEARTBEAT_MS = 60 * 1_000
@@ -53,6 +53,8 @@ const CONVERSATION_ADOPTION_INPUT_SCHEMA = {
 }
 
 const CONVERGENCE_INPUT_SCHEMA = {
+  conversationContinuation: z.enum(["manual", "same_project_on_exhaustion"]).default("manual")
+    .describe("Explicit opt-in permits broker-owned same-project successor reviews only after attributed conversation exhaustion; other failures never authorize rollover."),
   acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true).describe("Every ChatGPT review cycle and its read-only recovery may reclaim only this binding's exact deterministic Ego task space."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
@@ -120,11 +122,12 @@ const MCP_INSTRUCTIONS = [
   "Preserve at-most-once delivery without ending the conversation: after a possibly accepted Send, reconcile the same durable workflow until the response is attributable or delivery is proven absent. Only a proven absence may create a fresh uniquely marked attempt.",
   "Task-space ownership is automatic for the exact deterministic binding space. Pass allowTaskSpaceReclaim as true (the default) so Send, capture, and reconciliation can reclaim that one space; this never authorizes another task space or clearing an unrelated human draft.",
   "Never call ego_verify_conversation as a preflight for a fresh send. A fresh exchange or review performs its own canonical URL, stable-head, browser-readiness, automatic exact-space reclaim, and live model-policy checks. If binding identity is uncertain before a send, use ego_get_conversation instead because it reads durable state without browser control. Reserve ego_verify_conversation for an explicitly requested maintenance checkpoint or a documented migration or reconciliation case.",
-  "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in, open ego-chat-main, or provide another conversation URL unless the exact broker code is authentication_required or verification_challenge.",
+  "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in or open ego-chat-main for ordinary transport recovery. A verified conversation-exhaustion checkpoint may separately require an explicitly selected successor; authentication and verification_challenge require their own genuine user action.",
   "Use ego_converge_until_settled for durable multi-cycle work; supply an immutable target, observable acceptance criteria, and the absolute working directory. Use workspace-write when the user authorized local fixes and read-only for review-only targets.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
   "Keep the default progress wait for unattended convergence so deterministic broker supervision reports phase changes, recovery counters, and whether ChatGPT delivery is not started, unconfirmed, confirmed, or captured. These local status reads do not invoke another model. Use token_saver only when the user explicitly prefers a silent wait; keep that one tool call open and do not poll workflow_status or await_workflow.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
+  "A provider_paused, capture_paused, or continuation_paused workflow is a durable safety checkpoint, not permission to resend. Stopped thinking, authentication, quota, and unknown inactivity do not prove conversation exhaustion. Use ego_resume_convergence only with the exact checkpoint: omit successor to consume an already reconciled response; changing conversations additionally requires the user's explicit choice of an already-bound same-project successor and verified context-exhaustion evidence. This tool never creates a chat or renews one-time authority.",
   "Never infer commit, push, deployment, production, credential, approval, or scope-expansion authority.",
   "Never duplicate an ambiguous send. Keep its durable workflow alive and reconcile it; retry delivery only after exact evidence proves the prior marked prompt absent.",
   "An await_workflow attachment-window expiry returns waitStatus pending with the exact continuation for that same workflow, not a failure. Keep this task alive and reattach; never start again or call ego_reconcile_conversation on a still-running workflow. Older initial wait_timeout errors also carry details.workflowId for reattachment. A bounded final snapshot is allowed even in token_saver mode to resolve the terminal race; there is no periodic supervision in that mode.",
@@ -167,6 +170,7 @@ function waitedToolResult(value, waitMode) {
     ...(structured.nextAction ? { nextAction: structured.nextAction } : {}),
     ...(structured.waitStatus ? { waitStatus: structured.waitStatus } : {}),
     ...(structured.continuation ? { continuation: structured.continuation } : {}),
+    ...(structured.continuationCheckpoint ? { continuationCheckpoint: structured.continuationCheckpoint } : {}),
     ...(structured.delivery ? { delivery: structured.delivery } : {}),
     ...(Number.isInteger(structured.nextCycle) ? { nextCycle: structured.nextCycle } : {}),
     ...(structured.protocolNormalization?.applied
@@ -910,6 +914,36 @@ export function createMcpServer(config = loadConfig()) {
   )
 
   server.registerTool(
+    "ego_prepare_successor",
+    {
+      description: "Prepare one blank successor tab for the exact exhausted convergence checkpoint, with explicit acknowledgement. Reserves its own Space and binding durably before creation; lost-acknowledgement retries only inspect that reservation. It never sends a message, changes model policy, advances the task, or returns a canonical chat URL. The prepared binding is unbound and is not eligible for resume until separately established; this is not automatic rollover.",
+      inputSchema: PrepareSuccessorSchema.shape,
+    },
+    async (input) => {
+      try {
+        return toolResult(await requestBroker(config, "convergence.prepare_successor", input, { timeoutMs: 75_000 }))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
+    "ego_resume_convergence",
+    {
+      description: "Resume one exact paused convergence checkpoint. Without successor, consume only the same child's already-reconciled normal response, without another Send. An explicitly acknowledged, already-bound same-project successor is allowed only after attributed conversation-exhaustion evidence; it re-reviews the same captured candidate and preserves original identities. This does not create a chat, bypass Stopped thinking/auth/quota, retry ambiguous delivery, or expand task authority.",
+      inputSchema: ResumeConvergenceSchema.shape,
+    },
+    async (input) => {
+      try {
+        return toolResult(await requestBroker(config, "convergence.resume", input))
+      } catch (error) {
+        return toolError(error)
+      }
+    },
+  )
+
+  server.registerTool(
     "ego_converge_until_settled",
     {
       description: "Run a durable broker-owned Codex implementation and ChatGPT review loop until every acceptance criterion is settled. This is the preferred path whenever the user asks for multi-cycle discussion or review until settled, even when the current host initiated the work, because broker ownership survives host detachment and restart. Recoverable browser, model-policy, protocol, task-space, App Server, and oversized-packet states remain inside the durable workflow; do not call ego_verify_conversation first. Omit maxCycles for no arbitrary cycle ceiling; set it only for an explicit caller-selected budget. wallClockTimeoutMs bounds this host attachment, not the durable workflow. The default progress mode reports deterministic phase and delivery supervision without another model; choose token_saver only for an explicitly silent wait.",
@@ -1010,7 +1044,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "cancel_workflow",
     {
-      description: "Cancel a probe or non-sending conversation adoption cleanly. Message-sending browser and convergence workflows become human_required because visible delivery or an agent turn may be ambiguous.",
+      description: "Cancel a probe or non-sending conversation adoption cleanly. Cancel on a continuation_paused parent permanently revokes its resume checkpoint without changing old delivery evidence. Other active message-sending browser and convergence workflows become human_required because visible delivery or an agent turn may be ambiguous.",
       inputSchema: { workflowId: z.uuid() },
     },
     async (input) => {
