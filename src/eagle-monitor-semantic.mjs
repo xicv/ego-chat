@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 
 import { EgoChatError } from "./errors.mjs"
+import { isConfirmedPendingDelivery } from "./workflow-supervision.mjs"
 
 export const EAGLE_SEMANTIC_CHECKPOINT_SCHEMA = "EagleSemanticCheckpoint.v1"
 export const EAGLE_SEMANTIC_STATE_SCHEMA = "EagleSemanticState.v1"
@@ -23,6 +24,7 @@ const PHASE_ORDINALS = Object.freeze({
   chatgpt_running: 40,
   codex_captured: 30,
   codex_ready: 11,
+  codex_launching: 15,
   codex_recovering: 12,
   codex_running: 20,
   created: 0,
@@ -315,11 +317,11 @@ function semanticActionClass(workflow, delivery) {
     return workflow?.status === "succeeded" ? "settlement" : "terminal"
   }
   if (workflow.phase === "codex_recovering") return "codex_recovery"
-  if (["created", "codex_ready", "codex_running"].includes(workflow.phase)) return "codex_turn"
-  if (workflow.phase === "codex_captured") return "candidate_review"
+  if (["created", "codex_ready", "codex_launching", "codex_running"].includes(workflow.phase)) return "codex_turn"
+  if (["codex_captured", "successor_preparing"].includes(workflow.phase)) return "candidate_review"
   if (workflow.phase === "review_captured") return "candidate_review"
-  if (workflow.phase === "chatgpt_running") {
-    return delivery === "sent_waiting_response" ? "response_wait" : "browser_delivery"
+  if (["chatgpt_running", "successor_reviewing"].includes(workflow.phase)) {
+    return isConfirmedPendingDelivery(delivery) ? "response_wait" : "browser_delivery"
   }
   if (["send_confirmed", "capture_pending"].includes(workflow.phase)) return "response_wait"
   if (workflow.phase === "restart_reconciling") return "delivery_reconciliation"
@@ -395,20 +397,20 @@ function expectedWait(workflow, child, delivery, workflowDigest, candidateDigest
   let startAt = latestTimestamp(workflow.updatedAt, workflow.createdAt)
   let sourceDeadline = boundedTimestamp(workflow.deadlineAt)
 
-  if (["created", "codex_ready", "codex_running"].includes(workflow.phase)) {
+  if (["created", "codex_ready", "codex_launching", "codex_running"].includes(workflow.phase)) {
     operation = "codex_turn"
     durationMs = validDuration(workflow?.private?.request?.codexTurnTimeoutMs, 15 * 60_000)
   } else if (workflow.phase === "codex_recovering") {
     operation = "codex_recovery"
     durationMs = 5 * 60_000
-  } else if (workflow.phase === "codex_captured") {
+  } else if (["codex_captured", "successor_preparing"].includes(workflow.phase)) {
     operation = "broker_delivery"
     durationMs = 5 * 60_000
   } else if (workflow.phase === "review_captured") {
     operation = "broker_transition"
     durationMs = 60_000
-  } else if (workflow.phase === "chatgpt_running") {
-    operation = delivery === "sent_waiting_response"
+  } else if (["chatgpt_running", "successor_reviewing"].includes(workflow.phase)) {
+    operation = isConfirmedPendingDelivery(delivery)
       ? "chatgpt_response"
       : delivery === "reconciling_delivery"
         ? "delivery_reconciliation"

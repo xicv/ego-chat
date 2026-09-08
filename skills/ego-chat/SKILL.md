@@ -9,7 +9,7 @@ Use the `ego_chat` MCP server. The normal contract is continuous progress: trans
 
 ## Invariants
 
-- Keep one canonical ChatGPT conversation bound for the whole target. Use `ego-chat-main` unless the user supplies a private canonical `https://chatgpt.com/.../c/...` URL or names another binding.
+- Keep each canonical ChatGPT binding immutable. Use `ego-chat-main` unless the user supplies a private canonical `https://chatgpt.com/.../c/...` URL or names another binding. A logical target may move to an explicitly authorized successor only through the broker's checkpointed continuation path below; never overwrite the old binding or infer a chat from its title or recency.
 - Enforce ChatGPT's strongest available model and maximum available thinking before every Send. Never hardcode a model label and never downgrade. A temporarily unreadable or changing policy UI is an internal wait-and-retry condition, not a request for the user to select a model.
 - Give every exact candidate one stable `operationId`. Reuse it only with byte-identical arguments after a lost tool result. Generate a new ID when the candidate or cycle changes.
 - Preserve at-most-once delivery without sacrificing liveness. After a possibly accepted Send, reconcile the same durable workflow until the marked response is attributable or delivery is proven absent. Only a proven absence may create a fresh uniquely marked delivery attempt.
@@ -76,8 +76,29 @@ Routine recovery must remain inside the broker. Ask the user only for:
 
 - `authentication_required`: the dedicated ChatGPT session is conclusively signed out;
 - `verification_challenge`: ChatGPT presents a CAPTCHA or equivalent human challenge;
+- a typed provider pause, quota limit, deliberate stop, or inactive-capture checkpoint whose documented recovery needs a user choice; these are not permission to resend or evade account limits;
 - consequential authority genuinely missing for work outside review, such as merge, deployment, credentials, or scope expansion.
 
 Do not convert transport ambiguity, controller loss, protocol formatting, repeated review state, model-policy readback hydration, conversation-head movement, packet composition, App Server exit, or task-space ownership into a human ceremony. If a current runtime surfaces one of those as terminal, preserve its workflow ID, report it as an Ego Chat defect, and do not claim the review settled.
 
 If a mutation returns `restart_required`, the installed facade and authoritative daemon differ. Do not resend the operation. Update/setup the installation only when authorized, restart every open Ego Chat host, then let the durable workflow reconcile under the matching runtime.
+
+## Checkpointed conversation continuation
+
+`provider_paused`, `capture_paused`, and `continuation_paused` retain delivery and private task evidence. They are safety boundaries, not an expired waiter or proof of no delivery. “Stopped thinking,” generic errors, quota, authentication, and thirty minutes of inactive capture do not prove conversation exhaustion. Do not automatically continue, retry, replace the chat, or renew one-time authority for these conditions.
+
+For a qualified `continuationCheckpoint`, use `ego_resume_convergence` with the exact parent `workflowId` and `expectedCheckpointDigest`. Omit `successor` only after the exact child has become succeeded through supported read-only reconciliation; the broker consumes that response without another Send or implementation turn. An ambiguous local `codex_launching` receipt is not resumable through this browser-only path.
+
+For an authorized unattended task that may outgrow its chat, set `conversationContinuation: "same_project_on_exhaustion"` when starting convergence. The default is `"manual"`. Only attributed `chatgpt_conversation_exhausted` evidence permits the broker to prepare one isolated same-project successor, review the exact retained candidate using the enforced strongest-model/maximum-effort policy, and promote its verified permanent URL/head. Attach the same running parent through `successor_preparing` and `successor_reviewing`; never send a handoff yourself. Restart rediscovers the same child operation. A failed first successor remains reserved for exact recovery, not another replacement.
+
+For a manual paused workflow, the user must explicitly choose an already-bound same-project successor. Pass `successor` with its exact `bindingKey`, `canonicalUrl`, `expectedBindingRevision`, and `acknowledgeConversationChange: true`. Do not guess that choice. The broker retains the original binding and old operation, reserves one new generation, and reviews the same captured candidate once. An exact replay recovers that receipt; a changed selection must not be retried under the old checkpoint. `workflow_busy` during prior-runner cleanup permits only the same request after cleanup.
+
+When the user explicitly authorizes preparation of a new chat for an attributed exhaustion checkpoint, `ego_prepare_successor` accepts only the exact parent `workflowId`, `expectedCheckpointDigest`, and `acknowledgeNewChat: true`. It reserves one deterministic Space and binding slot before browser work and verifies a sole blank same-project starting tab. It sends nothing, makes no model call, leaves the parent paused, and returns `successorPreparation` with `bindingKey`, checkpoint digest, and `dispatched` or `prepared` state. Never invent a permanent `/c/` URL or treat an unbound prepared binding as resumable.
+
+After a lost preparation acknowledgement, retry only the same checkpoint and arguments. Recovery can inspect the reserved blank tab or complete navigation of its sole native New tab, but cannot recreate a missing Space or tab. A completed replay returns the unchanged stored receipt. Restart resumes a running opted-in handoff, not a manual pause. Preserve missing, ambiguous, nonempty, user-owned, or changed-identity artifacts; do not delete them or select another chat. Cancelling the parent prevents a late preparation commit or not-yet-dispatched successor Send, without deleting artifacts or releasing earlier delivery claims.
+
+Native blank preparation supports the browser's sole internal tab and title-suffixed routes for the same stable Project ID. Its zero-Send native check does not qualify provider-error selectors or an overnight run. Unsupported provider markup remains unclassified. Preserve unsupported checkpoints and report the limitation instead of claiming nightly recovery or settlement. The monitor observes the current successor through the parent but has no authority to invoke preparation/resume or control either chat directly. Exact paused successor reconciliation and resume can consume a late valid answer without another Send; do not use its predecessor's checkpoint to choose a third chat.
+
+For `successor_recovery_required`, recover only the exact retained artifacts: finish a lost blank-preparation acknowledgement with the same `ego_prepare_successor` arguments, then resume the opted-in parent without `successor`. An already committed successor answer can be consumed directly by that exact resume. A stopped successor child must first satisfy the supported read-only reconciliation path. Never substitute a new child or renewed Send.
+
+If the user cancels a `continuation_paused` parent, `cancel_workflow` permanently revokes its resume checkpoint while preserving the old child's delivery evidence. Do not resume it. Other stopped recovery states keep their existing explicit abandonment boundary.

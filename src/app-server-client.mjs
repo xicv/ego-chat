@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import readline from "node:readline"
 
 import { APP_VERSION } from "./constants.mjs"
@@ -229,6 +229,56 @@ export class AppServerClient {
     })
   }
 
+  async recoverStructuredLaunch(threadId, intent, timeoutMs = 30_000) {
+    const ambiguous = () => new EgoChatError(
+      "app_server_launch_ambiguous",
+      "The dispatched local turn has no unique attributable receipt; another launch is not authorized.",
+    )
+    if (
+      intent?.threadId !== threadId
+      || !/^EGO_CHAT_CODEX_LAUNCH_[A-F0-9]{32}$/.test(intent.marker ?? "")
+      || !/^[a-f0-9]{64}$/.test(intent.inputDigest ?? "")
+      || !Number.isSafeInteger(intent.beforeTurnCount)
+      || intent.beforeTurnCount < 0
+      || (intent.beforeTurnCount === 0
+        ? intent.beforeTurnId !== null
+        : typeof intent.beforeTurnId !== "string" || intent.beforeTurnId.length === 0)
+    ) throw ambiguous()
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const thread = await this.readThread(threadId, true, Math.max(1, deadline - Date.now()))
+      const turns = thread.turns
+      if (
+        !Array.isArray(turns)
+        || turns.some((turn) => typeof turn?.id !== "string" || turn.id.length === 0)
+        || new Set(turns.map(({ id }) => id)).size !== turns.length
+      ) throw ambiguous()
+      const boundary = intent.beforeTurnCount
+      if (
+        turns.length < boundary
+        || (boundary > 0 && turns[boundary - 1]?.id !== intent.beforeTurnId)
+        || (boundary === 0 && intent.beforeTurnId !== null)
+      ) throw ambiguous()
+      const matching = turns.slice(boundary).filter((turn) => (
+        Array.isArray(turn.items) && turn.items.some((item) => (
+          item.type === "userMessage"
+          && Array.isArray(item.content)
+          && item.content.length === 1
+          && item.content[0]?.type === "text"
+          && typeof item.content[0].text === "string"
+          && item.content[0].text.includes(intent.marker)
+          && digest(item.content[0].text) === intent.inputDigest
+        ))
+      ))
+      if (matching.length > 1) throw ambiguous()
+      if (matching.length === 1 && typeof matching[0].id === "string" && matching[0].id.length > 0) {
+        return { turnId: matching[0].id }
+      }
+      await delay(Math.min(1_000, Math.max(1, deadline - Date.now())))
+    }
+    throw ambiguous()
+  }
+
   async readThread(threadId, includeTurns = false, timeoutMs = 30_000) {
     const response = await this.request("thread/read", { includeTurns, threadId }, timeoutMs)
     if (response?.thread?.id !== threadId) {
@@ -281,6 +331,7 @@ export class AppServerClient {
 
   async runStructuredTurn({
     additionalContext = undefined,
+    onDispatching = undefined,
     onStarted = undefined,
     outputSchema,
     prompt,
@@ -289,6 +340,26 @@ export class AppServerClient {
   }) {
     const deadline = Date.now() + timeoutMs
     await this.#waitForThreadIdle(threadId, deadline)
+    if (onDispatching) {
+      const thread = await this.readThread(threadId, true, Math.max(1, deadline - Date.now()))
+      if (
+        !Array.isArray(thread.turns)
+        || thread.status?.type !== "idle"
+        || thread.turns.some((turn) => typeof turn?.id !== "string" || turn.id.length === 0)
+        || new Set(thread.turns.map(({ id }) => id)).size !== thread.turns.length
+      ) {
+        throw new EgoChatError("app_server_thread_not_ready", "The owned thread has no stable pre-launch boundary.")
+      }
+      const marker = `EGO_CHAT_CODEX_LAUNCH_${randomUUID().replaceAll("-", "").toUpperCase()}`
+      prompt = `${prompt}\n\nLocal delivery identity: ${marker}`
+      await onDispatching({
+        beforeTurnCount: thread.turns.length,
+        beforeTurnId: thread.turns.at(-1)?.id ?? null,
+        inputDigest: digest(prompt),
+        marker,
+        threadId,
+      })
+    }
     const response = await this.request("turn/start", {
       ...(additionalContext ? { additionalContext } : {}),
       approvalPolicy: "never",

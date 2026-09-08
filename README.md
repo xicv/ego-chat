@@ -67,6 +67,64 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 
 The delivery claim is deliberately limited: automatic sends are fail-closed and effectively at-most-once. Ego Chat does not claim exactly-once delivery across a browser UI and a remote service.
 
+### Overnight reliability and continuation
+
+The current reliability work preserves one logical task across recoverable interruptions; it does not promise an infinitely long ChatGPT conversation or unattended recovery from every failure.
+
+- Local turns record a launch intent before `turn/start`. A lost acknowledgement is reconciled against the exact thread boundary and uniquely marked input. Missing or conflicting receipts preserve an ambiguous checkpoint rather than launching the work again.
+- Read-only adoption cancellation is committed before aborting its runner, preventing a cancelled task from retaining a false active-binding reservation and blocking later upgrades.
+- Three invalid candidates in one cycle produce a strategy-change checkpoint for review, followed by fresh local-thread recovery. Already-captured reviews and settlement do not require an unnecessary local-client connection.
+- Attributable, repeated latest-turn provider UI signals distinguish stopped thinking, conversation exhaustion, provider error, and quota. These pause the exact sent turn without committing an error label as an assistant answer. Quoted text, old/global labels, active generation, and conflicting observations do not establish that evidence. The current selectors have synthetic regression coverage, **not live ChatGPT markup qualification**; unsupported markup remains unknown.
+- Inactive response capture backs off from two to thirty seconds. Thirty minutes of repeated inactive/nonterminal observations produces a retained `capture_paused` checkpoint. Active generation does not trigger this timer. A pause never authorizes a Send or proves conversation exhaustion.
+- A stopped convergence review preserves its private contract, candidate and evidence. Qualified checkpoints expose a compact `continuationCheckpoint` receipt. `ego_resume_convergence` (CLI: `ego-chat resume-convergence <input-json-file>`) can consume the exact child's subsequently reconciled response without another Send. A failed first response in a create-once chat also retains its exact read-only reconciliation path.
+
+For unattended convergence, explicitly opt in at start with `conversationContinuation: "same_project_on_exhaustion"`. The default is `"manual"`; existing workflows are not silently upgraded. Only attributed conversation exhaustion triggers preparation of one isolated same-project successor, one next-generation review of the retained candidate, and permanent-URL/head promotion after a valid captured answer. It uses the normal strongest-model/maximum-effort Send policy and the broker's existing serialized browser lane.
+
+The reservation, exact prompt identity, child operation and promotion are durable. Restart reattaches the same child rather than generating another Send. Pending-successor reservations exclude other tasks, survive recovery pauses and retention cleanup, and cannot be released by a racing duplicate resume. Cancellation revokes pending handoff authority before Send. A successor that fails before establishing a valid head stays reserved for exact recovery; it does not trigger an unbounded chain of empty chats.
+
+In manual mode, changing chats requires **both** attributed conversation-exhaustion evidence and an explicit caller-selected, already-bound successor. The resume input pins the parent workflow, checkpoint digest, successor key, canonical URL and binding revision:
+
+```json
+{
+  "workflowId": "<paused parent UUID>",
+  "expectedCheckpointDigest": "<receipt SHA-256>",
+  "successor": {
+    "bindingKey": "<verified successor binding>",
+    "canonicalUrl": "https://chatgpt.com/g/<same-project>/c/<successor>",
+    "expectedBindingRevision": 1,
+    "acknowledgeConversationChange": true
+  }
+}
+```
+
+Omit `successor` only to consume an already-reconciled normal response in the currently active bound chat. An exact resume replay rediscovers its existing receipt. A stale checkpoint or different selection fails closed. The original parent binding, old chat and old delivery records remain unchanged; an `activeChat` generation routes the same candidate to the successor. Generation history is private, crash-recoverable and bounded to 32 generations in v1. Cancellation, authentication, quota, “Stopped thinking,” unknown inactivity, ambiguous local acceptance and one-time attachment authority cannot authorize rollover.
+
+Continuation validation also retains explicit resource limits: 40,000 nodes, 64 nesting levels and a 64 MiB private snapshot. Serialized checkpoints allow 3.5 MiB, including worst-case JSON escaping of a valid 512 KiB review packet. These are fail-closed safety bounds, not an unlimited-history guarantee. Exact child responses remain protected from retention cleanup until the parent consumes or relinquishes its checkpoint.
+
+Blank-successor preparation is a separate, explicit transaction. For an attributed exhaustion checkpoint, `ego_prepare_successor` (CLI: `ego-chat prepare-successor <input-json-file>`) accepts:
+
+```json
+{
+  "workflowId": "<paused parent UUID>",
+  "expectedCheckpointDigest": "<receipt SHA-256>",
+  "acknowledgeNewChat": true
+}
+```
+
+Before touching the browser, it reserves one binding slot and a deterministic per-checkpoint Space name. It creates an empty same-project starting tab and atomically records an **unbound** `create_once` binding plus a `successorPreparation` receipt. This standalone transaction leaves the parent paused: it produces no prompt, model call, Send, canonical conversation URL, or generation advancement. A blank prepared binding cannot be passed straight to resume. An opted-in automatic runner uses the same preparation transaction internally and then performs the separately checkpointed first review.
+
+After a lost acknowledgement, retry only these same arguments. A `dispatched` receipt can inspect the reserved Space's sole blank tab or complete navigation of its sole native New tab, never create a replacement Space or tab. A `prepared` replay returns the stored receipt if its binding is unchanged. Restart resumes a running opted-in handoff, not a manually paused one. Missing, ambiguous, nonempty, user-owned, or identity-changing Spaces fail closed. Preparation supports the observed native `chrome://newtab/` / `chrome://new-tab-page/` pair and ChatGPT's title-suffixed Project route by stable Project ID. Native blank preparation was verified on 2026-09-08 with zero Sends; that is not a live provider-exhaustion or overnight qualification. Browser-global interference from external controllers remains outside the broker's guarantee.
+
+Automatic rollover belongs to the explicitly opted-in broker workflow. Eagle Monitor follows that workflow and its pending successor; it cannot independently invoke preparation/resume, invent a replacement chat or act as a second browser controller. Its deterministic checks use no LLM tokens. See [Eagle Monitor](docs/eagle-monitor.md).
+
+After `successor_recovery_required`, retain the exact checkpoint. If blank preparation lost its acknowledgement, finish `ego_prepare_successor` with the same arguments, then use `ego_resume_convergence` without `successor` to resume the already opted-in handoff. If the exact successor answer was already committed, that resume consumes it directly. If its child is stopped, first use eligible read-only reconciliation of that exact child. None of these paths replaces an unresolved successor or repeats an accepted Send.
+
+`cancel_workflow` on a `continuation_paused` parent permanently revokes that checkpoint and prevents a late preparation result from committing. It does not delete any possibly created blank Space or undo or release the old child's delivery evidence. A valid resume consumes the per-checkpoint preparation receipt, allowing later exhaustion to reserve a distinct successor. Other stopped recovery workflows retain their existing explicit `abandon_workflow_recovery` boundary.
+
+Before claiming nightly readiness, qualify real provider markup and run representative 8–12-hour fault-injected shadow/safe sessions covering disconnects, process death, live hangs, sleep/wake, notification failure, multiple chats, and successor-recovery crashes. Unit/integration tests are not live overnight proof, and a forced-asleep Mac cannot keep either client running.
+
+Further work remains on same-chat recovery after complete loss of an established browser Space, recovery when the first successor itself exhausts before a valid head, menu-order-independent model capability ranking, an optional budgeted BYOK advisor, and the experimental task-spine/admission simplification. These are not part of the bounded rollover guarantee.
+
 ### Concurrent hosts and Ego Spaces
 
 Codex.app and ZCode.app share one authoritative Ego Chat broker and the same default `ego-chat-main` binding. They do not silently create separate conversations or task spaces. One binding remains an exclusive ordered conversation lease: if another host already owns it, a different fresh operation receives `conversation_busy` instead of interleaving a stale prompt. An exact retry with the same operation identity still rediscovers its existing workflow.
@@ -528,10 +586,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.21 adds resumable MCP attachment expiry, bounded truthful capture observations, and early permanent-URL tracking with one-way create-once locator promotion. It does not add automatic resends, conversation rollover, or new MR authority. The browser and MCP contract revisions change; upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.22 adds checkpointed provider-terminal handling, opt-in same-project exhaustion rollover, local launch-acknowledgement recovery, inactive-capture backoff, and monitor freshness/notification hardening. It does not authorize blind resends or new MR actions, and is not yet qualified as interruption-free overnight operation. Browser, MCP and store contracts change; upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.21 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.22 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode

@@ -135,6 +135,26 @@ test("a new MCP facade reattaches to a broker workflow after the first facade ex
   assert.ok(tools.tools.some((tool) => tool.name === "ego_ensure_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_get_model_policy"))
   assert.ok(tools.tools.some((tool) => tool.name === "ego_start_convergence"))
+  const resumeTool = tools.tools.find((tool) => tool.name === "ego_resume_convergence")
+  assert.ok(resumeTool)
+  assert.equal(resumeTool.inputSchema.required.includes("expectedCheckpointDigest"), true)
+  assert.equal(resumeTool.inputSchema.properties.successor.properties.acknowledgeConversationChange.const, true)
+  assert.match(resumeTool.description, /does not create/)
+  const absentResume = await firstClient.callTool({
+    name: "ego_resume_convergence",
+    arguments: { workflowId: "36ebd590-3bdf-48fc-818d-2db58c3a8b90", expectedCheckpointDigest: "a".repeat(64) },
+  })
+  assert.equal(absentResume.isError, true)
+  assert.equal(JSON.parse(absentResume.content[0].text).code, "workflow_not_found")
+  const prepareTool = tools.tools.find((tool) => tool.name === "ego_prepare_successor")
+  assert.ok(prepareTool)
+  assert.equal(prepareTool.inputSchema.properties.acknowledgeNewChat.const, true)
+  assert.match(prepareTool.description, /never sends/)
+  const absentPreparation = await firstClient.callTool({ name: "ego_prepare_successor", arguments: {
+    workflowId: "36ebd590-3bdf-48fc-818d-2db58c3a8b90", expectedCheckpointDigest: "a".repeat(64), acknowledgeNewChat: true,
+  } })
+  assert.equal(absentPreparation.isError, true)
+  assert.equal(JSON.parse(absentPreparation.content[0].text).code, "workflow_not_found")
   assert.ok(tools.tools.some((tool) => tool.name === "ego_converge_until_settled"))
   const getBindingTool = tools.tools.find((tool) => tool.name === "ego_get_conversation")
   assert.match(getBindingTool.description, /preferred preflight for binding identity/)

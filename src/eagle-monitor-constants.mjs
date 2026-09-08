@@ -3,6 +3,8 @@ import { createHash } from "node:crypto"
 export const EAGLE_MONITOR_SCHEMA_VERSION = 1
 export const EAGLE_MONITOR_LABEL = "com.xicv.ego-chat.eagle-monitor"
 export const EAGLE_MONITOR_INCIDENT_LIMIT = 200
+// Allows the longest bounded reconciliation plus IPC/power observation overhead.
+export const EAGLE_MONITOR_OBSERVATION_GRACE_MS = 90_000
 
 export const EAGLE_MONITOR_MODES = Object.freeze(["safe", "shadow"])
 export const EAGLE_MONITOR_POWER_POLICIES = Object.freeze([

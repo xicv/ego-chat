@@ -26,6 +26,17 @@ import {
 } from "./attachment-execution-receipt.mjs"
 import { assertValidSignedAttachmentConsumerAcknowledgementEnvelope } from "./attachment-consumer-ack.mjs"
 import { EgoChatError } from "./errors.mjs"
+import {
+  activeConvergenceBindingKey,
+  automaticSuccessorPhase,
+  buildConvergenceResume,
+  buildPreparedSuccessorBinding,
+  buildSuccessorPreparation,
+  buildSuccessorPromotion,
+  convergenceReviewIdentity,
+  snapshotContinuationValue,
+  validateContinuationCheckpoint,
+} from "./conversation-continuation.mjs"
 
 const DEFAULT_MAX_BINDINGS = 256
 const DEFAULT_MAX_MODEL_POLICIES = 8
@@ -1163,6 +1174,15 @@ function applyEvent(state, event, { validateAttachmentEvidence = true } = {}) {
   }
 
   if (event.workflow && typeof event.workflow.id === "string") {
+    if (event.successorBinding) {
+      const plan = event.workflow.private?.successorPreparation
+      if (event.type !== "convergence.successor_prepared" || plan?.state !== "prepared"
+        || !isDeepStrictEqual(plan.preparedBinding, event.successorBinding)
+        || plan.bindingKey !== event.successorBinding.key) {
+        throw new EgoChatError("corrupt_event_log", "The successor preparation event is inconsistent.")
+      }
+      state.bindings[event.successorBinding.key] = event.successorBinding
+    }
     state.workflows[event.workflow.id] = preserveConvergenceLivenessCheckpoint(
       event.workflow,
       state.workflows[event.workflow.id],
@@ -1639,8 +1659,18 @@ export class EventStore {
     return this.#persistEntity(type, "workflow", workflow, expectedWorkflow)
   }
 
-  async persistStarted(type, workflow, receiptAdmission = undefined) {
+  async persistStarted(type, workflow, receiptAdmission = undefined, expectedParent = undefined) {
+    const parentSnapshot = expectedParent ? snapshotContinuationValue(expectedParent) : undefined
     const operation = this.#tail.then(async () => {
+      if (parentSnapshot && (!automaticSuccessorPhase(parentSnapshot)
+        || parentSnapshot.phase !== "successor_reviewing"
+        || !isDeepStrictEqual(this.#state.workflows[parentSnapshot.id], parentSnapshot)
+        || workflow.successorParentId !== parentSnapshot.id
+        || workflow.bindingKey !== parentSnapshot.private.successorReview?.bindingKey
+        || workflow.operationKey !== `exchange:${workflow.bindingKey}:${parentSnapshot.private.successorReview.turnMarker}`
+        || workflow.inputDigest !== parentSnapshot.private.successorReview.promptDigest)) {
+        throw new EgoChatError("continuation_transition_conflict", "The successor review parent changed before child admission.")
+      }
       const existingOperation = this.#state.operations[workflow.operationKey]
       const existing = existingOperation
         ? this.#state.workflows[existingOperation.workflowId]
@@ -1663,6 +1693,9 @@ export class EventStore {
         return { created: false, workflow: clone(existing) }
       }
 
+      if (parentSnapshot && !isDeepStrictEqual(this.#state.bindings[workflow.bindingKey], parentSnapshot.private.successorPreparation?.preparedBinding)) {
+        throw new EgoChatError("continuation_transition_conflict", "The prepared successor binding changed before first child admission.")
+      }
       this.#assertNewWorkflowCapacity(workflow, { operation: true })
 
       const attachmentEvidence = receiptAdmission
@@ -1679,6 +1712,123 @@ export class EventStore {
 
   async persistBinding(type, binding, expectedBinding = undefined) {
     return this.#persistEntity(type, "binding", binding, expectedBinding)
+  }
+
+  async persistConvergenceResume(input) {
+    // Capture caller-owned objects before joining the single-writer queue.
+    const captured = snapshotContinuationValue(input)
+    const {
+      expectedWorkflow, expectedChild, expectedBinding, expectedSuccessorBinding,
+      expectedCheckpointDigest, acknowledgeConversationChange = false, at,
+    } = captured
+    const prepared = buildConvergenceResume({
+      workflow: expectedWorkflow,
+      child: expectedChild,
+      binding: expectedBinding,
+      successorBinding: expectedSuccessorBinding,
+      expectedCheckpointDigest,
+      acknowledgeConversationChange,
+      at,
+    })
+    const operation = this.#tail.then(async () => {
+      const current = this.#state.workflows[expectedWorkflow.id]
+      if (
+        current?.continuationResume?.requestDigest === prepared.receipt.requestDigest
+        && current.bindingKey === expectedWorkflow.bindingKey
+      ) {
+        return { created: false, workflow: clone(current), receipt: clone(current.continuationResume) }
+      }
+      if (
+        !isDeepStrictEqual(current, expectedWorkflow)
+        || !isDeepStrictEqual(this.#state.workflows[expectedChild.id], expectedChild)
+        || !isDeepStrictEqual(this.#state.bindings[expectedBinding.key], expectedBinding)
+        || (expectedSuccessorBinding && !isDeepStrictEqual(
+          this.#state.bindings[expectedSuccessorBinding.key], expectedSuccessorBinding,
+        ))
+      ) {
+        throw new EgoChatError("continuation_transition_conflict", "The exact continuation checkpoint, source child, or selected binding changed before resume.")
+      }
+      const selectedKey = activeConvergenceBindingKey(prepared.workflow)
+      const conflicting = Object.values(this.#state.workflows).some((workflow) => {
+        if (workflow.id === current.id || workflow.id === expectedChild.id) return false
+        const key = workflow.kind === "convergence"
+          ? activeConvergenceBindingKey(workflow)
+          : workflow.bindingKey
+        return key === selectedKey && (
+          workflow.status === "running"
+          || (workflow.kind === "ego_exchange" && ["human_required", "failed"].includes(workflow.status))
+        )
+      })
+      if (conflicting) {
+        throw new EgoChatError("continuation_binding_reserved", "The selected continuation binding has another unresolved workflow.")
+      }
+      await this.#appendEntity("convergence.resumed", "workflow", prepared.workflow)
+      return { created: true, workflow: clone(prepared.workflow), receipt: clone(prepared.receipt) }
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async persistSuccessorPreparation(input) {
+    const captured = snapshotContinuationValue(input)
+    const { expectedWorkflow, expectedChild, expectedBinding, expectedCheckpointDigest, acknowledgeNewChat, result, at } = captured
+    const plan = buildSuccessorPreparation({ workflow: expectedWorkflow, child: expectedChild,
+      binding: expectedBinding, expectedCheckpointDigest, acknowledgeNewChat, at })
+    const operation = this.#tail.then(async () => {
+      if (!isDeepStrictEqual(this.#state.workflows[expectedWorkflow.id], expectedWorkflow)
+        || !isDeepStrictEqual(this.#state.workflows[expectedChild.id], expectedChild)
+        || !isDeepStrictEqual(this.#state.bindings[expectedBinding.key], expectedBinding)) {
+        throw new EgoChatError("continuation_transition_conflict", "The exact successor preparation evidence changed.")
+      }
+      const existing = this.#state.bindings[plan.bindingKey]
+      if (plan.state === "prepared") {
+        if (!isDeepStrictEqual(existing, plan.preparedBinding)) {
+          throw new EgoChatError("continuation_transition_conflict", "The prepared blank binding changed after preparation.")
+        }
+        return { created: false, workflow: clone(expectedWorkflow) }
+      }
+      if (existing) throw new EgoChatError("binding_exists", "The reserved successor binding already exists.")
+      this.#assertNewBindingCapacity(plan.bindingKey)
+      if (!result && expectedWorkflow.private.successorPreparation) {
+        return { created: false, workflow: clone(expectedWorkflow) }
+      }
+      if (result && !expectedWorkflow.private.successorPreparation) {
+        throw new EgoChatError("continuation_not_authorized", "A durable preparation intent is required before committing a blank successor.")
+      }
+      const preparedBinding = result ? buildPreparedSuccessorBinding(plan, result, at) : undefined
+      const workflow = {
+        ...expectedWorkflow, updatedAt: at,
+        private: { ...expectedWorkflow.private, successorPreparation: preparedBinding
+          ? { ...plan, state: "prepared", preparedBinding } : plan },
+      }
+      await this.#appendEvent({
+        at, schemaVersion: 1, seq: this.#state.nextSeq,
+        type: preparedBinding ? "convergence.successor_prepared" : "convergence.successor_reserved",
+        workflow, ...(preparedBinding ? { successorBinding: preparedBinding } : {}),
+      })
+      return { created: !expectedWorkflow.private.successorPreparation, workflow: clone(workflow) }
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
+  }
+
+  async persistSuccessorPromotion(input) {
+    const captured = snapshotContinuationValue(input)
+    const prepared = buildSuccessorPromotion(captured)
+    const operation = this.#tail.then(async () => {
+      const { workflow, child, binding, successorBinding, successorChild } = captured
+      if (!isDeepStrictEqual(this.#state.workflows[workflow.id], workflow)
+        || !isDeepStrictEqual(this.#state.workflows[child.id], child)
+        || !isDeepStrictEqual(this.#state.workflows[successorChild.id], successorChild)
+        || !isDeepStrictEqual(this.#state.bindings[binding.key], binding)
+        || !isDeepStrictEqual(this.#state.bindings[successorBinding.key], successorBinding)) {
+        throw new EgoChatError("continuation_transition_conflict", "The exact successor review evidence changed before promotion.")
+      }
+      await this.#appendEntity("convergence.successor_promoted", "workflow", prepared.workflow)
+      return clone(prepared.workflow)
+    })
+    this.#tail = operation.catch(() => {})
+    return operation
   }
 
   async persistConfirmedAttachmentSend(type, workflow, patch, sent) {
@@ -2294,17 +2444,7 @@ export class EventStore {
       if (entityName === "workflow" && !this.#state.workflows[entity.id]) {
         this.#assertNewWorkflowCapacity(entity)
       }
-      if (
-        entityName === "binding"
-        && !this.#state.bindings[entity.key]
-        && Object.keys(this.#state.bindings).length >= this.#maxBindings
-      ) {
-        throw new EgoChatError(
-          "binding_capacity_exhausted",
-          "The durable binding limit has been reached; no browser work was started.",
-          { limit: this.#maxBindings },
-        )
-      }
+      if (entityName === "binding" && !this.#state.bindings[entity.key]) this.#assertNewBindingCapacity(entity.key)
       if (
         entityName === "modelPolicy"
         && !this.#state.modelPolicies[entity.key]
@@ -2333,6 +2473,20 @@ export class EventStore {
       type,
     }
     await this.#appendEvent(event)
+  }
+
+  #assertNewBindingCapacity(key) {
+    const reservedKeys = new Set(Object.keys(this.#state.bindings))
+    for (const workflow of Object.values(this.#state.workflows)) {
+      const plan = workflow.private?.successorPreparation
+      if (workflow.kind === "convergence" && ((workflow.status === "human_required"
+        && workflow.phase === "continuation_paused") || automaticSuccessorPhase(workflow))
+        && plan?.state === "dispatched") reservedKeys.add(plan.bindingKey)
+    }
+    reservedKeys.delete(key)
+    if (reservedKeys.size >= this.#maxBindings) {
+      throw new EgoChatError("binding_capacity_exhausted", "The durable binding limit has been reached; no browser work was started.", { limit: this.#maxBindings })
+    }
   }
 
   async #appendEvent(event) {
@@ -2543,10 +2697,11 @@ export class EventStore {
 
   #recoveryCapacity() {
     const protectedDigests = new Map()
+    const continuationDependencies = this.#continuationDependencies()
     let recoveryWorkflowCount = 0
     let reservedBlobBytes = 0
     for (const workflow of Object.values(this.#state.workflows)) {
-      if (!hasProtectedRecoveryState(workflow)) {
+      if (!hasProtectedRecoveryState(workflow) && !continuationDependencies.has(workflow.id)) {
         continue
       }
       recoveryWorkflowCount += 1
@@ -2563,6 +2718,48 @@ export class EventStore {
       recoveryWorkflowCount,
       reservedBlobBytes,
     }
+  }
+
+  #continuationDependencies() {
+    const pinned = new Set()
+    const workflows = Object.values(this.#state.workflows)
+    const operations = new Map(workflows
+      .filter((workflow) => typeof workflow.operationKey === "string")
+      .map((workflow) => [workflow.operationKey, workflow]))
+    for (const parent of workflows) {
+      if (parent.kind !== "convergence" || parent.abandonment) continue
+      const checkpoint = parent.private?.continuationCheckpoint
+      if (checkpoint && ((parent.status === "human_required" && parent.phase === "continuation_paused") || automaticSuccessorPhase(parent))) {
+        const child = this.#state.workflows[checkpoint.source?.workflowId]
+        if (child) {
+          validateContinuationCheckpoint(checkpoint, { workflow: parent, child })
+          pinned.add(child.id)
+        }
+        const intent = parent.private.successorReview
+        if (intent) {
+          const next = operations.get(`exchange:${intent.bindingKey}:${intent.turnMarker}`)
+          if (next?.inputDigest === intent.promptDigest && next.successorParentId === parent.id) pinned.add(next.id)
+        }
+        continue
+      }
+      if (parent.status !== "running" || !["codex_captured", "chatgpt_running"].includes(parent.phase)) continue
+      const cycle = parent.private?.cycles?.at(-1)
+      if (
+        !cycle?.candidate || cycle.cycle !== parent.cycle
+        || cycle.candidateDigest !== parent.candidateDigest
+        || digestJson(cycle.candidate) !== parent.candidateDigest
+      ) continue
+      const key = activeConvergenceBindingKey(parent)
+      const identity = convergenceReviewIdentity(parent.id, parent.cycle, parent.activeChat?.generation ?? 0)
+      const child = operations.get(`exchange:${key}:${identity.turnMarker}`)
+      if (
+        child?.kind === "ego_exchange" && child.bindingKey === key
+        && child.reconciliation?.turnMarker === identity.turnMarker
+        && child.reconciliation?.expectedTerminalMarker === identity.terminalMarker
+        && (parent.phase === "codex_captured" || parent.childWorkflowId === child.id)
+      ) pinned.add(child.id)
+    }
+    return pinned
   }
 
   #referencedBlobMap() {
@@ -3071,10 +3268,13 @@ export class EventStore {
 
   #applyRetention() {
     const workflows = Object.values(this.#state.workflows)
+    const continuationDependencies = this.#continuationDependencies()
+    const protectedWorkflow = (workflow) => hasProtectedRecoveryState(workflow)
+      || continuationDependencies.has(workflow.id)
     const terminal = workflows
       .filter((workflow) => (
         ["cancelled", "failed", "succeeded"].includes(workflow.status)
-        && !hasProtectedRecoveryState(workflow)
+        && !protectedWorkflow(workflow)
       ))
       .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
     for (const workflow of terminal.slice(this.#maxTerminalWorkflows)) {
@@ -3088,14 +3288,14 @@ export class EventStore {
     const pinnedDigests = new Set()
     const retainedDigests = new Map()
     for (const workflow of candidates) {
-      if (hasProtectedRecoveryState(workflow)) {
+      if (protectedWorkflow(workflow)) {
         const reference = workflow.result.responseRef
         pinnedDigests.add(reference.digest)
         retainedDigests.set(reference.digest, reference.sizeBytes)
       }
     }
     for (const workflow of candidates) {
-      if (hasProtectedRecoveryState(workflow)) {
+      if (protectedWorkflow(workflow)) {
         continue
       }
       const reference = workflow.result.responseRef
@@ -3124,7 +3324,7 @@ export class EventStore {
       retainedDigests.delete(reference.digest)
       for (const shared of candidates) {
         if (
-          !hasProtectedRecoveryState(shared)
+          !protectedWorkflow(shared)
           && shared.result?.responseRef?.digest === reference.digest
         ) {
           this.#expireWorkflowResult(shared)

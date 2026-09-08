@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { superviseWorkflow } from "../src/workflow-supervision.mjs"
+import { isConfirmedPendingDelivery, superviseWorkflow } from "../src/workflow-supervision.mjs"
+import { projectEagleSemanticCheckpoint } from "../src/eagle-monitor-semantic.mjs"
 
 function convergence(overrides = {}) {
   return {
@@ -21,6 +22,18 @@ function convergence(overrides = {}) {
   }
 }
 
+test("confirmed pending delivery classification rejects unknown and non-confirmed states", () => {
+  for (const delivery of ["sent_waiting_response", "sent_generating", "sent_response_incomplete"]) {
+    assert.equal(isConfirmedPendingDelivery(delivery), true, delivery)
+  }
+  for (const delivery of [
+    null, undefined, "unknown", "sent_future_variant", "response_captured", "not_confirmed",
+    "reconciling_delivery", "queued", "child_stopped", "workflow_stopped",
+  ]) {
+    assert.equal(isConfirmedPendingDelivery(delivery), false, String(delivery))
+  }
+})
+
 test("supervision says when side A has not sent anything to ChatGPT", () => {
   const supervision = superviseWorkflow(convergence())
 
@@ -36,6 +49,18 @@ test("supervision says when side A has not sent anything to ChatGPT", () => {
   assert.match(supervision.message, /inspection retries 7/)
   assert.match(supervision.message, /liveness checkpoints 1/)
   assert.match(supervision.message, /ChatGPT review has not been sent/)
+})
+
+test("a pending local launch cannot inherit the previous cycle's completed browser delivery", () => {
+  const parent = convergence({ phase: "codex_launching", cycle: 2, childWorkflowId: "previous-child", codexCandidateCorrectionLivenessCheckpointCount: 2 })
+  const child = { id: "previous-child", phase: "head_committed", status: "succeeded" }
+  const supervision = superviseWorkflow(parent, child)
+  assert.equal(supervision.stage, "codex")
+  assert.equal(supervision.chatGpt.delivery, "not_started")
+  assert.equal(supervision.codex.candidateCorrectionLivenessCheckpointCount, 2)
+  const checkpoint = projectEagleSemanticCheckpoint(parent, child, supervision)
+  assert.equal(checkpoint.loop.actionClass, "codex_turn")
+  assert.equal(checkpoint.expectedWait.operation, "codex_turn")
 })
 
 test("supervision distinguishes an unconfirmed delivery from a confirmed Send", () => {

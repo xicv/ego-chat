@@ -5,9 +5,13 @@ import path from "node:path"
 import test from "node:test"
 
 import { runEagleMonitorCli } from "../src/eagle-monitor-cli.mjs"
-import { loadEagleMonitorConfig } from "../src/eagle-monitor-config.mjs"
+import { loadEagleMonitorConfig, safeDigest } from "../src/eagle-monitor-config.mjs"
 import { EagleMonitorLifecycle, generateLaunchAgent } from "../src/eagle-monitor-lifecycle.mjs"
 import { EagleMonitorStore } from "../src/eagle-monitor-store.mjs"
+import {
+  classifyEagleSemanticLiveness,
+  projectEagleSemanticCheckpoint,
+} from "../src/eagle-monitor-semantic.mjs"
 import { EgoChatError } from "../src/errors.mjs"
 
 const WORKFLOW_ID = "00000000-0000-4000-8000-000000000001"
@@ -499,6 +503,60 @@ test("status reports an active session without a monitor lease as degraded", asy
   assert.equal(exit, 2)
   assert.deepEqual(outputs.at(-1).result.monitor, { active: false, epoch: 4 })
   assert.equal(outputs.at(-1).result.session.workflowDigest.length, 64)
+})
+
+test("status and doctor reject an eight-hour-old observation despite a live monitor PID", async (t) => {
+  const { config } = await fixture(t)
+  const store = new EagleMonitorStore(config)
+  const at = "2026-09-04T00:00:00.000Z"
+  await store.configureSession({
+    bindingKey: "ego-chat-main",
+    launchAgentDigest: "a".repeat(64),
+    mode: "safe",
+    now: at,
+    powerPolicy: "allow-sleep",
+    workflowId: WORKFLOW_ID,
+  })
+  await store.writeState({
+    schemaVersion: 1,
+    workflowDigest: safeDigest(WORKFLOW_ID),
+    state: "send_confirmed_capture",
+    phase: "send_confirmed",
+    humanRequired: { required: false, reasonCode: "send_confirmed_read_only_capture" },
+    updatedAt: at,
+    nextObservationAt: "2026-09-04T00:00:05.000Z",
+    semantic: classifyEagleSemanticLiveness({
+      checkpoint: projectEagleSemanticCheckpoint({
+        id: WORKFLOW_ID, kind: "ego_exchange", phase: "send_confirmed",
+        status: "running", updatedAt: at, createdAt: at,
+      }),
+      brokerEpoch: 7,
+      nowMs: Date.parse(at),
+    }),
+  }, { assertCurrent: async () => {} })
+  const bytesBefore = await fs.readFile(config.paths.state)
+  for (const command of ["status", "doctor"]) {
+    let output
+    const exit = await runEagleMonitorCli({
+      argv: [command, "--json"],
+      config,
+      lifecycle: { status: async () => ({
+        loaded: true, definitionMatches: true, definitionPresent: true,
+      }) },
+      observeMonitor: async () => ({ active: true, epoch: 4 }),
+      now: () => "2026-09-04T08:00:00.000Z",
+      store,
+      write: (value) => { output = value },
+    })
+    assert.equal(exit, 2, command)
+    const status = command === "doctor" ? output.result.status : output.result
+    assert.equal(status.observationFreshness.fresh, false)
+    assert.equal(status.humanRequired.reasonCode, "monitor_observation_stale")
+    assert.equal(status.humanRequired.required, true)
+    assert.equal(status.semantic.expectedWaitLease.active, false)
+    if (command === "doctor") assert.equal(output.result.healthy, false)
+  }
+  assert.deepEqual(await fs.readFile(config.paths.state), bytesBefore)
 })
 
 test("status reports a shadow semantic loop as attention without taking action", async (t) => {

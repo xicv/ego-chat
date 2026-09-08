@@ -20,7 +20,7 @@ import {
   publicEagleSemanticStatus,
   validateEagleSemanticState,
 } from "./eagle-monitor-semantic.mjs"
-import { MonitorAction, MonitorState } from "./eagle-monitor-policy.mjs"
+import { MonitorAction, MonitorState, monitorObservationFreshness } from "./eagle-monitor-policy.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/
@@ -608,13 +608,17 @@ export class EagleMonitorStore {
     const currentState = active && state?.workflowDigest !== safeDigest(session.workflowId)
       ? null
       : state
+    const observationFreshness = monitorObservationFreshness(session, currentState, nowMs)
     return {
       broker: currentState?.broker ?? null,
       humanRequired: active
-        ? (currentState?.humanRequired ?? { reasonCode: "monitor_starting", required: false })
+        ? observationFreshness.fresh === false
+          ? { reasonCode: observationFreshness.reasonCode, required: true }
+          : (currentState?.humanRequired ?? { reasonCode: "monitor_starting", required: false })
         : { reasonCode: "monitor_not_started", required: false },
       lastAction: currentState?.lastAction ?? null,
       monitor,
+      observationFreshness,
       nextObservationAt: active ? (currentState?.nextObservationAt ?? null) : null,
       phase: currentState?.phase ?? null,
       policyMatches,

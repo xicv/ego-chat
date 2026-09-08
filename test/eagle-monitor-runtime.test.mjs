@@ -135,6 +135,7 @@ async function fixture(t, {
     wall: Date.parse("2026-09-04T00:00:00.000Z"),
   }
   const actions = []
+  let powerObservation = { onAc, sleepDetected: false, wakeDetected: false }
   let beforeDispatch = async () => {}
   let beforeObserve = async () => {}
   let observation = {
@@ -178,7 +179,7 @@ async function fixture(t, {
     },
   }
   const power = {
-    observe: async () => ({ onAc, sleepDetected: false, wakeDetected: false }),
+    observe: async () => structuredClone(powerObservation),
     setIdleSleepAssertion: async (enabled, fence) => {
       await fence.assertCurrent()
       actions.push(["power", enabled])
@@ -194,6 +195,7 @@ async function fixture(t, {
     lease: dispatchFence,
     notifier: {
       notify: async (_classification, fence) => {
+        await beforeDispatch("notify")
         await fence.assertCurrent()
         actions.push(["notify"])
       },
@@ -220,6 +222,7 @@ async function fixture(t, {
       }
     },
     setBeforeObserve: (value) => { beforeObserve = value },
+    setPowerObservation: (value) => { powerObservation = value },
     store,
     time,
   }
@@ -507,6 +510,46 @@ test("crash-loop history suppresses a fourth broker start and notifies", async (
 
 })
 
+test("failed authentication notification preserves the boundary and retries reporting", async (t) => {
+  const context = await fixture(t)
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      phase: "preflight",
+      status: "human_required",
+      updatedAt: "2026-09-04T00:00:00.000Z",
+      humanRequired: { code: "authentication_required" },
+    },
+  })
+  context.setBeforeDispatch(async (action) => {
+    if (action === "notify") throw new Error("notification unavailable")
+  })
+
+  const failed = await context.engine.tick()
+  assert.equal(failed.classification.state, MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE)
+  assert.equal(failed.state.semantic.classification, "human_required")
+  const persisted = await context.store.readState()
+  assert.equal(persisted.humanRequired.reasonCode, "authentication_required")
+  assert.equal(persisted.lastAction.outcome, "failed")
+  assert.equal(persisted.incidents.at(-1).reasonCode, "authentication_required")
+
+  context.setBeforeDispatch(async () => {})
+  context.time.wall += failed.backoffMs
+  context.time.monotonic += failed.backoffMs
+  const reported = await context.engine.tick()
+  assert.equal(reported.state.lastAction.outcome, "succeeded")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+  context.time.wall += reported.backoffMs
+  context.time.monotonic += reported.backoffMs
+  const unchanged = await context.engine.tick()
+  assert.equal(unchanged.state.lastAction.outcome, "already_reported")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+  assert.equal(context.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+})
+
 test("a wake discontinuity pauses recovery for one full revalidation", async (t) => {
   const context = await fixture(t)
   const initial = await context.engine.tick()
@@ -524,6 +567,43 @@ test("a wake discontinuity pauses recovery for one full revalidation", async (t)
   const resumed = await context.engine.tick()
   assert.equal(resumed.classification.state, MonitorState.HEALTHY)
   assert.equal(context.actions.filter(([action]) => action === "attach").length, attachedBeforeWake + 1)
+})
+
+test("sleep and wake revalidation preserve an underlying authentication boundary", async (t) => {
+  for (const event of ["sleepDetected", "wakeDetected"]) {
+    await t.test(event, async (t) => {
+      const context = await fixture(t)
+      context.setObservation({
+        available: true,
+        conclusivelyDead: false,
+        epoch: 7,
+        runtimeIdentity: RUNTIME_IDENTITY,
+        workflow: {
+          phase: "preflight",
+          status: "human_required",
+          updatedAt: "2026-09-04T00:00:00.000Z",
+          humanRequired: { code: "authentication_required" },
+        },
+      })
+      context.setPowerObservation({ onAc: true, [event]: true })
+
+      const paused = await context.engine.tick()
+      assert.equal(paused.classification.state, MonitorState.POWER_SLEEP)
+      assert.equal(paused.state.semantic.dimensions.humanBoundary, false)
+      assert.equal((await context.store.readState()).state, MonitorState.POWER_SLEEP)
+      assert.equal(context.actions.some(([action]) => action === "notify"), false)
+
+      context.setPowerObservation({ onAc: true, sleepDetected: false, wakeDetected: false })
+      context.time.wall += paused.backoffMs
+      context.time.monotonic += paused.backoffMs
+      const revalidated = await context.engine.tick()
+      assert.equal(revalidated.classification.state, MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE)
+      assert.equal(revalidated.state.semantic.classification, "human_required")
+      assert.equal((await context.store.readState()).humanRequired.reasonCode, "authentication_required")
+      assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+      assert.equal(context.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+    })
+  }
 })
 
 test("a long phase-aware backoff is not mistaken for sleep when both clocks advance", async (t) => {
@@ -797,7 +877,9 @@ test("convergence ambiguity stays durable, redacted, and exact-parent-bound acro
 
       const session = await context.store.readSession()
       const persisted = await context.store.readState()
-      const publicStatus = context.store.publicStatus(session, persisted, { loaded: true })
+      const publicStatus = context.store.publicStatus(
+        session, persisted, { loaded: true }, null, null, context.time.wall,
+      )
       const incidents = context.store.publicIncidents(persisted, 200)
       assert.equal(publicStatus.state, MonitorState.AMBIGUOUS_UNCONFIRMED_DELIVERY)
       assert.equal(publicStatus.humanRequired.reasonCode, reasonCode)

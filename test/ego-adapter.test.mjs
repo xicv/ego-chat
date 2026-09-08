@@ -1283,6 +1283,80 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
   }
 }
 
+// Synthetic DOM contract, not a recording of the provider's current markup.
+// The actual driver script executes against it; status/prose ancestry matters.
+function createProviderTerminalDom(options = {}, read = 1) {
+  class Element {
+    constructor(tag, attributes = {}, text = "", children = []) {
+      Object.assign(this, { tag, attributes, innerText: text, textContent: text, children })
+      for (const child of children) child.parentElement = this
+    }
+    getAttribute(name) { return this.attributes[name] ?? null }
+    matches(selector) {
+      return selector.split(",").some((part) => {
+        part = part.trim()
+        const tag = part.match(/^[a-z]+/)?.[0]
+        const cls = part.match(/\.([\w-]+)/)?.[1]
+        const attributes = [...part.matchAll(/\[([\w-]+)(?:(\*?=)"([^"]*)")?\]/g)]
+        return (!tag || this.tag === tag)
+          && (!cls || this.attributes.class === cls)
+          && attributes.every(([, name, operator, value]) => value === undefined
+            ? this.getAttribute(name) !== null
+            : operator === "*="
+              ? this.getAttribute(name)?.includes(value)
+              : this.getAttribute(name) === value)
+      })
+    }
+    closest(selector) {
+      return this.matches(selector) ? this : this.parentElement?.closest(selector) ?? null
+    }
+    contains(element) { return this === element || this.children.some((child) => child.contains(element)) }
+    querySelectorAll(selector) {
+      return this.children.flatMap((child) => [
+        ...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector),
+      ])
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null }
+    getClientRects() { return this.attributes.hidden ? [] : [{}] }
+  }
+  const message = (role, id) => new Element("div", {
+    "data-message-author-role": role, "data-message-id": id,
+  })
+  const priorMessage = message("assistant", "previous-assistant")
+  const promptMessage = message("user", "reconcile-user")
+  const responseMessage = message("assistant", options.responseId ?? "partial-assistant")
+  const turn = (role, id, child) => new Element("section", {
+    "data-turn": role, "data-turn-id": id,
+  }, "", [child])
+  const priorTurn = turn("assistant", "previous-turn", priorMessage)
+  const promptTurn = turn("user", "prompt-turn", promptMessage)
+  const responseTurn = turn("assistant", "response-turn", responseMessage)
+  const document = new Element("document", {}, "", [priorTurn, promptTurn, responseTurn])
+  if (options.promptOutsideTail) {
+    document.children = [priorTurn, responseTurn, promptMessage]
+    promptMessage.parentElement = document
+  }
+  const statuses = read > 1 && options.secondStatuses ? options.secondStatuses : options.statuses ?? []
+  for (const status of statuses) {
+    const node = new Element(status.button ? "button" : "div", {
+      ...(status.button ? {} : { role: status.role ?? "status" }),
+      ...(status.hidden ? { hidden: true } : {}),
+    }, status.label, status.containsProse
+      ? [new Element("div", { class: "markdown" }, status.label)] : [])
+    const parent = ({
+      previous: priorTurn, user: promptMessage, message: responseMessage, global: document,
+    })[status.location] ?? responseTurn
+    parent.children.push(node)
+    node.parentElement = parent
+  }
+  if (options.additionalUser) {
+    const later = turn("user", "later-turn", message("user", "later-user"))
+    document.children.push(later)
+    later.parentElement = document
+  }
+  return document
+}
+
 async function runTaskSpaceReconciliationCase({
   adoptedTaskSpaceOwnership = null,
   attachmentObservation = null,
@@ -1292,6 +1366,7 @@ async function runTaskSpaceReconciliationCase({
   bindingKey = "ego-chat-main",
   brokerFenceChangesDuringReclaimRelist = false,
   captureContinuationAllowed = false,
+  confirmedTailVisible = false,
   canonicalUrl = "https://chatgpt.com/c/reconcile-driver-test",
   composerDraft = "",
   createdTaskSpaceIdentity = undefined,
@@ -1311,6 +1386,8 @@ async function runTaskSpaceReconciliationCase({
   ownershipAfterSelection = null,
   postSelectionConflictingIdentity = null,
   promptIdentityMatches = true,
+  providerDomOptions = undefined,
+  providerObservationDrift = null,
   renderedPromptText = undefined,
   postReclaimIdentity = null,
   recycleBeforeReclaim = false,
@@ -1452,6 +1529,9 @@ let composerDraft = ${JSON.stringify(composerDraft)}
 let driftTaskSpace = false
 let observedCanonicalUrl = ${JSON.stringify(canonicalUrl)}
 let listTaskSpaceCalls = 0
+let providerStatusReads = 0
+const providerDomOptions = ${JSON.stringify(providerDomOptions ?? {})}
+const createProviderTerminalDom = ${createProviderTerminalDom.toString()}
 const taskSpaceRequests = []
 const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeOverTaskSpace: 0, typeText: 0 }
 globalThis.cliLog = (value) => console.log(value)
@@ -1562,6 +1642,17 @@ globalThis.typeText = async () => { counters.typeText += 1 }
 globalThis.pressKey = async () => { counters.pressKey += 1 }
 globalThis.cdp = async () => {}
 globalThis.js = async (source) => {
+  if (source.includes('ego-chat-provider-terminal-observation/v1')) {
+    providerStatusReads += 1
+    if (providerStatusReads === 2) {
+      if (${JSON.stringify(providerObservationDrift)} === 'canonical-url') observedCanonicalUrl = 'https://chatgpt.com/c/provider-terminal-drift'
+      if (${JSON.stringify(providerObservationDrift)} === 'task-space') driftTaskSpace = true
+      if (${JSON.stringify(providerObservationDrift)} === 'broker-fence') {
+        await fs.writeFile(${JSON.stringify(ownerPath)}, JSON.stringify({ brokerId: 'replacement-broker', epoch: 2, pid: process.pid }))
+      }
+    }
+    return Function('document', 'return ' + source)(createProviderTerminalDom(providerDomOptions, providerStatusReads))
+  }
   if (source.includes("composer.replaceChildren()") && source.includes("deleteContentBackward")) {
     composerDraft = ''
     return true
@@ -1582,7 +1673,7 @@ globalThis.js = async (source) => {
     source.includes("const messageNodes = [")
     || source.includes("return [...document.querySelectorAll('[data-message-author-role]')].map")
   ) {
-    const result = ${JSON.stringify(["capture_exchange", "reconcile"].includes(mode)
+    const result = ${JSON.stringify((confirmedTailVisible || ["capture_exchange", "reconcile"].includes(mode))
       ? captureEntries
       : [{ messageId: "previous-assistant", role: "assistant", text: previousText }])}
     if (${JSON.stringify(driftAfterConversationRead)}) driftTaskSpace = true
@@ -2234,7 +2325,7 @@ process.stdin.setEncoding("utf8")
 process.stdin.on("data", (chunk) => { source += chunk })
 process.stdin.on("end", () => {
   const invocation = source.trim()
-  const argumentStart = invocation.lastIndexOf(")(")
+  const argumentStart = invocation.lastIndexOf('})("') + 1
   const argumentEnd = invocation.indexOf(",", argumentStart + 2)
   const inputPath = JSON.parse(invocation.slice(argumentStart + 2, argumentEnd))
   const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))
@@ -3896,6 +3987,181 @@ test("bounded capture tolerates a transient missing generation control", async (
   assert.equal(captured.result.promptMessageId, "reconcile-user")
 })
 
+test("confirmed capture classifies a stable latest-turn stopped status without resending", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{ label: "Stopped thinking", button: true }] },
+    responseText: "",
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "stopped")
+  assert.equal(captured.result.providerTerminal.source, "latest_turn_status")
+  assert.equal(captured.result.providerTerminal.schema, "ego-chat-provider-terminal/v1")
+  assert.equal(captured.result.providerTerminal.stableObservations, 2)
+  assert.match(captured.result.providerTerminal.signalDigest, /^[a-f0-9]{64}$/)
+  assert.equal(captured.result.generationRunning, false)
+  assert.equal(captured.result.promptMessageId, "reconcile-user")
+  assert.ok(Object.values(captured.counters).every((count) => count === 0))
+  assert.equal(JSON.stringify(captured.result).includes("Stopped thinking"), false)
+})
+
+test("confirmed capture distinguishes explicit conversation exhaustion from stopped thinking", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    allowProtocolRepairCapture: true,
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "This conversation is too long. Please start a new chat.", role: "alert",
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
+  assert.equal(captured.result.providerTerminal.stableObservations, 2)
+  assert.equal(Object.hasOwn(captured.result, "responseText"), false)
+  assert.equal(Object.hasOwn(captured.result.providerTerminal, "rolloverEligible"), false)
+  assert.ok(Object.values(captured.counters).every((count) => count === 0))
+})
+
+test("confirmed capture keeps provider failures and quota separate from conversation exhaustion", async (t) => {
+  for (const [label, kind] of [
+    ["Something went wrong. Please try again.", "provider_error"],
+    ["An error occurred while generating the response.", "provider_error"],
+    ["You've reached your message limit. Please try again later.", "quota_limited"],
+  ]) {
+    await t.test(kind + label, async () => {
+      const captured = await runTaskSpaceReconciliationCase({
+        captureContinuationAllowed: true,
+        mode: "capture_exchange",
+        providerDomOptions: { statuses: [{ label, role: "alert" }] },
+      })
+      assert.equal(captured.error, undefined)
+      assert.equal(captured.result.captureState, "provider_terminal")
+      assert.equal(captured.result.providerTerminal.kind, kind)
+      assert.ok(Object.values(captured.counters).every((count) => count === 0))
+    })
+  }
+})
+
+test("provider terminal evidence requires the exact latest prompt followed by its assistant turn", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: {
+      promptOutsideTail: true,
+      statuses: [{ label: "This conversation is too long. Please start a new chat.", role: "alert" }],
+    },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "pending")
+  assert.equal(captured.result.providerTerminal, undefined)
+})
+
+test("unrecognized latest-turn alerts cannot grant context-exhaustion classification", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [
+      { label: "This conversation is too long. Please start a new chat.", role: "alert" },
+      { label: "You stopped this response.", role: "alert" },
+    ] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "pending")
+  assert.equal(captured.result.providerTerminal, undefined)
+})
+
+test("status wrappers containing assistant prose are not provider terminal evidence", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "This conversation is too long. Please start a new chat.", role: "alert", containsProse: true,
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "pending")
+  assert.equal(captured.result.providerTerminal, undefined)
+})
+
+test("provider terminal classification ignores stale, hidden, quoted, and conflicting UI evidence", async (t) => {
+  const label = "This conversation is too long. Please start a new chat."
+  const cases = [
+    ...["previous", "user", "message", "global"].map((location) => ({
+      name: location, statuses: [{ label, role: "alert", location }],
+    })),
+    { name: "hidden", statuses: [{ label, role: "alert", hidden: true }] },
+    { name: "quoted", statuses: [{ label: `Example: ${label}`, role: "alert" }] },
+    { name: "unqualified-button", statuses: [{ label, button: true }] },
+    { name: "ambiguous-length", statuses: [{ label: "This conversation is too long.", role: "alert" }] },
+    { name: "stopped-and-length", statuses: [{ label, role: "alert" }, { label: "Stopped thinking" }] },
+    { name: "quota-and-length", statuses: [{ label, role: "alert" }, {
+      label: "You've reached your message limit. Please try again later.", role: "alert",
+    }] },
+    { name: "later-user", statuses: [{ label, role: "alert" }], additionalUser: true },
+    { name: "different-response", statuses: [{ label, role: "alert" }], responseId: "different-assistant" },
+  ]
+  for (const { name, ...providerDomOptions } of cases) {
+    await t.test(name, async () => {
+      const captured = await runTaskSpaceReconciliationCase({
+        captureContinuationAllowed: true, mode: "capture_exchange", providerDomOptions,
+      })
+      assert.equal(captured.error, undefined)
+      assert.equal(captured.result.captureState, "pending")
+      assert.equal(captured.result.providerTerminal, undefined)
+      assert.ok(Object.values(captured.counters).every((count) => count === 0))
+    })
+  }
+})
+
+test("provider terminal capture requires repeated stable status and no active generation", async () => {
+  const statuses = [{ label: "Stopped thinking", button: true }]
+  const unstable = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true, mode: "capture_exchange",
+    providerDomOptions: { statuses, secondStatuses: [] },
+  })
+  assert.equal(unstable.result, undefined)
+  assert.equal(unstable.error?.details?.reason, "provider_terminal_observation_unstable")
+  const generating = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true, mode: "capture_exchange", generationRunning: true,
+    providerDomOptions: { statuses },
+  })
+  assert.equal(generating.error, undefined)
+  assert.equal(generating.result.captureReason, "generation_running")
+  assert.equal(generating.result.providerTerminal, undefined)
+})
+
+test("provider terminal results retain final canonical, task-space and broker fences", async (t) => {
+  for (const providerObservationDrift of ["canonical-url", "task-space", "broker-fence"]) {
+    await t.test(providerObservationDrift, async () => {
+      const captured = await runTaskSpaceReconciliationCase({
+        captureContinuationAllowed: true, mode: "capture_exchange", providerObservationDrift,
+        providerDomOptions: { statuses: [{ label: "Stopped thinking", button: true }] },
+      })
+      assert.equal(captured.result, undefined)
+      assert.ok(captured.error)
+      assert.ok(Object.values(captured.counters).every((count) => count === 0))
+    })
+  }
+})
+
+test("provider terminal classification is shared by confirmed capture and read-only reconciliation", async (t) => {
+  for (const mode of ["capture_exchange", "reconcile_bound"]) {
+    await t.test(mode, async () => {
+      const captured = await runTaskSpaceReconciliationCase({
+        mode, confirmedTailVisible: true, captureContinuationAllowed: true,
+        providerDomOptions: { statuses: [{ label: "Stopped thinking" }] },
+      })
+      assert.equal(captured.error, undefined)
+      assert.equal(captured.result.captureState, "provider_terminal")
+      assert.equal(captured.result.providerTerminal.kind, "stopped")
+      assert.ok(Object.values(captured.counters).every((count) => count === 0))
+    })
+  }
+})
+
 test("bounded capture fails closed for a completed image-only assistant turn without the terminal marker", async () => {
   const captured = await runTaskSpaceReconciliationCase({
     captureContinuationAllowed: true,
@@ -4089,7 +4355,7 @@ process.stdin.setEncoding("utf8")
 process.stdin.on("data", (chunk) => { source += chunk })
 process.stdin.on("end", () => {
   const invocation = source.trim()
-  const argumentStart = invocation.lastIndexOf(")(")
+  const argumentStart = invocation.lastIndexOf('})("') + 1
   const argumentEnd = invocation.indexOf(",", argumentStart + 2)
   const inputPath = JSON.parse(invocation.slice(argumentStart + 2, argumentEnd))
   const input = JSON.parse(fs.readFileSync(inputPath, "utf8"))

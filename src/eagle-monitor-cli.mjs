@@ -285,6 +285,18 @@ export async function runEagleMonitorCli({
         ok: session?.active === true ? monitor.active : !monitor.active,
       }
       checks.sessionPolicy = { ok: policyMatches }
+      const status = monitorStore.publicStatus(
+        session,
+        state,
+        service,
+        monitor,
+        policyMatches,
+        Date.parse(now()),
+      )
+      checks.observationFreshness = {
+        ok: status.observationFreshness?.fresh !== false,
+        reasonCode: status.observationFreshness?.reasonCode ?? "monitor_observation_unavailable",
+      }
       const healthy = Object.values(checks).every((check) => check.ok)
         && service.definitionMatches
         && (!service.loaded || session?.active === true)
@@ -293,14 +305,7 @@ export async function runEagleMonitorCli({
         healthy,
         mvpDependencies: { llm: false, network: false },
         service,
-        status: monitorStore.publicStatus(
-          session,
-          state,
-          service,
-          monitor,
-          policyMatches,
-          Date.parse(now()),
-        ),
+        status,
       }
       if (!healthy) exitCode = EAGLE_MONITOR_EXIT.ATTENTION_REQUIRED
     }

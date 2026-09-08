@@ -251,10 +251,36 @@ export const EgoExchangeSchema = z.object({
   turnMarker: z.string().regex(/^EGO_CHAT_[A-Z0-9_-]{8,160}$/),
 })
 
+export const ProviderTerminalObservationSchema = z.object({
+  schema: z.literal("ego-chat-provider-terminal/v1"),
+  kind: z.enum(["stopped", "conversation_exhausted", "provider_error", "quota_limited"]),
+  source: z.literal("latest_turn_status"),
+  signalDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  stableObservations: z.number().int().min(2).max(100),
+}).strict()
+
+export const PrepareSuccessorSchema = z.object({
+  workflowId: WorkflowIdSchema,
+  expectedCheckpointDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  acknowledgeNewChat: z.literal(true),
+}).strict()
+
+export const ResumeConvergenceSchema = z.object({
+  workflowId: WorkflowIdSchema,
+  expectedCheckpointDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  successor: z.object({
+    bindingKey: BindingKeySchema,
+    canonicalUrl: CanonicalConversationUrlSchema,
+    expectedBindingRevision: z.number().int().positive(),
+    acknowledgeConversationChange: z.literal(true),
+  }).strict().optional(),
+}).strict()
+
 const ConvergenceTextSchema = (maximum) => z.string().trim().min(1).max(maximum)
   .refine((value) => !value.includes("\0"), "Text must not contain null bytes")
 
 export const StartConvergenceSchema = z.object({
+  conversationContinuation: z.enum(["manual", "same_project_on_exhaustion"]).default("manual"),
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,

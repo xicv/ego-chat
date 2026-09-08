@@ -1,4 +1,5 @@
 import readline from "node:readline"
+import fs from "node:fs"
 
 const lines = readline.createInterface({ input: process.stdin })
 const threadId = "019d0000-0000-7000-8000-000000000001"
@@ -10,9 +11,15 @@ const phaseUnknownMessages = process.argv.includes("--phase-unknown-messages")
 const interruptedTurnReads = process.argv.includes("--interrupted-turn-reads")
 const interruptedTurnWithoutItems = process.argv.includes("--interrupted-turn-without-items")
 const omitTurnCompleted = process.argv.includes("--omit-turn-completed")
+const loseTurnStartAck = process.argv.includes("--lose-turn-start-ack")
+const stateFileIndex = process.argv.indexOf("--state-file")
+const stateFile = stateFileIndex >= 0 ? process.argv[stateFileIndex + 1] : null
 let turnNumber = 1
 let activeReadsRemaining = 0
-const completedTurns = []
+const completedTurns = stateFile && fs.existsSync(stateFile)
+  ? JSON.parse(fs.readFileSync(stateFile, "utf8"))
+  : []
+turnNumber += completedTurns.length
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`)
@@ -65,6 +72,7 @@ lines.on("line", (line) => {
       durationMs: 1,
       id: `019d0000-0000-7000-8000-${String(turnNumber).padStart(12, "0")}`,
       items: [
+        { id: `user-${turnNumber}`, type: "userMessage", content: message.params.input },
         {
           aggregatedOutput: "test/fixtures/fake-app-server.mjs\n",
           command: "rg --files",
@@ -99,6 +107,10 @@ lines.on("line", (line) => {
       delete turn.items
     }
     completedTurns.push(turn)
+    if (stateFile) fs.writeFileSync(stateFile, JSON.stringify(completedTurns), { mode: 0o600 })
+    if (loseTurnStartAck && completedTurns.length === 1) {
+      process.exit(70)
+    }
     activeReadsRemaining = 1
     send({ id: message.id, result: { turn: { ...turn, items: [], status: "inProgress" } } })
     if (exitAfterTurnStart || signalAfterTurnStart) {

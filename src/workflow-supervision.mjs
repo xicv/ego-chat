@@ -1,9 +1,21 @@
 const CODEX_PHASES = new Set([
+  "codex_launching",
   "codex_ready",
   "codex_recovering",
   "codex_running",
   "created",
 ])
+
+const CONFIRMED_PENDING_DELIVERIES = new Set([
+  "sent_generating",
+  "sent_response_incomplete",
+  "sent_waiting_response",
+])
+
+/** Whether the projection proves Send confirmed while response capture remains pending. */
+export function isConfirmedPendingDelivery(delivery) {
+  return CONFIRMED_PENDING_DELIVERIES.has(delivery)
+}
 
 function finiteCount(value) {
   return Number.isSafeInteger(value) && value > 0 ? value : 0
@@ -17,7 +29,7 @@ function chatGptDelivery(workflow, childWorkflow) {
     return "response_captured"
   }
   if (CODEX_PHASES.has(workflow.phase)) return "not_started"
-  if (workflow.phase === "codex_captured") return "queued"
+  if (["codex_captured", "successor_preparing"].includes(workflow.phase)) return "queued"
   if (!workflow.childWorkflowId) {
     return "not_started"
   }
@@ -52,8 +64,8 @@ function convergenceStage(workflow) {
   if (["failed", "human_required", "cancelled"].includes(workflow.status)) return "stopped"
   if (workflow.status === "succeeded") return workflow.phase === "settled" ? "settled" : "stopped"
   if (CODEX_PHASES.has(workflow.phase)) return "codex"
-  if (workflow.phase === "codex_captured") return "handoff"
-  if (workflow.phase === "chatgpt_running") return "chatgpt"
+  if (["codex_captured", "successor_preparing"].includes(workflow.phase)) return "handoff"
+  if (["chatgpt_running", "successor_reviewing"].includes(workflow.phase)) return "chatgpt"
   if (workflow.phase === "review_captured") return "review"
   if (workflow.phase === "settled") return "settled"
   return workflow.status === "running" ? "recovering" : "stopped"
@@ -109,6 +121,7 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
     workflow.codexAppServerLivenessCheckpointCount,
   )
   const candidateCorrectionCount = finiteCount(workflow.candidateCorrectionCount)
+  const candidateCorrectionLivenessCheckpointCount = finiteCount(workflow.codexCandidateCorrectionLivenessCheckpointCount)
   const inspectionRetryCount = finiteCount(workflow.codexInspectionRetryCount)
   const livenessCheckpointCount = finiteCount(workflow.codexInspectionLivenessCheckpointCount)
   const activeInspectionRetryCount = finiteCount(workflow.activeCodexInspectionRetryCount)
@@ -133,6 +146,7 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
   }
   if (inspectionRetryCount > 0) recoveryParts.push(`inspection retries ${inspectionRetryCount}`)
   if (candidateCorrectionCount > 0) recoveryParts.push(`candidate corrections ${candidateCorrectionCount}`)
+  if (candidateCorrectionLivenessCheckpointCount > 0) recoveryParts.push(`candidate correction checkpoints ${candidateCorrectionLivenessCheckpointCount}`)
   if (livenessCheckpointCount > 0) recoveryParts.push(`liveness checkpoints ${livenessCheckpointCount}`)
   if (cycleActivityCount > 0) recoveryParts.push(`cycle workspace activity ${cycleActivityCount}`)
   if (threadRotationCount > 0) recoveryParts.push(`Codex thread rotations ${threadRotationCount}`)
@@ -151,6 +165,7 @@ export function superviseWorkflow(workflow, childWorkflow = undefined) {
       appServerLivenessCheckpointCount,
       activeInspectionRetryCount,
       candidateCorrectionCount,
+      candidateCorrectionLivenessCheckpointCount,
       cycleActivityCount,
       inspectionRetryCount,
       livenessCheckpointCount,
