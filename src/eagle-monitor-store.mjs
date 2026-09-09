@@ -14,13 +14,13 @@ import {
   removeFileIfPresent,
   writeAtomicJson,
 } from "./eagle-monitor-fs.mjs"
-import { safeDigest } from "./eagle-monitor-config.mjs"
+import { monitorSessionDigest, safeDigest } from "./eagle-monitor-config.mjs"
 import {
   deriveEagleSemanticIncidentKey,
   publicEagleSemanticStatus,
   validateEagleSemanticState,
 } from "./eagle-monitor-semantic.mjs"
-import { MonitorAction, MonitorState, monitorObservationFreshness } from "./eagle-monitor-policy.mjs"
+import { MONITOR_ACTION_POLICY, MonitorAction, MonitorState, monitorObservationFreshness } from "./eagle-monitor-policy.mjs"
 import { EgoChatError } from "./errors.mjs"
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/
@@ -65,6 +65,10 @@ const STATE_KEYS = new Set([
   "lastTick",
   "monitorEpoch",
   "nextObservationAt",
+  "notification",
+  "notificationBacklog",
+  "sessionDigest",
+  "unavailability",
   "phase",
   "reconciliation",
   "recoveryCount",
@@ -238,6 +242,20 @@ function semanticIncidentId(hex) {
   ).toString(16)}${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
+function assertNotification(n) {
+  assertKeys(n, new Set(["key", "reasonCode", "state", "outcome", "attemptedAt", "retryAt"]), "Notification submission")
+  if (!DIGEST_PATTERN.test(n.key ?? "") || !validNullableEvidenceCode(n.reasonCode)
+    || !MONITOR_ACTION_POLICY[n.state]?.includes(MonitorAction.NOTIFY_USER)
+    || !["pending", "dispatching", "failed", "accepted"].includes(n.outcome)
+    || !validNullableInteger(n.attemptedAt) || !validNullableInteger(n.retryAt)
+    || (n.outcome === "pending" && (n.attemptedAt !== null || n.retryAt !== null))
+    || (n.outcome === "accepted" && (n.attemptedAt === null || n.retryAt !== null))
+    || (["dispatching", "failed"].includes(n.outcome)
+      && (n.attemptedAt === null || n.retryAt === null || n.retryAt < n.attemptedAt))) {
+    failCorrupt("Notification submission has an invalid value.")
+  }
+}
+
 function assertState(value) {
   assertKeys(value, STATE_KEYS, "The Eagle Monitor state")
   if (value.schemaVersion !== EAGLE_MONITOR_SCHEMA_VERSION) {
@@ -251,6 +269,34 @@ function assertState(value) {
     value.backoffKey !== undefined
     && !(value.backoffKey === null || DIGEST_PATTERN.test(value.backoffKey ?? ""))
   ) failCorrupt("The monitor backoff key is invalid.")
+  if (value.sessionDigest !== undefined && !DIGEST_PATTERN.test(value.sessionDigest ?? "")) {
+    failCorrupt("The monitor session digest is invalid.")
+  }
+  if (value.unavailability !== undefined && value.unavailability !== null) {
+    assertKeys(value.unavailability, new Set(["identity", "firstObservedAt", "brokerEpoch", "runtimeDigest"]), "Broker unavailability")
+    if (!DIGEST_PATTERN.test(value.unavailability.identity ?? "")
+      || !validNullableInteger(value.unavailability.brokerEpoch)
+      || !(value.unavailability.runtimeDigest === null || DIGEST_PATTERN.test(value.unavailability.runtimeDigest ?? ""))
+      || !Number.isSafeInteger(value.unavailability.firstObservedAt) || value.unavailability.firstObservedAt < 0) {
+      failCorrupt("Broker unavailability has an invalid value.")
+    }
+  }
+  if (value.notification !== undefined && value.notification !== null) assertNotification(value.notification)
+  if (value.notificationBacklog !== undefined) {
+    const backlog = value.notificationBacklog
+    if (!Array.isArray(backlog) || backlog.length > EAGLE_MONITOR_POLICY.notificationBacklogLimit + 1) {
+      failCorrupt("The notification backlog is invalid.")
+    }
+    backlog.forEach(assertNotification)
+    if (backlog.length > EAGLE_MONITOR_POLICY.notificationBacklogLimit
+      && !backlog.some(entry => entry.reasonCode === "notification_backlog_overflow")) {
+      failCorrupt("The notification backlog overflow summary is missing.")
+    }
+    if (new Set(backlog.map(entry => entry.key)).size !== backlog.length
+      || backlog.some(entry => entry.key === value.notification?.key)) {
+      failCorrupt("The notification backlog contains a duplicate identity.")
+    }
+  }
   if (value.broker !== undefined && value.broker !== null) {
     assertKeys(value.broker, new Set(["available", "epoch", "runtimeDigest"]), "Broker evidence")
     if (
@@ -605,18 +651,42 @@ export class EagleMonitorStore {
 
   publicStatus(session, state, service, monitor = null, policyMatches = null, nowMs = Date.now()) {
     const active = session?.active === true
-    const currentState = active && state?.workflowDigest !== safeDigest(session.workflowId)
+    const currentState = active && (state?.workflowDigest !== safeDigest(session.workflowId)
+      || (state?.sessionDigest && state.sessionDigest !== monitorSessionDigest(session))
+      || Date.parse(state?.updatedAt) < Date.parse(session.configuredAt))
       ? null
       : state
     const observationFreshness = monitorObservationFreshness(session, currentState, nowMs)
+    const monitorActive = active && service?.loaded === true && service?.definitionMatches === true
+      && monitor?.active === true && Number.isSafeInteger(monitor.epoch) && monitor.epoch > 0
+      && policyMatches === true
+    const observationFresh = observationFreshness.fresh === true && observationFreshness.observedAt !== null
+      && currentState?.monitorEpoch === monitor?.epoch
+    const operationalHealthy = currentState?.broker?.available === true
+      && currentState?.humanRequired?.required === false
+      && ![MonitorState.CRASH_LOOP, MonitorState.DISK_FULL, MonitorState.VERSION_SKEW, MonitorState.STARTUP, MonitorState.POWER_SLEEP].includes(currentState?.state)
+      && !["human_required", "looping", "stagnant"].includes(currentState?.semantic?.classification)
+    const ready = monitorActive && observationFresh && operationalHealthy
     return {
+      readiness: {
+        monitorActive,
+        observationFresh,
+        ready,
+        recoveryEnabled: monitorActive && session?.mode === "safe",
+        state: ready ? "active" : !active && !service?.loaded && !monitor?.active ? "inactive"
+          : monitorActive && observationFreshness.reasonCode === "monitor_starting" ? "starting" : "degraded",
+      },
       broker: currentState?.broker ?? null,
+      unavailability: currentState?.unavailability ?? null,
       humanRequired: active
         ? observationFreshness.fresh === false
           ? { reasonCode: observationFreshness.reasonCode, required: true }
           : (currentState?.humanRequired ?? { reasonCode: "monitor_starting", required: false })
         : { reasonCode: "monitor_not_started", required: false },
       lastAction: currentState?.lastAction ?? null,
+      notification: currentState?.notification ?? null,
+      pendingNotificationCount: (currentState?.notificationBacklog ?? []).filter(entry => entry.outcome !== "accepted").length
+        + (currentState?.notification && currentState.notification.outcome !== "accepted" ? 1 : 0),
       monitor,
       observationFreshness,
       nextObservationAt: active ? (currentState?.nextObservationAt ?? null) : null,

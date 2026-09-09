@@ -75,6 +75,10 @@ export function safeDigest(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex")
 }
 
+export function monitorSessionDigest(session) {
+  return safeDigest(JSON.stringify([session.workflowId, session.bindingKey, session.configuredAt]))
+}
+
 export function loadEagleMonitorConfig(overrides = {}) {
   const loadedBrokerConfig = loadConfig(overrides.brokerConfig ?? {})
   const brokerConfig = {

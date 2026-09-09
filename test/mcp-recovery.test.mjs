@@ -276,7 +276,7 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
           messageCount: 2,
           renderedMessageCount: 2,
         },
-        modelPolicy: modelPolicyObservation(),
+        modelPolicy: { ...modelPolicyObservation(), modelLabel: "Latest", pillLabel: "6 Pro", effortLabel: "6 Pro" },
         responseDigest,
         responseText,
         targetId: "mcp-adopt-tab",
@@ -329,6 +329,19 @@ test("conversation adoption returns the stable ChatGPT tail into the same MCP tu
   assert.equal(adopted.structuredContent.result.modelPolicy.powerLevel, 5)
   assert.equal(adopted.structuredContent.waitMode, "token_saver")
   assert.equal(adopted.content[0].text.includes("\n"), false)
+  const compactPolicy = JSON.parse(adopted.content[0].text).modelPolicy
+  const verifiedPolicy = adopted.structuredContent.result.modelPolicy
+  assert.deepEqual(compactPolicy, {
+    effortLabel: verifiedPolicy.effortLabel,
+    modelLabel: verifiedPolicy.modelLabel,
+    pillLabel: verifiedPolicy.pillLabel,
+    powerLevel: verifiedPolicy.powerLevel,
+    powerMax: verifiedPolicy.powerMax,
+    verifiedAt: verifiedPolicy.verifiedAt,
+  })
+  assert.ok(compactPolicy.verifiedAt)
+  assert.equal(compactPolicy.modelLabel, "Latest")
+  assert.equal(compactPolicy.pillLabel, "6 Pro")
   assert.equal(adoptionCalls, 1)
   assert.equal(exchangeCalls, 0)
   assert.equal(receivedAllowTaskSpaceReclaim, true)
@@ -1067,6 +1080,10 @@ test("candidate review crosses MCP, keeps retrying proven absence, and consumes 
   assert.match(settled.structuredContent.operationId, /^review-[a-f0-9]{48}$/)
   assert.equal(settled.structuredContent.waitMode, "token_saver")
   assert.equal(settled.content[0].text.includes("\n"), false)
+  const compactPolicy = JSON.parse(settled.content[0].text).modelPolicy
+  assert.equal(compactPolicy.pillLabel, settled.structuredContent.modelPolicy.pillLabel)
+  assert.equal(compactPolicy.verifiedAt, settled.structuredContent.modelPolicy.verifiedAt)
+  assert.ok(compactPolicy.verifiedAt)
 
   const replayed = await client.callTool({
     arguments: directInput,
