@@ -195,7 +195,7 @@ async function fixture(t, {
     lease: dispatchFence,
     notifier: {
       notify: async (_classification, fence) => {
-        await beforeDispatch("notify")
+        await beforeDispatch("notify", _classification)
         await fence.assertCurrent()
         actions.push(["notify"])
       },
@@ -1520,4 +1520,311 @@ test("the atomic state store retains only the newest bounded incidents", async (
   assert.equal(state.incidents.length, 200)
   assert.equal(state.incidents[0].reasonCode, "reason_5")
   assert.equal(state.incidents.at(-1).reasonCode, "reason_204")
+})
+
+for (const recoveryFailure of [false, true]) {
+  test(`notification failure survives restart after ${recoveryFailure ? "failed recovery" : "terminal reconciliation"}`, async (t) => {
+    const c = await fixture(t)
+    c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { status: "human_required", phase: "recovery_required",
+        humanRequired: { code: "send_confirmation_ambiguous" } } })
+    let attempts = 0
+    c.setBeforeDispatch(async action => {
+      if (action === "reconcile" && recoveryFailure) throw new Error("synthetic recovery failure")
+      if (action === "notify" && ++attempts === 1) throw new Error("synthetic notifier failure")
+    })
+    const first = await c.engine.tick()
+    assert.equal(first.state.notification.outcome, "failed")
+    assert.equal(first.state.lastAction.outcome, recoveryFailure ? "failed" : "terminal_observed")
+    await c.createEngine().tick()
+    assert.equal(attempts, 1, "an early poll must not bypass notification backoff")
+    c.time.wall += 300_000
+    c.time.monotonic += 300_000
+    if (recoveryFailure) c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { status: "running", phase: "codex_running" } })
+    const retry = await c.createEngine().tick()
+    assert.equal(attempts, 2)
+    assert.equal(retry.state.notification.outcome, "accepted")
+    await c.createEngine().tick()
+    assert.equal(attempts, 2)
+  })
+}
+
+test("persistent ambiguous IPC alerts after five minutes across restart without restarting owner", async (t) => {
+  const c = await fixture(t)
+  c.setObservation({ available: false, conclusivelyDead: false, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY })
+  const first = await c.engine.tick()
+  c.time.wall += 299_999
+  c.time.monotonic += 299_999
+  assert.equal((await c.createEngine().tick()).classification.humanRequired, false)
+  c.time.wall += 1
+  c.time.monotonic += 1
+  const alert = await c.createEngine().tick()
+  assert.equal(alert.classification.reasonCode, "broker_ipc_unavailable")
+  assert.equal(alert.state.unavailability.firstObservedAt, first.state.unavailability.firstObservedAt)
+  assert.equal(c.actions.filter(([action]) => action === "notify").length, 1)
+  assert.equal(c.actions.some(([action]) => ["start", "reconcile", "attach"].includes(action)), false)
+})
+
+test("IPC unavailability resets only for healthy IPC, broker identity or exact session replacement", async (t) => {
+  const c = await fixture(t)
+  const unavailable = epoch => ({ available: false, conclusivelyDead: false, epoch, runtimeIdentity: RUNTIME_IDENTITY })
+  c.setObservation(unavailable(7))
+  await c.engine.tick()
+  c.time.wall += 300_000
+  c.time.monotonic += 300_000
+  c.setObservation(unavailable(8))
+  assert.equal((await c.createEngine().tick()).classification.humanRequired, false)
+  c.time.wall += 100_000
+  c.time.monotonic += 100_000
+  c.setObservation({ available: true, epoch: 8, runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: { phase: "codex_running", status: "running" } })
+  assert.equal((await c.engine.tick()).state.unavailability, null)
+  c.setObservation(unavailable(8))
+  await c.engine.tick()
+  const previous = await c.store.readSession()
+  await c.store.restoreSession({ ...previous, configuredAt: new Date(c.time.wall + 1).toISOString() })
+  c.time.wall += 300_000
+  c.time.monotonic += 300_000
+  assert.equal((await c.createEngine().tick()).classification.humanRequired, false)
+  const bytes = await fs.readFile(c.config.paths.state)
+  c.time.wall -= 1
+  await assert.rejects(c.createEngine().tick(), { code: "invalid_semantic_observation" })
+  assert.deepEqual(await fs.readFile(c.config.paths.state), bytes)
+})
+
+test("changed notification incident is submitted independently of a failed prior attempt", async (t) => {
+  const c = await fixture(t)
+  const observation = code => ({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: { phase: "preflight", status: "human_required", humanRequired: { code } } })
+  c.setObservation(observation("authentication_required"))
+  c.setBeforeDispatch(async action => { if (action === "notify") throw new Error("synthetic failure") })
+  const failed = await c.engine.tick()
+  c.setObservation(observation("captcha_required"))
+  c.setBeforeDispatch(async () => {})
+  const changed = await c.createEngine().tick()
+  assert.notEqual(changed.state.notification.key, failed.state.notification.key)
+  assert.equal(changed.state.notification.outcome, "accepted")
+  assert.equal(changed.state.notification.reasonCode, "captcha_required")
+  assert.equal(changed.state.notificationBacklog[0].key, failed.state.notification.key)
+  await c.createEngine().tick()
+  assert.equal(c.actions.filter(([action]) => action === "notify").length, 1)
+  c.time.wall += 300_000
+  c.time.monotonic += 300_000
+  const retriedPrior = await c.createEngine().tick()
+  assert.equal(c.actions.filter(([action]) => action === "notify").length, 2)
+  assert.deepEqual(retriedPrior.state.notificationBacklog, [])
+})
+
+test("unknown lease evidence cannot renew the unavailable IPC grace period", async (t) => {
+  const c = await fixture(t)
+  let firstObservedAt
+  for (let i = 0; i < 97; i += 1) {
+    c.setObservation({ available: false, conclusivelyDead: false,
+      epoch: i % 2 ? null : 7, runtimeIdentity: i % 2 ? null : RUNTIME_IDENTITY })
+    const result = await c.createEngine().tick()
+    firstObservedAt ??= result.state.unavailability.firstObservedAt
+    assert.equal(result.state.unavailability.firstObservedAt, firstObservedAt)
+    if (i > 0) assert.equal(result.classification.reasonCode, "broker_ipc_unavailable")
+    c.time.wall += 300_000
+    c.time.monotonic += 300_000
+  }
+  assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+  assert.equal(c.actions.filter(([action]) => action === "notify").length, 1)
+})
+
+test("failed notification backlog is bounded and retains an explicit overflow alert", async (t) => {
+  const c = await fixture(t)
+  c.setBeforeDispatch(async action => { if (action === "notify") throw new Error("private arbitrary notifier failure") })
+  for (let i = 0; i < 20; i += 1) {
+    c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { phase: "preflight", status: "human_required", updatedAt: new Date(c.time.wall + i).toISOString(),
+        humanRequired: { code: "authentication_required" } } })
+    await c.createEngine().tick()
+  }
+  const state = await c.store.readState()
+  assert.equal(state.notificationBacklog.length, c.config.policy.notificationBacklogLimit + 1)
+  assert.equal(state.notificationBacklog.at(-1).reasonCode, "notification_backlog_overflow")
+  assert.equal(state.notificationBacklog.at(-1).outcome, "failed")
+  assert.equal(JSON.stringify(state).includes("private arbitrary"), false)
+  const bytes = await fs.readFile(c.config.paths.state)
+  const invalid = structuredClone(state)
+  invalid.notification.outcome = "delivered_to_human"
+  await assert.rejects(c.store.writeState(invalid, c.lease), { code: "corrupt_monitor_state" })
+  assert.deepEqual(await fs.readFile(c.config.paths.state), bytes)
+})
+
+test("interrupted submission remains retryable while shadow mode suppresses pending reports", async (t) => {
+  const c = await fixture(t)
+  c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: { phase: "preflight", status: "human_required", humanRequired: { code: "authentication_required" } } })
+  let attempts = 0
+  c.setBeforeDispatch(async action => {
+    if (action === "notify") { attempts += 1; throw new Error("synthetic interruption") }
+  })
+  await c.engine.tick()
+  const state = await c.store.readState()
+  state.notification.outcome = "dispatching"
+  await c.store.writeState(state, c.lease)
+  await c.createEngine().tick()
+  assert.equal(attempts, 1)
+  const session = await c.store.readSession()
+  await c.store.restoreSession({ ...session, mode: "shadow" })
+  c.time.wall += 300_000
+  c.time.monotonic += 300_000
+  const shadow = await c.createEngine().tick()
+  assert.equal(attempts, 1)
+  assert.equal(shadow.state.notification.outcome, "dispatching")
+  assert.equal(shadow.state.lastAction.outcome, "predicted_shadow_only")
+  await c.store.restoreSession(session)
+  c.setBeforeDispatch(async action => { if (action === "notify") attempts += 1 })
+  assert.equal((await c.createEngine().tick()).state.notification.outcome, "accepted")
+  assert.equal(attempts, 2)
+  // Legacy incident/action bookkeeping is not a notification acceptance receipt.
+  const legacy = await c.store.readState()
+  delete legacy.notification
+  delete legacy.notificationBacklog
+  await c.store.writeState(legacy, c.lease)
+  assert.equal((await c.createEngine().tick()).state.notification.outcome, "accepted")
+  assert.equal(attempts, 3)
+})
+
+for (const code of ["ENOSPC", "EDQUOT", "EROFS", "EACCES", "EPERM", "EIO"]) {
+  test(`notification persistence ${code} still permits a throttled storage alert`, async (t) => {
+    const c = await fixture(t)
+    c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { phase: "preflight", status: "human_required", humanRequired: { code: "authentication_required" } } })
+    const before = await c.store.readState()
+    const reports = []
+    c.setBeforeDispatch(async (action, classification) => {
+      if (action === "notify") reports.push(classification)
+    })
+    c.store.writeState = async () => { throw Object.assign(new Error("private write failure"), { code }) }
+    await assert.rejects(c.engine.tick(), { code })
+    await assert.rejects(c.engine.tick(), { code })
+    assert.equal(c.actions.filter(([action]) => action === "notify").length, 1)
+    c.time.wall += 300_000
+    c.time.monotonic += 300_000
+    await assert.rejects(c.engine.tick(), { code })
+    assert.equal(c.actions.filter(([action]) => action === "notify").length, 2)
+    assert.deepEqual(await c.store.readState(), before, "failed writes cannot claim durable alert acceptance")
+    assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+    await assert.rejects(c.createEngine().tick(), { code })
+    assert.equal(c.actions.filter(([action]) => action === "notify").length, 3, "storage failure backoff is process-local")
+    assert.deepEqual(reports, Array.from({ length: 3 }, () => ({ humanRequired: true,
+      reasonCode: "monitor_storage_unavailable", state: MonitorState.DISK_FULL })))
+  })
+}
+
+test("storage alert fallback preserves shadow, corruption and revoked-fence boundaries", async (t) => {
+  for (const scenario of ["shadow", "corrupt", "revoked"]) {
+    const c = await fixture(t, { mode: scenario === "shadow" ? "shadow" : "safe" })
+    c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { phase: "preflight", status: "human_required", humanRequired: { code: "authentication_required" } } })
+    const code = scenario === "corrupt" ? "corrupt_monitor_state" : "ENOSPC"
+    c.store.writeState = async () => {
+      if (scenario === "revoked") c.revokeDispatch()
+      throw Object.assign(new Error("synthetic write rejection"), { code })
+    }
+    await assert.rejects(c.engine.tick(), { code: scenario === "revoked" ? "monitor_stopping" : code })
+    assert.equal(c.actions.filter(([action]) => action === "notify").length, 0)
+    assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+  }
+})
+
+for (const intervalMs of [300_000, 600_000]) {
+  test(`retained alert retries remain fair across restart and ${intervalMs}ms ticks`, async (t) => {
+    const c = await fixture(t)
+    c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { phase: "preflight", status: "human_required", humanRequired: { code: "authentication_required" } } })
+    await c.engine.tick()
+    const state = await c.store.readState()
+    const reasons = ["authentication_required", "captcha_required", "notification_backlog_overflow"]
+    state.notificationBacklog = reasons.map(reasonCode => ({ key: safeDigest(reasonCode), reasonCode,
+      state: reasonCode === "notification_backlog_overflow" ? MonitorState.HUMAN_REQUIRED_OTHER : MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE,
+      outcome: "failed", attemptedAt: c.time.wall - 300_000, retryAt: c.time.wall }))
+    await c.store.writeState(state, c.lease)
+    const attempts = []
+    c.setBeforeDispatch(async (action, classification) => {
+      if (action !== "notify") return
+      attempts.push(classification.reasonCode)
+      if (classification.reasonCode === reasons[0]) throw new Error("first retained alert keeps failing")
+    })
+    for (let i = 0; i < 3; i += 1) {
+      await c.createEngine().tick()
+      assert.equal(attempts.length, i + 1, "at most one retained submission per tick")
+      c.time.wall += intervalMs
+      c.time.monotonic += intervalMs
+    }
+    assert.deepEqual(attempts, reasons, "older due receipts and the overflow summary must receive a retry")
+    const remaining = (await c.store.readState()).notificationBacklog
+    assert.equal(remaining.length, 1)
+    assert.equal(remaining[0].reasonCode, reasons[0])
+    assert.equal(remaining[0].outcome, "failed")
+    assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+  })
+
+  test(`continuous overflow cannot starve retained details across restart and ${intervalMs}ms ticks`, async (t) => {
+    const c = await fixture(t)
+    const reports = []
+    c.setBeforeDispatch(async (action, classification) => {
+      if (action !== "notify") return
+      reports.push(classification.reasonCode)
+      if (classification.reasonCode === "authentication_required") throw new Error("new current alert fails")
+    })
+    const observeCurrent = updatedAt => c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+      workflow: { phase: "preflight", status: "human_required", updatedAt,
+        humanRequired: { code: "authentication_required" } } })
+    observeCurrent(new Date(c.time.wall).toISOString())
+    await c.engine.tick()
+    const state = await c.store.readState()
+    const reasons = Array.from({ length: c.config.policy.notificationBacklogLimit }, (_, i) => `retained_alert_${i}`)
+    state.notificationBacklog = reasons.map(reasonCode => ({ key: safeDigest(reasonCode), reasonCode,
+      state: MonitorState.HUMAN_REQUIRED_OTHER, outcome: "failed",
+      attemptedAt: c.time.wall - 300_000, retryAt: c.time.wall }))
+    await c.store.writeState(state, c.lease)
+    reports.length = 0
+    for (let i = 0; i <= reasons.length; i += 1) {
+      c.time.wall += intervalMs
+      c.time.monotonic += intervalMs
+      observeCurrent(new Date(c.time.wall).toISOString())
+      await c.createEngine().tick()
+      assert.equal(reports.length, (i + 1) * 2, "one current and one retained attempt per tick")
+      assert.ok((await c.store.readState()).notificationBacklog.length <= reasons.length + 1)
+    }
+    assert.deepEqual(reports.filter(reason => reason !== "authentication_required"),
+      [...reasons, "notification_backlog_overflow"])
+    const remaining = (await c.store.readState()).notificationBacklog
+    assert.equal(remaining.some(entry => reasons.includes(entry.reasonCode)), false)
+    assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
+  })
+}
+
+test("failed notification outcome persistence preserves the dispatch receipt", async (t) => {
+  const c = await fixture(t)
+  c.setObservation({ available: true, epoch: 7, runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: { phase: "preflight", status: "human_required", humanRequired: { code: "authentication_required" } } })
+  const writeState = c.store.writeState.bind(c.store)
+  c.store.writeState = async (state, lease) => {
+    if (state.notification?.outcome === "accepted") {
+      throw Object.assign(new Error("synthetic outcome write failure"), { code: "ENOSPC" })
+    }
+    return writeState(state, lease)
+  }
+  const reports = []
+  c.setBeforeDispatch(async (action, classification) => {
+    if (action === "notify") reports.push(classification.reasonCode)
+  })
+  await assert.rejects(c.engine.tick(), { code: "ENOSPC" })
+  assert.deepEqual(reports, ["authentication_required", "monitor_storage_unavailable"])
+  const persisted = await c.store.readState()
+  assert.equal(persisted.notification.outcome, "dispatching")
+  assert.equal(persisted.notification.retryAt, c.time.wall + 300_000)
+  c.store.writeState = writeState
+  await c.createEngine().tick()
+  assert.equal(reports.length, 2, "the durable ambiguous attempt retains its retry deadline")
+  c.time.wall += 300_000
+  c.time.monotonic += 300_000
+  assert.equal((await c.createEngine().tick()).state.notification.outcome, "accepted")
+  assert.deepEqual(reports, ["authentication_required", "monitor_storage_unavailable", "authentication_required"])
 })

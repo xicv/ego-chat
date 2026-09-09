@@ -4,6 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
+import { setImmediate } from "node:timers"
 
 import { Broker } from "../src/broker.mjs"
 import { createContract, digestJson } from "../src/convergence.mjs"
@@ -247,6 +248,8 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
       ? await store.beforeReviewIntent.promise.then(() => broker.getWorkflow({ workflowId: parent.id }))
     : store.beforePromotion
       ? await store.beforePromotion.promise.then(() => broker.getWorkflow({ workflowId: parent.id }))
+    : store.initialPauseCommitted
+      ? await store.initialPauseCommitted.promise.then(() => broker.getWorkflow({ workflowId: parent.id }))
     : await broker.awaitWorkflow({ workflowId: parent.id, timeoutMs: 2_000 })
   const successor = (key = keys[1]) => ({
     bindingKey: key, canonicalUrl: location(key).canonicalUrl,
@@ -301,22 +304,42 @@ test("an unexpected successor preparation failure retains its checkpoint and res
   assert.equal(f.sends.length, 2)
 })
 
-test("an unexpected promotion failure can consume its already completed successor without reconciliation or Send", async (t) => {
+test("an unexpected promotion failure can consume its already completed successor without reconciliation or Send", { timeout: 10_000 }, async (t) => {
   class FailPromotionOnceStore extends EventStore {
-    constructor(directory) { super(directory, { maxEvents: 1, maxTerminalWorkflows: 0, rawRetentionMs: 0 }); this.failPromotion = true }
+    constructor(directory) {
+      super(directory, { maxEvents: 1, maxTerminalWorkflows: 0, rawRetentionMs: 0 })
+      this.failPromotion = true
+      this.initialPauseCommitted = Promise.withResolvers()
+    }
+    async persist(type, workflow, expectedWorkflow = undefined) {
+      const result = await super.persist(type, workflow, expectedWorkflow)
+      if (type === "workflow.human_required" && workflow.kind === "convergence") {
+        // Let the already committed terminal transition unwind its runner fence.
+        setImmediate(() => this.initialPauseCommitted.resolve())
+      }
+      return result
+    }
     async persistSuccessorPromotion(input) {
       if (this.failPromotion) { this.failPromotion = false; throw new Error("Synthetic promotion failure") }
       return super.persistSuccessorPromotion(input)
     }
   }
+  // Under full-suite load the initial successor setup is still durably writing at
+  // the attachment's 2s deadline (observed: successor_reviewing -> paused at 2208ms).
+  // Synchronize on the injected failure's committed checkpoint, not setup latency.
+  // Keep the recovery attachment deadline and all external-action assertions intact.
   const f = await harness(t, { automatic: true, Store: FailPromotionOnceStore })
   assert.equal(f.paused.status, "human_required")
   assert.equal(f.paused.humanRequired.code, "successor_recovery_required")
   await f.broker.resumeConvergence(f.request(null))
   const done = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
   assert.equal(done.status, "succeeded")
+  assert.equal(done.phase, "settled")
+  assert.equal(done.activeChat.generation, 1)
+  assert.equal(done.candidateDigest, f.parent.candidateDigest)
   assert.equal(f.sends.length, 2)
   assert.equal(f.counts().reconciliations, 0)
+  assert.equal(f.counts().localCalls, 0)
 })
 
 test("monitor supervision follows the pending successor rather than the exhausted predecessor", async (t) => {

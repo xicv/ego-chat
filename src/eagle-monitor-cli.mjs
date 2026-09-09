@@ -230,6 +230,7 @@ export async function runEagleMonitorCli({
         || !monitor.active
         || !policyMatches
         || result.humanRequired.required
+        || result.readiness?.state === "degraded"
         || ["crash_loop", "disk_full", "version_skew"].includes(result.state)
         || ["human_required", "looping", "stagnant"].includes(result.semantic?.classification)
       ) exitCode = EAGLE_MONITOR_EXIT.ATTENTION_REQUIRED
@@ -266,6 +267,7 @@ export async function runEagleMonitorCli({
         policy: { digest: resolvedConfig.policy.digest, ok: true },
         powerStatus: await pathCheck(resolvedConfig.commands.pmset, fsConstants.X_OK),
       }
+      const dependenciesHealthy = Object.values(checks).every((check) => check.ok)
       let state = null
       let stateReadable = true
       try {
@@ -298,10 +300,13 @@ export async function runEagleMonitorCli({
         reasonCode: status.observationFreshness?.reasonCode ?? "monitor_observation_unavailable",
       }
       const healthy = Object.values(checks).every((check) => check.ok)
+        && status.readiness?.state !== "degraded"
         && service.definitionMatches
         && (!service.loaded || session?.active === true)
       result = {
         checks,
+        dependenciesHealthy,
+        readiness: { ...status.readiness, ready: dependenciesHealthy && status.readiness?.ready === true },
         healthy,
         mvpDependencies: { llm: false, network: false },
         service,

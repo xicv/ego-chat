@@ -122,6 +122,7 @@ const MCP_INSTRUCTIONS = [
   "Preserve at-most-once delivery without ending the conversation: after a possibly accepted Send, reconcile the same durable workflow until the response is attributable or delivery is proven absent. Only a proven absence may create a fresh uniquely marked attempt.",
   "Task-space ownership is automatic for the exact deterministic binding space. Pass allowTaskSpaceReclaim as true (the default) so Send, capture, and reconciliation can reclaim that one space; this never authorizes another task space or clearing an unrelated human draft.",
   "Never call ego_verify_conversation as a preflight for a fresh send. A fresh exchange or review performs its own canonical URL, stable-head, browser-readiness, automatic exact-space reclaim, and live model-policy checks. If binding identity is uncertain before a send, use ego_get_conversation instead because it reads durable state without browser control. Reserve ego_verify_conversation for an explicitly requested maintenance checkpoint or a documented migration or reconciliation case.",
+  "For model-setting questions, read ego_get_model_policy.lastObserved: modelLabel is the menu route, pillLabel is the closed composer label, and powerLevel/powerMax is the verified thinking setting. In the separate-model menu effortLabel repeats pillLabel and is not an independent effort option. Report these observed labels and verifiedAt without guessing versioned names or an API model identifier. Ordinary sends already discover and verify maximum policy; do not add a browser preflight or manual label search.",
   "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in or open ego-chat-main for ordinary transport recovery. A verified conversation-exhaustion checkpoint may separately require an explicitly selected successor; authentication and verification_challenge require their own genuine user action.",
   "Use ego_converge_until_settled for durable multi-cycle work; supply an immutable target, observable acceptance criteria, and the absolute working directory. Use workspace-write when the user authorized local fixes and read-only for review-only targets.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
@@ -160,8 +161,10 @@ function waitedToolResult(value, waitMode) {
           modelPolicy: {
             effortLabel: modelPolicy.effortLabel,
             modelLabel: modelPolicy.modelLabel,
+            pillLabel: modelPolicy.pillLabel,
             powerLevel: modelPolicy.powerLevel,
             powerMax: modelPolicy.powerMax,
+            ...(modelPolicy.verifiedAt ? { verifiedAt: modelPolicy.verifiedAt } : {}),
           },
         }
       : {}),
@@ -490,7 +493,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_get_model_policy",
     {
-      description: "Read the durable ChatGPT web policy and its last observed model, effort, and power level. Never opens the browser.",
+      description: "Read the durable ChatGPT policy without opening the browser. lastObserved contains the menu route (modelLabel), closed composer label (pillLabel), thinking setting (powerLevel/powerMax), and verifiedAt. In the separate-model menu effortLabel repeats pillLabel; it is not an independent effort name. This is stored evidence, not a fresh UI check.",
       inputSchema: {},
     },
     async () => {
@@ -505,7 +508,7 @@ export function createMcpServer(config = loadConfig()) {
   server.registerTool(
     "ego_ensure_model_policy",
     {
-      description: "Set ChatGPT's provider-defined power control to its maximum for one bound conversation, then read back the resolved model and effort. Never sends a prompt and fails closed on unknown UI.",
+      description: "For explicitly requested live policy maintenance, discover the provider's strongest available model route and maximum Power setting in one bound conversation, then verify the selected route, closed composer label, and numeric thinking setting. Never sends a prompt and fails closed on unknown UI. Ordinary exchanges already perform these checks; no extra preflight is needed.",
       inputSchema: {
         bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
       },

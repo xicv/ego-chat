@@ -421,6 +421,9 @@ test("the public CLI emits stable JSON and never registers a real LaunchAgent in
   assert.equal(outputs.at(-1).result.session.bindingDigest.length, 64)
   assert.deepEqual(outputs.at(-1).result.monitor, { active: true, epoch: 1 })
   assert.equal(outputs.at(-1).result.policyMatches, true)
+  assert.equal(outputs.at(-1).result.readiness.state, "starting")
+  assert.equal(outputs.at(-1).result.readiness.ready, false)
+  assert.equal(outputs.at(-1).result.readiness.observationFresh, false)
   assert.equal(outputs.at(-1).result.semantic.schema, "EagleSemanticState.v1")
   assert.equal(outputs.at(-1).result.semantic.classification, "suspect")
   assert.equal(outputs.at(-1).result.semantic.reasonCode, "semantic_monitor_starting")
@@ -629,4 +632,50 @@ test("stop leaves recovery-state mutation to the fenced daemon", async () => {
   assert.equal(exit, 0)
   assert.equal(outputs.at(-1).ok, true)
   assert.equal(stateWrites, 0)
+})
+
+test("read-only readiness separates dependencies, loaded lease, and a real fresh observation", async (t) => {
+  const { config } = await fixture(t)
+  const store = new EagleMonitorStore(config)
+  const at = "2026-09-04T00:00:00.000Z"
+  await store.configureSession({ bindingKey: "ego-chat-main",
+    launchAgentDigest: "a".repeat(64), mode: "safe", now: at,
+    powerPolicy: "allow-sleep", workflowId: WORKFLOW_ID })
+  const session = await store.readSession()
+  const state = { schemaVersion: 1, workflowDigest: safeDigest(WORKFLOW_ID),
+    state: "healthy", phase: "codex_running", incidents: [], monitorEpoch: 7,
+    broker: { available: true, epoch: 7, runtimeDigest: null },
+    humanRequired: { required: false, reasonCode: "workflow_active" },
+    updatedAt: at, nextObservationAt: "2026-09-04T00:00:05.000Z" }
+  for (const scenario of [
+    { name: "inactive", active: false, loaded: false, lease: false, fresh: false, ready: false, exit: 0 },
+    { name: "active", active: true, loaded: true, lease: true, fresh: true, ready: true, exit: 0 },
+    { name: "stale", active: true, loaded: true, lease: true, fresh: false, ready: false, exit: 2 },
+    { name: "degraded", active: true, loaded: true, lease: false, fresh: true, ready: false, exit: 2 },
+    { name: "replaced_lease", active: true, loaded: true, lease: true, fresh: false, ready: false, exit: 2 },
+  ]) {
+    await store.restoreSession({ ...session, active: scenario.active })
+    await store.writeState(state, { assertCurrent: async () => {} })
+    const before = await fs.readFile(config.paths.state)
+    for (const command of ["doctor", "status"]) {
+      let output
+      const exit = await runEagleMonitorCli({ argv: [command, "--json"], config, store,
+        lifecycle: { status: async () => ({ loaded: scenario.loaded, definitionMatches: true,
+          definitionPresent: scenario.loaded }) },
+        observeMonitor: async () => ({ active: scenario.lease, epoch: scenario.name === "replaced_lease" ? 8 : 7 }),
+        now: () => scenario.name === "stale" ? "2026-09-04T08:00:00.000Z" : at,
+        write: value => { output = value } })
+      const status = command === "doctor" ? output.result.status : output.result
+      assert.equal(exit, command === "status" && !scenario.active ? 3 : scenario.exit, scenario.name)
+      assert.equal(status.readiness.monitorActive, scenario.active && scenario.loaded && scenario.lease)
+      assert.equal(status.readiness.observationFresh, scenario.fresh)
+      assert.equal(status.readiness.ready, scenario.ready)
+      assert.equal(status.readiness.state, ["stale", "replaced_lease"].includes(scenario.name) ? "degraded" : scenario.name)
+      if (command === "doctor") {
+        assert.equal(output.result.dependenciesHealthy, true)
+        assert.equal(output.result.readiness.ready, scenario.ready)
+      }
+    }
+    assert.deepEqual(await fs.readFile(config.paths.state), before)
+  }
 })

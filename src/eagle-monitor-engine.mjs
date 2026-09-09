@@ -1,4 +1,4 @@
-import { safeDigest } from "./eagle-monitor-config.mjs"
+import { monitorSessionDigest, safeDigest } from "./eagle-monitor-config.mjs"
 import {
   EAGLE_MONITOR_SCHEMA_VERSION,
   safeEvidenceCode,
@@ -115,6 +115,7 @@ export class EagleMonitorEngine {
   #notifier
   #power
   #storage
+  #storageAlertRetryAt = null
   #store
 
   constructor({ broker, clock, config, lease, notifier, power, storage, store }) {
@@ -140,6 +141,81 @@ export class EagleMonitorEngine {
     await this.#lease.assertCurrent()
   }
 
+  #retainPendingNotification(state, notification) {
+    if (!notification || notification.outcome === "accepted") return
+    const backlog = state.notificationBacklog ??= []
+    if (backlog.some(entry => entry.key === notification.key)) return
+    if (backlog.length < this.#config.policy.notificationBacklogLimit) {
+      backlog.push(notification)
+    } else if (!backlog.some(entry => entry.reasonCode === "notification_backlog_overflow")) {
+      // Keep an explicit retryable summary instead of silently losing excess reports.
+      backlog.push({ key: safeDigest("notification_backlog_overflow"),
+        reasonCode: "notification_backlog_overflow", state: MonitorState.HUMAN_REQUIRED_OTHER,
+        outcome: "pending", attemptedAt: null, retryAt: null })
+    }
+  }
+
+  async #writeNotificationState(state) {
+    try {
+      await this.#store.writeState(state, this.#lease)
+      this.#storageAlertRetryAt = null
+    } catch (error) {
+      // A storage alert cannot depend on the failed storage it reports. Keep this
+      // exception alert-only and process-local; never manufacture a durable receipt.
+      if (["ENOSPC", "EDQUOT", "EROFS", "EACCES", "EPERM", "EIO"].includes(error.code)) {
+        const nowMs = this.#clock.wallMs()
+        if (this.#storageAlertRetryAt === null || nowMs >= this.#storageAlertRetryAt) {
+          assertMonitorActionAllowed(MonitorState.DISK_FULL, MonitorAction.NOTIFY_USER)
+          await this.#lease.assertCurrent()
+          this.#storageAlertRetryAt = nowMs + this.#config.policy.notificationRetryMs
+          await this.#notifier.notify({ humanRequired: true,
+            reasonCode: "monitor_storage_unavailable", state: MonitorState.DISK_FULL }, this.#lease).catch(() => {})
+          await this.#lease.assertCurrent()
+        }
+      }
+      throw error
+    }
+  }
+
+  async #submitNotification(state, notification, nowMs) {
+    if (notification.outcome === "accepted") return "already_reported"
+    if (notification.retryAt !== null && nowMs < notification.retryAt) return "failed"
+    assertMonitorActionAllowed(notification.state, MonitorAction.NOTIFY_USER)
+    notification.outcome = "dispatching"
+    notification.attemptedAt = Math.max(nowMs, this.#clock.wallMs())
+    notification.retryAt = notification.attemptedAt + this.#config.policy.notificationRetryMs
+    // Persist the intent before dispatch. A crash leaves a retryable, ambiguous submission.
+    await this.#lease.assertCurrent()
+    await this.#writeNotificationState(state)
+    await this.#lease.assertCurrent()
+    try {
+      await this.#notifier.notify({ humanRequired: true,
+        reasonCode: notification.reasonCode, state: notification.state }, this.#lease)
+      notification.outcome = "accepted"
+      notification.retryAt = null
+    } catch (_error) {
+      notification.outcome = "failed"
+    }
+    await this.#lease.assertCurrent()
+    await this.#writeNotificationState(state)
+    return notification.outcome === "accepted" ? "succeeded" : "failed"
+  }
+
+  async #notify(state, classification, identity, nowMs) {
+    const key = safeDigest(JSON.stringify({ identity, reasonCode: classification.reasonCode, state: classification.state }))
+    if (state.notification?.key !== key) {
+      this.#retainPendingNotification(state, state.notification)
+      // A returning incident reuses its pending receipt and backoff.
+      const backlog = state.notificationBacklog ?? []
+      state.notification = backlog.find(entry => entry.key === key) ?? {
+        key, reasonCode: classification.reasonCode, state: classification.state,
+        outcome: "pending", attemptedAt: null, retryAt: null,
+      }
+      state.notificationBacklog = backlog.filter(entry => entry.key !== key)
+    }
+    return this.#submitNotification(state, state.notification, nowMs)
+  }
+
   async tick() {
     await this.#lease.assertCurrent()
     const session = await this.#store.readSession()
@@ -155,6 +231,12 @@ export class EagleMonitorEngine {
         incidents: previousState.incidents ?? [],
       }
     }
+    const sessionDigest = monitorSessionDigest(session)
+    if ((state.sessionDigest && state.sessionDigest !== sessionDigest)
+      || Date.parse(state.updatedAt) < Date.parse(session.configuredAt)) {
+      state = { ...defaultState(nowMs), brokerStarts: state.brokerStarts ?? [], incidents: state.incidents ?? [] }
+    }
+    state.sessionDigest = sessionDigest
     const tickClock = { monotonicMs: this.#clock.monotonicMs(), wallMs: nowMs }
     const [storage, observedPower, broker] = await Promise.all([
       this.#storage.observe(),
@@ -175,7 +257,24 @@ export class EagleMonitorEngine {
     }
     const deadConfirmed = Number.isFinite(deadSinceAt)
       && nowMs - deadSinceAt >= this.#config.policy.deadConfirmationMs
+    if (broker.available || broker.conclusivelyDead) state.unavailability = null
+    else {
+      const previous = state.unavailability
+      const brokerEpoch = broker.epoch ?? previous?.brokerEpoch ?? null
+      const runtimeDigest = safeDigest(broker.runtimeIdentity?.contractDigest) ?? previous?.runtimeDigest ?? null
+      const changedOwner = (previous?.brokerEpoch !== undefined && previous.brokerEpoch !== null && brokerEpoch !== previous.brokerEpoch)
+        || (previous?.runtimeDigest !== undefined && previous.runtimeDigest !== null && runtimeDigest !== previous.runtimeDigest)
+      state.unavailability = {
+        identity: safeDigest(JSON.stringify([sessionDigest, brokerEpoch, runtimeDigest])),
+        brokerEpoch,
+        runtimeDigest,
+        firstObservedAt: !previous || changedOwner ? nowMs : previous.firstObservedAt,
+      }
+    }
+    const unavailableExpired = state.unavailability !== null
+      && nowMs - state.unavailability.firstObservedAt >= this.#config.policy.brokerUnavailableAlertMs
     const observation = {
+      unavailableExpired,
       bindingAvailable: typeof session.bindingKey === "string",
       bindingMatches: session.bindingKey === null
         || broker.workflow?.bindingKey === session.bindingKey,
@@ -243,6 +342,7 @@ export class EagleMonitorEngine {
       .map((incident) => incident.semanticIncidentKey)
       .filter(Boolean))]
     if (session.mode === "safe") {
+      let notificationRequired = action === MonitorAction.NOTIFY_USER
       try {
         if (action === MonitorAction.START_BROKER) {
           state.recoveryCount = (state.recoveryCount ?? 0) + 1
@@ -283,29 +383,11 @@ export class EagleMonitorEngine {
           }
           state.lastAction.outcome = "terminal_observed"
           classification = unresolvedTerminalClassification()
-          const incidentKey = `${classification.state}:${classification.reasonCode}`
-          if (classification.humanRequired && state.lastIncidentKey !== incidentKey) {
-            await this.#lease.assertCurrent()
-            await this.#notifier.notify(classification, this.#lease).catch(() => {})
-          }
-        } else if (action === MonitorAction.NOTIFY_USER) {
-          const incidentKey = `${classification.state}:${classification.reasonCode}`
-          const alreadyReported = state.lastIncidentKey === incidentKey
-            && !(state.lastAction?.action === MonitorAction.NOTIFY_USER
-              && state.lastAction.outcome === "failed")
-          if (!alreadyReported) {
-            await this.#lease.assertCurrent()
-            await this.#notifier.notify(classification, this.#lease)
-          }
-          state.lastAction = {
-            action,
-            at: new Date(nowMs).toISOString(),
-            monitorEpoch: this.#lease.identity.epoch,
-            outcome: alreadyReported ? "already_reported" : "succeeded",
-          }
+          notificationRequired = true
         }
       } catch (_error) {
         const failedAction = action
+        notificationRequired = true
         if (failedAction !== MonitorAction.NOTIFY_USER) {
           classification = {
             humanRequired: true,
@@ -319,11 +401,32 @@ export class EagleMonitorEngine {
           monitorEpoch: this.#lease.identity.epoch,
           outcome: "failed",
         }
-        if (failedAction !== MonitorAction.NOTIFY_USER) {
-          await this.#lease.assertCurrent()
-          await this.#notifier.notify(classification, this.#lease).catch(() => {})
-        }
       }
+      const notificationIdentity = { sessionDigest,
+        brokerEpoch: state.unavailability?.brokerEpoch ?? broker.epoch ?? null,
+        unavailableIdentity: state.unavailability?.identity ?? null, terminalDigest }
+      if (notificationRequired && classification.humanRequired) {
+        const outcome = await this.#notify(state, classification, notificationIdentity, nowMs)
+        if (action === MonitorAction.NOTIFY_USER) state.lastAction = {
+          action, at: new Date(nowMs).toISOString(), monitorEpoch: this.#lease.identity.epoch, outcome,
+        }
+      } else if (state.notification && state.notification.outcome !== "accepted") {
+        // A recovery failure can disappear from the next observation; still retry its report.
+        await this.#submitNotification(state, state.notification, nowMs)
+      } else if ([MonitorState.HEALTHY, MonitorState.SETTLED].includes(classification.state)) {
+        state.notification = null
+      }
+      // At most one retained report per tick, in addition to the current incident.
+      const pending = state.notificationBacklog?.find(entry => entry.outcome !== "accepted"
+        && (entry.retryAt === null || nowMs >= entry.retryAt))
+      if (pending) {
+        // Persist the queue rotation with the submission intent. Failed retries
+        // and newly appended overflow reports cannot monopolize later ticks.
+        state.notificationBacklog = state.notificationBacklog.filter(entry => entry !== pending)
+        state.notificationBacklog.push(pending)
+        await this.#submitNotification(state, pending, nowMs)
+      }
+      state.notificationBacklog = (state.notificationBacklog ?? []).filter(entry => entry.outcome !== "accepted")
     } else {
       state.lastAction = {
         action,

@@ -153,6 +153,9 @@ export function classifyMonitorState(observation) {
     return { humanRequired: true, reasonCode: "broker_runtime_version_skew", state: MonitorState.VERSION_SKEW }
   }
   if (observation.broker?.available !== true) {
+    if (!observation.broker?.conclusivelyDead && observation.unavailableExpired === true) {
+      return { humanRequired: true, reasonCode: "broker_ipc_unavailable", state: MonitorState.HUMAN_REQUIRED_OTHER }
+    }
     return {
       humanRequired: false,
       reasonCode: observation.broker?.conclusivelyDead

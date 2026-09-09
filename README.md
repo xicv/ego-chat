@@ -395,6 +395,8 @@ If ChatGPT later places a stronger model first or renames the maximum effort, th
 
 Successful adoption validates and durably records the observation with its source workflow identity and policy revision. `ego_get_model_policy` returns that verified state after normal store replay as well. Read the last durable observation without opening the browser:
 
+Interpret `lastObserved.modelLabel` as the selected menu route and `pillLabel` as the closed composer label. In the separate-model menu, the compatibility field `effortLabel` repeats `pillLabel`; use `powerLevel/powerMax` to identify the thinking setting. For example, report an observed `Latest` → `6 Pro`, Power `5/5`, with its `verifiedAt` timestamp. These are observed UI labels, not a fixed API model identifier. Token-Saver replies retain the composer label and verification timestamp so the same distinction is available in compact text. The stored observation does not replace the next Send's live checks.
+
 ```sh
 node ./bin/ego-chat.mjs model-policy
 ```
@@ -540,6 +542,16 @@ eagle-monitor start --workflow <durable-workflow-uuid> --binding-key <existing-b
 ```
 
 `start` and `stop` manage only `gui/<uid>/com.xicv.ego-chat.eagle-monitor` through a user LaunchAgent. They never use root or a system domain. Do not run `start` in automated tests; the focused suite injects a fake launchctl runner. See [`docs/eagle-monitor.md`](docs/eagle-monitor.md) for the state/action contract, stable JSON/exit semantics, power caveats, security boundary, and runbook.
+
+`doctor.dependenciesHealthy` is separate from `readiness`: a stopped monitor can have healthy
+dependencies but `readiness.ready: false`. Status/doctor expose whether the configured service and
+lease are active, a real observation is fresh, and safe recovery is enabled. Persistent unavailable
+broker IPC reaches an alert-only boundary after five minutes without restarting an ambiguously
+live owner. All notification paths persist command acceptance separately from incident/recovery
+state and retry failed submissions with bounded backoff, including across restart and incident
+changes. Command acceptance does not prove human receipt. Semantic alerts, independent observer
+freshness escalation, context capsules, real-provider successor qualification and an 8–12-hour
+soak remain future work; see the [monitor behavior and limits](docs/eagle-monitor.md).
 
 ## Validation
 

@@ -58,11 +58,71 @@ loaded service. An observation overdue beyond the bounded next-observation sched
 current health proof. Startup has a bounded grace period. These checks are read-only and do
 not grant process-kill or restart authority.
 
-Failed macOS notification delivery is persisted separately from the real authentication or
-other operational condition, retried at the existing bounded backoff, and deduplicated after
-successful delivery. Sleep/wake revalidation can temporarily take operational precedence over
-an underlying authentication condition without contradicting semantic state; the next normal
-observation rediscovers that unchanged condition. Reporting failure must not crash reporting.
+`doctor.dependenciesHealthy` describes executable/platform dependencies only. The additive
+`readiness` object in both commands separates `monitorActive` (active session, matching loaded
+service, valid live monitor lease and current policy), `observationFresh` (an actual observation,
+from that monitor lease epoch, not just startup grace), `ready`, and `recoveryEnabled` (safe mode). Its state is `inactive`,
+`starting`, `active`, or `degraded`. `ready` also requires available broker IPC and no recorded
+operational or semantic attention condition; it is local observation readiness, not an overnight
+qualification or notification receipt. Shadow can be actively observing with `recoveryEnabled: false`.
+An intentionally inactive monitor may still return doctor exit 0 and `healthy: true`, with
+`dependenciesHealthy: true`, `readiness.state: inactive`, and `readiness.ready: false`. Status
+returns exit 3 for inactivity; degraded active observations return exit 2. Startup grace is
+compatible with exit 0 but never counts as a fresh observation or `ready: true`.
+
+All notification paths (direct human boundary, terminal reconciliation, and recovery failure)
+share durable typed submission receipts independent of `lastAction` and incident creation.
+`notification.outcome` is `pending`, `dispatching`, `failed`, or `accepted`; **accepted means only
+that the macOS notification command succeeded, not that a person saw it**. Intent and retry time
+are written before ordinary dispatch, and the outcome is persisted after it. Failed or interrupted
+submissions retry no earlier than five minutes, at the next observation opportunity, including
+after monitor restart or after the triggering recovery condition clears. Successful submission
+alone deduplicates the current incident. A crash after command success but before its receipt is
+saved can produce a duplicate local alert; this never permits a duplicate browser Send.
+
+If receipt persistence fails with a typed filesystem capacity, write-access, or I/O error,
+safe mode can submit a fenced `monitor_storage_unavailable` alert without writing a receipt.
+This fallback retains a five-minute retry delay only in the current monitor process, so a
+restart may repeat it. The tick still fails with the storage error and cannot claim durable
+acceptance or proceed with recovery. Corrupt state and lost monitor authority do not enter
+this fallback; shadow mode remains silent.
+
+Incident changes retain failed reports in a bounded backlog (16 detailed receipts plus one
+retryable `notification_backlog_overflow` summary for excess reports). Each safe-mode tick can
+submit the current incident and at most one due retained report in durable queue order. Each
+attempted retained report moves to the back before its intent is persisted; new retained reports
+and overflow summaries join the back. Future retry deadlines are still respected. The backlog
+never stores exception text or notification content. Status exposes the latest receipt and
+`pendingNotificationCount`. A new exact session resets session-scoped reporting; an ordinary
+monitor process restart does not. Shadow records predicted operational actions and submits no
+notifications, including pending retries. Retained notification retries use their original
+human-required classification; they do not alter the current recovery action or grant recovery
+permission. Sleep/wake revalidation can temporarily take operational precedence over an
+underlying authentication condition; the next normal observation rediscovers it.
+
+Unavailable IPC with a live or ambiguous canonical broker lease starts a durable five-minute
+clock at the first qualifying failed observation (`unavailability.firstObservedAt` in status).
+The first normal observation at or after that
+threshold reports `broker_ipc_unavailable` and, in safe mode, submits an alert. The startup polling
+backoff adds at most its bounded observation interval while the monitor is running; sleep or a
+hung observer cannot meet that latency guarantee. Repeated polls and monitor process restarts
+retain the original timestamp. Successful IPC, conclusively dead evidence (handled by the existing
+death-confirmation path), a new exact session, or a positively changed known broker epoch/runtime
+reset it. Temporarily unknown lease identity retains the last known identity and cannot renew the
+grace period. Clock regression fails closed without dispatch or timestamp replacement; read-only
+status/doctor report the clock anomaly. No elapsed threshold proves an ambiguous owner dead:
+this path cannot kill/restart it, delete its lease, control a browser, resend, or change chats.
+
+State schema 1 remains readable for old valid records without these optional fields. Missing
+notification receipts are not inferred successful from `lastAction` or incident identity; missing
+unavailability history starts at the next observation rather than inventing past outage time.
+The monitor policy digest includes the new retry/escalation/backlog bounds. An existing session
+with the old digest remains policy-skewed until explicitly reconfigured under the normal lifecycle
+rules. Older binaries reject the new state fields rather than silently misinterpreting them;
+downgrade is not a supported state conversion. Broker IPC/schema/runtime identity is unchanged:
+this slice changes monitor policy and optional monitor state, not the broker protocol. Existing
+embedded-runtime file declarations already cover every changed module. No installed runtime or
+service is changed by source validation.
 
 The shared confirmed-delivery projection includes `sent_waiting_response`, `sent_generating`,
 and `sent_response_incomplete`. All three retain post-Send capture supervision; observations,
@@ -259,3 +319,16 @@ Automated interaction with ChatGPT may be governed by the applicable OpenAI indi
 9. Use `eagle-monitor stop --json` before changing the exact workflow, binding, mode, or power policy.
 
 Tests exercise lifecycle behavior with an injected fake runner. They must never call real `launchctl bootstrap`, `bootout`, or install/register a live LaunchAgent.
+
+## Remaining qualification
+
+This slice does not qualify unattended overnight useful progress. Semantic liveness remains
+shadow/read-only and creates diagnostic incidents; an explicit alert-only semantic policy and
+an independently scheduled monitor-freshness escalation remain future improvements. Other
+separate work includes a bounded context capsule with a lost-context regression, sanitized real
+provider terminal markup, a complete live successor exchange/promotion test, and an authorized
+8–12-hour installed-runtime soak measuring safety, useful progress, and observability separately.
+The 97-observation/eight-hour IPC regression is simulated time, not a live soak. Notification
+command acceptance is not human receipt. Same-project exhaustion rollover remains broker-owned
+and limited to attributed exhaustion; generic errors, quota, auth, and Stopped thinking grant no
+new-chat permission.
