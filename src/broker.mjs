@@ -31,6 +31,7 @@ import {
 import { projectEagleSemanticCheckpoint } from "./eagle-monitor-semantic.mjs"
 import { superviseWorkflow } from "./workflow-supervision.mjs"
 import {
+  BOUND_TASK_SPACE_RECREATE_DELAY_MS,
   DEFAULT_CHATGPT_GENERATION_MS,
   DEFAULT_MODEL_POLICY,
   TERMINAL_STATUSES,
@@ -231,6 +232,38 @@ function validateTaskSpaceControlRecovery(value) {
     )
   }
   return structuredClone(value)
+}
+
+function validateTaskSpaceRecovery(value) {
+  if (value === undefined) {
+    return undefined
+  }
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || value.method !== "recreate"
+    || !Number.isSafeInteger(value.previousTaskSpaceId)
+    || value.previousTaskSpaceId < 1
+    || !Number.isSafeInteger(value.taskSpaceId)
+    || value.taskSpaceId < 1
+    || Object.keys(value).some((key) => !["method", "previousTaskSpaceId", "taskSpaceId"].includes(key))
+  ) {
+    throw new EgoChatError(
+      "human_required",
+      "The browser returned invalid task-space recovery evidence.",
+      { reason: "task_space_recovery_proof_invalid" },
+    )
+  }
+  return structuredClone(value)
+}
+
+// A driver failure is proven pre-Send when it stopped at a pre-click stage and
+// either cleared its draft or never reached prompt composition.
+function provenPreSendDriverFailure(details) {
+  const stage = details?.driverStage
+  return PRECLICK_DRIVER_STAGES.has(stage)
+    && (details?.draftCleared === true || PRE_COMPOSITION_DRIVER_STAGES.has(stage))
 }
 
 function validateTaskSpaceIdentity(value) {
@@ -921,6 +954,7 @@ const HUMAN_ONLY_BROWSER_REASONS = new Set([
 const RETRYABLE_PRE_SEND_REASONS = new Set([
   "bound_conversation_open_failed",
   "bound_tab_missing",
+  "bound_task_space_missing",
   "browser_control_reclaim_failed",
   "browser_control_unavailable",
   "canonical_conversation_redirected",
@@ -996,6 +1030,18 @@ const PRECLICK_DRIVER_STAGES = new Set([
   "verifying_model_policy",
   "verifying_presend_model_policy",
   "verifying_preclick_prompt",
+  "verifying_precompose_head",
+])
+// Stages at which the driver has not yet inserted any prompt text, so a crash
+// there leaves nothing to clear and is proven to have happened before Send.
+const PRE_COMPOSITION_DRIVER_STAGES = new Set([
+  "checking_browser_contract",
+  "checking_generation_state",
+  "dispatching_exchange",
+  "inspecting_composer",
+  "reading_before_head",
+  "selecting_conversation",
+  "verifying_model_policy",
   "verifying_precompose_head",
 ])
 const DURABLE_DRIVER_STAGES = new Set([
@@ -1080,6 +1126,7 @@ export class Broker {
   #convergenceClients = new Map()
   #controllers = new Map()
   #egoAdapter
+  #boundTaskSpaceRecreateDelayMs
   #recoveryDelaysMs
   #captureObservationIntervalMs
   #store
@@ -1093,6 +1140,7 @@ export class Broker {
   constructor({
     appServerFactory,
     attachmentReceiptAuthority = undefined,
+    boundTaskSpaceRecreateDelayMs = BOUND_TASK_SPACE_RECREATE_DELAY_MS,
     brokerIdentity = undefined,
     brokerLease = undefined,
     captureObservationIntervalMs = 60_000,
@@ -1115,6 +1163,10 @@ export class Broker {
     if (!Number.isSafeInteger(captureObservationIntervalMs) || captureObservationIntervalMs < 1) {
       throw new TypeError("captureObservationIntervalMs must be a positive safe integer")
     }
+    if (!Number.isSafeInteger(boundTaskSpaceRecreateDelayMs) || boundTaskSpaceRecreateDelayMs < 0) {
+      throw new TypeError("boundTaskSpaceRecreateDelayMs must be a non-negative safe integer")
+    }
+    this.#boundTaskSpaceRecreateDelayMs = boundTaskSpaceRecreateDelayMs
     this.#captureObservationIntervalMs = captureObservationIntervalMs
     this.#appServerFactory = appServerFactory
     this.#attachmentReceiptAuthority = attachmentReceiptAuthority
@@ -1730,7 +1782,7 @@ export class Broker {
     this.#activeBindings.add(bindingKey)
     try {
       const verified = await this.#egoAdapter.verify(
-        { binding },
+        { binding, taskSpaceRecovery: { allowRecreate: true } },
         undefined,
         (result) => this.#reserveBrowserTaskSpaceIdentity({
           expectedCanonicalUrl: binding.canonicalUrl,
@@ -1746,6 +1798,7 @@ export class Broker {
         owner: admissionOwner,
         result: verified,
       })
+      const taskSpaceRecovery = validateTaskSpaceRecovery(verified.taskSpaceRecovery)
       const now = new Date().toISOString()
       const nextBinding = {
         ...binding,
@@ -1760,8 +1813,16 @@ export class Broker {
         updatedAt: now,
         verifiedAt: now,
       }
-      await this.#persistIsolatedBinding("binding.checkpointed", nextBinding, binding, admissionOwner)
-      return publicBinding(nextBinding)
+      await this.#persistIsolatedBinding(
+        taskSpaceRecovery ? "binding.task_space_recovered" : "binding.checkpointed",
+        nextBinding,
+        binding,
+        admissionOwner,
+      )
+      return {
+        ...publicBinding(nextBinding),
+        ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
+      }
     } finally {
       this.#activeBindings.delete(bindingKey)
       this.#releaseTaskSpaceAdmission(admissionOwner)
@@ -1881,6 +1942,7 @@ export class Broker {
             allowTaskSpaceReclaim: true,
             binding,
             expectedObservedHeadFingerprint: params.expectedObservedHeadFingerprint,
+            taskSpaceRecovery: { allowRecreate: true },
           },
           undefined,
           (result) => this.#reserveBrowserTaskSpaceIdentity({
@@ -1895,6 +1957,7 @@ export class Broker {
         params,
         expectedHeadChange.data,
       )
+      const taskSpaceRecovery = validateTaskSpaceRecovery(capture.taskSpaceRecovery)
       this.#reserveBrowserTaskSpaceIdentity({
         expectedCanonicalUrl: binding.canonicalUrl,
         key: binding.key,
@@ -1933,7 +1996,10 @@ export class Broker {
           status: "cancelled",
         })
       }
-      return reanchorResult(nextBinding)
+      return {
+        ...reanchorResult(nextBinding),
+        ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
+      }
     } finally {
       this.#activeBindings.delete(params.bindingKey)
       this.#releaseTaskSpaceAdmission(admissionOwner)
@@ -2023,8 +2089,7 @@ export class Broker {
     const allowDeliveryAbsent = (
       workflow.status === "human_required"
       && recoveryCode === "browser_operation_interrupted_before_send_confirmation"
-      && browserInterruption?.draftCleared === true
-      && PRECLICK_DRIVER_STAGES.has(browserInterruption.driverStage)
+      && provenPreSendDriverFailure(browserInterruption)
     )
     if (!unboundRecovery && !boundRecovery && !capturedRecovery) {
       throw new EgoChatError(
@@ -2111,6 +2176,7 @@ export class Broker {
                 ...(allowProtocolRepairCapture ? { allowProtocolRepairCapture: true } : {}),
                 allowTaskSpaceReclaim: params.allowTaskSpaceReclaim,
                 binding: identityBinding,
+                taskSpaceRecovery: { allowRecreate: true },
                 expectedPreviousContentDigest,
                 expectedPreviousMessageId,
                 expectedTerminalMarker,
@@ -2137,6 +2203,7 @@ export class Broker {
         })
       }
       const verifiedIdentity = taskSpaceIdentityCommitPatch(verified, identityBinding)
+      const reconciledTaskSpaceRecovery = validateTaskSpaceRecovery(verified.taskSpaceRecovery)
       if (verified.captureState === "provider_terminal") {
         validatePendingCapture(verified, workflow, binding)
         // Read-only reconciliation can confirm a terminal provider condition,
@@ -2189,6 +2256,7 @@ export class Broker {
           result: {
             deliveryState: "absent",
             reconciled: true,
+            ...(reconciledTaskSpaceRecovery ? { taskSpaceRecovery: reconciledTaskSpaceRecovery } : {}),
           },
           status: "cancelled",
         })
@@ -2248,6 +2316,7 @@ export class Broker {
           targetId: verified.targetId,
             ...verifiedIdentity,
           taskSpaceId: verified.taskSpaceId,
+          ...(reconciledTaskSpaceRecovery ? { taskSpaceRecovery: reconciledTaskSpaceRecovery } : {}),
           turnMarker,
         }
         if (responseRef.sizeBytes > 16 * 1024) {
@@ -2262,6 +2331,7 @@ export class Broker {
           )
         }
         await this.#transition(workflow, "exchange.response_captured", {
+          ...(reconciledTaskSpaceRecovery ? { taskSpaceRecovery: reconciledTaskSpaceRecovery } : {}),
           phase: "response_captured",
           private: undefined,
           result: capturedResult,
@@ -2345,7 +2415,7 @@ export class Broker {
           verifiedAt: now,
         }
         await this.#persistIsolatedBinding(
-          "binding.reconciled",
+          reconciledTaskSpaceRecovery ? "binding.task_space_recovered" : "binding.reconciled",
           nextBinding,
           binding,
           admissionOwner,
@@ -3821,10 +3891,35 @@ export class Broker {
     }
   }
 
+  // Consecutive bound_task_space_missing records keep the time of the first
+  // missing observation so recreation authority measures the whole outage.
+  #browserRecoveryRecord(error, attempt, previous) {
+    const record = this.#recoveryRecord(error, attempt)
+    if (record.code === "bound_task_space_missing") {
+      record.missingSince = previous?.code === "bound_task_space_missing"
+        ? (previous.missingSince ?? previous.at)
+        : record.at
+    }
+    return record
+  }
+
+  // Recreation of a vanished bound task space is granted only after the space
+  // has stayed missing across the configured delay, so a browser that is still
+  // restoring its spaces is not handed a duplicate.
+  #taskSpaceRecoveryInput(record) {
+    if (record?.code !== "bound_task_space_missing") {
+      return undefined
+    }
+    const missingSince = Date.parse(record.missingSince ?? record.at)
+    if (!Number.isFinite(missingSince) || Date.now() - missingSince < this.#boundTaskSpaceRecreateDelayMs) {
+      return undefined
+    }
+    return { allowRecreate: true }
+  }
+
   #canRetryPreSend(error) {
     if (!(error instanceof EgoChatError)) {
-      return error?.details?.draftCleared === true
-        && PRECLICK_DRIVER_STAGES.has(error?.details?.driverStage)
+      return provenPreSendDriverFailure(error?.details)
     }
     const reason = error.details?.reason ?? error.code
     if (HUMAN_ONLY_BROWSER_REASONS.has(reason)) {
@@ -3833,8 +3928,7 @@ export class Broker {
     if (error.code === "human_required") {
       return RETRYABLE_PRE_SEND_REASONS.has(reason)
     }
-    return error.details?.draftCleared === true
-      && PRECLICK_DRIVER_STAGES.has(error.details?.driverStage)
+    return provenPreSendDriverFailure(error.details)
   }
 
   #isHumanOnlyBrowserError(error) {
@@ -3875,8 +3969,7 @@ export class Broker {
     ) {
       return true
     }
-    return error?.details?.draftCleared === true
-      && PRECLICK_DRIVER_STAGES.has(error?.details?.driverStage)
+    return provenPreSendDriverFailure(error?.details)
   }
 
   async #armReceiptDispatch(workflow, binding) {
@@ -4009,7 +4102,7 @@ export class Broker {
     return persisted
   }
 
-  async #autoReanchorRunningExchange(workflow, error, signal) {
+  async #autoReanchorRunningExchange(workflow, error, signal, taskSpaceRecovery = undefined) {
     const headChange = safeHeadChangeEvidence(error)
     if (headChange?.observedRole !== "assistant" || typeof this.#egoAdapter.reanchor !== "function") {
       return null
@@ -4031,6 +4124,7 @@ export class Broker {
           allowTaskSpaceReclaim: true,
           binding,
           expectedObservedHeadFingerprint: headChange.observedFingerprint,
+          ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
         },
         signal,
         (result) => this.#reserveBrowserTaskSpaceIdentity({
@@ -4045,6 +4139,7 @@ export class Broker {
       expected,
       headChange,
     )
+    const recoveredTaskSpace = validateTaskSpaceRecovery(capture.taskSpaceRecovery)
     this.#reserveBrowserTaskSpaceIdentity({
       expectedCanonicalUrl: binding.canonicalUrl,
       key: binding.key,
@@ -4083,6 +4178,7 @@ export class Broker {
     }
     await this.#transition(current, "exchange.head_reanchored_automatically", {
       automaticReanchorCount: (current.automaticReanchorCount ?? 0) + 1,
+      ...(recoveredTaskSpace ? { taskSpaceRecovery: recoveredTaskSpace } : {}),
       reconciliation: {
         ...current.reconciliation,
         beforeHead: bindingHeadAnchor(nextBinding),
@@ -4097,6 +4193,9 @@ export class Broker {
     let attempt = 0
     while (true) {
       attempt += 1
+      const taskSpaceRecovery = this.#taskSpaceRecoveryInput(
+        this.#store.getWorkflow(workflow.id)?.lastRecovery ?? workflow.lastRecovery,
+      )
       try {
         const verified = await this.#egoAdapter.reconcileBound(
           {
@@ -4106,6 +4205,7 @@ export class Broker {
             allowDeliveryAbsent: true,
             allowTaskSpaceReclaim: true,
             binding,
+            ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
             expectedPreviousContentDigest: workflow.reconciliation.beforeHead.contentDigest,
             expectedPreviousMessageId: workflow.reconciliation.beforeHead.messageId,
             expectedTerminalMarker: workflow.reconciliation.expectedTerminalMarker,
@@ -4128,6 +4228,7 @@ export class Broker {
           result: verified,
         })
         taskSpaceIdentityCommitPatch(verified, binding)
+        const restartTaskSpaceRecovery = validateTaskSpaceRecovery(verified.taskSpaceRecovery)
         if (verified.deliveryState === "absent") {
           const beforeHead = workflow.reconciliation.beforeHead
           const bindingUnchanged = headAnchorsMatch(bindingHeadAnchor(binding), beforeHead)
@@ -4158,6 +4259,7 @@ export class Broker {
           const current = this.#store.getWorkflow(workflow.id)
           if (current?.status === "running") {
             await this.#transition(current, "exchange.restart_delivery_absent", {
+              ...(restartTaskSpaceRecovery ? { taskSpaceRecovery: restartTaskSpaceRecovery } : {}),
               lastRecovery: {
                 at: new Date().toISOString(),
                 attempt,
@@ -4209,6 +4311,7 @@ export class Broker {
           binding,
           result: {
             ...verified,
+            ...(restartTaskSpaceRecovery ? { taskSpaceRecovery: restartTaskSpaceRecovery } : {}),
             modelPolicy: this.#validateModelPolicyObservation(observedPolicy),
           },
         }
@@ -4235,7 +4338,7 @@ export class Broker {
           throw new EgoChatError("convergence_stopped", "The exchange stopped during restart recovery.")
         }
         await this.#transition(current, "exchange.restart_reconciliation_retry_scheduled", {
-          lastRecovery: this.#recoveryRecord(error, attempt),
+          lastRecovery: this.#browserRecoveryRecord(error, attempt, current.lastRecovery),
           phase: "restart_reconciling",
           private: current.private,
           restartReconciliationAttempts: attempt,
@@ -4302,12 +4405,14 @@ export class Broker {
             let sendRecoveryCount = current.recoveryCount ?? 0
             let sent
             while (!sent) {
+              const taskSpaceRecovery = this.#taskSpaceRecoveryInput(current.lastRecovery)
               try {
                 sent = await this.#egoAdapter.sendExchange(
                   {
                     ...current.private.request,
                     binding,
                     modelPolicy: current.private.modelPolicy ?? this.#resolveModelPolicy(),
+                    ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
                   },
                   controller.signal,
                   (result) => this.#reserveBrowserTaskSpaceIdentity({
@@ -4334,6 +4439,7 @@ export class Broker {
                     current,
                     error,
                     controller.signal,
+                    taskSpaceRecovery,
                   )
                   if (reanchored) {
                     binding = reanchored
@@ -4345,7 +4451,7 @@ export class Broker {
                   return
                 }
                 await this.#transition(current, "exchange.pre_send_recovery_scheduled", {
-                  lastRecovery: this.#recoveryRecord(error, sendRecoveryCount),
+                  lastRecovery: this.#browserRecoveryRecord(error, sendRecoveryCount, current.lastRecovery),
                   phase: "browser_owned",
                   recoveryCount: sendRecoveryCount,
                   private: current.private,
@@ -4365,6 +4471,7 @@ export class Broker {
             const taskSpaceControlRecovery = validateTaskSpaceControlRecovery(
               sent.taskSpaceControlRecovery,
             )
+            const sentTaskSpaceRecovery = validateTaskSpaceRecovery(sent.taskSpaceRecovery)
             current = this.#store.getWorkflow(workflow.id)
             if (!current || current.status !== "running") {
               return
@@ -4373,6 +4480,7 @@ export class Broker {
               deadlineAt: new Date(
                 Date.now() + current.private.request.timeoutMs,
               ).toISOString(),
+              ...(sentTaskSpaceRecovery ? { taskSpaceRecovery: sentTaskSpaceRecovery } : {}),
               phase: current.private.request.receiptCapture
                 ? "awaiting_attachment_capture"
                 : "send_confirmed",
@@ -4396,6 +4504,7 @@ export class Broker {
                   ...sendIdentity,
                   modelPolicy: observation,
                   ...(taskSpaceControlRecovery ? { taskSpaceControlRecovery } : {}),
+                  ...(sentTaskSpaceRecovery ? { taskSpaceRecovery: sentTaskSpaceRecovery } : {}),
                 },
               },
               reconciliation: {
@@ -4447,11 +4556,13 @@ export class Broker {
             }
             try {
               const captureBinding = effectiveWorkflowBinding(binding, current)
+              const captureTaskSpaceRecovery = this.#taskSpaceRecoveryInput(current.lastCaptureRecovery)
               const captured = await this.#egoAdapter.captureExchange(
                 {
                   ...current.private.request,
                   binding: captureBinding,
                   canonicalUrl: current.private.send.canonicalUrl,
+                  ...(captureTaskSpaceRecovery ? { taskSpaceRecovery: captureTaskSpaceRecovery } : {}),
                   expectedPreviousContentDigest: current.reconciliation.beforeHead.contentDigest,
                   expectedPreviousMessageId: current.reconciliation.beforeHead.messageId,
                   inputDigest: current.inputDigest,
@@ -4590,6 +4701,13 @@ export class Broker {
               if (taskSpaceControlRecovery) {
                 result.taskSpaceControlRecovery = taskSpaceControlRecovery
               }
+              const captureRecovery = validateTaskSpaceRecovery(captured.taskSpaceRecovery)
+                ?? validateTaskSpaceRecovery(current.private.send.taskSpaceRecovery)
+              if (captureRecovery) {
+                result.taskSpaceRecovery = captureRecovery
+              } else {
+                delete result.taskSpaceRecovery
+              }
               break
             } catch (error) {
               if (controller.signal.aborted) {
@@ -4606,7 +4724,7 @@ export class Broker {
               await this.#transition(current, "exchange.capture_failed", {
                 capturePending: undefined,
                 captureRecoveryCount: captureFailures,
-                lastCaptureRecovery: this.#recoveryRecord(error, captureFailures),
+                lastCaptureRecovery: this.#browserRecoveryRecord(error, captureFailures, current.lastCaptureRecovery),
                 phase: "send_confirmed",
                 private: {
                   ...current.private,
@@ -4686,6 +4804,7 @@ export class Broker {
           return
         }
         await this.#transition(current, "exchange.response_captured", {
+          ...(capturedResult.taskSpaceRecovery ? { taskSpaceRecovery: capturedResult.taskSpaceRecovery } : {}),
           capturePending: undefined,
           phase: "response_captured",
           private: current.private,
@@ -4768,7 +4887,9 @@ export class Broker {
           verifiedAt: now,
         }
         await this.#persistIsolatedBinding(
-          currentBinding.state === "unbound" ? "binding.promoted" : "binding.verified",
+          currentBinding.state === "unbound"
+            ? "binding.promoted"
+            : (result.taskSpaceRecovery ? "binding.task_space_recovered" : "binding.verified"),
           nextBinding,
           currentBinding,
           workflow.id,

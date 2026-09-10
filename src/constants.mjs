@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 
 export const APP_NAME = "ego-chat"
 export const APP_VERSION = "0.2.22"
-export const BROWSER_CONTRACT_REVISION = 18
+export const BROWSER_CONTRACT_REVISION = 19
 export const IPC_VERSION = 1
 
 const RUNTIME_CONTRACT = {
@@ -10,7 +10,7 @@ const RUNTIME_CONTRACT = {
   browserContractRevision: BROWSER_CONTRACT_REVISION,
   ipcVersion: IPC_VERSION,
   mcpSchemaRevision: 14,
-  runtimeGeneration: "2026-09-08.3",
+  runtimeGeneration: "2026-09-10.1",
   storeSchemaRevision: 10,
   taskStoreSchemaRevision: 1,
 }
@@ -36,6 +36,7 @@ export const MAX_REVIEW_PACKET_BYTES = 512 * 1024
 export const MAX_RESULT_BYTES = 256 * 1024
 export const DEFAULT_CHATGPT_GENERATION_MS = 2 * 60 * 60 * 1000
 export const DEFAULT_BROWSER_CAPTURE_SLICE_MS = 15 * 1000
+export const BOUND_TASK_SPACE_RECREATE_DELAY_MS = 30_000
 export const MAX_WAIT_MS = 8 * 60 * 60 * 1000
 export const ATTACHMENT_EVIDENCE_RESERVATION_BYTES = 1024 * 1024
 export const MAX_ATTACHMENT_EVIDENCE_INTENTS = 16
