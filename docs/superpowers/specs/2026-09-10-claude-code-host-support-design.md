@@ -68,7 +68,7 @@ A new `CLAUDE_SKILL_FILES` constant embeds `SKILL.md` only, matching `ZCODE_SKIL
 4. `install_runtime`, `redirect_stale_broker_launchers`, `handoff_installed_broker` exactly as today.
 5. `install_skill(&paths.claude_skill_dir, CLAUDE_SKILL_FILES, force)`.
 6. `configure_claude(&paths.claude_config, &claude, &executable, force)`.
-7. Print the runtime path, skill path, MCP server name, a line that the Claude.app Code tab picks up the same configuration, the restart instruction, and the Codex-absent note when Codex was not found.
+7. Print the runtime path, skill path, MCP server name, the restart instruction, the Codex-absent note when Codex was not found, and either a line that the Claude.app Code tab picks up the same configuration or a warning when `claude_desktop_config.json` also defines `ego_chat`.
 
 ### Configuration write
 
@@ -95,6 +95,7 @@ The `env` and any other keys the CLI adds are left as the CLI wrote them.
 - Runtime installed and broker generation current, as today.
 - Skill bytes match `CLAUDE_SKILL_FILES`.
 - `claude_server_status(&paths.claude_config, &executable)` is `Ready`; otherwise `host_config_problem("Claude Code", "timeout", MCP_TOOL_TIMEOUT_MILLISECONDS, "milliseconds", status)`.
+- A read-only check of `~/Library/Application Support/Claude/claude_desktop_config.json` prints `[warn]` when that file also defines `ego_chat` (the Code tab would use that definition instead of the timeout-carrying user-scope entry) or when it cannot be parsed; it never fails doctor and never edits the file.
 - Closing line on success: Ego Chat is ready. Restart open Claude Code sessions and Claude.app after configuration changes. On failure: doctor-claude found N problem(s); run ego-chat setup-claude.
 
 Doctor never spawns the MCP server and never invokes `claude mcp get`, so it cannot start a broker or open the browser.
@@ -150,6 +151,7 @@ Rust unit tests in `rust/main.rs`, using the existing `TestDirectory` and fake s
 - `parse_claude_version` accepts `2.1.261 (Claude Code)` and rejects garbage; the 2.1.203 minimum comparison is covered.
 - `embedded_paths_are_relative_and_unique` includes `CLAUDE_SKILL_FILES`.
 - `skill_installation_requires_force_for_different_managed_files` is reused for the Claude skill directory.
+- desktop-config shadow detection: missing, blank, other-server, shadowing, and broken files.
 
 Node: `npm test` and `npm run lint` unchanged in scope, run to confirm nothing regressed. Rust: `cargo test` and `cargo clippy --all-targets`.
 
