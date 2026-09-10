@@ -1360,3 +1360,20 @@ Fix every confirmed finding on the branch with its own conventional commit, re-r
 - [ ] **Step 3: Finish the branch**
 
 Use the superpowers:finishing-a-development-branch skill: present merge / pull request / keep-branch options to the user. The repo convention is a pull request into `main`.
+
+## Evidence
+
+Recorded 2026-09-10 on the development Mac (Claude Code 2.1.267, Codex and ZCode also installed).
+
+Deterministic suites in the worktree: `cargo fmt --check` clean; `cargo clippy --all-targets` zero warnings; `cargo test` 33 passed, 0 failed; `npm run lint` exit 0; `npm test` 695 tests, 694 pass, 0 fail.
+
+Live install (`cargo install --path . --locked`, then the host commands):
+
+```
+Ego Chat runtime: /Users/xicao/Library/Application Support/Ego Chat/runtime/0.2.22
+Claude Code 2.1.267 at /Users/xicao/.local/bin/claude
+Claude Code skill: /Users/xicao/.claude/skills/ego-chat
+Claude Code MCP server: ego_chat registered in user scope with a 29100000 ms tool timeout in /Users/xicao/.claude/.claude.json
+```
+
+`ego-chat doctor-claude` reported every check `[ok]`, including the desktop-config shadow check. `claude mcp get ego_chat` reported `Status: ✔ Connected`, `Command: /Users/xicao/.cargo/bin/ego-chat`, `Args: mcp`, `Timeout: 29100000ms`. A second `ego-chat setup-claude` reported the server was already configured and made no CLI write. `ego-chat install-skill --force` plus `ego-chat doctor`, and `ego-chat install-zcode-skill --force` plus `ego-chat doctor-zcode`, both passed, and all three installed `SKILL.md` copies match the branch. The live ChatGPT round trip (Task 8, step 5) was not run; it needs the user's go-ahead because it creates a conversation and spends a strongest-model turn.
