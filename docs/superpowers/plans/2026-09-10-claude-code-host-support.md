@@ -746,7 +746,7 @@ Add directly above `fn skill_installation_requires_force_for_different_managed_f
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test claude_host_paths claude_skill_files embedded_paths`
+Run: `cargo test --no-run`
 Expected: compile error `error[E0425]: cannot find value `CLAUDE_SKILL_FILES`` / `cannot find function `claude_host_paths``.
 
 - [ ] **Step 3: Add the embedded skill constant and the paths**
@@ -1046,7 +1046,7 @@ All other commands are forwarded to the qualified Ego Chat broker CLI."
 Run: `cargo fmt && cargo clippy --all-targets && cargo test`
 Expected: clippy prints no warnings (the `dead_code` warnings from Tasks 1 to 3 are gone); `test result: ok. 30 passed` (20 baseline + 2 + 1 + 5 + 2).
 
-Run: `cargo run -- help`
+Run: `cargo run --bin ego-chat -- help`
 Expected: the usage block lists `setup-claude`, `install-claude-skill`, and `doctor-claude`.
 
 - [ ] **Step 7: Commit**
