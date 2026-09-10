@@ -2363,6 +2363,8 @@ mod tests {
         let executable_json = serde_json::to_string(executable.to_str().expect("utf8 path"))
             .expect("encode executable");
         let config = directory.0.join(".claude.json");
+        let minimum = MCP_TOOL_TIMEOUT_MILLISECONDS;
+        let longer = MCP_TOOL_TIMEOUT_MILLISECONDS + 60_000;
         let status = |label: &str| {
             claude_server_status(&config, &executable)
                 .unwrap_or_else(|error| panic!("inspect {label}: {error}"))
@@ -2379,7 +2381,9 @@ mod tests {
         assert_eq!(status("other server only"), HostConfigStatus::Missing);
         fs::write(
             &config,
-            r#"{"mcpServers":{"ego_chat":{"type":"stdio","command":"someone-else","args":["mcp"],"timeout":29100000}}}"#,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":"someone-else","args":["mcp"],"timeout":{minimum}}}}}}}"#
+            ),
         )
         .expect("seed foreign command");
         assert_eq!(
@@ -2389,7 +2393,7 @@ mod tests {
         fs::write(
             &config,
             format!(
-                r#"{{"mcpServers":{{"ego_chat":{{"type":"http","command":{executable_json},"args":["mcp"],"timeout":29100000}}}}}}"#
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"http","command":{executable_json},"args":["mcp"],"timeout":{minimum}}}}}}}"#
             ),
         )
         .expect("seed wrong transport");
@@ -2400,7 +2404,7 @@ mod tests {
         fs::write(
             &config,
             format!(
-                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp","--verbose"],"timeout":29100000}}}}}}"#
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp","--verbose"],"timeout":{minimum}}}}}}}"#
             ),
         )
         .expect("seed wrong args");
@@ -2438,7 +2442,7 @@ mod tests {
         fs::write(
             &config,
             format!(
-                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"env":{{}},"timeout":29100000}}}}}}"#
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"env":{{}},"timeout":{minimum}}}}}}}"#
             ),
         )
         .expect("seed ready entry");
@@ -2446,11 +2450,26 @@ mod tests {
         fs::write(
             &config,
             format!(
-                r#"{{"mcpServers":{{"ego_chat":{{"command":{executable_json},"args":["mcp"],"timeout":29160000}}}}}}"#
+                r#"{{"mcpServers":{{"ego_chat":{{"command":{executable_json},"args":["mcp"],"timeout":{longer}}}}}}}"#
             ),
         )
         .expect("seed ready entry without type");
         assert_eq!(status("ready without type"), HostConfigStatus::Ready);
+
+        fs::write(&config, r#"{"mcpServers":"oops"}"#).expect("seed non-object servers");
+        assert_eq!(status("non-object servers"), HostConfigStatus::Missing);
+        fs::write(
+            &config,
+            format!(r#"{{"mcpServers":{{"ego_chat":{{"command":{executable_json},"args":"mcp","timeout":{minimum}}}}}}}"#),
+        )
+        .expect("seed string args");
+        assert_eq!(status("string args"), HostConfigStatus::IdentityMismatch);
+        fs::write(
+            &config,
+            format!(r#"{{"mcpServers":{{"ego_chat":{{"type":123,"command":{executable_json},"args":["mcp"],"timeout":{minimum}}}}}}}"#),
+        )
+        .expect("seed numeric type");
+        assert_eq!(status("numeric type"), HostConfigStatus::IdentityMismatch);
 
         fs::write(&config, "[]\n").expect("seed non-object");
         let error = claude_server_status(&config, &executable).expect_err("must reject an array");
