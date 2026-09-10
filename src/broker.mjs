@@ -4764,7 +4764,11 @@ export class Broker {
             result,
           })
         }
+      }
 
+      // A fresh capture and a response recovered by restart reconciliation are
+      // committed the same way: attributable, content-addressed, then durable.
+      if (result && !result.responseRef) {
         const resultIdentity = taskSpaceIdentityCommitPatch(
           result,
           effectiveWorkflowBinding(binding, current),

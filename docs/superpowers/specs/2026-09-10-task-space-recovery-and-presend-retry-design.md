@@ -102,6 +102,10 @@ The driver reports `driverStage` only on the unexpected-error path (`ego_driver_
 
 An `ego_driver_error` at `selecting_conversation` is retried through `exchange.pre_send_recovery_scheduled` with `lastRecovery.code: "ego_driver_error"` and its `driverStage`, bounded by the workflow deadline. The same error at `verifying_composed_prompt` without `draftCleared` still ends as `browser_operation_interrupted_before_send_confirmation`, and stage-unknown failures are unchanged.
 
+## Part C: commit a response recovered by restart reconciliation
+
+Found while testing Part A. When a broker restart interrupted a browser-owned exchange and restart reconciliation then found the complete attributable response, `#runEgoExchange` skipped the capture-commit tail (blob storage and `exchange.response_captured`) because the result was already set, and the following integrity check ended the workflow with `response_capture_state_invalid`. The ledger has never recorded that code, so the path had not been exercised live. The commit tail now runs for any result that has no stored `responseRef`, which makes a fresh capture and a restart-recovered response commit identically. No behaviour changes for results restored from the `response_captured` phase.
+
 ## Contracts and constants
 
 - `BROWSER_CONTRACT_REVISION` 18 → 19 (new driver input `taskSpaceRecovery` and result field `taskSpaceRecovery`).

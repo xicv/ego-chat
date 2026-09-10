@@ -39,6 +39,7 @@ File `src/broker.mjs`.
 - [ ] **Step 6: explicit operations** — `verifyConversation`, `reconcileConversation` (both `reconcile` and `reconcileBound` branches) and `reanchorConversation`: pass `taskSpaceRecovery: { allowRecreate: true }`; validate the returned record; `verifyConversation` writes `binding.task_space_recovered` instead of `binding.checkpointed` when present and returns `{ ...publicBinding(nextBinding), ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}) }`; `reanchorConversation` returns the record the same way; `reconcileConversation` stores it on the workflow when it transitions.
 - [ ] **Step 7: CLI/MCP surface** — no schema change. Confirm `workflow_status` shows `taskSpaceRecovery` through `publicWorkflow` (structuredClone of the record, nothing to add).
 - [ ] **Step 8: commit** — `feat: grant and record bound task-space recreation across exchange, capture and reconciliation`.
+- [ ] **Step 9: restart commit fix (spec Part C)** — in `#runEgoExchange`, close the `if (!result)` block after the staged/monolithic capture and run the capture-commit tail under `if (result && !result.responseRef)` so a restart-recovered response is stored and committed. Commit `fix: commit a response recovered by restart reconciliation`.
 
 ### Task 4: driver tests (`test/ego-adapter.test.mjs`)
 
