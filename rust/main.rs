@@ -1100,6 +1100,66 @@ fn host_config_problem(
     }
 }
 
+fn claude_server_entry(config_path: &Path) -> Result<Option<JsonValue>, String> {
+    let contents = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    if contents.trim().is_empty() {
+        return Ok(None);
+    }
+    let document = serde_json::from_str::<JsonValue>(&contents)
+        .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?;
+    let root = document
+        .as_object()
+        .ok_or_else(|| format!("{} must contain a JSON object", config_path.display()))?;
+    Ok(root
+        .get("mcpServers")
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+        .cloned())
+}
+
+fn claude_server_identity_matches(value: &JsonValue, executable: &str) -> bool {
+    let Some(server) = value.as_object() else {
+        return false;
+    };
+    let transport_matches = server
+        .get("type")
+        .is_none_or(|transport| transport.as_str() == Some("stdio"));
+    let command_matches = server.get("command").and_then(JsonValue::as_str) == Some(executable);
+    let args_match = server
+        .get("args")
+        .and_then(JsonValue::as_array)
+        .map(|values| values.len() == 1 && values[0].as_str() == Some("mcp"))
+        .unwrap_or(false);
+    transport_matches && command_matches && args_match
+}
+
+fn claude_server_value_status(value: &JsonValue, executable: &str) -> HostConfigStatus {
+    if !claude_server_identity_matches(value, executable) {
+        return HostConfigStatus::IdentityMismatch;
+    }
+    let Some(timeout) = value.get("timeout").and_then(JsonValue::as_u64) else {
+        return HostConfigStatus::TimeoutMissingOrInvalid;
+    };
+    if timeout < MCP_TOOL_TIMEOUT_MILLISECONDS {
+        HostConfigStatus::TimeoutTooShort
+    } else {
+        HostConfigStatus::Ready
+    }
+}
+
+fn claude_server_status(config_path: &Path, executable: &Path) -> Result<HostConfigStatus, String> {
+    match claude_server_entry(config_path)? {
+        None => Ok(HostConfigStatus::Missing),
+        Some(server) => Ok(claude_server_value_status(
+            &server,
+            &path_bytes(executable)?,
+        )),
+    }
+}
+
 fn parse_claude_version(version: &str) -> Option<(u64, u64, u64)> {
     fn leading_number(part: &str) -> Option<u64> {
         let digits = part
@@ -2294,6 +2354,122 @@ mod tests {
         );
         let error = check_claude_version(&broken).expect_err("must reject garbage");
         assert!(error.contains("could not parse Claude Code version"));
+    }
+
+    #[test]
+    fn claude_doctor_status_distinguishes_missing_mismatched_and_timeout_problems() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("ego-chat");
+        let executable_json = serde_json::to_string(executable.to_str().expect("utf8 path"))
+            .expect("encode executable");
+        let config = directory.0.join(".claude.json");
+        let status = |label: &str| {
+            claude_server_status(&config, &executable)
+                .unwrap_or_else(|error| panic!("inspect {label}: {error}"))
+        };
+
+        assert_eq!(status("missing file"), HostConfigStatus::Missing);
+        fs::write(&config, "  \n").expect("seed blank file");
+        assert_eq!(status("blank file"), HostConfigStatus::Missing);
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"other":{"type":"stdio","command":"other"}}}"#,
+        )
+        .expect("seed other server");
+        assert_eq!(status("other server only"), HostConfigStatus::Missing);
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"ego_chat":{"type":"stdio","command":"someone-else","args":["mcp"],"timeout":29100000}}}"#,
+        )
+        .expect("seed foreign command");
+        assert_eq!(
+            status("foreign command"),
+            HostConfigStatus::IdentityMismatch
+        );
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"http","command":{executable_json},"args":["mcp"],"timeout":29100000}}}}}}"#
+            ),
+        )
+        .expect("seed wrong transport");
+        assert_eq!(
+            status("wrong transport"),
+            HostConfigStatus::IdentityMismatch
+        );
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp","--verbose"],"timeout":29100000}}}}}}"#
+            ),
+        )
+        .expect("seed wrong args");
+        assert_eq!(status("wrong args"), HostConfigStatus::IdentityMismatch);
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"command":{executable_json},"args":["mcp"]}}}}}}"#
+            ),
+        )
+        .expect("seed missing timeout");
+        assert_eq!(
+            status("missing timeout"),
+            HostConfigStatus::TimeoutMissingOrInvalid
+        );
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"timeout":"29100000"}}}}}}"#
+            ),
+        )
+        .expect("seed string timeout");
+        assert_eq!(
+            status("string timeout"),
+            HostConfigStatus::TimeoutMissingOrInvalid
+        );
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"timeout":600000}}}}}}"#
+            ),
+        )
+        .expect("seed short timeout");
+        assert_eq!(status("short timeout"), HostConfigStatus::TimeoutTooShort);
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"env":{{}},"timeout":29100000}}}}}}"#
+            ),
+        )
+        .expect("seed ready entry");
+        assert_eq!(status("ready entry"), HostConfigStatus::Ready);
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"command":{executable_json},"args":["mcp"],"timeout":29160000}}}}}}"#
+            ),
+        )
+        .expect("seed ready entry without type");
+        assert_eq!(status("ready without type"), HostConfigStatus::Ready);
+
+        fs::write(&config, "[]\n").expect("seed non-object");
+        let error = claude_server_status(&config, &executable).expect_err("must reject an array");
+        assert!(error.contains("must contain a JSON object"));
+        fs::write(&config, "{not json").expect("seed broken json");
+        let error =
+            claude_server_status(&config, &executable).expect_err("must reject broken JSON");
+        assert!(error.contains("could not parse"));
+
+        assert!(
+            host_config_problem(
+                "Claude Code",
+                "timeout",
+                MCP_TOOL_TIMEOUT_MILLISECONDS,
+                "milliseconds",
+                HostConfigStatus::TimeoutTooShort,
+            )
+            .contains("Claude Code MCP server ego_chat has a too-short timeout")
+        );
     }
 
     #[test]
