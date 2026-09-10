@@ -1294,16 +1294,16 @@ Expected: JSON with no running workflows. If any workflow is `running`, `human_r
 - [ ] **Step 3: Install the launcher and run the Claude setup**
 
 Run: `cargo install --path . --locked`
-Expected: `Replacing /Users/xicao/.cargo/bin/ego-chat` ... `Replaced package ego-chat v0.2.22`.
+Expected: `Replacing ~/.cargo/bin/ego-chat` ... `Replaced package ego-chat v0.2.22`.
 
 Run: `ego-chat setup-claude`
 Expected output (paths may differ):
 
 ```
-Ego Chat runtime: /Users/xicao/Library/Application Support/Ego Chat/runtime/0.2.22
-Claude Code 2.1.261 at /Users/xicao/.local/bin/claude
-Claude Code skill: /Users/xicao/.claude/skills/ego-chat
-Claude Code MCP server: ego_chat registered in user scope with a 29100000 ms tool timeout in /Users/xicao/.claude/.claude.json
+Ego Chat runtime: ~/Library/Application Support/Ego Chat/runtime/0.2.22
+Claude Code 2.1.261 at ~/.local/bin/claude
+Claude Code skill: ~/.claude/skills/ego-chat
+Claude Code MCP server: ego_chat registered in user scope with a 29100000 ms tool timeout in ~/.claude/.claude.json
 Restart open Claude Code sessions and Claude.app, then run `claude mcp get ego_chat` to verify the connection. The Claude.app Code tab uses this same configuration.
 ```
 
@@ -1311,7 +1311,7 @@ Run: `ego-chat doctor-claude`
 Expected: every line `[ok]`, ending `Ego Chat is ready. Restart open Claude Code sessions and Claude.app after configuration changes.`
 
 Run: `claude mcp get ego_chat`
-Expected: `Scope: User config`, `Type: stdio`, `Command: /Users/xicao/.cargo/bin/ego-chat`, `Args: mcp`, `Timeout: 29100000ms`, `Status: ✔ Connected`.
+Expected: `Scope: User config`, `Type: stdio`, `Command: ~/.cargo/bin/ego-chat`, `Args: mcp`, `Timeout: 29100000ms`, `Status: ✔ Connected`.
 
 Run: `ego-chat setup-claude`
 Expected: second run prints `Claude Code MCP server: ego_chat was already configured in ...` and makes no CLI write.
@@ -1319,7 +1319,7 @@ Expected: second run prints `Claude Code MCP server: ego_chat was already config
 - [ ] **Step 4: Refresh the other installed skill copies so they match the new SKILL.md**
 
 Run: `ego-chat install-skill --force && ego-chat doctor`
-Expected: `Installed Codex skill at /Users/xicao/.codex/skills/ego-chat`; doctor ends `Ego Chat is ready.`
+Expected: `Installed Codex skill at ~/.codex/skills/ego-chat`; doctor ends `Ego Chat is ready.`
 
 Run: `test -d ~/.zcode/skills/ego-chat && ego-chat install-zcode-skill --force && ego-chat doctor-zcode || echo "no ZCode skill installed; skipping"`
 Expected: either the ZCode skill is refreshed and doctor-zcode passes, or the skip message.
@@ -1370,12 +1370,12 @@ Deterministic suites in the worktree: `cargo fmt --check` clean; `cargo clippy -
 Live install (`cargo install --path . --locked`, then the host commands):
 
 ```
-Ego Chat runtime: /Users/xicao/Library/Application Support/Ego Chat/runtime/0.2.22
-Claude Code 2.1.267 at /Users/xicao/.local/bin/claude
-Claude Code skill: /Users/xicao/.claude/skills/ego-chat
-Claude Code MCP server: ego_chat registered in user scope with a 29100000 ms tool timeout in /Users/xicao/.claude/.claude.json
+Ego Chat runtime: ~/Library/Application Support/Ego Chat/runtime/0.2.22
+Claude Code 2.1.267 at ~/.local/bin/claude
+Claude Code skill: ~/.claude/skills/ego-chat
+Claude Code MCP server: ego_chat registered in user scope with a 29100000 ms tool timeout in ~/.claude/.claude.json
 ```
 
-`ego-chat doctor-claude` reported every check `[ok]`, including the desktop-config shadow check. `claude mcp get ego_chat` reported `Status: ✔ Connected`, `Command: /Users/xicao/.cargo/bin/ego-chat`, `Args: mcp`, `Timeout: 29100000ms`. A second `ego-chat setup-claude` reported the server was already configured and made no CLI write. `ego-chat install-skill --force` plus `ego-chat doctor`, and `ego-chat install-zcode-skill --force` plus `ego-chat doctor-zcode`, both passed, and all three installed `SKILL.md` copies match the branch. The live ChatGPT round trip (Task 8, step 5) was not run; it needs the user's go-ahead because it creates a conversation and spends a strongest-model turn.
+`ego-chat doctor-claude` reported every check `[ok]`, including the desktop-config shadow check. `claude mcp get ego_chat` reported `Status: ✔ Connected`, `Command: ~/.cargo/bin/ego-chat`, `Args: mcp`, `Timeout: 29100000ms`. A second `ego-chat setup-claude` reported the server was already configured and made no CLI write. `ego-chat install-skill --force` plus `ego-chat doctor`, and `ego-chat install-zcode-skill --force` plus `ego-chat doctor-zcode`, both passed, and all three installed `SKILL.md` copies match the branch. The live ChatGPT round trip (Task 8, step 5) was not run; it needs the user's go-ahead because it creates a conversation and spends a strongest-model turn.
 
 A fresh headless Claude Code session (`claude -p --allowedTools mcp__ego_chat__ego_get_conversation`) loaded the user-scope server and returned the bound `ego-chat-main` binding (state `bound`, revision 44, 52 messages) in about 16 seconds without any Send. The Claude Code session that ran `setup-claude` did not see the new server until restarted, as expected: user-scope MCP servers connect at session start.
