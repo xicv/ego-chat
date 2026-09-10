@@ -621,10 +621,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.22 adds checkpointed provider-terminal handling, opt-in same-project exhaustion rollover, local launch-acknowledgement recovery, inactive-capture backoff, and monitor freshness/notification hardening. It does not authorize blind resends or new MR actions, and is not yet qualified as interruption-free overnight operation. Browser, MCP and store contracts change; upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.23 recreates a vanished Ego-Chat-named task space by name after a short delay and reopens the bound conversation in it, retries driver crashes that provably happened before prompt composition, and commits a response found by restart reconciliation. It does not authorize blind resends or new MR actions, and is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 19); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.22 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.23 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
