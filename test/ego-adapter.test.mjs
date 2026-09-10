@@ -328,6 +328,7 @@ console.log('__EGO_CHAT_TEST_COUNTERS__' + JSON.stringify(counters))
 
 async function runPreSendDriverCase({
   allowTaskSpaceReclaim = false,
+  boundTaskSpaceIdentity = undefined,
   boundTaskSpaceOwnership = null,
   changeSendControlAtRecheck = false,
   cleanupFirstAttemptFails = false,
@@ -347,6 +348,8 @@ async function runPreSendDriverCase({
   taskSpaceGuard = null,
   taskSpaceDriftAtFence = null,
   taskSpaceLocation = 10,
+  taskSpaceMissingFromStart = false,
+  taskSpaceRecovery = undefined,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-presend-${process.pid}-${driverCase}`
@@ -391,6 +394,7 @@ async function runPreSendDriverCase({
           messageCount: 2,
           state: "bound",
           targetId: "presend-tab",
+          ...(boundTaskSpaceIdentity ? { taskSpaceIdentity: boundTaskSpaceIdentity } : {}),
           taskSpaceId: 10,
         },
     brokerLease: {
@@ -420,10 +424,13 @@ async function runPreSendDriverCase({
                       identity: { name: "presend-new-workspace", taskId: "presend-new-workspace" },
                       kind: "stable_identity",
                     })
-              : { kind: "name", value: fallbackName },
+              : (boundTaskSpaceIdentity
+                  ? { identity: boundTaskSpaceIdentity, kind: "stable_identity" }
+                  : { kind: "name", value: fallbackName }),
             taskSpaceGuard ?? undefined,
           ),
         }),
+    ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
     timeoutMs: 1_000,
     turnMarker,
   }
@@ -479,9 +486,36 @@ const counters = {
   takeOverTaskSpace: 0,
 }
 globalThis.cliLog = (value) => console.log(value)
+const boundIdentity = ${JSON.stringify(boundTaskSpaceIdentity ?? null)}
+let boundListedTaskSpaces = ${JSON.stringify(
+    boundTaskSpaceIdentity && !taskSpaceMissingFromStart
+      ? [{ id: taskSpaceLocation, name: boundTaskSpaceIdentity.name, ownership: "agent", taskId: boundTaskSpaceIdentity.taskId }]
+      : [],
+  )}
+let boundSpaceCreated = false
+let listTabsCalls = 0
+let nextCreatedTaskSpaceId = 100
+let taskSpaceCreations = 0
 globalThis.listTaskSpaces = async () => {
   taskSpaceListReads += 1
   counters.taskSpaceLists += 1
+  if (boundIdentity) {
+    const driftPoint = ${JSON.stringify(taskSpaceDriftAtFence)}
+    const missing = !boundSpaceCreated && (
+      ${JSON.stringify(taskSpaceMissingFromStart)}
+      || (driftPoint === 'before_navigation' && listTabsCalls >= 1)
+      || (
+        driftPoint === 'before_composition'
+        && counters.switches >= 1
+        && policyReads >= 1
+        && counters.composerMutations === 0
+      )
+      || (driftPoint === 'before_send_click' && counters.composerMutations >= 1)
+    )
+    return missing
+      ? boundListedTaskSpaces.filter((space) => space.name !== boundIdentity.name)
+      : boundListedTaskSpaces
+  }
   if (taskSpaceOwnership !== null) {
     return [{ id: 12, name: ${JSON.stringify(fallbackName)}, ownership: taskSpaceOwnership, taskId: ${JSON.stringify(fallbackName)} }]
   }
@@ -518,9 +552,20 @@ globalThis.takeOverTaskSpace = async (taskSpaceId) => {
 }
 globalThis.useOrCreateTaskSpace = async (value) => {
   counters.taskSpaceSelections += 1
+  if (boundIdentity && typeof value === 'string') {
+    boundSpaceCreated = true
+    taskSpaceCreations += 1
+    const id = nextCreatedTaskSpaceId
+    nextCreatedTaskSpaceId += 1
+    boundListedTaskSpaces.push({ id, name: value, ownership: 'agent', taskId: value })
+    return { id }
+  }
   return { id: value === 12 ? 12 : ${JSON.stringify(taskSpaceLocation)} }
 }
-globalThis.listTabs = async () => [{ active: true, targetId: 'presend-tab' }]
+globalThis.listTabs = async () => {
+  listTabsCalls += 1
+  return [{ active: true, targetId: 'presend-tab' }]
+}
 globalThis.switchTab = async () => { counters.switches += 1 }
 globalThis.openOrReuseTab = async () => {
   counters.openNavigations += 1
@@ -609,7 +654,14 @@ globalThis.js = async (source) => {
     }
   }
   if (source.includes("const messageNodes = [")) {
-    return taskSpaceOwnership === null ? [] : beforeEntries
+    if (taskSpaceOwnership === null && !boundIdentity) return []
+    if (counters.mouseEvents >= 2) {
+      return [...beforeEntries, { messageId: 'presend-sent-user', role: 'user', text: input.prompt }]
+    }
+    return beforeEntries
+  }
+  if (source.includes('draftMarkerCount')) {
+    return { draftMarkerCount: 0, renderedMarkerCount: 1, userMarkerCount: 1 }
   }
   if (source.trimStart().startsWith('Boolean(')) return false
   if (source.includes("const rendered = [...document.querySelectorAll('[data-message-author-role]')")) return 0
@@ -731,6 +783,7 @@ globalThis.js = async (source) => {
 }
 await ${EGO_DRIVER_SOURCE.trim()}
 console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
+console.log('__EGO_CHAT_PRESEND_CREATIONS__' + JSON.stringify(taskSpaceCreations))
 `
 
   try {
@@ -739,19 +792,26 @@ console.log('__EGO_CHAT_PRESEND_COUNTERS__' + JSON.stringify(counters))
       input: harness,
     })
     assert.equal(executed.status, 0, executed.stderr)
+    let result
     let error
     try {
-      decodeDriverResult(executed.stdout)
+      result = decodeDriverResult(executed.stdout)
     } catch (caught) {
       error = caught
     }
     const countersLine = executed.stdout
       .split("\n")
       .find((line) => line.startsWith("__EGO_CHAT_PRESEND_COUNTERS__"))
+    const creationsLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_PRESEND_CREATIONS__"))
     assert.ok(countersLine)
+    assert.ok(creationsLine)
     return {
       counters: JSON.parse(countersLine.slice("__EGO_CHAT_PRESEND_COUNTERS__".length)),
       error,
+      result,
+      taskSpaceCreations: JSON.parse(creationsLine.slice("__EGO_CHAT_PRESEND_CREATIONS__".length)),
     }
   } finally {
     await fs.rm(mailboxDirectory, { force: true, recursive: true })
@@ -765,6 +825,8 @@ async function runBoundHeadDriverCase({
   finalUrl = null,
   hydrateToBinding = false,
   mode = "reanchor",
+  taskSpaceMissing = false,
+  taskSpaceRecovery = undefined,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reanchor-${process.pid}-${driverCase}`
@@ -813,6 +875,7 @@ async function runBoundHeadDriverCase({
       identity: { name: "bound", taskId: "bound" },
       kind: "stable_identity",
     }),
+    ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
   await fs.writeFile(ownerPath, JSON.stringify(input.brokerLease), { mode: 0o600 })
@@ -826,13 +889,28 @@ let generationReads = 0
 let inspectionReads = 0
 let pageInfoReads = 0
 globalThis.cliLog = (value) => console.log(value)
-globalThis.listTaskSpaces = async () => [{
-  id: 10,
-  name: ${JSON.stringify(driftAtResult)} && entryReads > 0 ? 'drifted-before-bound-head-result' : 'bound',
-  ownership: 'agent',
-  taskId: ${JSON.stringify(driftAtResult)} && entryReads > 0 ? 'drifted-before-bound-head-result' : 'bound',
-}]
-globalThis.useOrCreateTaskSpace = async () => ({ id: 10 })
+let listedTaskSpaces = ${JSON.stringify(taskSpaceMissing ? [] : [{ id: 10, name: "bound", ownership: "agent", taskId: "bound" }])}
+let taskSpaceCreations = 0
+let nextCreatedTaskSpaceId = 100
+globalThis.listTaskSpaces = async () => {
+  if (${JSON.stringify(driftAtResult)} && entryReads > 0) {
+    return listedTaskSpaces.map((space) => space.id === 10
+      ? { id: 10, name: 'drifted-before-bound-head-result', ownership: 'agent', taskId: 'drifted-before-bound-head-result' }
+      : space)
+  }
+  return listedTaskSpaces
+}
+globalThis.useOrCreateTaskSpace = async (value) => {
+  if (value === 10) return { id: 10 }
+  if (typeof value === 'string') {
+    taskSpaceCreations += 1
+    const id = nextCreatedTaskSpaceId
+    nextCreatedTaskSpaceId += 1
+    listedTaskSpaces.push({ id, name: value, ownership: 'agent', taskId: value })
+    return { id }
+  }
+  throw new Error('Unexpected task space request: ' + value)
+}
 globalThis.listTabs = async () => [{ active: true, targetId: 'reanchor-tab' }]
 globalThis.switchTab = async () => {}
 globalThis.openOrReuseTab = async () => { throw new Error('unexpected navigation') }
@@ -874,6 +952,7 @@ globalThis.js = async (source) => {
   throw new Error('Unexpected page script: ' + source.slice(0, 120))
 }
 await ${EGO_DRIVER_SOURCE.trim()}
+console.log('__EGO_CHAT_REANCHOR_CREATIONS__' + JSON.stringify(taskSpaceCreations))
 `
 
   try {
@@ -882,7 +961,14 @@ await ${EGO_DRIVER_SOURCE.trim()}
       input: harness,
     })
     assert.equal(executed.status, 0, executed.stderr)
-    return decodeDriverResult(executed.stdout)
+    const creationsLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_REANCHOR_CREATIONS__"))
+    const decoded = decodeDriverResult(executed.stdout)
+    if (creationsLine) {
+      decoded.taskSpaceCreations = JSON.parse(creationsLine.slice("__EGO_CHAT_REANCHOR_CREATIONS__".length))
+    }
+    return decoded
   } finally {
     await fs.rm(mailboxDirectory, { force: true, recursive: true })
   }
@@ -912,6 +998,7 @@ async function runAdoptionDriverCase({
   taskSpaceGuard = null,
   taskSpaceName = "adoption-driver-space",
   taskSpaceOwnership = "agent",
+  taskSpaceRecovery = undefined,
   taskSpaceSelector = 10,
   taskSpaceTaskId = "adoption-driver-space",
   targetId = null,
@@ -958,6 +1045,7 @@ async function runAdoptionDriverCase({
         : { kind: "legacy_string", value: String(taskSpaceSelector) },
       taskSpaceGuard ?? undefined,
     ),
+    ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
     timeoutMs,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
@@ -1031,12 +1119,17 @@ globalThis.claimTaskSpace = async (id) => {
 globalThis.takeOverTaskSpace = async (id) => {
   listedTaskSpaces = listedTaskSpaces.map((space) => space.id === id ? { ...space, ownership: 'agent' } : space)
 }
+let taskSpaceCreations = 0
 globalThis.useOrCreateTaskSpace = async (value) => {
   taskSpaceRequests.push(value)
   if (!${JSON.stringify(taskSpaceAvailable)} && value === 10) {
     throw new Error('No task space matches numeric id 10')
   }
-  return { id: value === 10 || value === ${JSON.stringify(taskSpaceName)} ? 10 : 11 }
+  if (value === 10 || value === ${JSON.stringify(taskSpaceName)}) {
+    return { id: 10 }
+  }
+  taskSpaceCreations += 1
+  return { id: 11 }
 }
 globalThis.listTabs = async () => {
   if (!${JSON.stringify(taskSpaceAvailable)}) {
@@ -1249,6 +1342,7 @@ globalThis.js = async (source) => {
 await ${EGO_DRIVER_SOURCE.trim()}
 console.log('__EGO_CHAT_ADOPT_COUNTERS__' + JSON.stringify({ ...counters, waits }))
 console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests))
+console.log('__EGO_CHAT_ADOPT_CREATIONS__' + JSON.stringify(taskSpaceCreations))
 `
 
   try {
@@ -1263,8 +1357,12 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
     const taskSpacesLine = executed.stdout
       .split("\n")
       .find((line) => line.startsWith("__EGO_CHAT_ADOPT_TASK_SPACES__"))
+    const creationsLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_ADOPT_CREATIONS__"))
     assert.ok(countersLine)
     assert.ok(taskSpacesLine)
+    assert.ok(creationsLine)
     let result
     let error
     try {
@@ -1276,6 +1374,7 @@ console.log('__EGO_CHAT_ADOPT_TASK_SPACES__' + JSON.stringify(taskSpaceRequests)
       counters: JSON.parse(countersLine.slice("__EGO_CHAT_ADOPT_COUNTERS__".length)),
       error,
       result,
+      taskSpaceCreations: JSON.parse(creationsLine.slice("__EGO_CHAT_ADOPT_CREATIONS__".length)),
       taskSpaceRequests: JSON.parse(taskSpacesLine.slice("__EGO_CHAT_ADOPT_TASK_SPACES__".length)),
     }
   } finally {
@@ -1397,7 +1496,9 @@ async function runTaskSpaceReconciliationCase({
   createdTaskSpaceTaskId = null,
   recycleIdentityAfterSelection = false,
   selectorIdentityOverride = null,
+  taskSpaceGuard = null,
   taskSpaceIdentity = null,
+  taskSpaceRecovery = undefined,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
@@ -1510,7 +1611,9 @@ async function runTaskSpaceReconciliationCase({
       completeTaskSpaceIdentity(effectiveTaskSpaceIdentity)
         ? { identity: effectiveTaskSpaceIdentity, kind: "stable_identity" }
         : { kind: "name", value: fallbackName },
+      taskSpaceGuard ?? undefined,
     ),
+    ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
     turnMarker,
   }
   await fs.mkdir(mailboxDirectory, { mode: 0o700, recursive: true })
@@ -1537,6 +1640,8 @@ const counters = { claimTaskSpace: 0, click: 0, fillInput: 0, pressKey: 0, takeO
 globalThis.cliLog = (value) => console.log(value)
 const fallbackName = ${JSON.stringify(fallbackName)}
 let listedTaskSpaces = ${JSON.stringify(listedTaskSpaces)}
+let taskSpaceCreations = 0
+let nextCreatedTaskSpaceId = 100
 globalThis.listTaskSpaces = async () => {
   listTaskSpaceCalls += 1
   if (${JSON.stringify(brokerFenceChangesDuringReclaimRelist)} && listTaskSpaceCalls === 2) {
@@ -1625,6 +1730,13 @@ globalThis.useOrCreateTaskSpace = async (value) => {
     }
     return { id: listedTaskSpaces.find((space) => space.name === fallbackName)?.id ?? 11 }
   }
+  if (typeof value === 'string') {
+    taskSpaceCreations += 1
+    const id = nextCreatedTaskSpaceId
+    nextCreatedTaskSpaceId += 1
+    listedTaskSpaces.push({ id, name: value, ownership: 'agent', taskId: value })
+    return { id }
+  }
   throw new Error('Unexpected task space request: ' + value)
 }
 globalThis.listTabs = async () => opened ? [{ active: true, targetId: 'recovered-bound-tab' }] : []
@@ -1699,6 +1811,7 @@ globalThis.js = async (source) => {
 await ${EGO_DRIVER_SOURCE.trim()}
 console.log('__EGO_CHAT_RECONCILE_COUNTERS__' + JSON.stringify(counters))
 console.log('__EGO_CHAT_RECONCILE_TASK_SPACES__' + JSON.stringify(taskSpaceRequests))
+console.log('__EGO_CHAT_RECONCILE_CREATIONS__' + JSON.stringify(taskSpaceCreations))
 `
 
   try {
@@ -1713,8 +1826,12 @@ console.log('__EGO_CHAT_RECONCILE_TASK_SPACES__' + JSON.stringify(taskSpaceReque
     const taskSpacesLine = executed.stdout
       .split("\n")
       .find((line) => line.startsWith("__EGO_CHAT_RECONCILE_TASK_SPACES__"))
+    const creationsLine = executed.stdout
+      .split("\n")
+      .find((line) => line.startsWith("__EGO_CHAT_RECONCILE_CREATIONS__"))
     assert.ok(countersLine)
     assert.ok(taskSpacesLine)
+    assert.ok(creationsLine)
     let result
     let error
     try {
@@ -1726,6 +1843,7 @@ console.log('__EGO_CHAT_RECONCILE_TASK_SPACES__' + JSON.stringify(taskSpaceReque
       counters: JSON.parse(countersLine.slice("__EGO_CHAT_RECONCILE_COUNTERS__".length)),
       error,
       result,
+      taskSpaceCreations: JSON.parse(creationsLine.slice("__EGO_CHAT_RECONCILE_CREATIONS__".length)),
       taskSpaceRequests: JSON.parse(taskSpacesLine.slice("__EGO_CHAT_RECONCILE_TASK_SPACES__".length)),
     }
   } finally {
@@ -1888,6 +2006,26 @@ test("a transient hydrated tail that returns to the bound head does not stop ver
   assert.equal(result.head.lastRole, "assistant")
   assert.equal(result.head.messageCount, 2)
   assert.equal(result.head.renderedMessageCount, 2)
+})
+
+test("verify mode recreates a vanished bound task space with authority", async () => {
+  const result = await runBoundHeadDriverCase({
+    hydrateToBinding: true,
+    mode: "verify",
+    taskSpaceMissing: true,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(result.taskSpaceCreations, 1)
+  assert.notEqual(result.taskSpaceId, 10)
+  assert.deepEqual(result.taskSpaceIdentity, { name: "bound", taskId: "bound" })
+  assert.deepEqual(result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: result.taskSpaceId,
+  })
+  assert.equal(result.head.lastMessageId, "initial-assistant")
+  assert.equal(result.head.messageCount, 2)
 })
 
 test("a persistent external tail returns classified evidence without changing browser state", async () => {
@@ -2752,6 +2890,72 @@ test("selected task-space identity is re-proved at every critical browser action
   }
 })
 
+test("a granted recreation completes the exchange Send and reports the recovery", async () => {
+  const identity = { name: "recreatable-exchange-workspace", taskId: "recreatable-exchange-workspace" }
+  const stopped = await runPreSendDriverCase({
+    boundTaskSpaceIdentity: identity,
+    boundTaskSpaceOwnership: "agent",
+    taskSpaceMissingFromStart: true,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(stopped.error, undefined)
+  assert.equal(stopped.taskSpaceCreations, 1)
+  assert.equal(stopped.counters.mouseEvents, 2)
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.notEqual(stopped.result.taskSpaceId, 10)
+  assert.deepEqual(stopped.result.taskSpaceIdentity, identity)
+  assert.deepEqual(stopped.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: stopped.result.taskSpaceId,
+  })
+  // Proves the post-click messageNodes branch actually fed verifying_sent_identity
+  // (the driver's own durable-identity check), not just that no error surfaced.
+  assert.equal(stopped.result.promptMessageId, "presend-sent-user")
+  assert.equal(stopped.result.canonicalUrl, "https://chatgpt.com/c/presend-driver-test")
+})
+
+test("a vanished bound task space is reported as missing at each critical browser action", async () => {
+  const identity = { name: "vanishing-bound-workspace", taskId: "vanishing-bound-workspace" }
+  for (const taskSpaceDriftAtFence of [
+    "before_navigation",
+    "before_composition",
+    "before_send_click",
+  ]) {
+    const stopped = await runPreSendDriverCase({
+      boundTaskSpaceIdentity: identity,
+      boundTaskSpaceOwnership: "agent",
+      taskSpaceDriftAtFence,
+    })
+    assert.equal(stopped.error?.code, "human_required")
+    assert.equal(stopped.error?.details?.reason, "bound_task_space_missing")
+    assert.equal(stopped.error?.details?.evidence?.recreatable, true)
+    assert.equal(stopped.error?.details?.evidence?.matchCount, 0)
+    // A non-empty phase distinguishes revalidateSelectedTaskSpace's re-proof fence
+    // (which always adds `phase`) from useBoundTaskSpace's initial-selection raise
+    // (which never does) -- confirming this exercises the fence path, not the
+    // already-covered initial-selection path from the runTaskSpaceReconciliationCase tests.
+    assert.equal(typeof stopped.error?.details?.evidence?.phase, "string")
+    assert.notEqual(stopped.error?.details?.evidence?.phase, "")
+    assert.equal(stopped.taskSpaceCreations, 0)
+    assert.equal(stopped.counters.mouseEvents, 0)
+    assert.equal(stopped.counters.openNavigations, 0)
+    // Each fence value must land at a genuinely different point in the flow --
+    // mirrors the discriminating counters the neighbouring renamed-drift test
+    // (above) uses for the same three values, so the three cases aren't silently
+    // collapsing onto the same early check.
+    assert.equal(
+      stopped.counters.switches,
+      taskSpaceDriftAtFence === "before_navigation" ? 0 : 1,
+    )
+    assert.equal(
+      stopped.counters.composerMutations,
+      taskSpaceDriftAtFence === "before_send_click" ? 1 : 0,
+    )
+  }
+})
+
 test("broker task-space guards reject exact and half conflicts before numeric selection", async () => {
   const selectedIdentity = { name: "presend-new-workspace", taskId: "presend-new-workspace" }
   for (const deniedIdentity of [
@@ -3413,6 +3617,17 @@ test("conversation adoption stays in its explicit space when an unrelated fallba
   assert.equal(adopted.counters.typeText, 0)
 })
 
+test("conversation adoption ignores a recreation grant, since adopt has no bound identity to recreate", async () => {
+  const adopted = await runAdoptionDriverCase({
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.taskSpaceId, 10)
+  assert.equal(adopted.result.taskSpaceRecovery, undefined)
+  assert.equal(adopted.taskSpaceCreations, 0)
+  assert.deepEqual(adopted.taskSpaceRequests, [10])
+})
+
 test("conversation adoption selects the exact tab returned by canonical navigation", async () => {
   const adopted = await runAdoptionDriverCase({ unrelatedActiveAfterOpen: true })
   assert.equal(adopted.error, undefined)
@@ -3547,7 +3762,7 @@ test("bound recovery follows the persisted task-space identity instead of a recy
   assert.deepEqual(reconciled.result.taskSpaceIdentity, taskSpaceIdentity)
 })
 
-test("an established identity that disappears cannot fall through to a replacement workspace", async () => {
+test("a vanished bound task space is reported as missing without recreation authority", async () => {
   const reconciled = await runTaskSpaceReconciliationCase({
     taskSpaceIdentity: {
       name: "disappeared-workspace",
@@ -3557,7 +3772,11 @@ test("an established identity that disappears cannot fall through to a replaceme
 
   assert.equal(reconciled.result, undefined)
   assert.equal(reconciled.error?.code, "human_required")
-  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_missing")
+  assert.equal(reconciled.error?.details?.evidence?.recreatable, true)
+  assert.equal(reconciled.error?.details?.evidence?.matchCount, 0)
+  assert.equal(reconciled.error?.details?.evidence?.taskSpaceId, 10)
+  assert.equal(reconciled.taskSpaceCreations, 0)
   assert.deepEqual(reconciled.taskSpaceRequests, [])
   assert.deepEqual(reconciled.counters, {
     claimTaskSpace: 0,
@@ -3567,6 +3786,116 @@ test("an established identity that disappears cannot fall through to a replaceme
     takeOverTaskSpace: 0,
     typeText: 0,
   })
+})
+
+test("a granted recreation recreates the recorded identity, reopens the canonical conversation and reports the recovery", async () => {
+  const identity = { name: "recreatable-workspace", taskId: "recreatable-workspace" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.taskSpaceCreations, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [identity.name])
+  assert.notEqual(reconciled.result.taskSpaceId, 10)
+  assert.deepEqual(reconciled.result.taskSpaceIdentity, identity)
+  assert.deepEqual(reconciled.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: reconciled.result.taskSpaceId,
+  })
+  assert.equal(reconciled.result.targetId, "recovered-bound-tab")
+  assert.equal(reconciled.result.canonicalUrl, "https://chatgpt.com/c/reconcile-driver-test")
+})
+
+test("capture_exchange mode recreates a vanished bound task space with authority", async () => {
+  const identity = { name: "capture-recreate-workspace", taskId: "capture-recreate-workspace" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    generationRunning: true,
+    mode: "capture_exchange",
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.taskSpaceCreations, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [identity.name])
+  assert.deepEqual(reconciled.result.taskSpaceIdentity, identity)
+  assert.deepEqual(reconciled.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: reconciled.result.taskSpaceId,
+  })
+})
+
+test("an opaque identity that vanishes cannot be recreated even with authority", async () => {
+  const identity = { name: "opaque-workspace", taskId: "opaque-task-id" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_changed")
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("a name-only conflict blocks recreation even with authority", async () => {
+  const identity = { name: "conflict-workspace", taskId: "conflict-workspace" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    identityTaskSpaceLiveIdentity: { name: identity.name, taskId: "different-task-id" },
+    identityTaskSpaceOwnership: "agent",
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_conflict")
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+})
+
+test("a malformed recreation grant is treated as not granted", async () => {
+  const identity = { name: "malformed-grant-workspace", taskId: "malformed-grant-workspace" }
+  for (const taskSpaceRecovery of [
+    { allowRecreate: true, extra: true },
+    { allowRecreate: "yes" },
+  ]) {
+    const reconciled = await runTaskSpaceReconciliationCase({
+      taskSpaceIdentity: identity,
+      taskSpaceRecovery,
+    })
+
+    assert.equal(reconciled.result, undefined)
+    assert.equal(reconciled.error?.code, "human_required")
+    assert.equal(reconciled.error?.details?.reason, "bound_task_space_missing")
+    assert.equal(reconciled.taskSpaceCreations, 0)
+    assert.deepEqual(reconciled.taskSpaceRequests, [])
+  }
+})
+
+// NOTE: recreation always creates exactly guard.ownerSelector's own identity, so a
+// guard denying that same identity is self-contradictory and is rejected up front by
+// requireTaskSpaceGuard as task_space_guard_invalid -- not task_space_identity_already_bound
+// from taskSpaceGuardIdentityAllowed post-creation. See the report for the full trace.
+test("a guard that denies the recreated identity refuses the operation before any mutation", async () => {
+  const identity = { name: "guard-denied-workspace", taskId: "guard-denied-workspace" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    taskSpaceGuard: { deniedIdentities: [identity] },
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "task_space_guard_invalid")
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
 })
 
 test("bound recovery fails closed when a persisted task-space identity is ambiguous", async () => {
