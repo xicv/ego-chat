@@ -1160,6 +1160,75 @@ fn claude_server_status(config_path: &Path, executable: &Path) -> Result<HostCon
     }
 }
 
+fn run_claude_mcp(claude: &Path, arguments: &[&str]) -> Result<(), String> {
+    let output = Command::new(claude)
+        .arg("mcp")
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not run {}: {error}", claude.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} mcp {} exited with {}: {}",
+            claude.display(),
+            arguments.first().copied().unwrap_or_default(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Registers this executable as the user-scope `ego_chat` stdio server. Reads
+/// the config only to classify an existing entry and to verify the result;
+/// every write is delegated to the Claude CLI so concurrent Claude Code
+/// sessions are never clobbered. Returns whether a write happened.
+fn configure_claude(
+    config_path: &Path,
+    claude: &Path,
+    executable: &Path,
+    force: bool,
+) -> Result<bool, String> {
+    let executable_text = path_bytes(executable)?;
+    if let Some(existing) = claude_server_entry(config_path)? {
+        let owned = claude_server_identity_matches(&existing, &executable_text);
+        if !owned && !force {
+            return Err(format!(
+                "Claude Code already has a different {MCP_SERVER_NAME} MCP server; rerun with --force only after verifying that replacement is intended"
+            ));
+        }
+        if owned
+            && claude_server_value_status(&existing, &executable_text) == HostConfigStatus::Ready
+        {
+            return Ok(false);
+        }
+        run_claude_mcp(claude, &["remove", MCP_SERVER_NAME, "-s", "user"])?;
+    }
+    let entry = serde_json::json!({
+        "type": "stdio",
+        "command": executable_text,
+        "args": ["mcp"],
+        "timeout": MCP_TOOL_TIMEOUT_MILLISECONDS,
+    });
+    let entry = serde_json::to_string(&entry)
+        .map_err(|error| format!("could not encode the {MCP_SERVER_NAME} MCP entry: {error}"))?;
+    run_claude_mcp(claude, &["add-json", "-s", "user", MCP_SERVER_NAME, &entry])?;
+    let status = claude_server_status(config_path, executable)?;
+    if status != HostConfigStatus::Ready {
+        return Err(format!(
+            "claude mcp add-json did not leave {} ready: {}",
+            config_path.display(),
+            host_config_problem(
+                "Claude Code",
+                "timeout",
+                MCP_TOOL_TIMEOUT_MILLISECONDS,
+                "milliseconds",
+                status,
+            )
+        ));
+    }
+    Ok(true)
+}
+
 fn parse_claude_version(version: &str) -> Option<(u64, u64, u64)> {
     fn leading_number(part: &str) -> Option<u64> {
         let digits = part
@@ -1657,6 +1726,50 @@ mod tests {
             fs::set_permissions(path, permissions).expect("set executable mode");
         }
         path.to_path_buf()
+    }
+
+    /// A stand-in for the `claude` CLI: appends every argument vector to `log`
+    /// and, when `applies_writes` is set, edits `config` the way the real CLI does
+    /// (`add-json` stores the sixth argument under `mcpServers.ego_chat`,
+    /// `remove` deletes the entry). Unrelated top-level content is preserved.
+    fn fake_claude_cli(
+        directory: &Path,
+        name: &str,
+        config: &Path,
+        log: &Path,
+        applies_writes: bool,
+    ) -> PathBuf {
+        let write_block = if applies_writes {
+            format!(
+                "case \"$2\" in\n  add-json) printf '{{\"mcpServers\":{{\"ego_chat\":%s}},\"unrelated\":true}}\\n' \"$6\" > '{config}' ;;\n  remove) printf '{{\"mcpServers\":{{}},\"unrelated\":true}}\\n' > '{config}' ;;\nesac\n",
+                config = config.display()
+            )
+        } else {
+            String::new()
+        };
+        write_fake_executable(
+            &directory.join(name),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{write_block}",
+                log.display()
+            ),
+        )
+    }
+
+    fn expected_claude_entry(executable: &Path) -> String {
+        format!(
+            r#"{{"type":"stdio","command":{},"args":["mcp"],"timeout":{MCP_TOOL_TIMEOUT_MILLISECONDS}}}"#,
+            serde_json::to_string(executable.to_str().expect("utf8 path"))
+                .expect("encode executable")
+        )
+    }
+
+    fn read_lines(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .expect("read recorded invocations")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
@@ -2489,6 +2602,171 @@ mod tests {
             )
             .contains("Claude Code MCP server ego_chat has a too-short timeout")
         );
+    }
+
+    #[test]
+    fn claude_configuration_registers_a_fresh_user_scope_server_through_the_cli() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let claude = fake_claude_cli(&directory.0, "claude", &config, &log, true);
+        let executable = directory.0.join("bin/ego-chat");
+
+        assert!(configure_claude(&config, &claude, &executable, false).expect("register server"));
+
+        assert_eq!(
+            read_lines(&log),
+            [format!(
+                "mcp add-json -s user {MCP_SERVER_NAME} {}",
+                expected_claude_entry(&executable)
+            )]
+        );
+        assert_eq!(
+            claude_server_status(&config, &executable).expect("inspect configured file"),
+            HostConfigStatus::Ready
+        );
+        let document = serde_json::from_str::<JsonValue>(
+            &fs::read_to_string(&config).expect("read configured file"),
+        )
+        .expect("parse configured file");
+        assert_eq!(document["unrelated"].as_bool(), Some(true));
+        assert_eq!(
+            document["mcpServers"][MCP_SERVER_NAME]["timeout"].as_u64(),
+            Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
+        );
+    }
+
+    #[test]
+    fn claude_configuration_repairs_an_owned_short_timeout_without_force() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let claude = fake_claude_cli(&directory.0, "claude", &config, &log, true);
+        let executable = directory.0.join("bin/ego-chat");
+        let executable_json = serde_json::to_string(executable.to_str().expect("utf8 path"))
+            .expect("encode executable");
+        for seed in [
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"timeout":600000}}}},"unrelated":true}}"#
+            ),
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"]}}}},"unrelated":true}}"#
+            ),
+        ] {
+            fs::write(&config, seed).expect("seed owned entry");
+            let _ = fs::remove_file(&log);
+            assert_ne!(
+                claude_server_status(&config, &executable).expect("inspect seeded file"),
+                HostConfigStatus::Ready
+            );
+
+            assert!(
+                configure_claude(&config, &claude, &executable, false).expect("repair timeout")
+            );
+
+            assert_eq!(
+                read_lines(&log),
+                [
+                    format!("mcp remove {MCP_SERVER_NAME} -s user"),
+                    format!(
+                        "mcp add-json -s user {MCP_SERVER_NAME} {}",
+                        expected_claude_entry(&executable)
+                    ),
+                ]
+            );
+            assert_eq!(
+                claude_server_status(&config, &executable).expect("inspect repaired file"),
+                HostConfigStatus::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn claude_configuration_refuses_an_unowned_server_without_force() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let claude = fake_claude_cli(&directory.0, "claude", &config, &log, true);
+        let executable = directory.0.join("bin/ego-chat");
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"ego_chat":{"type":"stdio","command":"someone-else","args":["mcp"],"timeout":29100000}},"unrelated":true}"#,
+        )
+        .expect("seed foreign entry");
+
+        let error = configure_claude(&config, &claude, &executable, false)
+            .expect_err("must reject conflict");
+        assert!(error.contains("different ego_chat"));
+        assert!(
+            !log.exists(),
+            "the CLI must not run before the conflict check"
+        );
+        assert!(
+            fs::read_to_string(&config)
+                .expect("read untouched file")
+                .contains("someone-else")
+        );
+
+        assert!(configure_claude(&config, &claude, &executable, true).expect("replace with force"));
+        assert_eq!(
+            read_lines(&log),
+            [
+                format!("mcp remove {MCP_SERVER_NAME} -s user"),
+                format!(
+                    "mcp add-json -s user {MCP_SERVER_NAME} {}",
+                    expected_claude_entry(&executable)
+                ),
+            ]
+        );
+        assert_eq!(
+            claude_server_status(&config, &executable).expect("inspect replaced file"),
+            HostConfigStatus::Ready
+        );
+    }
+
+    #[test]
+    fn claude_configuration_leaves_a_ready_server_untouched() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let claude = fake_claude_cli(&directory.0, "claude", &config, &log, true);
+        let executable = directory.0.join("bin/ego-chat");
+        let longer = MCP_TOOL_TIMEOUT_MILLISECONDS + 60_000;
+        let seed = format!(
+            r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{},"args":["mcp"],"env":{{"KEEP":"1"}},"timeout":{longer}}}}},"unrelated":true}}"#,
+            serde_json::to_string(executable.to_str().expect("utf8 path"))
+                .expect("encode executable")
+        );
+        fs::write(&config, &seed).expect("seed ready entry");
+
+        assert!(!configure_claude(&config, &claude, &executable, false).expect("no-op"));
+
+        assert!(!log.exists(), "a ready entry must not invoke the CLI");
+        assert_eq!(fs::read_to_string(&config).expect("read file"), seed);
+    }
+
+    #[test]
+    fn claude_configuration_fails_closed_when_the_cli_does_not_write() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let executable = directory.0.join("bin/ego-chat");
+
+        let silent = fake_claude_cli(&directory.0, "claude-silent", &config, &log, false);
+        let error = configure_claude(&config, &silent, &executable, false)
+            .expect_err("must detect a missing entry after add-json");
+        assert!(error.contains("did not leave"));
+        assert!(error.contains("is missing"));
+        assert!(!config.exists());
+
+        let failing = write_fake_executable(
+            &directory.0.join("claude-failing"),
+            "#!/bin/sh\nprintf 'boom\\n' >&2\nexit 3\n",
+        );
+        let error = configure_claude(&config, &failing, &executable, false)
+            .expect_err("must surface a non-zero exit");
+        assert!(error.contains("mcp add-json exited with"));
+        assert!(error.contains("boom"));
     }
 
     #[test]
