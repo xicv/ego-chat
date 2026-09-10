@@ -68,7 +68,7 @@ A new `CLAUDE_SKILL_FILES` constant embeds `SKILL.md` only, matching `ZCODE_SKIL
 4. `install_runtime`, `redirect_stale_broker_launchers`, `handoff_installed_broker` exactly as today.
 5. `install_skill(&paths.claude_skill_dir, CLAUDE_SKILL_FILES, force)`.
 6. `configure_claude(&paths.claude_config, &claude, &executable, force)`.
-7. Print the runtime path, skill path, MCP server name, the restart instruction, the Codex-absent note when Codex was not found, and either a line that the Claude.app Code tab picks up the same configuration or a warning when `claude_desktop_config.json` also defines `ego_chat`.
+7. Print the runtime path, skill path, MCP server name, the restart instruction, either a line that the Claude.app Code tab picks up the same configuration or a warning when `claude_desktop_config.json` also defines `ego_chat`, and the Codex-absent note when Codex was not found.
 
 ### Configuration write
 

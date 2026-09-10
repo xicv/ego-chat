@@ -1383,7 +1383,7 @@ fn desktop_config_defines_server(config_path: &Path) -> Result<bool, String> {
 fn desktop_config_shadow_warning(config_path: &Path) -> Option<String> {
     match desktop_config_defines_server(config_path) {
         Ok(true) => Some(format!(
-            "{} also defines {MCP_SERVER_NAME}; the Claude.app Code tab will use that definition and its timeout instead of the user-scope entry. Remove it, or give it the same command, args, and timeout.",
+            "{} also defines {MCP_SERVER_NAME}; the Claude.app Code tab will use that definition and its timeout instead of the user-scope entry. Remove it, or give it the same command, args, and a timeout of at least {MCP_TOOL_TIMEOUT_MILLISECONDS} ms.",
             config_path.display()
         )),
         Ok(false) => None,
@@ -3204,8 +3204,7 @@ mod tests {
         assert!(warning.contains("Claude.app Code tab"));
         fs::write(&config, "{broken").expect("seed broken file");
         assert!(desktop_config_defines_server(&config).is_err());
-        let warning =
-            desktop_config_shadow_warning(&config).expect("warn about an unreadable file");
+        let warning = desktop_config_shadow_warning(&config).expect("warn about a broken file");
         assert!(warning.contains("could not parse"));
     }
 
