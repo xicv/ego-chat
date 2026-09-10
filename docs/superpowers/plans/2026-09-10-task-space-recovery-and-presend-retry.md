@@ -94,3 +94,9 @@ Use `new Broker({ ..., recoveryDelaysMs: [0], boundTaskSpaceRecreateDelayMs: 0 }
 ## Evidence
 
 (appended as tasks complete)
+
+Recorded 2026-09-10 on the development Mac, branch `feature/space-recovery-presend-retry` at the commits listed by `git log main..HEAD`.
+
+Deterministic suites: `npm run lint` exit 0; `npm test` 718 tests, 717 pass, 0 fail, 1 skipped (the long MCP lane, as on `main`); `cargo fmt --check` clean; `cargo clippy --all-targets` zero warnings; `cargo test` 33 passed. New coverage: 11 driver cases in `test/ego-adapter.test.mjs` (175 in the file) and 12 broker cases in `test/store-broker.test.mjs` (198 in the file). The committed A3K public-boundary fixture was regenerated with `node test/fixtures/build-a3k-public-boundary-v1.mjs test/fixtures` because the producer contract hashes `src/constants.mjs`.
+
+Two defects surfaced during the work and were fixed on the branch: a response found by restart reconciliation was never committed (spec Part C; the ledger has no `response_capture_state_invalid` record, so it had never happened live), and the first Codex pass found that a Space vanishing after the Send click would have been retried as pre-Send; it is now reported as `send_confirmation_ambiguous` with `taskSpaceMissing: true` and covered by a driver regression.
