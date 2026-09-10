@@ -77,6 +77,7 @@ async function egoDriverMain(
   let selectedTaskSpaceEvidence = null
   let selectedTaskSpaceGuard = null
   let taskSpaceControlRecovery = null
+  let taskSpaceRecovery = null
   let unsentDraftMayExist = false
 
   function emit(value) {
@@ -1019,17 +1020,39 @@ async function egoDriverMain(
       || identityMatches[0].id !== evidence.taskSpaceId
       || identityConflicts.length > 0
     ) {
+      const missing = locationMatches.length === 0
+        && identityMatches.length === 0
+        && identityConflicts.length === 0
+        && canRecreateBoundTaskSpace(input.binding)
+      if (missing && sendClickStarted) {
+        // The prompt may already have been accepted: a vanished space after the
+        // click is an ambiguous send for reconciliation, never a pre-Send retry.
+        return fail(
+          "send_confirmation_ambiguous",
+          "The send click may have occurred, but the bound Ego task space vanished before the send could be confirmed.",
+          {
+            draftMarkerCount: null,
+            renderedMarkerCount: null,
+            taskSpaceId: evidence.taskSpaceId,
+            taskSpaceMissing: true,
+            userMarkerCount: null,
+          },
+        )
+      }
       return fail(
         identityMatches.length > 1
           ? "bound_task_space_identity_ambiguous"
           : (identityConflicts.length > 0
               ? "bound_task_space_identity_conflict"
-              : "bound_task_space_identity_changed"),
-        "The selected task-space identity changed before a critical browser action.",
+              : (missing ? "bound_task_space_missing" : "bound_task_space_identity_changed")),
+        missing
+          ? "The bound Ego task space is not present in the live browser state."
+          : "The selected task-space identity changed before a critical browser action.",
         {
           conflictCount: identityConflicts.length,
           identityMatchCount: identityMatches.length,
           matchCount: locationMatches.length,
+          ...(missing ? { recreatable: true } : {}),
           taskSpaceId: evidence.taskSpaceId,
         },
       )
@@ -1141,6 +1164,7 @@ async function egoDriverMain(
       ok: true,
       result: {
         ...result,
+        ...(taskSpaceRecovery ? { taskSpaceRecovery } : {}),
         ...(actualCanonicalUrl ? { canonicalUrl: actualCanonicalUrl } : {}),
         taskSpaceId: live.taskSpaceId,
         taskSpaceIdentity: { ...live.taskSpaceIdentity },
@@ -1180,6 +1204,7 @@ async function egoDriverMain(
     expectedIdentity = null,
     expectedName = null,
     allowCreate = true,
+    allowRecreate = false,
     requireAbsent = false,
   } = {}) {
     if (typeof globalThis.listTaskSpaces !== "function") {
@@ -1280,13 +1305,25 @@ async function egoDriverMain(
         )
         return null
       }
+      // A granted recreation may create exactly the reserved stable identity by
+      // its own name; every later check still re-proves the observed identity.
+      const recreation = allowRecreate
+        && allowCreate
+        && typeof identifier === "string"
+        && recreatableTaskSpaceIdentity(expectedIdentity)
+        && identifier === expectedIdentity.name
+        && guard.ownerSelector.kind === "stable_identity"
+        && taskSpaceIdentityMatches({ name: identifier, taskId: identifier }, guard.ownerSelector.identity)
       if (
-        !allowCreate
-        || numericSelector
-        || guard.ownerSelector.kind === "stable_identity"
-        || guard.ownerSelector.kind === "task_id"
-        || guard.ownerSelector.kind === "legacy_string"
-        || expectedIdentity
+        !recreation
+        && (
+          !allowCreate
+          || numericSelector
+          || guard.ownerSelector.kind === "stable_identity"
+          || guard.ownerSelector.kind === "task_id"
+          || guard.ownerSelector.kind === "legacy_string"
+          || expectedIdentity
+        )
       ) {
         humanRequired(
           expectedIdentity
@@ -1437,6 +1474,31 @@ async function egoDriverMain(
         || (input.mode === "adopt" && typeof binding.bindingKey === "string" && binding.bindingKey.length > 0)
       )
       && ["adopt", "capture_exchange", "exchange", "reanchor", "reconcile_bound"].includes(input.mode)
+  }
+
+  // Only a Space that Ego Chat itself named can be recreated: Ego assigns the
+  // task ID from the requested name, so the recorded identity is reproduced.
+  function recreatableTaskSpaceIdentity(identity) {
+    return validTaskSpaceIdentity(identity) && identity.name === identity.taskId
+  }
+
+  function canRecreateBoundTaskSpace(binding) {
+    return binding?.state === "bound"
+      && typeof binding.canonicalUrl === "string"
+      && binding.canonicalUrl.length > 0
+      && Number.isSafeInteger(binding.taskSpaceId)
+      && binding.taskSpaceId > 0
+      && recreatableTaskSpaceIdentity(binding.taskSpaceIdentity)
+      && ["capture_exchange", "exchange", "reanchor", "reconcile_bound", "verify"].includes(input.mode)
+  }
+
+  function taskSpaceRecreateGranted() {
+    const grant = input.taskSpaceRecovery
+    return Boolean(grant)
+      && typeof grant === "object"
+      && !Array.isArray(grant)
+      && Object.keys(grant).length === 1
+      && grant.allowRecreate === true
   }
 
   async function reclaimBoundTaskSpace(taskSpace, expectedIdentity) {
@@ -1612,6 +1674,29 @@ async function egoDriverMain(
           return null
         }
         return selectObservedTaskSpace(exact.id, { expectedIdentity: binding.taskSpaceIdentity })
+      }
+      if (canRecreateBoundTaskSpace(binding)) {
+        if (!taskSpaceRecreateGranted()) {
+          humanRequired("bound_task_space_missing", "The bound Ego task space is not present in the live browser state.", {
+            matchCount: 0,
+            recreatable: true,
+            taskSpaceId: binding.taskSpaceId,
+          })
+          return null
+        }
+        const recreated = await selectObservedTaskSpace(binding.taskSpaceIdentity.name, {
+          allowRecreate: true,
+          expectedIdentity: binding.taskSpaceIdentity,
+        })
+        if (!recreated) {
+          return null
+        }
+        taskSpaceRecovery = {
+          method: "recreate",
+          previousTaskSpaceId: binding.taskSpaceId,
+          taskSpaceId: recreated.id,
+        }
+        return recreated
       }
       humanRequired("bound_task_space_identity_changed", "The durable task-space identity is no longer present in the live browser state.", {
         matchCount: 0,
