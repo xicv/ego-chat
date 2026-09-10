@@ -250,6 +250,7 @@ const CLAUDE_SKILL_FILES: &[EmbeddedFile] = &[EmbeddedFile {
 #[derive(Clone, Debug)]
 struct InstallPaths {
     claude_config: PathBuf,
+    claude_desktop_config: PathBuf,
     claude_skill_dir: PathBuf,
     codex_config: PathBuf,
     codex_skill_dir: PathBuf,
@@ -412,6 +413,16 @@ All other commands are forwarded to the qualified Ego Chat broker CLI."
     );
 }
 
+/// Claude.app's chat surface reads `claude_desktop_config.json`, and its Code
+/// tab prefers a server defined there over the user-scope entry. The path is
+/// fixed under the home directory and is not relocated by `CLAUDE_CONFIG_DIR`.
+fn claude_desktop_config_path(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("claude_desktop_config.json")
+}
+
 /// Claude Code keeps its user-scope MCP config in `.claude.json` and personal
 /// skills under `skills/`. `CLAUDE_CONFIG_DIR` relocates both; without it the
 /// config sits in the home directory and skills under `~/.claude`.
@@ -452,6 +463,7 @@ impl InstallPaths {
             });
         Ok(Self {
             claude_config,
+            claude_desktop_config: claude_desktop_config_path(&home),
             claude_skill_dir,
             codex_config: codex_home.join("config.toml"),
             codex_skill_dir: codex_home.join("skills").join("ego-chat"),
@@ -639,8 +651,12 @@ fn setup_claude(force: bool) -> Result<(), String> {
         );
     }
     println!(
-        "Restart open Claude Code sessions and Claude.app, then run `claude mcp get {MCP_SERVER_NAME}` to verify the connection. The Claude.app Code tab uses this same configuration."
+        "Restart open Claude Code sessions and Claude.app, then run `claude mcp get {MCP_SERVER_NAME}` to verify the connection."
     );
+    match desktop_config_shadow_warning(&paths.claude_desktop_config) {
+        Some(warning) => println!("Warning: {warning}"),
+        None => println!("The Claude.app Code tab uses this same configuration."),
+    }
     if tools.codex.is_none() {
         println!(
             "Codex was not found; Claude Code-owned reviews work, while broker-owned Codex convergence remains unavailable."
@@ -1345,6 +1361,38 @@ fn configure_claude(
     Ok(true)
 }
 
+fn desktop_config_defines_server(config_path: &Path) -> Result<bool, String> {
+    let contents = match fs::read_to_string(config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not read {}: {error}", config_path.display())),
+    };
+    if contents.trim().is_empty() {
+        return Ok(false);
+    }
+    let document = serde_json::from_str::<JsonValue>(&contents)
+        .map_err(|error| format!("could not parse {}: {error}", config_path.display()))?;
+    Ok(document
+        .get("mcpServers")
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+        .is_some())
+}
+
+/// Read-only: Ego Chat never edits the desktop file, it only reports when
+/// that file would shadow the user-scope entry for the Claude.app Code tab.
+fn desktop_config_shadow_warning(config_path: &Path) -> Option<String> {
+    match desktop_config_defines_server(config_path) {
+        Ok(true) => Some(format!(
+            "{} also defines {MCP_SERVER_NAME}; the Claude.app Code tab will use that definition and its timeout instead of the user-scope entry. Remove it, or give it the same command, args, and timeout.",
+            config_path.display()
+        )),
+        Ok(false) => None,
+        Err(error) => Some(format!(
+            "{error}; could not confirm that the Claude.app Code tab will use the user-scope {MCP_SERVER_NAME} entry"
+        )),
+    }
+}
+
 fn parse_claude_version(version: &str) -> Option<(u64, u64, u64)> {
     fn leading_number(part: &str) -> Option<u64> {
         let digits = part
@@ -1634,6 +1682,13 @@ fn doctor_claude() -> Result<(), String> {
         );
         println!("[fail] {message}");
         failures.push(message);
+    }
+    match desktop_config_shadow_warning(&paths.claude_desktop_config) {
+        Some(warning) => println!("[warn] {warning}"),
+        None => println!(
+            "[ok] {} does not shadow the user-scope {MCP_SERVER_NAME} entry for the Claude.app Code tab",
+            paths.claude_desktop_config.display()
+        ),
     }
 
     if failures.is_empty() {
@@ -3082,6 +3137,12 @@ mod tests {
             skill,
             PathBuf::from("/Users/tester/.claude/skills/ego-chat")
         );
+        assert_eq!(
+            claude_desktop_config_path(home),
+            PathBuf::from(
+                "/Users/tester/Library/Application Support/Claude/claude_desktop_config.json"
+            )
+        );
 
         let (config, skill) =
             claude_host_paths(home, Some(Path::new("/Users/tester/claude-config")));
@@ -3114,6 +3175,38 @@ mod tests {
         install_skill(&skill, CLAUDE_SKILL_FILES, true).expect("force managed skill files");
         assert!(skill_matches(&skill, CLAUDE_SKILL_FILES));
         assert!(!skill.join("agents").exists());
+    }
+
+    #[test]
+    fn desktop_config_shadow_detection_reads_only_the_ego_chat_entry() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("claude_desktop_config.json");
+
+        assert!(!desktop_config_defines_server(&config).expect("missing file"));
+        assert!(desktop_config_shadow_warning(&config).is_none());
+        fs::write(&config, "\n").expect("seed blank file");
+        assert!(!desktop_config_defines_server(&config).expect("blank file"));
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"sequel-mcp":{"command":"sequel-mcp","args":["serve"]}},"preferences":{}}"#,
+        )
+        .expect("seed other server");
+        assert!(!desktop_config_defines_server(&config).expect("other server"));
+        assert!(desktop_config_shadow_warning(&config).is_none());
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"ego_chat":{"command":"ego-chat","args":["mcp"]}}}"#,
+        )
+        .expect("seed shadowing entry");
+        assert!(desktop_config_defines_server(&config).expect("shadowing entry"));
+        let warning = desktop_config_shadow_warning(&config).expect("warn about the shadow");
+        assert!(warning.contains("also defines ego_chat"));
+        assert!(warning.contains("Claude.app Code tab"));
+        fs::write(&config, "{broken").expect("seed broken file");
+        assert!(desktop_config_defines_server(&config).is_err());
+        let warning =
+            desktop_config_shadow_warning(&config).expect("warn about an unreadable file");
+        assert!(warning.contains("could not parse"));
     }
 
     #[test]
