@@ -176,7 +176,7 @@ export async function requestBroker(config, method, params = {}, options = {}) {
         if (!READ_ONLY_IPC_METHODS.has(method)) {
           throw new EgoChatError(
             "restart_required",
-            "A legacy Ego Chat broker is still active. Restart Codex and ZCode before starting another durable operation.",
+            "A legacy Ego Chat broker is still active. Restart Codex, ZCode, and Claude Code before starting another durable operation.",
             { pid: ping.pid, socketPath: legacySocketPath },
           )
         }

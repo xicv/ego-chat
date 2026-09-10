@@ -31,7 +31,7 @@ for (const legacySocketPath of config.legacySocketPaths) {
     await lease.release()
     throw new EgoChatError(
       "legacy_broker_active",
-      "A legacy Ego Chat broker still owns this data directory. Restart Codex and ZCode before starting the canonical broker generation.",
+      "A legacy Ego Chat broker still owns this data directory. Restart Codex, ZCode, and Claude Code before starting the canonical broker generation.",
       { socketPath: legacySocketPath },
     )
   }
@@ -171,7 +171,7 @@ try {
   if (error instanceof EgoChatError && error.code === "already_running") {
     throw new EgoChatError(
       "legacy_broker_active",
-      "A legacy Ego Chat broker claimed a compatibility socket while the canonical broker was starting. Restart Codex and ZCode before retrying.",
+      "A legacy Ego Chat broker claimed a compatibility socket while the canonical broker was starting. Restart Codex, ZCode, and Claude Code before retrying.",
       { socketPath: error.details?.socketPath },
     )
   }

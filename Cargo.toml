@@ -3,11 +3,11 @@ name = "ego-chat"
 version = "0.2.22"
 edition = "2024"
 rust-version = "1.88"
-description = "Portable launcher for durable Codex, ZCode, and ChatGPT review loops through Ego Browser"
+description = "Portable launcher for durable Codex, ZCode, Claude Code, and ChatGPT review loops through Ego Browser"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/xicv/ego-chat"
-keywords = ["codex", "zcode", "chatgpt", "mcp", "browser"]
+keywords = ["codex", "zcode", "claude", "chatgpt", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
   "/build.rs",

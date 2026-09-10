@@ -1,11 +1,11 @@
 # Ego Chat
 
-Ego Chat is a local durable broker for Codex- or ZCode-to-ChatGPT collaboration through Ego Lite. It is not a second chat UI. A thin MCP process connects the coding agent, the broker owns each browser handoff independently of that client connection, and a fixed Ego Browser driver operates one persistent ChatGPT conversation.
+Ego Chat is a local durable broker for Codex-, ZCode-, or Claude Code-to-ChatGPT collaboration through Ego Lite. It is not a second chat UI. A thin MCP process connects the coding agent, the broker owns each browser handoff independently of that client connection, and a fixed Ego Browser driver operates one persistent ChatGPT conversation.
 
 The supported surfaces are a one-shot advisory handoff, durable broker-owned Codex convergence, and a current-host fallback loop:
 
 ```text
-Codex or ZCode
+Codex, ZCode, or Claude Code
     -> stdio MCP facade
     -> authenticated local Unix socket
     -> durable single-user broker
@@ -24,7 +24,7 @@ one start request
 
 or
 
-current Codex or ZCode task/Goal (A)
+current Codex, ZCode, or Claude Code task/Goal (A)
     -> schema-constrained candidate
     -> one-candidate Ego Chat review call
     -> persistent ChatGPT web conversation (B)
@@ -38,7 +38,7 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 
 - Checkpointed JSONL workflow and binding ledger that avoids rewriting the full state on every transition, compacts after 5,000 events or 8 MiB, and reduces completed convergence cycles to bounded identity/recovery metadata before storing the next candidate.
 - Content-addressed private result blobs, 30-day raw-body retention, a 256 MiB default blob quota, and retained metadata for the latest 500 ordinary terminal workflows. Running, `human_required`, and still-reconcilable failed browser workflows retain their bodies or a full-size result reservation.
-- One canonical broker identity per real data-directory path, a stable socket independent of `TMPDIR`, an exclusive broker lease, and a monotonic fencing epoch. The canonical broker also reserves known v0.1 socket aliases so a late stale Codex or ZCode facade cannot launch a second daemon.
+- One canonical broker identity per real data-directory path, a stable socket independent of `TMPDIR`, an exclusive broker lease, and a monotonic fencing epoch. The canonical broker also reserves known v0.1 socket aliases so a late stale Codex, ZCode, or Claude Code facade cannot launch a second daemon.
 - Private local state directory, files, token, runtime directory, and Unix socket.
 - A private 4 MiB / 16-file driver mailbox with a 512 KiB per-input ceiling, five-minute inactive crash retention, strict lstat ownership/mode/link checks, live-child preservation, and child-owned unlink immediately after a successful read and before browser interaction.
 - Authenticated IPC and an independently restartable stdio MCP facade.
@@ -63,7 +63,7 @@ The broker persists a named conversation lease. `create_once` starts from a veri
 - A bounded durable task/runner core with immutable acceptance-and-evidence settlement contracts, exact-revision artifacts and evidence, completion-bound fenced verification leases, approval invalidation, and an effect ledger exercised only through fake adapters in this slice.
 - Exclusive conversation leases across every cycle, an optional caller-selected cycle budget, caller-attachment deadlines, liveness guidance for repeated state, secret scanning of exact outbound review bytes, and terminal-state compare-and-set protection.
 - ChatGPT feedback injected into the next Codex turn as explicitly untrusted App Server context.
-- Native Rust setup, conflict-safe MCP configuration, and the same host-aware skill for both Codex and ZCode.
+- Native Rust setup, conflict-safe MCP configuration, and the same host-aware skill for Codex, ZCode, and Claude Code.
 
 The delivery claim is deliberately limited: automatic sends are fail-closed and effectively at-most-once. Ego Chat does not claim exactly-once delivery across a browser UI and a remote service.
 
@@ -127,9 +127,9 @@ Further work remains on same-chat recovery after complete loss of an established
 
 ### Concurrent hosts and Ego Spaces
 
-Codex.app and ZCode.app share one authoritative Ego Chat broker and the same default `ego-chat-main` binding. They do not silently create separate conversations or task spaces. One binding remains an exclusive ordered conversation lease: if another host already owns it, a different fresh operation receives `conversation_busy` instead of interleaving a stale prompt. An exact retry with the same operation identity still rediscovers its existing workflow.
+Codex.app, ZCode.app, and Claude Code share one authoritative Ego Chat broker and the same default `ego-chat-main` binding. They do not silently create separate conversations or task spaces. One binding remains an exclusive ordered conversation lease: if another host already owns it, a different fresh operation receives `conversation_busy` instead of interleaving a stale prompt. An exact retry with the same operation identity still rediscovers its existing workflow.
 
-Independent host tasks use explicitly distinct binding keys, canonical ChatGPT conversations, and Ego task spaces. Each new binding, and each successfully recovered legacy binding, records the complete browser-observed task-space `name`/`taskId` tuple, while its numeric ID remains only a location hint. If an old binding has no stable task-space identity, Ego Chat derives a private recovery-space name from the canonical conversation URL, not from a reusable binding-key convention. That typed `name` selector constrains only the live name; Ego Lite's independently observed opaque `taskId` is retained rather than assumed equal to it. Explicit legacy strings remain compatible by resolving to one unique name-or-task-ID match, while a split match is ambiguous. Immediately after acquiring the serialized browser lane, every operation receives a strict versioned owner/deny guard assembled from all other persisted tuples, in-flight tuples, and unresolved stable selectors. A missing, malformed, duplicate, or internally conflicting guard stops before task-space discovery or mutation. Existing typed matches are selected by their observed numeric location so the legacy `useOrCreateTaskSpace(string)` API cannot reinterpret a name as an opaque task ID; creation also stops before mutation when such a decoy exists. The returned live tuple and actual browser-reported canonical URL are reserved synchronously before that lane is released and remain reserved across confirmed-Send capture, retries, durable blobs, events, and binding commits. Confirmed-Send and validated adoption-capture claims remain authoritative after `failed` or `human_required`, are rebuilt after broker restart, and are released only after exact transfer to the binding or explicit recovery abandonment. A distinct session therefore cannot collapse its chat into another session's workspace merely because both hosts use familiar binding-key names or Ego Lite later recycles a numeric ID. Ego Chat serializes all of its browser-driver children inside one broker even across those independent bindings, so Codex and ZCode queue rather than racing Ego Lite's global automation channel. A long confirmed-send capture releases that lane every 15 seconds while ChatGPT keeps thinking remotely; the caller remains in one Token-Saver wait and no second Send is created.
+Independent host tasks use explicitly distinct binding keys, canonical ChatGPT conversations, and Ego task spaces. Each new binding, and each successfully recovered legacy binding, records the complete browser-observed task-space `name`/`taskId` tuple, while its numeric ID remains only a location hint. If an old binding has no stable task-space identity, Ego Chat derives a private recovery-space name from the canonical conversation URL, not from a reusable binding-key convention. That typed `name` selector constrains only the live name; Ego Lite's independently observed opaque `taskId` is retained rather than assumed equal to it. Explicit legacy strings remain compatible by resolving to one unique name-or-task-ID match, while a split match is ambiguous. Immediately after acquiring the serialized browser lane, every operation receives a strict versioned owner/deny guard assembled from all other persisted tuples, in-flight tuples, and unresolved stable selectors. A missing, malformed, duplicate, or internally conflicting guard stops before task-space discovery or mutation. Existing typed matches are selected by their observed numeric location so the legacy `useOrCreateTaskSpace(string)` API cannot reinterpret a name as an opaque task ID; creation also stops before mutation when such a decoy exists. The returned live tuple and actual browser-reported canonical URL are reserved synchronously before that lane is released and remain reserved across confirmed-Send capture, retries, durable blobs, events, and binding commits. Confirmed-Send and validated adoption-capture claims remain authoritative after `failed` or `human_required`, are rebuilt after broker restart, and are released only after exact transfer to the binding or explicit recovery abandonment. A distinct session therefore cannot collapse its chat into another session's workspace merely because both hosts use familiar binding-key names or Ego Lite later recycles a numeric ID. Ego Chat serializes all of its browser-driver children inside one broker even across those independent bindings, so Codex, ZCode, and Claude Code queue rather than racing Ego Lite's global automation channel. A long confirmed-send capture releases that lane every 15 seconds while ChatGPT keeps thinking remotely; the caller remains in one Token-Saver wait and no second Send is created.
 
 Using another Ego Space manually does not change a durable Ego Chat binding. Do not take over, close, stop, or type into the exact bound Space or its ChatGPT conversation while a workflow is active. Automation started outside Ego Chat is not part of its broker lane, and separately configured broker data domains cannot provide a process-global Ego Lite automation mutex. Until Ego Lite provides per-task-space CDP channels, simultaneous unrelated agent automation can still interfere despite separate Spaces. Track the upstream limitation in [`citrolabs/ego-lite#213`](https://github.com/citrolabs/ego-lite/issues/213).
 
@@ -139,6 +139,7 @@ Using another Ego Space manually does not change a durable Ego Chat binding. Do 
 - Node.js 24 or newer.
 - Codex CLI 0.149.0 or a compatible Codex app installation for Codex setup and broker-owned Codex convergence.
 - ZCode for a ZCode-owned implementation/review loop; Codex is optional on a ZCode-only installation.
+- Claude Code 2.1.203 or newer for a Claude Code-owned implementation/review loop, which also covers the Claude.app Code tab; Codex is optional on a Claude-only installation.
 
 Install the locked dependencies:
 
@@ -148,9 +149,9 @@ npm ci
 
 ## Portable Rust installation
 
-The Rust binary is a distribution and launch wrapper around the qualified Node broker; it does not reimplement the browser protocol. This keeps one proven core while giving other Macs a stable command, embedded host skills, and automatic Codex or ZCode MCP configuration.
+The Rust binary is a distribution and launch wrapper around the qualified Node broker; it does not reimplement the browser protocol. This keeps one proven core while giving other Macs a stable command, embedded host skills, and automatic Codex, ZCode, or Claude Code MCP configuration.
 
-The receiving Mac still needs Ego Lite with ChatGPT logged in, Node.js 24 or newer, npm, Rust 1.88 or newer for `cargo install`, and at least one supported coding client. From a local checkout, configure either or both clients:
+The receiving Mac still needs Ego Lite with ChatGPT logged in, Node.js 24 or newer, npm, Rust 1.88 or newer for `cargo install`, and at least one supported coding client. From a local checkout, configure any of the clients:
 
 ```sh
 cargo install --path /absolute/path/to/ego-chat --locked
@@ -158,6 +159,8 @@ ego-chat setup
 ego-chat doctor
 ego-chat setup-zcode
 ego-chat doctor-zcode
+ego-chat setup-claude
+ego-chat doctor-claude
 ```
 
 `ego-chat setup` performs these bounded local actions:
@@ -180,6 +183,16 @@ Restart Codex.app after setup and use `/mcp` to verify `ego_chat`. Use `ego-chat
 
 Restart ZCode.app after setup and verify `ego_chat` under MCP Services. The paths and configuration shape follow ZCode's official [MCP Services](https://zcode.z.ai/en/docs/mcp-services) and [Skills](https://zcode.z.ai/en/docs/skill) documentation. A conflicting `ego_chat` server or skill is never replaced without explicit `--force`.
 
+`ego-chat setup-claude` uses Claude Code's native user-level surfaces and also covers the Claude.app Code tab:
+
+- installs `SKILL.md` under `~/.claude/skills/ego-chat`, or under `$CLAUDE_CONFIG_DIR/skills/ego-chat` when that variable relocates the Claude home directory;
+- registers the absolute installed executable with `args: ["mcp"]` as the user-scope `ego_chat` stdio server through `claude mcp add-json --scope user`, with a per-server `timeout` of at least 29,100,000 ms: the eight-hour attachment plus five minutes of host transport margin. Setup never rewrites `.claude.json` itself; it reads the file to detect a conflicting entry, delegates the write to the Claude CLI, and re-reads the file to verify the result, which `doctor-claude` also validates read-only;
+- requires Claude Code 2.1.203 or newer, because from that version the per-server timeout also floors the 30-minute stdio idle abort that would otherwise end a silent Token-Saver wait;
+- warns, without editing anything, when `~/Library/Application Support/Claude/claude_desktop_config.json` also defines `ego_chat`, because the Claude.app Code tab would use that definition and its timeout instead of the user-scope entry;
+- does not require Codex for Claude Code-owned review cycles; broker-owned Codex convergence remains available when Codex is installed.
+
+Restart open Claude Code sessions and Claude.app after setup and verify with `claude mcp get ego_chat`, which reports the executable and the timeout. Claude Code moves a main-conversation tool call that runs past two minutes to a background task and delivers its result as a notification, which suits Ego Chat's single long wait. The Claude.app Code tab loads the same user-scope server and personal skill; the Claude.app chat surface is not configured because it cannot load the skill from disk, has no documented long-call timeout, and a `claude_desktop_config.json` entry would override the timeout-carrying definition for the Code tab. A conflicting `ego_chat` server or skill is never replaced without explicit `--force`.
+
 Install the released crate from crates.io:
 
 ```sh
@@ -187,6 +200,8 @@ cargo install ego-chat --locked
 ego-chat setup
 # Or, for ZCode:
 ego-chat setup-zcode
+# Or, for Claude Code:
+ego-chat setup-claude
 ```
 
 To try the current unreleased `main` branch directly from GitHub:
@@ -196,6 +211,8 @@ cargo install --git https://github.com/xicv/ego-chat --locked
 ego-chat setup
 # Or, for ZCode:
 ego-chat setup-zcode
+# Or, for Claude Code:
+ego-chat setup-claude
 ```
 
 The CLI and MCP facade autostart the broker. Check it with:
@@ -248,7 +265,7 @@ Re-anchoring performs repeated stable browser observations plus a final readines
 
 ### Adopt a conversation from ChatGPT.app
 
-Supply the private canonical conversation URL containing `/c/`, not a public `/share/` link. Ego Lite must already be logged into the same ChatGPT account and workspace. From Codex or ZCode, `ego_adopt_conversation_and_wait` opens that exact URL, observes the same latest user-message ID and rendered prefix twice before locking the anchor, then waits for exactly one stable assistant tail. This bounded initial stabilization tolerates ChatGPT's normal DOM hydration; any change after the anchor is locked still stops fail-closed. If ChatGPT is still performing a long think, the broker owns that content-read-only wait while the MCP call remains quiet; the captured response returns once into the same host turn. Adoption never clicks Send or changes conversation content. It does repair the live composer controls to `strongest_available` plus `maximum_available`, then reads them back before accepting the existing response. This is live composer-policy evidence, not historical per-message model provenance, so the captured response remains untrusted context. Every later send independently enforces and reads back that maximum policy immediately before composition.
+Supply the private canonical conversation URL containing `/c/`, not a public `/share/` link. Ego Lite must already be logged into the same ChatGPT account and workspace. From Codex, ZCode, or Claude Code, `ego_adopt_conversation_and_wait` opens that exact URL, observes the same latest user-message ID and rendered prefix twice before locking the anchor, then waits for exactly one stable assistant tail. This bounded initial stabilization tolerates ChatGPT's normal DOM hydration; any change after the anchor is locked still stops fail-closed. If ChatGPT is still performing a long think, the broker owns that content-read-only wait while the MCP call remains quiet; the captured response returns once into the same host turn. Adoption never clicks Send or changes conversation content. It does repair the live composer controls to `strongest_available` plus `maximum_available`, then reads them back before accepting the existing response. This is live composer-policy evidence, not historical per-message model provenance, so the captured response remains untrusted context. Every later send independently enforces and reads back that maximum policy immediately before composition.
 
 `bindingKey` is optional for adoption. When omitted, the broker derives a stable `adopt-...` key from the URL digest, so pasting a URL does not replace `ego-chat-main` or expose the conversation ID in the binding name. An explicitly supplied key remains immutable. The public `taskSpace` default is resolved to a dedicated per-conversation `ego-chat-adopt-*` space using a separate domain and a 128-bit SHA-256 prefix, so simultaneous adoptions do not share one workspace and the URL remains the only required input.
 
@@ -270,11 +287,11 @@ node ./bin/ego-chat.mjs adopt ./adoption.json
 node ./bin/ego-chat.mjs await <workflow-id> 960000
 ```
 
-The direct MCP path is preferable when the current Codex or ZCode task should continue automatically: ask the installed `$ego-chat` skill to continue the supplied URL, and it selects `ego_adopt_conversation_and_wait`. If that host task or its MCP call exits, the workflow remains durable, but reattachment is by workflow ID rather than an unsupported external task wake.
+The direct MCP path is preferable when the current Codex, ZCode, or Claude Code task should continue automatically: ask the installed `$ego-chat` skill to continue the supplied URL, and it selects `ego_adopt_conversation_and_wait`. If that host task or its MCP call exits, the workflow remains durable, but reattachment is by workflow ID rather than an unsupported external task wake.
 
 ### Token-Saver mode
 
-Set `waitMode` to `token_saver` on a direct wait tool only when Codex or ZCode should stay silent while ChatGPT thinks. Ego Chat keeps exactly one MCP call attached to the durable broker workflow, emits no periodic progress notifications, and returns one small summary marked with `waitMode: token_saver` when the workflow finishes. Do not poll `workflow_status` or repeatedly call `await_workflow`. A caller disconnect detaches only that waiter: after the prompt is confirmed once, the broker continues read-only capture for up to two hours by default and can resume that capture after its own restart. If a still-connected host receives a wait error, Ego Chat includes the durable workflow ID so it can reattach once; a fully exited host task still has no external wake guarantee. Conversation adoption defaults to Token-Saver. Durable convergence keeps its default `progress` mode: a deterministic local supervisor reports phase changes, recovery counters, exact ChatGPT delivery state, and terminal parent/child state, with a bounded one-minute unchanged-state heartbeat. Initial and interval status reads are both abortable and drained before the wait result returns. Notification writes use one owned, coalescing queue: status reads continue during stdio backpressure, pending observations collapse to the latest state, and the accepted write completes before the terminal result is returned, so stale running text cannot follow completion. Those status reads do not invoke another model or start another browser workflow.
+Set `waitMode` to `token_saver` on a direct wait tool only when Codex, ZCode, or Claude Code should stay silent while ChatGPT thinks. Ego Chat keeps exactly one MCP call attached to the durable broker workflow, emits no periodic progress notifications, and returns one small summary marked with `waitMode: token_saver` when the workflow finishes. Do not poll `workflow_status` or repeatedly call `await_workflow`. A caller disconnect detaches only that waiter: after the prompt is confirmed once, the broker continues read-only capture for up to two hours by default and can resume that capture after its own restart. If a still-connected host receives a wait error, Ego Chat includes the durable workflow ID so it can reattach once; a fully exited host task still has no external wake guarantee. Conversation adoption defaults to Token-Saver. Durable convergence keeps its default `progress` mode: a deterministic local supervisor reports phase changes, recovery counters, exact ChatGPT delivery state, and terminal parent/child state, with a bounded one-minute unchanged-state heartbeat. Initial and interval status reads are both abortable and drained before the wait result returns. Notification writes use one owned, coalescing queue: status reads continue during stdio backpressure, pending observations collapse to the latest state, and the accepted write completes before the terminal result is returned, so stale running text cannot follow completion. Those status reads do not invoke another model or start another browser workflow.
 
 Token-Saver reduces idle outer-agent turns and transport chatter. It does not weaken the strongest-model policy, shorten ChatGPT's reasoning, reduce the implementation turns genuinely needed for convergence, or provide an external wake after the host task has exited.
 
@@ -292,7 +309,7 @@ The equivalent direct CLI form is `ego-chat abandon <workflow-id> --acknowledge-
 
 ## Real-world workflows
 
-In these workflows, **the local coding agent** means Codex.app or ZCode.app, and **the web reviewer** means the private ChatGPT web conversation opened through Ego Lite. Ego Chat installs into Codex and ZCode; it does not install an MCP server into ChatGPT.app. If a discussion starts in ChatGPT.app, copy its private canonical `/c/` conversation URL and adopt it from Codex or ZCode while Ego Lite is logged into the same ChatGPT account and workspace.
+In these workflows, **the local coding agent** means Codex.app, ZCode.app, or Claude Code, and **the web reviewer** means the private ChatGPT web conversation opened through Ego Lite. Ego Chat installs into Codex, ZCode, and Claude Code; it does not install an MCP server into ChatGPT.app. If a discussion starts in ChatGPT.app, copy its private canonical `/c/` conversation URL and adopt it from Codex, ZCode, or Claude Code while Ego Lite is logged into the same ChatGPT account and workspace.
 
 Ego Chat transports prompts, responses, and bounded review packets. It deliberately does not transport ZIP archives, clone repositories, upload files, create merge requests, or grant commit, merge, deployment, or release authority. For a code handoff, prefer an accessible repository plus an exact commit SHA or merge-request URL over a ZIP because the local agent can verify identity and drift independently.
 
@@ -300,22 +317,22 @@ Ego Chat transports prompts, responses, and bounded review packets. It deliberat
 
 | Need | Coverage | Boundary |
 | --- | --- | --- |
-| Start from Codex or ZCode and ask ChatGPT to research or brainstorm | Supported | Use durable convergence when the request says to continue until settled; use a Token-Saver exchange for one turn. |
+| Start from Codex, ZCode, or Claude Code and ask ChatGPT to research or brainstorm | Supported | Use durable convergence when the request says to continue until settled; use a Token-Saver exchange for one turn. |
 | Reuse the same private ChatGPT conversation for later turns | Supported | The durable binding verifies the canonical URL and conversation head before every send. |
 | Continue after a deliberate manual or other-client ChatGPT turn | Supported before Ego Chat sends | A proven stable assistant-tail advance is re-anchored automatically. A possibly accepted Ego Chat Send remains in read-only reconciliation so it is never duplicated. |
 | Start from ChatGPT web or ChatGPT.app and continue locally from a URL | Supported | Adoption accepts a private canonical `/c/` URL, never a public `/share/` URL. |
 | Wait while an already-running ChatGPT response performs a long think | Supported | Adoption waits read-only. For Ego Chat sends, `send_confirmed` is durable and capture continues independently of the caller's original wait. |
 | Import the entire earlier transcript into the local task | Not provided | Adoption returns the latest stable assistant tail; the web conversation itself retains the earlier history. Use a self-contained final handoff packet. |
-| Iterate implementation and review without human copy and paste | Supported | Codex defaults to broker-owned durable convergence for explicit until-settled requests. A current Codex or ZCode task can submit one candidate per cycle as a fallback. Neither path has an implicit cycle ceiling. |
-| Use Codex and ZCode at the same time | Supported with separate bindings | Both hosts share one broker. Distinct conversations queue through one browser lane; the same binding remains exclusive and is never auto-forked. |
+| Iterate implementation and review without human copy and paste | Supported | Codex defaults to broker-owned durable convergence for explicit until-settled requests. A current Codex, ZCode, or Claude Code task can submit one candidate per cycle as a fallback. Neither path has an implicit cycle ceiling. |
+| Use Codex, ZCode, and Claude Code at the same time | Supported with separate bindings | All hosts share one broker. Distinct conversations queue through one browser lane; the same binding remains exclusive and is never auto-forked. |
 | Always use ChatGPT's strongest current model and maximum thinking effort | Supported | Every adoption and send repairs and verifies the live provider-defined maximum without pinning a model label. GPT-6 Astra is selected through ChatGPT's current GPT-6 Pro route when that option is available to the signed-in account and workspace. |
 | Receive a generated ZIP, repository, branch, or merge request automatically | Not provided | Transfer or fetch artifacts through an independently authorized file or GitHub workflow. Ego Chat carries text and bounded review evidence only. |
-| Wake a Codex or ZCode task after that host task has fully exited | Not provided | The broker remains durable, but automatic external task wake is not claimed. Reattach once by workflow ID when possible. |
+| Wake a Codex, ZCode, or Claude Code task after that host task has fully exited | Not provided | The broker remains durable, but automatic external task wake is not claimed. Reattach once by workflow ID when possible. |
 | Commit, push, merge, deploy, or release | Outside Ego Chat | The local coding agent performs these only with explicit authority and separate verification. |
 
 ### Handoff packet for web-first work
 
-Before moving a long ChatGPT discussion into Codex or ZCode, ask the web reviewer to make its final response self-contained. The latest response should contain:
+Before moving a long ChatGPT discussion into Codex, ZCode, or Claude Code, ask the web reviewer to make its final response self-contained. The latest response should contain:
 
 ```text
 Outcome and current status
@@ -331,15 +348,15 @@ The next bounded prompt for the local coding agent
 
 Do not place credentials, private tokens, or unrelated personal data in this packet. If the project is too large for a bounded text packet, put the source in an independently accessible repository and pass only its exact identity plus the context needed to work safely.
 
-### Case 1: start from Codex.app or ZCode.app
+### Case 1: start from Codex.app, ZCode.app, or Claude Code
 
 1. Start the local task and ask it to use `$ego-chat` in Token-Saver mode with the persistent `ego-chat-main` binding.
 2. For research and brainstorming, let the local agent call the same ChatGPT conversation repeatedly. Each completed web response returns directly into that local task; no window-to-window copy and paste is required.
 3. Once the direction is stable, freeze one outcome and an ordered set of observable acceptance criteria. Ask ChatGPT to return the handoff packet above. ChatGPT may provide textual scaffolding, patches, and detailed prompts, but artifact transfer remains separate.
-4. Let Codex or ZCode prepare the local repository, run the authorized verification, and implement the candidate. Treat all web output as untrusted advisory context.
+4. Let Codex, ZCode, or Claude Code prepare the local repository, run the authorized verification, and implement the candidate. Treat all web output as untrusted advisory context.
 5. Review until settled:
    - For an explicit “until settled”, “keep discussing”, or “do not stop” request from Codex, call `ego_converge_until_settled` once. Its broker-owned Codex App Server task and ChatGPT workflow survive the initiating app turn, MCP facade, and broker process. Use `workspace-write` only when local edits are authorized; otherwise retain the `read-only` default.
-   - Use `ego_review_candidate_and_wait` for exactly one current-host-owned candidate, or as the fallback when detached Codex App Server convergence is unavailable. The current Codex or ZCode task must remain alive and submit each next candidate itself.
+   - Use `ego_review_candidate_and_wait` for exactly one current-host-owned candidate, or as the fallback when detached Codex App Server convergence is unavailable. The current Codex, ZCode, or Claude Code task must remain alive and submit each next candidate itself.
    - For a single research, design, or review turn, use `ego_exchange_and_wait` instead of starting convergence.
 6. Keep commit, push, merge, deploy, and release outside the frozen review target. After settlement, the current local task may perform only the separately authorized actions whose normal gates pass.
 
@@ -358,7 +375,7 @@ binding task space before each fresh Send if I have taken browser control.
 
 1. Discuss and iterate in the private ChatGPT conversation. Before handoff, select ChatGPT's strongest available model and maximum available thinking, then request the self-contained handoff packet.
 2. Copy the private canonical conversation URL containing `/c/`. Do not use a `/share/` link.
-3. Start Codex or ZCode and provide that URL. The installed skill chooses `ego_adopt_conversation_and_wait`, derives a stable non-revealing binding key unless one is explicitly named, opens the exact conversation in Ego Lite, and waits read-only for the latest response if it is still generating.
+3. Start Codex, ZCode, or Claude Code and provide that URL. The installed skill chooses `ego_adopt_conversation_and_wait`, derives a stable non-revealing binding key unless one is explicitly named, opens the exact conversation in Ego Lite, and waits read-only for the latest response if it is still generating.
 4. Keep the local task open until adoption returns. Do not stop the generation, edit an earlier web message, create a draft, or send another web turn while adoption is waiting.
 5. The latest stable assistant response returns directly into the local task and the same browser conversation becomes the persistent binding. Continue from step 4 of Case 1.
 
@@ -375,7 +392,7 @@ and continue the implementation/review loop until the frozen criteria are settle
 
 1. Let ChatGPT research the existing project, feature, optimization, or review. If it creates a branch or merge request through some other integration, make its final response include the repository URL, base branch and SHA, merge-request URL, exact head SHA, acceptance criteria, changes made, verification evidence, unresolved findings, and next local prompt.
 2. Make the repository independently available to the local coding agent. Ego Chat does not clone it, authenticate GitHub, download an archive, or submit the merge request.
-3. Open Codex or ZCode, provide both the private `/c/` conversation URL and the repository or merge-request identity, and ask `$ego-chat` to adopt the conversation.
+3. Open Codex, ZCode, or Claude Code, provide both the private `/c/` conversation URL and the repository or merge-request identity, and ask `$ego-chat` to adopt the conversation.
 4. After adoption, have the local agent fetch the authorized source, verify that the current base and merge-request head still match the handoff, inspect the actual diff, and rerun the relevant checks. The conversation is context, not proof of repository state.
 5. Continue the Case 1 implementation/review loop. Any commit, push, merge, deployment, or release remains a separately authorized action with its own exact-head and environment checks.
 
@@ -409,7 +426,7 @@ node ./bin/ego-chat.mjs ensure-model-policy ego-chat-main
 
 The equivalent MCP tools are `ego_get_model_policy` and `ego_ensure_model_policy`. Every normal handoff and every ChatGPT review cycle performs the repair-and-readback before composition plus a fresh read-only maximum check immediately before Send.
 
-## Codex and ZCode MCP configuration
+## Codex, ZCode, and Claude Code MCP configuration
 
 The Cargo wrapper configures this automatically. For development directly from this checkout, add the facade to the Codex configuration using the absolute path:
 
@@ -437,15 +454,21 @@ For development directly from this checkout, ZCode's equivalent native user conf
 }
 ```
 
-Both values are eight hours plus five minutes of host transport margin. The one-minute supervised heartbeat keeps a healthy attached call observable; these configured host caps only bound that attachment and remain longer than the broker's eight-hour attachment window. Per-review and per-Codex-turn deadlines remain recovery triggers inside the durable workflow rather than limits on the overall workflow.
+For development directly from this checkout, register the facade with Claude Code's own CLI in user scope:
 
-## Codex and ZCode skill
+```sh
+claude mcp add-json --scope user ego_chat '{"type":"stdio","command":"node","args":["/absolute/path/to/ego-chat/bin/ego-chat-mcp.mjs"],"timeout":29100000}'
+```
 
-The distributable host-aware skill lives at [`skills/ego-chat`](https://github.com/xicv/ego-chat/tree/main/skills/ego-chat). `ego-chat setup` installs the Codex copy, while `ego-chat setup-zcode` installs the ZCode copy. After restarting the client, invoke it explicitly with `$ego-chat` or ask naturally:
+All three values are eight hours plus five minutes of host transport margin. The one-minute supervised heartbeat keeps a healthy attached call observable; these configured host caps only bound that attachment and remain longer than the broker's eight-hour attachment window. Per-review and per-Codex-turn deadlines remain recovery triggers inside the durable workflow rather than limits on the overall workflow.
+
+## Codex, ZCode, and Claude Code skill
+
+The distributable host-aware skill lives at [`skills/ego-chat`](https://github.com/xicv/ego-chat/tree/main/skills/ego-chat). `ego-chat setup` installs the Codex copy, `ego-chat setup-zcode` the ZCode copy, and `ego-chat setup-claude` the Claude Code copy. After restarting the client, invoke it explicitly with `$ego-chat` or ask naturally:
 
 > Use Ego Chat to review this implementation with ChatGPT until the acceptance criteria are settled.
 
-The skill chooses between private conversation adoption, a one-shot review, durable broker-owned Codex convergence, and a current-task-owned Codex or ZCode fallback loop. An explicit until-settled request selects durable convergence by default. It preserves `ego-chat-main`, defaults convergence to read-only, and reconciles ambiguous delivery inside the original durable workflow instead of asking the user to relay or resend anything.
+The skill chooses between private conversation adoption, a one-shot review, durable broker-owned Codex convergence, and a current-task-owned Codex, ZCode, or Claude Code fallback loop. An explicit until-settled request selects durable convergence by default. It preserves `ego-chat-main`, defaults convergence to read-only, and reconciles ambiguous delivery inside the original durable workflow instead of asking the user to relay or resend anything.
 
 For the normal path, the current agent calls `ego_exchange_and_wait` with:
 
@@ -458,7 +481,7 @@ The tool remains pending and returns the terminal workflow and captured response
 
 ## Current-host-owned convergence
 
-When the current Codex or ZCode task must remain side A, keep that task (or ZCode [Goal](https://zcode.z.ai/en/docs/goal)) as the implementation owner. Freeze the stable outcome and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. This is a fallback, not the durable default for an unattended multi-cycle Codex request: an exited current-host task cannot submit its next candidate. Put mutable candidate identity such as an exact commit SHA in the candidate summary and review packet, not in the frozen target, so a corrective cycle does not silently change the contract. Finalize the packet before giving each exact candidate call one stable, non-secret `operationId`, then retain that ID until the result is recovered. Reissuing byte-identical arguments with that same ID rediscovers the original workflow after a lost tool result; reusing it with changed input fails closed. Ego Chat derives stable unique markers from that identity, redacts high-confidence secret signatures, verifies the exact composer contents, and repairs then verifies the strongest-model policy before every Send.
+When the current Codex, ZCode, or Claude Code task must remain side A, keep that task (or ZCode [Goal](https://zcode.z.ai/en/docs/goal)) as the implementation owner. Freeze the stable outcome and ordered acceptance criteria, then call `ego_review_candidate_and_wait` after each candidate. This is a fallback, not the durable default for an unattended multi-cycle Codex request: an exited current-host task cannot submit its next candidate. Put mutable candidate identity such as an exact commit SHA in the candidate summary and review packet, not in the frozen target, so a corrective cycle does not silently change the contract. Finalize the packet before giving each exact candidate call one stable, non-secret `operationId`, then retain that ID until the result is recovered. Reissuing byte-identical arguments with that same ID rediscovers the original workflow after a lost tool result; reusing it with changed input fails closed. Ego Chat derives stable unique markers from that identity, redacts high-confidence secret signatures, verifies the exact composer contents, and repairs then verifies the strongest-model policy before every Send.
 
 A candidate review packet admits up to 524,288 UTF-8 bytes, while the complete generated browser prompt is limited to 196,608 UTF-8 bytes. This exceeds the old 28,000-character and 65,536-byte admission ceilings without allowing an oversized browser transaction. When the assembled prompt exceeds its smaller transport budget, Ego Chat deterministically compacts its largest fields, includes digests and a transport note, and sends the bounded review automatically. A compacted review cannot settle the target by itself: it continues the loop and asks the next Codex cycle for a smaller evidence packet or exact accessible revision references. The driver inserts the assembled prompt into ChatGPT's rich editor in one bounded DOM input transaction, then verifies the exact canonical digest before and immediately before Send. For an independently accessible repository or pull request, prefer a compact evidence manifest: canonical URL, exact base and head revisions, changed-file inventory, critical security or correctness excerpts, deterministic tests and hosted checks, and unresolved risks. Use self-contained relevant hunks when the reviewer cannot access the source. Ego Chat does not publish source or split one candidate into independently settleable fragments.
 
@@ -615,13 +638,16 @@ The crate carries the MIT license and canonical repository metadata needed for p
 
 ## Not yet supported
 
-- Direct MCP hosting inside ChatGPT.app; a ChatGPT.app conversation can only be continued by adopting its private `/c/` URL from Codex or ZCode.
+- Direct MCP hosting inside ChatGPT.app; a ChatGPT.app conversation can only be continued by adopting its private `/c/` URL from Codex, ZCode, or Claude Code.
 - Full historical transcript import into the local coding task during URL adoption; only the latest stable assistant tail is returned, while the browser conversation retains its full history.
 - ChatGPT-first initiation through a private plugin and Secure MCP Tunnel.
 - Automatic GitHub push, repository upload, or attachment transfer.
 - Automatic attachment/context-capsule construction beyond the bounded, secret-scanned implementing-agent review packet.
 - Externally waking a Codex desktop task after its MCP adoption waiter has exited; adoption continues the same task while `ego_adopt_conversation_and_wait` remains open, while convergence owns a dedicated App Server thread.
 - Externally waking or resuming a ZCode task after ZCode exits; ZCode-owned loops remain continuous while their current task or Goal is active.
+- Externally waking a Claude Code session after its turn ends; Claude Code-owned loops remain continuous while the tool call, or the background task Claude Code moves it to, is still pending.
+- The Claude.app chat surface; only Claude Code and the Claude.app Code tab are configured, because the chat surface cannot load the skill from disk and has no documented long-call timeout.
+- A Claude-owned implementing agent for detached convergence; broker-owned convergence still uses the Codex App Server.
 - True simultaneous CDP automation between Ego Chat and unrelated external `ego-browser` clients. Ego Chat serializes its own children, but cannot serialize another process outside its authoritative broker while upstream per-Space CDP isolation remains unresolved.
 - Blind replay of a possibly accepted browser Send. Ego Chat instead keeps the original workflow in read-only reconciliation and retries delivery only after exact absence proof.
 - Automatic bypass of CAPTCHA or a conclusive sign-out. These are the intended browser-level human boundaries. Unknown or hydrating model/UI state retries without downgrading.
