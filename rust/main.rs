@@ -1181,7 +1181,9 @@ fn run_claude_mcp(claude: &Path, arguments: &[&str]) -> Result<(), String> {
 /// Registers this executable as the user-scope `ego_chat` stdio server. Reads
 /// the config only to classify an existing entry and to verify the result;
 /// every write is delegated to the Claude CLI so concurrent Claude Code
-/// sessions are never clobbered. Returns whether a write happened.
+/// sessions are never clobbered. An owned entry that needs repair keeps its
+/// extra fields (such as `env`); a foreign entry replaced under `--force` does
+/// not. Returns whether a write happened.
 fn configure_claude(
     config_path: &Path,
     claude: &Path,
@@ -1189,6 +1191,7 @@ fn configure_claude(
     force: bool,
 ) -> Result<bool, String> {
     let executable_text = path_bytes(executable)?;
+    let mut preserved_fields = JsonMap::new();
     if let Some(existing) = claude_server_entry(config_path)? {
         let owned = claude_server_identity_matches(&existing, &executable_text);
         if !owned && !force {
@@ -1196,20 +1199,31 @@ fn configure_claude(
                 "Claude Code already has a different {MCP_SERVER_NAME} MCP server; rerun with --force only after verifying that replacement is intended"
             ));
         }
-        if owned
-            && claude_server_value_status(&existing, &executable_text) == HostConfigStatus::Ready
-        {
-            return Ok(false);
+        if owned {
+            if claude_server_value_status(&existing, &executable_text) == HostConfigStatus::Ready {
+                return Ok(false);
+            }
+            if let Some(fields) = existing.as_object() {
+                preserved_fields = fields.clone();
+            }
         }
         run_claude_mcp(claude, &["remove", MCP_SERVER_NAME, "-s", "user"])?;
     }
-    let entry = serde_json::json!({
-        "type": "stdio",
-        "command": executable_text,
-        "args": ["mcp"],
-        "timeout": MCP_TOOL_TIMEOUT_MILLISECONDS,
-    });
-    let entry = serde_json::to_string(&entry)
+    let mut entry = JsonMap::new();
+    entry.insert("type".to_string(), JsonValue::String("stdio".to_string()));
+    entry.insert("command".to_string(), JsonValue::String(executable_text));
+    entry.insert(
+        "args".to_string(),
+        JsonValue::Array(vec![JsonValue::String("mcp".to_string())]),
+    );
+    entry.insert(
+        "timeout".to_string(),
+        JsonValue::from(MCP_TOOL_TIMEOUT_MILLISECONDS),
+    );
+    for (key, value) in preserved_fields {
+        entry.entry(key).or_insert(value);
+    }
+    let entry = serde_json::to_string(&JsonValue::Object(entry))
         .map_err(|error| format!("could not encode the {MCP_SERVER_NAME} MCP entry: {error}"))?;
     run_claude_mcp(claude, &["add-json", "-s", "user", MCP_SERVER_NAME, &entry])?;
     let status = claude_server_status(config_path, executable)?;
@@ -2690,7 +2704,7 @@ mod tests {
         let executable = directory.0.join("bin/ego-chat");
         fs::write(
             &config,
-            r#"{"mcpServers":{"ego_chat":{"type":"stdio","command":"someone-else","args":["mcp"],"timeout":29100000}},"unrelated":true}"#,
+            r#"{"mcpServers":{"ego_chat":{"type":"stdio","command":"someone-else","args":["mcp"],"env":{"FOREIGN":"1"},"timeout":29100000}},"unrelated":true}"#,
         )
         .expect("seed foreign entry");
 
@@ -2740,6 +2754,7 @@ mod tests {
         fs::write(&config, &seed).expect("seed ready entry");
 
         assert!(!configure_claude(&config, &claude, &executable, false).expect("no-op"));
+        assert!(!configure_claude(&config, &claude, &executable, true).expect("no-op under force"));
 
         assert!(!log.exists(), "a ready entry must not invoke the CLI");
         assert_eq!(fs::read_to_string(&config).expect("read file"), seed);
@@ -2767,6 +2782,91 @@ mod tests {
             .expect_err("must surface a non-zero exit");
         assert!(error.contains("mcp add-json exited with"));
         assert!(error.contains("boom"));
+    }
+
+    #[test]
+    fn claude_configuration_repair_keeps_extra_owned_fields() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let claude = fake_claude_cli(&directory.0, "claude", &config, &log, true);
+        let executable = directory.0.join("bin/ego-chat");
+        let executable_json = serde_json::to_string(executable.to_str().expect("utf8 path"))
+            .expect("encode executable");
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"env":{{"EGO_CHAT_DATA_DIR":"/tmp/ego"}},"command":{executable_json},"custom":true,"args":["mcp"],"timeout":600000}}}},"unrelated":true}}"#
+            ),
+        )
+        .expect("seed owned entry with extra fields");
+
+        assert!(configure_claude(&config, &claude, &executable, false).expect("repair timeout"));
+
+        let expected_entry = format!(
+            r#"{{"type":"stdio","command":{executable_json},"args":["mcp"],"timeout":{MCP_TOOL_TIMEOUT_MILLISECONDS},"env":{{"EGO_CHAT_DATA_DIR":"/tmp/ego"}},"custom":true}}"#
+        );
+        assert_eq!(
+            read_lines(&log),
+            [
+                format!("mcp remove {MCP_SERVER_NAME} -s user"),
+                format!("mcp add-json -s user {MCP_SERVER_NAME} {expected_entry}"),
+            ]
+        );
+        let document = serde_json::from_str::<JsonValue>(
+            &fs::read_to_string(&config).expect("read repaired file"),
+        )
+        .expect("parse repaired file");
+        let server = &document["mcpServers"][MCP_SERVER_NAME];
+        assert_eq!(
+            server["env"]["EGO_CHAT_DATA_DIR"].as_str(),
+            Some("/tmp/ego")
+        );
+        assert_eq!(server["custom"].as_bool(), Some(true));
+        assert_eq!(
+            server["timeout"].as_u64(),
+            Some(MCP_TOOL_TIMEOUT_MILLISECONDS)
+        );
+        assert_eq!(
+            claude_server_status(&config, &executable).expect("inspect repaired file"),
+            HostConfigStatus::Ready
+        );
+    }
+
+    #[test]
+    fn claude_configuration_leaves_no_entry_when_add_json_fails_after_remove() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join(".claude.json");
+        let log = directory.0.join("claude-invocations.txt");
+        let executable = directory.0.join("bin/ego-chat");
+        let executable_json = serde_json::to_string(executable.to_str().expect("utf8 path"))
+            .expect("encode executable");
+        let claude = write_fake_executable(
+            &directory.0.join("claude-half"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$2\" in\n  remove) printf '{{\"mcpServers\":{{}},\"unrelated\":true}}\\n' > '{}' ;;\n  add-json) printf 'quota exhausted\\n' >&2; exit 2 ;;\nesac\n",
+                log.display(),
+                config.display()
+            ),
+        );
+        fs::write(
+            &config,
+            format!(
+                r#"{{"mcpServers":{{"ego_chat":{{"type":"stdio","command":{executable_json},"args":["mcp"],"timeout":600000}}}},"unrelated":true}}"#
+            ),
+        )
+        .expect("seed owned short timeout");
+
+        let error = configure_claude(&config, &claude, &executable, false)
+            .expect_err("must surface the add-json failure");
+        assert!(error.contains("mcp add-json exited with"));
+        assert!(error.contains("quota exhausted"));
+        assert_eq!(read_lines(&log).len(), 2);
+        assert_eq!(
+            claude_server_status(&config, &executable).expect("inspect half-repaired file"),
+            HostConfigStatus::Missing,
+            "a rerun must take the fresh-registration path"
+        );
     }
 
     #[test]
