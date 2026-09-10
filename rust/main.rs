@@ -25,6 +25,7 @@ const MCP_TOOL_TIMEOUT_SECONDS: i64 =
     MAX_CONVERGENCE_ATTACHMENT_SECONDS + MCP_TOOL_TIMEOUT_GRACE_SECONDS;
 const MCP_TOOL_TIMEOUT_MILLISECONDS: u64 = MCP_TOOL_TIMEOUT_SECONDS as u64 * 1_000;
 const COCO_MCP_END_MARKER: &str = "# --- end coco MCP server ---";
+const MINIMUM_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 203);
 const NPM_CI_ARGS: &[&str] = &[
     "ci",
     "--omit=dev",
@@ -1099,6 +1100,38 @@ fn host_config_problem(
     }
 }
 
+fn parse_claude_version(version: &str) -> Option<(u64, u64, u64)> {
+    fn leading_number(part: &str) -> Option<u64> {
+        let digits = part
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    }
+    let mut parts = version
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('v')
+        .split('.');
+    let major = leading_number(parts.next()?)?;
+    let minor = leading_number(parts.next()?)?;
+    let patch = leading_number(parts.next()?)?;
+    Some((major, minor, patch))
+}
+
+fn check_claude_version(claude: &Path) -> Result<String, String> {
+    let output = command_output(claude, &[OsStr::new("--version")])?;
+    let (major, minor, patch) = parse_claude_version(&output)
+        .ok_or_else(|| format!("could not parse Claude Code version {output:?}"))?;
+    if (major, minor, patch) < MINIMUM_CLAUDE_VERSION {
+        let (required_major, required_minor, required_patch) = MINIMUM_CLAUDE_VERSION;
+        return Err(format!(
+            "Claude Code {required_major}.{required_minor}.{required_patch} or newer is required so the per-server MCP timeout also floors the 30-minute stdio idle abort; found {output}. Upgrade Claude Code and rerun ego-chat setup-claude"
+        ));
+    }
+    Ok(format!("{major}.{minor}.{patch}"))
+}
+
 fn doctor() -> Result<(), String> {
     let paths = InstallPaths::discover()?;
     let tools = Toolchain::discover(true)?;
@@ -1553,6 +1586,17 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("remove owned test directory");
         }
+    }
+
+    fn write_fake_executable(path: &Path, script: &str) -> PathBuf {
+        fs::write(path, script).expect("write fake executable");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path).expect("read mode").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).expect("set executable mode");
+        }
+        path.to_path_buf()
     }
 
     #[test]
@@ -2198,6 +2242,49 @@ mod tests {
             )
             .contains("missing or invalid timeoutMs")
         );
+    }
+
+    #[test]
+    fn claude_version_parser_accepts_cli_output() {
+        assert_eq!(
+            parse_claude_version("2.1.261 (Claude Code)"),
+            Some((2, 1, 261))
+        );
+        assert_eq!(parse_claude_version("v2.1.203\n"), Some((2, 1, 203)));
+        assert_eq!(parse_claude_version("2.2.0-beta.1"), Some((2, 2, 0)));
+        assert_eq!(parse_claude_version("unknown"), None);
+        assert_eq!(parse_claude_version("2.1"), None);
+        assert!((2, 1, 202) < MINIMUM_CLAUDE_VERSION);
+        assert!((2, 1, 203) >= MINIMUM_CLAUDE_VERSION);
+        assert!((2, 2, 0) > MINIMUM_CLAUDE_VERSION);
+    }
+
+    #[test]
+    fn claude_version_check_rejects_hosts_older_than_the_idle_floor_release() {
+        let directory = TestDirectory::new();
+        let old = write_fake_executable(
+            &directory.0.join("claude-old"),
+            "#!/bin/sh\nprintf '2.1.202 (Claude Code)\\n'\n",
+        );
+        let error = check_claude_version(&old).expect_err("must reject 2.1.202");
+        assert!(error.contains("2.1.203 or newer"));
+        assert!(error.contains("2.1.202"));
+
+        let current = write_fake_executable(
+            &directory.0.join("claude-current"),
+            "#!/bin/sh\nprintf '2.1.261 (Claude Code)\\n'\n",
+        );
+        assert_eq!(
+            check_claude_version(&current).expect("accept 2.1.261"),
+            "2.1.261"
+        );
+
+        let broken = write_fake_executable(
+            &directory.0.join("claude-broken"),
+            "#!/bin/sh\nprintf 'not a version\\n'\n",
+        );
+        let error = check_claude_version(&broken).expect_err("must reject garbage");
+        assert!(error.contains("could not parse Claude Code version"));
     }
 
     #[test]
