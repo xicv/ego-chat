@@ -80,7 +80,7 @@ A new `CLAUDE_SKILL_FILES` constant embeds `SKILL.md` only, matching `ZCODE_SKIL
    - `timeout` must be a number of milliseconds at least `MCP_TOOL_TIMEOUT_MILLISECONDS`.
 3. If the entry exists, identity does not match, and `--force` was not given: fail with the same wording the other hosts use, before any CLI invocation.
 4. If the status is `Ready`: write nothing and report that the server is already configured.
-5. Otherwise, if an entry exists, run `claude mcp remove ego_chat -s user`. Then run `claude mcp add-json -s user ego_chat <json>` where `<json>` is `{"type":"stdio","command":<executable>,"args":["mcp"],"timeout":<ms>}` and `<ms>` is the larger of `MCP_TOOL_TIMEOUT_MILLISECONDS` and the existing timeout of an owned entry; an unowned entry replaced under `--force` gets the default.
+5. Otherwise, if an entry exists, run `claude mcp remove ego_chat -s user`. Then run `claude mcp add-json -s user ego_chat <json>` where `<json>` is `{"type":"stdio","command":<executable>,"args":["mcp"],"timeout":<ms>}` and `<ms>` is `MCP_TOOL_TIMEOUT_MILLISECONDS`. A longer existing timeout survives because an owned entry that is already `Ready` is never rewritten (step 4); an owned entry that reaches this step always has a missing, invalid, or too-short timeout, and an unowned entry replaced under `--force` gets the default.
 6. Both CLI calls inherit the launcher's environment so they target the file inspected in step 1. A non-zero exit is an error; CLI output is not parsed because step 7 verifies the file itself.
 7. Re-read the file and re-classify. Anything other than `Ready` is an error naming the file and the status, so a CLI that silently declined cannot leave a half-configured host.
 
