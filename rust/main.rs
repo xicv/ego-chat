@@ -2279,6 +2279,15 @@ mod tests {
             "2.1.261"
         );
 
+        let minimum = write_fake_executable(
+            &directory.0.join("claude-minimum"),
+            "#!/bin/sh\nprintf '2.1.203 (Claude Code)\\n'\n",
+        );
+        assert_eq!(
+            check_claude_version(&minimum).expect("accept the exact minimum"),
+            "2.1.203"
+        );
+
         let broken = write_fake_executable(
             &directory.0.join("claude-broken"),
             "#!/bin/sh\nprintf 'not a version\\n'\n",
