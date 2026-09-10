@@ -30,7 +30,7 @@ Verified on 2026-09-10 against the official Claude Code MCP, desktop, skills, an
 - The per-server `timeout` is a hard wall-clock cap per tool call. Progress notifications do not extend it. Values below 1000 are ignored and fall through to `MCP_TOOL_TIMEOUT`, whose unset default is about 28 hours.
 - Stdio servers have a separate idle abort, default 30 minutes, for calls that send neither a response nor a progress notification. From Claude Code 2.1.203 onward, a per-server `timeout` of at least 1000 ms also floors that idle window. Below 2.1.203 a Token-Saver wait (which sends no notifications) would abort after 30 minutes.
 - A main-conversation tool call that runs past two minutes is moved to a background task and its result is delivered to the session as a notification.
-- `claude mcp add-json --scope user <name> '<json>'` writes the entry including `timeout`; `claude mcp get <name>` reports the timeout. `add-json` refuses an existing name ("already exists"). `claude mcp remove <name> -s user` removes only the user-scope entry.
+- `claude mcp add-json -s user <name> '<json>'` writes the entry including `timeout`; `claude mcp get <name>` reports the timeout. `add-json` refuses an existing name ("already exists"). `claude mcp remove <name> -s user` removes only the user-scope entry.
 - Personal skills load from `skills/<name>/SKILL.md` under the Claude home directory. All frontmatter fields are optional; `name` and `description` are the ones this project uses. Extra files in the directory are allowed.
 - The desktop app's Code tab loads MCP servers from `claude_desktop_config.json`, `~/.claude.json`, and `.mcp.json`, and personal skills from the Claude home directory in local sessions. If the same name is in `claude_desktop_config.json` and `~/.claude.json`, the Code tab uses the desktop definition. The standalone CLI never reads `claude_desktop_config.json`.
 
@@ -80,7 +80,7 @@ A new `CLAUDE_SKILL_FILES` constant embeds `SKILL.md` only, matching `ZCODE_SKIL
    - `timeout` must be a number of milliseconds at least `MCP_TOOL_TIMEOUT_MILLISECONDS`.
 3. If the entry exists, identity does not match, and `--force` was not given: fail with the same wording the other hosts use, before any CLI invocation.
 4. If the status is `Ready`: write nothing and report that the server is already configured.
-5. Otherwise, if an entry exists, run `claude mcp remove ego_chat -s user`. Then run `claude mcp add-json -s user ego_chat <json>` where `<json>` is `{"type":"stdio","command":<executable>,"args":["mcp"],"timeout":<ms>}` and `<ms>` is `MCP_TOOL_TIMEOUT_MILLISECONDS`. A longer existing timeout survives because an owned entry that is already `Ready` is never rewritten (step 4); an owned entry that reaches this step always has a missing, invalid, or too-short timeout, and an unowned entry replaced under `--force` gets the default.
+5. Otherwise, if an entry exists, run `claude mcp remove ego_chat -s user`. Then run `claude mcp add-json -s user ego_chat <json>` where `<json>` is `{"type":"stdio","command":<executable>,"args":["mcp"],"timeout":<ms>}` and `<ms>` is `MCP_TOOL_TIMEOUT_MILLISECONDS`, followed by every extra field of the owned entry being repaired (such as `env`) in its original order; a foreign entry replaced under `--force` contributes nothing. A longer existing timeout survives because an owned entry that is already `Ready` is never rewritten (step 4); an owned entry that reaches this step always has a missing, invalid, or too-short timeout.
 6. Both CLI calls inherit the launcher's environment so they target the file inspected in step 1. A non-zero exit is an error; CLI output is not parsed because step 7 verifies the file itself.
 7. Re-read the file and re-classify. Anything other than `Ready` is an error naming the file and the status, so a CLI that silently declined cannot leave a half-configured host.
 
@@ -144,7 +144,9 @@ Rust unit tests in `rust/main.rs`, using the existing `TestDirectory` and fake s
   - owned entry with a longer timeout: preserved;
   - unowned entry without `--force`: error and no invocation;
   - ready entry: no invocation;
-  - a fake CLI that exits zero but writes nothing: error from post-write verification.
+  - a fake CLI that exits zero but writes nothing: error from post-write verification;
+  - owned entry with extra fields such as `env`: carried into the replacement after the managed keys; foreign fields under `--force`: dropped;
+  - remove succeeds but add-json fails: error surfaced, no entry left, so a rerun takes the fresh path.
 - `parse_claude_version` accepts `2.1.261 (Claude Code)` and rejects garbage; the 2.1.203 minimum comparison is covered.
 - `embedded_paths_are_relative_and_unique` includes `CLAUDE_SKILL_FILES`.
 - `skill_installation_requires_force_for_different_managed_files` is reused for the Claude skill directory.
