@@ -242,8 +242,15 @@ const ZCODE_SKILL_FILES: &[EmbeddedFile] = &[EmbeddedFile {
     bytes: include_bytes!("../skills/ego-chat/SKILL.md"),
 }];
 
+const CLAUDE_SKILL_FILES: &[EmbeddedFile] = &[EmbeddedFile {
+    path: "SKILL.md",
+    bytes: include_bytes!("../skills/ego-chat/SKILL.md"),
+}];
+
 #[derive(Clone, Debug)]
 struct InstallPaths {
+    claude_config: PathBuf,
+    claude_skill_dir: PathBuf,
     codex_config: PathBuf,
     codex_skill_dir: PathBuf,
     runtime_dir: PathBuf,
@@ -297,6 +304,12 @@ fn run() -> Result<u8, String> {
             setup_zcode(force)?;
             Ok(0)
         }
+        "setup-claude" => {
+            args.remove(0);
+            let force = parse_force_only(&args, "setup-claude")?;
+            setup_claude(force)?;
+            Ok(0)
+        }
         "install-skill" => {
             args.remove(0);
             let force = parse_force_only(&args, "install-skill")?;
@@ -319,12 +332,27 @@ fn run() -> Result<u8, String> {
             );
             Ok(0)
         }
+        "install-claude-skill" => {
+            args.remove(0);
+            let force = parse_force_only(&args, "install-claude-skill")?;
+            let paths = InstallPaths::discover()?;
+            install_skill(&paths.claude_skill_dir, CLAUDE_SKILL_FILES, force)?;
+            println!(
+                "Installed Claude Code skill at {}",
+                paths.claude_skill_dir.display()
+            );
+            Ok(0)
+        }
         "doctor" => {
             doctor()?;
             Ok(0)
         }
         "doctor-zcode" => {
             doctor_zcode()?;
+            Ok(0)
+        }
+        "doctor-claude" => {
+            doctor_claude()?;
             Ok(0)
         }
         "mcp" => {
@@ -368,17 +396,36 @@ fn print_help() {
 Usage:\n  \
   ego-chat setup [--force] [--skip-codex-config]\n  \
   ego-chat setup-zcode [--force]\n  \
+  ego-chat setup-claude [--force]\n  \
   ego-chat install-skill [--force]\n  \
   ego-chat install-zcode-skill [--force]\n  \
+  ego-chat install-claude-skill [--force]\n  \
   ego-chat doctor\n  \
   ego-chat doctor-zcode\n  \
+  ego-chat doctor-claude\n  \
   ego-chat receipt-signer-enroll\n  \
   ego-chat broker-status\n  \
   ego-chat mcp\n  \
   ego-chat <broker-cli-command> [args...]\n\n\
-setup configures Codex; setup-zcode configures ZCode. Both install the same embedded runtime and host skill, then register this executable as the ego_chat MCP server.\n\
+setup configures Codex; setup-zcode configures ZCode; setup-claude configures Claude Code and the Claude.app Code tab. All three install the same embedded runtime and host skill, then register this executable as the ego_chat MCP server.\n\
 All other commands are forwarded to the qualified Ego Chat broker CLI."
     );
+}
+
+/// Claude Code keeps its user-scope MCP config in `.claude.json` and personal
+/// skills under `skills/`. `CLAUDE_CONFIG_DIR` relocates both; without it the
+/// config sits in the home directory and skills under `~/.claude`.
+fn claude_host_paths(home: &Path, config_dir: Option<&Path>) -> (PathBuf, PathBuf) {
+    match config_dir {
+        Some(directory) => (
+            directory.join(".claude.json"),
+            directory.join("skills").join("ego-chat"),
+        ),
+        None => (
+            home.join(".claude.json"),
+            home.join(".claude").join("skills").join("ego-chat"),
+        ),
+    }
 }
 
 impl InstallPaths {
@@ -392,6 +439,9 @@ impl InstallPaths {
         let zcode_home = env::var_os("ZCODE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".zcode"));
+        let claude_config_dir = env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let (claude_config, claude_skill_dir) =
+            claude_host_paths(&home, claude_config_dir.as_deref());
         let install_root = env::var_os("EGO_CHAT_INSTALL_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -401,6 +451,8 @@ impl InstallPaths {
                     .join("runtime")
             });
         Ok(Self {
+            claude_config,
+            claude_skill_dir,
             codex_config: codex_home.join("config.toml"),
             codex_skill_dir: codex_home.join("skills").join("ego-chat"),
             runtime_dir: install_root.join(env!("CARGO_PKG_VERSION")),
@@ -542,6 +594,56 @@ fn setup_zcode(force: bool) -> Result<(), String> {
     if tools.codex.is_none() {
         println!(
             "Codex was not found; ZCode-owned reviews work, while broker-owned Codex convergence remains unavailable."
+        );
+    }
+    Ok(())
+}
+
+fn setup_claude(force: bool) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("the Ego Lite integration currently supports macOS only".to_string());
+    }
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover(false)?;
+    tools.validate(false)?;
+    let claude = find_program("claude", "EGO_CHAT_CLAUDE")?;
+    let claude_version = check_claude_version(&claude)?;
+    install_runtime(&paths.runtime_dir, &tools, force)?;
+    let redirected_launchers = redirect_stale_broker_launchers(&paths.runtime_dir)?;
+    let handoff_status = handoff_installed_broker(&paths.runtime_dir, &tools)?;
+    install_skill(&paths.claude_skill_dir, CLAUDE_SKILL_FILES, force)?;
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+    let registered = configure_claude(&paths.claude_config, &claude, &executable, force)?;
+
+    println!("Ego Chat runtime: {}", paths.runtime_dir.display());
+    if handoff_status == "stopped" {
+        println!("Stopped the idle stale Ego Chat broker before activating this runtime.");
+    }
+    if redirected_launchers > 0 {
+        println!(
+            "Redirected {redirected_launchers} older managed broker launcher(s) to this runtime."
+        );
+    }
+    println!("Claude Code {claude_version} at {}", claude.display());
+    println!("Claude Code skill: {}", paths.claude_skill_dir.display());
+    if registered {
+        println!(
+            "Claude Code MCP server: {MCP_SERVER_NAME} registered in user scope with a {MCP_TOOL_TIMEOUT_MILLISECONDS} ms tool timeout in {}",
+            paths.claude_config.display()
+        );
+    } else {
+        println!(
+            "Claude Code MCP server: {MCP_SERVER_NAME} was already configured in {}",
+            paths.claude_config.display()
+        );
+    }
+    println!(
+        "Restart open Claude Code sessions and Claude.app, then run `claude mcp get {MCP_SERVER_NAME}` to verify the connection. The Claude.app Code tab uses this same configuration."
+    );
+    if tools.codex.is_none() {
+        println!(
+            "Codex was not found; Claude Code-owned reviews work, while broker-owned Codex convergence remains unavailable."
         );
     }
     Ok(())
@@ -1447,6 +1549,106 @@ fn doctor_zcode() -> Result<(), String> {
     }
 }
 
+fn doctor_claude() -> Result<(), String> {
+    let paths = InstallPaths::discover()?;
+    let tools = Toolchain::discover(false)?;
+    let mut failures = Vec::new();
+
+    match tools.validate(false) {
+        Ok(()) => println!("[ok] Node.js, npm, and ego-browser are available"),
+        Err(error) => {
+            println!("[fail] {error}");
+            failures.push(error);
+        }
+    }
+    if let Some(codex) = &tools.codex {
+        match command_output(codex, &[OsStr::new("--version")]) {
+            Ok(_) => println!("[ok] Codex is also available for broker-owned convergence"),
+            Err(error) => println!(
+                "[warn] Codex was detected but is not usable for optional broker-owned convergence: {error}"
+            ),
+        }
+    }
+    match find_program("claude", "EGO_CHAT_CLAUDE").and_then(|claude| check_claude_version(&claude))
+    {
+        Ok(version) => println!("[ok] Claude Code {version} is available"),
+        Err(error) => {
+            println!("[fail] {error}");
+            failures.push(error);
+        }
+    }
+    let runtime_installed = runtime_ready(&paths.runtime_dir);
+    if runtime_installed {
+        println!("[ok] Runtime {} is installed", paths.runtime_dir.display());
+    } else {
+        let message = format!("Runtime {} is not ready", paths.runtime_dir.display());
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    if runtime_installed {
+        match inspect_installed_broker_runtime(&paths.runtime_dir, &tools) {
+            Ok(status) if status == "current" => {
+                println!("[ok] The authoritative broker matches the installed runtime")
+            }
+            Ok(status) if status == "not_running" => {
+                println!("[ok] No authoritative Ego Chat broker is currently running")
+            }
+            Ok(_) => {
+                let message = "A stale authoritative broker is still running; run ego-chat setup-claude after its active work stops".to_string();
+                println!("[fail] {message}");
+                failures.push(message);
+            }
+            Err(error) => {
+                println!("[fail] {error}");
+                failures.push(error);
+            }
+        }
+    }
+    if skill_matches(&paths.claude_skill_dir, CLAUDE_SKILL_FILES) {
+        println!(
+            "[ok] Claude Code skill {} is installed",
+            paths.claude_skill_dir.display()
+        );
+    } else {
+        let message = format!(
+            "Claude Code skill {} is missing or differs",
+            paths.claude_skill_dir.display()
+        );
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not resolve the ego-chat executable: {error}"))?;
+    let server_status = claude_server_status(&paths.claude_config, &executable)?;
+    if server_status == HostConfigStatus::Ready {
+        println!(
+            "[ok] Claude Code MCP server {MCP_SERVER_NAME} points to this executable with the required tool timeout"
+        );
+    } else {
+        let message = host_config_problem(
+            "Claude Code",
+            "timeout",
+            MCP_TOOL_TIMEOUT_MILLISECONDS,
+            "milliseconds",
+            server_status,
+        );
+        println!("[fail] {message}");
+        failures.push(message);
+    }
+
+    if failures.is_empty() {
+        println!(
+            "Ego Chat is ready. Restart open Claude Code sessions and Claude.app after configuration changes."
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "doctor-claude found {} problem(s); run ego-chat setup-claude",
+            failures.len()
+        ))
+    }
+}
+
 fn runtime_ready(runtime_dir: &Path) -> bool {
     fs::read_to_string(runtime_dir.join(RUNTIME_MARKER))
         .map(|value| value.trim() == env!("CARGO_PKG_VERSION"))
@@ -1806,6 +2008,7 @@ mod tests {
             .iter()
             .chain(SKILL_FILES.iter())
             .chain(ZCODE_SKILL_FILES.iter())
+            .chain(CLAUDE_SKILL_FILES.iter())
         {
             assert!(safe_join(Path::new("/tmp/owned"), file.path).is_ok());
             assert!(!file.bytes.is_empty());
@@ -2867,6 +3070,50 @@ mod tests {
             HostConfigStatus::Missing,
             "a rerun must take the fresh-registration path"
         );
+    }
+
+    #[test]
+    fn claude_host_paths_follow_claude_config_dir() {
+        let home = Path::new("/Users/tester");
+
+        let (config, skill) = claude_host_paths(home, None);
+        assert_eq!(config, PathBuf::from("/Users/tester/.claude.json"));
+        assert_eq!(
+            skill,
+            PathBuf::from("/Users/tester/.claude/skills/ego-chat")
+        );
+
+        let (config, skill) =
+            claude_host_paths(home, Some(Path::new("/Users/tester/claude-config")));
+        assert_eq!(
+            config,
+            PathBuf::from("/Users/tester/claude-config/.claude.json")
+        );
+        assert_eq!(
+            skill,
+            PathBuf::from("/Users/tester/claude-config/skills/ego-chat")
+        );
+    }
+
+    #[test]
+    fn claude_skill_files_carry_only_the_skill_document() {
+        assert_eq!(
+            CLAUDE_SKILL_FILES
+                .iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            ["SKILL.md"]
+        );
+        assert_eq!(CLAUDE_SKILL_FILES[0].bytes, SKILL_FILES[0].bytes);
+
+        let directory = TestDirectory::new();
+        let skill = directory.0.join("ego-chat");
+        fs::create_dir_all(&skill).expect("create skill");
+        fs::write(skill.join("SKILL.md"), "custom skill").expect("write custom skill");
+        assert!(install_skill(&skill, CLAUDE_SKILL_FILES, false).is_err());
+        install_skill(&skill, CLAUDE_SKILL_FILES, true).expect("force managed skill files");
+        assert!(skill_matches(&skill, CLAUDE_SKILL_FILES));
+        assert!(!skill.join("agents").exists());
     }
 
     #[test]
