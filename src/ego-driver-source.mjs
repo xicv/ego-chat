@@ -1024,6 +1024,21 @@ async function egoDriverMain(
         && identityMatches.length === 0
         && identityConflicts.length === 0
         && canRecreateBoundTaskSpace(input.binding)
+      if (missing && sendClickStarted) {
+        // The prompt may already have been accepted: a vanished space after the
+        // click is an ambiguous send for reconciliation, never a pre-Send retry.
+        return fail(
+          "send_confirmation_ambiguous",
+          "The send click may have occurred, but the bound Ego task space vanished before the send could be confirmed.",
+          {
+            draftMarkerCount: null,
+            renderedMarkerCount: null,
+            taskSpaceId: evidence.taskSpaceId,
+            taskSpaceMissing: true,
+            userMarkerCount: null,
+          },
+        )
+      }
       return fail(
         identityMatches.length > 1
           ? "bound_task_space_identity_ambiguous"

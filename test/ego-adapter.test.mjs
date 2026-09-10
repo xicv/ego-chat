@@ -511,6 +511,7 @@ globalThis.listTaskSpaces = async () => {
         && counters.composerMutations === 0
       )
       || (driftPoint === 'before_send_click' && counters.composerMutations >= 1)
+      || (driftPoint === 'after_send_click' && counters.mouseEvents >= 2)
     )
     return missing
       ? boundListedTaskSpaces.filter((space) => space.name !== boundIdentity.name)
@@ -2954,6 +2955,25 @@ test("a vanished bound task space is reported as missing at each critical browse
       taskSpaceDriftAtFence === "before_send_click" ? 1 : 0,
     )
   }
+})
+
+test("a bound task space that vanishes after the Send click is an ambiguous send, not a pre-Send retry", async () => {
+  const identity = { name: "vanishing-after-click-workspace", taskId: "vanishing-after-click-workspace" }
+  const stopped = await runPreSendDriverCase({
+    boundTaskSpaceIdentity: identity,
+    boundTaskSpaceOwnership: "agent",
+    taskSpaceDriftAtFence: "after_send_click",
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "send_confirmation_ambiguous")
+  assert.equal(stopped.error?.details?.evidence?.taskSpaceMissing, true)
+  assert.equal(stopped.error?.details?.evidence?.userMarkerCount, null)
+  assert.equal(stopped.error?.details?.evidence?.phase, "before_send_confirmation_result")
+  // The click was dispatched (press and release), so the prompt may have been
+  // accepted; the driver must not hand the broker a retryable pre-Send reason.
+  assert.equal(stopped.counters.mouseEvents, 2)
+  assert.equal(stopped.counters.composerMutations, 1)
+  assert.equal(stopped.taskSpaceCreations, 0)
 })
 
 test("broker task-space guards reject exact and half conflicts before numeric selection", async () => {
