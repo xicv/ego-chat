@@ -14413,3 +14413,1135 @@ test("orphan quarantine root remains descriptor-pinned across pathname replaceme
   assert.ok((await fs.readFile(path.join(quarantinePath, replacementEntries[0])))
     .equals(orphanBody))
 })
+
+test("a pre-Send bound task-space recreation is granted after the missing delay elapses and records the recovery", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-presend"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_PRESEND_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_PRESEND_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("presend-recreate")
+  const boundTaskSpaceId = 100
+  const recreatedTaskSpaceId = 101
+  let sends = 0
+  const sendParams = []
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "presend-recreate-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "presend-recreate-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "presend-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async () => {
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "presend-recreate-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "presend-recreate-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "presend-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        turnMarker,
+      }
+    },
+    sendExchange: async (params) => {
+      sends += 1
+      sendParams.push(params.taskSpaceRecovery)
+      if (params.taskSpaceRecovery === undefined) {
+        throw new EgoChatError(
+          "human_required",
+          "The durable task-space identity is no longer present in the live browser state.",
+          { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+        )
+      }
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "presend-recreate-user",
+        sentAt: new Date().toISOString(),
+        targetId: "presend-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        taskSpaceRecovery: {
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: recreatedTaskSpaceId,
+        },
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 0,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-presend",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-presend",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nContinue after the bound task space vanishes.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.ok(completed.recoveryCount >= 1)
+  assert.equal(completed.lastRecovery.code, "bound_task_space_missing")
+  assert.equal(typeof completed.lastRecovery.missingSince, "string")
+  assert.deepEqual(completed.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+  assert.equal("private" in completed, false)
+  assert.equal(sends, 2)
+  assert.equal(sendParams[0], undefined)
+  assert.deepEqual(sendParams[1], { allowRecreate: true })
+
+  const binding = broker.getConversationBinding({ bindingKey: "task-space-recovery-presend" })
+  assert.equal(binding.taskSpaceId, recreatedTaskSpaceId)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+  assert.equal(
+    events.some((event) => JSON.stringify(event).includes("bound_task_space_identity_changed")),
+    false,
+  )
+})
+
+test("a bound task-space recreation flag is withheld until the missing delay elapses", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-delay-withheld"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DELAY_WITHHELD_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DELAY_WITHHELD_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("delay-withheld")
+  const boundTaskSpaceId = 102
+  let sends = 0
+  const sendParams = []
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "delay-withheld-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "delay-withheld-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "delay-withheld-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async () => {
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "delay-withheld-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "delay-withheld-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "delay-withheld-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId,
+        turnMarker,
+      }
+    },
+    sendExchange: async (params) => {
+      sends += 1
+      sendParams.push(params.taskSpaceRecovery)
+      if (sends < 4) {
+        throw new EgoChatError(
+          "human_required",
+          "The durable task-space identity is no longer present in the live browser state.",
+          { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+        )
+      }
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "delay-withheld-user",
+        sentAt: new Date().toISOString(),
+        targetId: "delay-withheld-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 60_000,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-delay-withheld",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-delay-withheld",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nContinue while the task space briefly disappears.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.taskSpaceRecovery, undefined)
+  assert.equal(sends, 4)
+  assert.deepEqual(sendParams, [undefined, undefined, undefined, undefined])
+})
+
+test("an invalid pre-Send task-space recovery proof ends the workflow without a second send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-invalid-proof"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_INVALID_PROOF_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_INVALID_PROOF_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("invalid-proof")
+  const boundTaskSpaceId = 103
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "invalid-proof-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "invalid-proof-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "invalid-proof-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async () => {
+      throw new Error("not expected")
+    },
+    sendExchange: async () => {
+      sends += 1
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "invalid-proof-user",
+        sentAt: new Date().toISOString(),
+        targetId: "invalid-proof-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId + 1,
+        taskSpaceRecovery: {
+          extra: true,
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: boundTaskSpaceId + 1,
+        },
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-invalid-proof",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-invalid-proof",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nSend once with an invalid recovery proof.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "human_required")
+  assert.equal(completed.humanRequired.code, "task_space_recovery_proof_invalid")
+  assert.equal(sends, 1)
+})
+
+test("a capture-loop bound task-space recreation is granted and recorded", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-capture"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_CAPTURE_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_CAPTURE_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("capture-recreate")
+  const boundTaskSpaceId = 105
+  const recreatedTaskSpaceId = 106
+  let captures = 0
+  const captureParams = []
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "capture-recreate-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "capture-recreate-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "capture-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async (params) => {
+      captures += 1
+      captureParams.push(params.taskSpaceRecovery)
+      if (params.taskSpaceRecovery === undefined) {
+        throw new EgoChatError(
+          "human_required",
+          "The durable task-space identity is no longer present in the live browser state.",
+          { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+        )
+      }
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "capture-recreate-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "capture-recreate-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "capture-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        taskSpaceRecovery: {
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: recreatedTaskSpaceId,
+        },
+        turnMarker,
+      }
+    },
+    sendExchange: async () => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "capture-recreate-user",
+      sentAt: new Date().toISOString(),
+      targetId: "capture-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+      turnMarker,
+    }),
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 0,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-capture",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-capture",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nCapture after the bound task space vanishes.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.captureRecoveryCount, 1)
+  assert.equal(captures, 2)
+  assert.equal(captureParams[0], undefined)
+  assert.deepEqual(captureParams[1], { allowRecreate: true })
+  assert.deepEqual(completed.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+})
+
+test("restart reconciliation grants task-space recreation, records the outage and commits the recovered response", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const now = new Date().toISOString()
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-restart"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_RESTART_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_RESTART_TEST"
+  const prompt = `${turnMarker}\nContinue after broker restart with a vanished task space.`
+  const taskSpaceIdentity = browserTaskSpaceIdentity("restart-recreate")
+  const boundTaskSpaceId = 107
+  const recreatedTaskSpaceId = 108
+  const beforeHead = {
+    contentDigest: "a".repeat(64),
+    fingerprint: "b".repeat(64),
+    fingerprintVersion: "tail-v1",
+    messageId: "task-space-recovery-restart-assistant-before",
+    role: "assistant",
+  }
+  await store.persistBinding("binding.created", {
+    canonicalUrl,
+    createdAt: now,
+    headContentDigest: beforeHead.contentDigest,
+    headFingerprint: beforeHead.fingerprint,
+    headFingerprintVersion: beforeHead.fingerprintVersion,
+    headMessageId: beforeHead.messageId,
+    headRole: beforeHead.role,
+    key: "task-space-recovery-restart",
+    messageCount: 2,
+    mode: "existing",
+    modelPolicyKey: "chatgpt-web-default",
+    projectUrl: null,
+    revision: 1,
+    startUrl: canonicalUrl,
+    state: "bound",
+    targetId: "task-space-recovery-restart-tab",
+    taskSpaceIdentity,
+    taskSpaceId: boundTaskSpaceId,
+    updatedAt: now,
+    verifiedAt: now,
+  })
+  const workflow = {
+    bindingKey: "task-space-recovery-restart",
+    createdAt: now,
+    deadlineAt: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
+    id: "b3e0b6b1-3d0a-4c53-9a4a-3c9f7c2f5a11",
+    inputDigest: digest(prompt),
+    kind: "ego_exchange",
+    operationKey: `exchange:task-space-recovery-restart:${turnMarker}`,
+    phase: "browser_owned",
+    private: {
+      modelPolicy: {
+        enforcement: "repair_then_verify",
+        key: "chatgpt-web-default",
+        modelSelection: "strongest_available",
+        thinkingEffort: "maximum_available",
+      },
+      request: {
+        allowProtocolRepairCapture: true,
+        allowTaskSpaceReclaim: true,
+        bindingKey: "task-space-recovery-restart",
+        expectedTerminalMarker: terminalMarker,
+        prompt,
+        requestedTimeoutMs: 30_000,
+        timeoutMs: 2 * 60 * 60 * 1_000,
+        turnMarker,
+      },
+    },
+    reconciliation: {
+      allowProtocolRepairCapture: true,
+      beforeHead,
+      bindingRevision: 1,
+      expectedTerminalMarker: terminalMarker,
+      turnMarker,
+    },
+    status: "running",
+    updatedAt: now,
+  }
+  await store.persist("workflow.started", workflow)
+
+  let reconciliations = 0
+  const reconcileParams = []
+  const responseText = terminalMarker
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 0,
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      ensureModelPolicy: async () => modelPolicyObservation(),
+      reconcileBound: async (input) => {
+        reconciliations += 1
+        reconcileParams.push(input.taskSpaceRecovery)
+        if (input.taskSpaceRecovery === undefined) {
+          throw new EgoChatError(
+            "human_required",
+            "The durable task-space identity is no longer present in the live browser state.",
+            { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+          )
+        }
+        return {
+          canonicalUrl,
+          head: {
+            fingerprint: "c".repeat(64),
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(responseText),
+            lastMessageId: "task-space-recovery-restart-assistant-after",
+            lastRole: "assistant",
+            messageCount: 4,
+          },
+          responseDigest: digest(responseText),
+          responseText,
+          targetId: "task-space-recovery-restart-tab",
+          taskSpaceIdentity,
+          taskSpaceId: recreatedTaskSpaceId,
+          taskSpaceRecovery: {
+            method: "recreate",
+            previousTaskSpaceId: boundTaskSpaceId,
+            taskSpaceId: recreatedTaskSpaceId,
+          },
+          turnMarker,
+        }
+      },
+    },
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  const completed = await broker.awaitWorkflow({ timeoutMs: 3_000, workflowId: workflow.id })
+
+  assert.equal(reconciliations, 2)
+  assert.equal(reconcileParams[0], undefined)
+  assert.deepEqual(reconcileParams[1], { allowRecreate: true })
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.workflow?.id === workflow.id)
+  const retryScheduled = events.find(
+    (event) => event.type === "exchange.restart_reconciliation_retry_scheduled",
+  )
+  assert.ok(retryScheduled)
+  assert.equal(retryScheduled.workflow.lastRecovery.code, "bound_task_space_missing")
+  assert.equal(typeof retryScheduled.workflow.lastRecovery.missingSince, "string")
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.phase, "head_committed")
+  assert.deepEqual(completed.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+  assert.equal(completed.result.responseRef.digest, digest(responseText))
+  assert.equal(completed.result.taskSpaceId, recreatedTaskSpaceId)
+  assert.equal("private" in completed, false)
+
+  const recoveredBinding = broker.getConversationBinding({ bindingKey: "task-space-recovery-restart" })
+  assert.equal(recoveredBinding.taskSpaceId, recreatedTaskSpaceId)
+  assert.equal(recoveredBinding.headContentDigest, digest(responseText))
+
+  const finalEvents = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(finalEvents.some((event) => event.type === "exchange.response_captured"), true)
+  assert.equal(finalEvents.some((event) => event.type === "binding.task_space_recovered"), true)
+  assert.equal(
+    finalEvents.some((event) => JSON.stringify(event).includes("response_capture_state_invalid")),
+    false,
+  )
+})
+
+test("verifyConversation grants task-space recreation immediately and records the recovery", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-verify"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("verify-recreate")
+  const boundTaskSpaceId = 109
+  const recreatedTaskSpaceId = 110
+  const head = {
+    fingerprint: "verify-recreate-before",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "a".repeat(64),
+    lastMessageId: "verify-recreate-assistant-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  let verifyParams
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async () => ({
+        canonicalUrl,
+        head,
+        targetId: "verify-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId,
+      }),
+      verify: async (input) => {
+        verifyParams = input.taskSpaceRecovery
+        return {
+          canonicalUrl,
+          head,
+          targetId: "verify-recreate-tab",
+          taskSpaceIdentity,
+          taskSpaceId: recreatedTaskSpaceId,
+          taskSpaceRecovery: {
+            method: "recreate",
+            previousTaskSpaceId: boundTaskSpaceId,
+            taskSpaceId: recreatedTaskSpaceId,
+          },
+        }
+      },
+    },
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-verify",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const result = await broker.verifyConversation({ bindingKey: "task-space-recovery-verify" })
+
+  assert.deepEqual(verifyParams, { allowRecreate: true })
+  assert.deepEqual(result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+  assert.equal(result.taskSpaceId, recreatedTaskSpaceId)
+
+  const binding = broker.getConversationBinding({ bindingKey: "task-space-recovery-verify" })
+  assert.equal(binding.taskSpaceId, recreatedTaskSpaceId)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+})
+
+test("reconcileConversation grants task-space recreation through reconcileBound and records the recovery", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-reconcile"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_RECONCILE_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_RECONCILE_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("reconcile-recreate")
+  const boundTaskSpaceId = 111
+  const recreatedTaskSpaceId = 112
+  const beforeHead = {
+    fingerprint: "reconcile-recreate-before",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "a".repeat(64),
+    lastMessageId: "reconcile-recreate-assistant-before",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  let reconcileParams
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: beforeHead,
+      targetId: "reconcile-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "human_required",
+        "The Send confirmation is ambiguous.",
+        { reason: "send_confirmation_ambiguous", evidence: { modelPolicy: modelPolicyObservation() } },
+      )
+    },
+    reconcileBound: async (input) => {
+      reconcileParams = input.taskSpaceRecovery
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "reconcile-recreate-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "reconcile-recreate-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "reconcile-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        taskSpaceRecovery: {
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: recreatedTaskSpaceId,
+        },
+        turnMarker: input.turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-reconcile",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-reconcile",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(stopped.humanRequired.code, "send_confirmation_ambiguous")
+
+  await broker.reconcileConversation({
+    bindingKey: "task-space-recovery-reconcile",
+    workflowId: started.id,
+  })
+
+  assert.deepEqual(reconcileParams, { allowRecreate: true })
+  assert.deepEqual(
+    broker.getWorkflow({ workflowId: started.id }).taskSpaceRecovery,
+    {
+      method: "recreate",
+      previousTaskSpaceId: boundTaskSpaceId,
+      taskSpaceId: recreatedTaskSpaceId,
+    },
+  )
+  const binding = broker.getConversationBinding({ bindingKey: "task-space-recovery-reconcile" })
+  assert.equal(binding.taskSpaceId, recreatedTaskSpaceId)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+})
+
+test("reanchorConversation grants task-space recreation and returns the recovery record", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const initialHead = {
+    fingerprint: "a".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "b".repeat(64),
+    lastMessageId: "task-space-recovery-reanchor-initial-assistant",
+    lastRole: "assistant",
+    messageCount: 2,
+  }
+  const observedHead = {
+    fingerprint: "c".repeat(64),
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "d".repeat(64),
+    lastMessageId: "task-space-recovery-reanchor-external-assistant",
+    lastRole: "assistant",
+    messageCount: 4,
+    renderedMessageCount: 4,
+  }
+  const headChange = {
+    changeKind: "message_appended",
+    expectedFingerprint: initialHead.fingerprint,
+    expectedMessageCount: 2,
+    expectedRole: "assistant",
+    observedFingerprint: observedHead.fingerprint,
+    observedRenderedMessageCount: 4,
+    observedRole: "assistant",
+  }
+  const taskSpaceIdentity = {
+    name: "task-space-recovery-reanchor-space",
+    taskId: "task-space-recovery-reanchor-space",
+  }
+  const boundTaskSpaceId = 113
+  const recreatedTaskSpaceId = 114
+  let reanchorParams
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: initialHead,
+      targetId: "task-space-recovery-reanchor-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "human_required",
+        "The bound conversation head changed outside the broker workflow.",
+        { evidence: { headChange }, reason: "conversation_head_changed" },
+      )
+    },
+    reanchor: async (input) => {
+      reanchorParams = input.taskSpaceRecovery
+      return {
+        canonicalUrl: input.binding.canonicalUrl,
+        head: observedHead,
+        headChange,
+        targetId: "task-space-recovery-reanchor-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        taskSpaceRecovery: {
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: recreatedTaskSpaceId,
+        },
+      }
+    },
+  }
+  const store = new EventStore(dataDir)
+  const broker = new Broker({ egoAdapter, store })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-reanchor",
+    canonicalUrl: "https://chatgpt.com/c/task-space-recovery-reanchor",
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_REANCHOR_TEST"
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-reanchor",
+    expectedTerminalMarker: "EGO_CHAT_TASK_SPACE_RECOVERY_REANCHOR_DONE",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  const reanchored = await broker.reanchorConversation({
+    acknowledgeExternalChange: true,
+    bindingKey: "task-space-recovery-reanchor",
+    expectedBindingRevision: 1,
+    expectedObservedHeadFingerprint: observedHead.fingerprint,
+    sourceWorkflowId: stopped.id,
+  })
+
+  assert.deepEqual(reanchorParams, { allowRecreate: true })
+  assert.deepEqual(reanchored.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+  assert.equal(reanchored.taskSpaceId, recreatedTaskSpaceId)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.reanchored"), true)
+})
+
+test("a driver crash at a pre-composition stage retries through the pre-Send backoff without draftCleared", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-driver-retry"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DRIVER_RETRY_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DRIVER_RETRY_TEST"
+  const taskSpaceId = 115
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "driver-retry-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "driver-retry-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "driver-retry-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+      taskSpaceId,
+    }),
+    captureExchange: async () => {
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "driver-retry-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "driver-retry-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "driver-retry-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+        taskSpaceId,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => {
+      sends += 1
+      if (sends <= 2) {
+        throw new EgoChatError(
+          "ego_driver_error",
+          "The fixed Ego Browser driver failed.",
+          { driverStage: "selecting_conversation" },
+        )
+      }
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "driver-retry-user",
+        sentAt: new Date().toISOString(),
+        targetId: "driver-retry-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+        taskSpaceId,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-driver-retry",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: taskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-driver-retry",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nContinue after a proven pre-composition driver crash.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.recoveryCount, 2)
+  assert.equal(completed.lastRecovery.code, "ego_driver_error")
+  assert.equal(completed.lastRecovery.driverStage, "selecting_conversation")
+  assert.equal(sends, 3)
+})
+
+test("a driver crash after prompt composition without draftCleared still ends as an interrupted pre-Send operation", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-driver-terminal"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DRIVER_TERMINAL_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_DRIVER_TERMINAL_TEST"
+  const taskSpaceId = 116
+  let sends = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "driver-terminal-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "driver-terminal-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "driver-terminal-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+      taskSpaceId,
+    }),
+    captureExchange: async () => {
+      throw new Error("not expected")
+    },
+    sendExchange: async () => {
+      sends += 1
+      throw new EgoChatError(
+        "ego_driver_error",
+        "The fixed Ego Browser driver failed.",
+        { driverStage: "verifying_composed_prompt" },
+      )
+    },
+  }
+  const broker = new Broker({
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-driver-terminal",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: taskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-driver-terminal",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nA driver crash after composition without draftCleared is not provable.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "human_required")
+  assert.equal(
+    completed.humanRequired.code,
+    "browser_operation_interrupted_before_send_confirmation",
+  )
+  assert.equal(sends, 1)
+})
+
+test("reconcileConversation proves delivery absent for a pre-composition driver crash without draftCleared", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const taskSpaceId = 117
+  const beforeHead = {
+    fingerprint: "task-space-recovery-absence-tail",
+    fingerprintVersion: "tail-v1",
+    lastContentDigest: "c".repeat(64),
+    lastMessageId: "task-space-recovery-absence-assistant",
+    lastRole: "assistant",
+    messageCount: 8,
+  }
+  let reconciliationCalls = 0
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: beforeHead,
+      targetId: "task-space-recovery-absence-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+      taskSpaceId,
+    }),
+    exchange: async () => {
+      throw new EgoChatError(
+        "ego_driver_error",
+        "The fixed Ego Browser driver failed.",
+        { driverStage: "selecting_conversation" },
+      )
+    },
+    reconcileBound: async (input) => {
+      reconciliationCalls += 1
+      assert.equal(input.allowDeliveryAbsent, true)
+      return {
+        canonicalUrl: input.binding.canonicalUrl,
+        deliveryState: "absent",
+        head: beforeHead,
+        targetId: "task-space-recovery-absence-tab",
+        taskSpaceIdentity: browserTaskSpaceIdentity(String(taskSpaceId)),
+        taskSpaceId,
+        turnMarker: input.turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-absence",
+    canonicalUrl: "https://chatgpt.com/c/task-space-recovery-absence",
+    mode: "existing",
+    taskSpace: taskSpaceId,
+  })
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_ABSENCE_TEST"
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-absence",
+    expectedTerminalMarker: "EGO_CHAT_TASK_SPACE_RECOVERY_ABSENCE_DONE",
+    prompt: `${turnMarker}\nreview`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(
+    stopped.humanRequired.code,
+    "browser_operation_interrupted_before_send_confirmation",
+  )
+  assert.deepEqual(stopped.reconciliation.browserInterruption, {
+    errorCode: "ego_driver_error",
+    driverStage: "selecting_conversation",
+  })
+
+  const reconciled = await broker.reconcileConversation({
+    bindingKey: "task-space-recovery-absence",
+    workflowId: stopped.id,
+  })
+
+  assert.equal(reconciled.recovery.deliveryState, "absent")
+  assert.equal(reconciliationCalls, 1)
+})
+
+test("the broker rejects a negative bound task-space recreation delay", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  assert.throws(
+    () => new Broker({
+      boundTaskSpaceRecreateDelayMs: -1,
+      egoAdapter: unusedEgoAdapter,
+      store: new EventStore(dataDir),
+    }),
+    TypeError,
+  )
+})
