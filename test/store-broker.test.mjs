@@ -14828,6 +14828,254 @@ test("a capture-loop bound task-space recreation is granted and recorded", async
   assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
 })
 
+test("a recreation observed during a pending capture is retained and closes the outage", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-pending-capture"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_PENDING_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_PENDING_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("pending-recreate")
+  const boundTaskSpaceId = 109
+  const recreatedTaskSpaceId = 110
+  const responseText = terminalMarker
+  const recovery = {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  }
+  const captureParams = []
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "pending-recreate-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "pending-recreate-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "pending-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async (params) => {
+      captureParams.push(params.taskSpaceRecovery)
+      if (captureParams.length === 1) {
+        throw new EgoChatError(
+          "human_required",
+          "The bound Ego task space is not present in the live browser state.",
+          { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+        )
+      }
+      if (captureParams.length === 2) {
+        return {
+          canonicalUrl,
+          captureReason: "generation_running",
+          captureState: "pending",
+          generationRunning: true,
+          promptMessageId: "pending-recreate-user",
+          targetId: "pending-recreate-tab",
+          taskSpaceIdentity,
+          taskSpaceId: recreatedTaskSpaceId,
+          taskSpaceRecovery: { ...recovery },
+          turnMarker,
+        }
+      }
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "pending-recreate-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "pending-recreate-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "pending-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "pending-recreate-user",
+      sentAt: new Date().toISOString(),
+      targetId: "pending-recreate-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+      turnMarker,
+    }),
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 0,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-pending",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-pending",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nCapture across a pending observation after recreation.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.deepEqual(captureParams, [undefined, { allowRecreate: true }, undefined])
+  assert.deepEqual(completed.taskSpaceRecovery, recovery)
+  assert.deepEqual(completed.result.taskSpaceRecovery, recovery)
+  assert.equal(completed.lastCaptureRecovery.code, "bound_task_space_missing")
+  assert.equal(typeof completed.lastCaptureRecovery.resolvedAt, "string")
+  assert.equal("private" in completed, false)
+  const binding = broker.getConversationBinding({ bindingKey: "task-space-recovery-pending" })
+  assert.equal(binding.taskSpaceId, recreatedTaskSpaceId)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "exchange.task_space_restored"), true)
+  assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+  assert.equal(events.some((event) => event.type === "binding.verified"), false)
+})
+
+test("a later disappearance during the same capture earns its own recreation delay", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/task-space-recovery-second-outage"
+  const terminalMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_SECOND_OUTAGE_DONE"
+  const turnMarker = "EGO_CHAT_TASK_SPACE_RECOVERY_SECOND_OUTAGE_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("second-outage")
+  const boundTaskSpaceId = 111
+  const responseText = terminalMarker
+  const captureParams = []
+  const missing = () => new EgoChatError(
+    "human_required",
+    "The bound Ego task space is not present in the live browser state.",
+    { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+  )
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: {
+        fingerprint: "second-outage-before",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: "a".repeat(64),
+        lastMessageId: "second-outage-assistant-before",
+        lastRole: "assistant",
+        messageCount: 2,
+      },
+      targetId: "second-outage-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async (params) => {
+      captureParams.push(params.taskSpaceRecovery)
+      if (captureParams.length === 1 || captureParams.length === 3) {
+        throw missing()
+      }
+      if (captureParams.length === 2) {
+        return {
+          canonicalUrl,
+          captureReason: "generation_running",
+          captureState: "pending",
+          generationRunning: true,
+          promptMessageId: "second-outage-user",
+          targetId: "second-outage-tab",
+          taskSpaceIdentity,
+          taskSpaceId: boundTaskSpaceId,
+          turnMarker,
+        }
+      }
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "second-outage-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "second-outage-assistant-after",
+          lastRole: "assistant",
+          messageCount: 4,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "second-outage-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId,
+        turnMarker,
+      }
+    },
+    sendExchange: async () => ({
+      canonicalUrl,
+      modelPolicy: modelPolicyObservation(),
+      promptMessageId: "second-outage-user",
+      sentAt: new Date().toISOString(),
+      targetId: "second-outage-tab",
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+      turnMarker,
+    }),
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 5_000,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "task-space-recovery-second-outage",
+    canonicalUrl,
+    mode: "existing",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "task-space-recovery-second-outage",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nTwo separate outages during one capture.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.captureRecoveryCount, 2)
+  assert.deepEqual(captureParams, [undefined, undefined, undefined, undefined])
+  assert.equal("taskSpaceRecovery" in completed, false)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  const outages = events
+    .filter((event) => event.type === "exchange.capture_failed")
+    .map((event) => event.workflow.lastCaptureRecovery)
+  assert.equal(outages.length, 2)
+  assert.equal(outages[0].missingSince, outages[0].at)
+  assert.equal(outages[1].missingSince, outages[1].at)
+  assert.notEqual(outages[1].missingSince, outages[0].missingSince)
+  assert.equal(events.filter((event) => event.type === "exchange.task_space_restored").length, 2)
+})
+
 test("restart reconciliation grants task-space recreation, records the outage and commits the recovered response", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

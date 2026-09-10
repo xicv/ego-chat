@@ -3896,7 +3896,7 @@ export class Broker {
   #browserRecoveryRecord(error, attempt, previous) {
     const record = this.#recoveryRecord(error, attempt)
     if (record.code === "bound_task_space_missing") {
-      record.missingSince = previous?.code === "bound_task_space_missing"
+      record.missingSince = previous?.code === "bound_task_space_missing" && !previous.resolvedAt
         ? (previous.missingSince ?? previous.at)
         : record.at
     }
@@ -3907,7 +3907,7 @@ export class Broker {
   // has stayed missing across the configured delay, so a browser that is still
   // restoring its spaces is not handed a duplicate.
   #taskSpaceRecoveryInput(record) {
-    if (record?.code !== "bound_task_space_missing") {
+    if (record?.code !== "bound_task_space_missing" || record.resolvedAt) {
       return undefined
     }
     const missingSince = Date.parse(record.missingSince ?? record.at)
@@ -4590,6 +4590,32 @@ export class Broker {
                 owner: workflow.id,
                 result: captured,
               })
+              const restoredTaskSpace = validateTaskSpaceRecovery(captured.taskSpaceRecovery)
+              const captureOutage = current.lastCaptureRecovery
+              const outageResolved = captureOutage?.code === "bound_task_space_missing"
+                && !captureOutage.resolvedAt
+              if (
+                outageResolved
+                || (restoredTaskSpace
+                  && !isDeepStrictEqual(current.private.captureTaskSpaceRecovery, restoredTaskSpace))
+              ) {
+                // The bound space is live again: persist any recreation evidence now
+                // (a pending capture would otherwise drop it) and close the outage so
+                // a later disappearance earns its own recreation delay.
+                await this.#transition(current, "exchange.task_space_restored", {
+                  ...(restoredTaskSpace ? { taskSpaceRecovery: restoredTaskSpace } : {}),
+                  ...(outageResolved
+                    ? { lastCaptureRecovery: { ...captureOutage, resolvedAt: new Date().toISOString() } }
+                    : {}),
+                  ...(restoredTaskSpace
+                    ? { private: { ...current.private, captureTaskSpaceRecovery: restoredTaskSpace } }
+                    : {}),
+                }, { touchUpdatedAt: false })
+                current = this.#store.getWorkflow(workflow.id)
+                if (!current || current.status !== "running") {
+                  return
+                }
+              }
               if (captured.captureState === "provider_terminal") {
                 const providerTerminal = {
                   ...ProviderTerminalObservationSchema.parse(captured.providerTerminal),
@@ -4702,6 +4728,7 @@ export class Broker {
                 result.taskSpaceControlRecovery = taskSpaceControlRecovery
               }
               const captureRecovery = validateTaskSpaceRecovery(captured.taskSpaceRecovery)
+                ?? validateTaskSpaceRecovery(current.private.captureTaskSpaceRecovery)
                 ?? validateTaskSpaceRecovery(current.private.send.taskSpaceRecovery)
               if (captureRecovery) {
                 result.taskSpaceRecovery = captureRecovery
