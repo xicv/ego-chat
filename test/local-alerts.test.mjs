@@ -212,6 +212,26 @@ test("formatAlertMessage truncates the message to 120 characters and includes id
   assert.equal(truncatedPortion.length, 120)
 })
 
+test("formatAlertMessage renders a model_downgrade alert without a status or phase", () => {
+  const alert = {
+    at: new Date().toISOString(),
+    bindingKey: "ego-chat-main",
+    code: "answering_model_downgraded",
+    kind: "model_downgrade",
+    message: "ego-chat-main answered by gpt-5-6-thinking after gpt-6-pro",
+    phase: null,
+    status: null,
+    workflowId: "abcdefgh-1234-4000-8000-000000000002",
+    workflowKind: "ego_exchange",
+  }
+  const message = formatAlertMessage(alert)
+  assert.equal(
+    message,
+    "ego_exchange · model downgrade · answering_model_downgraded · abcdefgh: "
+      + "ego-chat-main answered by gpt-5-6-thinking after gpt-6-pro",
+  )
+})
+
 test("formatAlertMessage is safe to JSON-quote for AppleScript when it contains quotes and newlines", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: true, recursive: true }))

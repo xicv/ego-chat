@@ -16395,3 +16395,228 @@ test("the broker rejects a negative bound task-space recreation delay", async (t
     TypeError,
   )
 })
+
+function fakeAlertSink() {
+  const alerts = []
+  return {
+    alerts,
+    describe: () => ({ enabled: true, reason: null, sound: "Glass", webhook: false }),
+    notify: async (alert) => {
+      alerts.push(alert)
+      return { channels: [{ channel: "macos", outcome: "accepted" }] }
+    },
+  }
+}
+
+// A minimal `bind` + `exchange` adapter whose captured response carries a
+// caller-chosen `head.lastModelSlug` per call, consumed in order and keyed
+// by binding, so a test can script exactly which answering model "responds"
+// to each exchange on each binding.
+function slugAdapter(slugsByBindingKey) {
+  const counts = {}
+  return {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: input.canonicalUrl,
+      head: { fingerprint: `${input.canonicalUrl}-head-0`, lastRole: "assistant", messageCount: 2 },
+      targetId: `${input.bindingKey}-tab`,
+      taskSpaceIdentity: browserTaskSpaceIdentity(input.bindingKey),
+      taskSpaceId: 10,
+    }),
+    exchange: async (input) => {
+      const key = input.binding.key
+      const index = counts[key] ?? 0
+      counts[key] = index + 1
+      const slug = slugsByBindingKey[key][index]
+      const responseText = `Answer ${key} ${index}.\n${input.expectedTerminalMarker}`
+      const responseDigest = digest(responseText)
+      return {
+        canonicalUrl: input.binding.canonicalUrl,
+        durationMs: 5,
+        head: {
+          fingerprint: `${key}-head-${index + 1}`,
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: responseDigest,
+          lastMessageId: `${key}-assistant-${index + 1}`,
+          lastModelSlug: slug,
+          lastRole: "assistant",
+          messageCount: 2 + (index + 1) * 2,
+        },
+        modelPolicy: modelPolicyObservation(),
+        responseDigest,
+        responseText,
+        targetId: `${key}-tab`,
+        taskSpaceIdentity: browserTaskSpaceIdentity(key),
+        taskSpaceId: 10,
+        turnMarker: input.turnMarker,
+      }
+    },
+  }
+}
+
+async function runSlugExchange(broker, bindingKey, n) {
+  const turnMarker = `EGO_CHAT_SLUG_${bindingKey.toUpperCase().replace(/-/g, "_")}_${n}`
+  const started = await broker.startEgoExchange({
+    bindingKey,
+    expectedTerminalMarker: `${turnMarker}_DONE`,
+    prompt: `${turnMarker}\nReview this.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  return broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+}
+
+test("an answering-model downgrade on one binding dispatches one model_downgrade alert and records a downgrade ledger entry", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const sink = fakeAlertSink()
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    alertSink: sink,
+    egoAdapter: slugAdapter({ "downgrade-binding": ["gpt-6-pro", "gpt-5-6-thinking"] }),
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "downgrade-binding",
+    canonicalUrl: "https://chatgpt.com/c/downgrade-binding",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  const first = await runSlugExchange(broker, "downgrade-binding", 1)
+  assert.equal(first.status, "succeeded")
+  assert.equal(sink.alerts.length, 0)
+
+  const second = await runSlugExchange(broker, "downgrade-binding", 2)
+  assert.equal(second.status, "succeeded")
+
+  assert.equal(sink.alerts.length, 1)
+  const alert = sink.alerts[0]
+  assert.equal(alert.kind, "model_downgrade")
+  assert.equal(alert.code, "answering_model_downgraded")
+  assert.equal(alert.bindingKey, "downgrade-binding")
+  assert.equal(alert.status, null)
+  assert.equal(alert.phase, null)
+  assert.equal(alert.workflowId, second.id)
+  assert.equal(alert.workflowKind, "ego_exchange")
+  assert.equal(alert.message, "downgrade-binding answered by gpt-5-6-thinking after gpt-6-pro")
+  assert.ok(Number.isFinite(Date.parse(alert.at)))
+
+  const modelPolicy = broker.getModelPolicy()
+  assert.deepEqual(modelPolicy.lastDowngrade, {
+    at: alert.at,
+    bindingKey: "downgrade-binding",
+    previousSlug: "gpt-6-pro",
+    slug: "gpt-5-6-thinking",
+    workflowId: second.id,
+  })
+})
+
+test("an answering-model upgrade dispatches no alert and records no downgrade", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const sink = fakeAlertSink()
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    alertSink: sink,
+    egoAdapter: slugAdapter({ "upgrade-binding": ["gpt-5-6-thinking", "gpt-6-pro"] }),
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "upgrade-binding",
+    canonicalUrl: "https://chatgpt.com/c/upgrade-binding",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  await runSlugExchange(broker, "upgrade-binding", 1)
+  await runSlugExchange(broker, "upgrade-binding", 2)
+
+  assert.equal(sink.alerts.length, 0)
+  assert.equal(broker.getModelPolicy().lastDowngrade, undefined)
+})
+
+test("an unchanged answering model dispatches no alert and records no downgrade", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const sink = fakeAlertSink()
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    alertSink: sink,
+    egoAdapter: slugAdapter({ "steady-binding": ["gpt-6-pro", "gpt-6-pro"] }),
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "steady-binding",
+    canonicalUrl: "https://chatgpt.com/c/steady-binding",
+    mode: "existing",
+    taskSpace: 10,
+  })
+
+  await runSlugExchange(broker, "steady-binding", 1)
+  await runSlugExchange(broker, "steady-binding", 2)
+
+  assert.equal(sink.alerts.length, 0)
+  assert.equal(broker.getModelPolicy().lastDowngrade, undefined)
+})
+
+test("a restart between two exchanges on different bindings still detects a downgrade via the seeded per-binding map", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const sink = fakeAlertSink()
+  const adapter = slugAdapter({
+    "restart-binding-a": ["gpt-6-pro", "gpt-5-6-thinking"],
+    "restart-binding-b": ["gpt-5-5"],
+  })
+
+  const firstStore = new EventStore(dataDir)
+  const firstBroker = new Broker({ alertSink: sink, egoAdapter: adapter, store: firstStore })
+  await firstBroker.initialize()
+  await firstBroker.bindConversation({
+    bindingKey: "restart-binding-a",
+    canonicalUrl: "https://chatgpt.com/c/restart-binding-a",
+    mode: "existing",
+    taskSpace: 10,
+  })
+  await firstBroker.bindConversation({
+    bindingKey: "restart-binding-b",
+    canonicalUrl: "https://chatgpt.com/c/restart-binding-b",
+    mode: "existing",
+    taskSpace: 11,
+  })
+  // binding-a answers first, then binding-b answers, so the single durable
+  // model-policy record's lastObserved now belongs to binding-b, not
+  // binding-a; only the seeded per-binding map still knows binding-a's slug.
+  await runSlugExchange(firstBroker, "restart-binding-a", 1)
+  await runSlugExchange(firstBroker, "restart-binding-b", 1)
+  assert.equal(firstStore.getModelPolicy("chatgpt-web-default").lastObserved.bindingKey, "restart-binding-b")
+  firstBroker.close()
+
+  const secondStore = new EventStore(dataDir)
+  const secondBroker = new Broker({ alertSink: sink, egoAdapter: adapter, store: secondStore })
+  await secondBroker.initialize()
+  t.after(() => secondBroker.close())
+
+  const downgraded = await runSlugExchange(secondBroker, "restart-binding-a", 2)
+  assert.equal(downgraded.status, "succeeded")
+
+  assert.equal(sink.alerts.length, 1)
+  const alert = sink.alerts[0]
+  assert.equal(alert.kind, "model_downgrade")
+  assert.equal(alert.bindingKey, "restart-binding-a")
+  assert.equal(alert.message, "restart-binding-a answered by gpt-5-6-thinking after gpt-6-pro")
+
+  assert.deepEqual(secondBroker.getModelPolicy().lastDowngrade, {
+    at: alert.at,
+    bindingKey: "restart-binding-a",
+    previousSlug: "gpt-6-pro",
+    slug: "gpt-5-6-thinking",
+    workflowId: downgraded.id,
+  })
+})

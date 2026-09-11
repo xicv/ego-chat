@@ -48,6 +48,36 @@ test("convergence accepts exactly eight hours and rejects a larger attachment wi
   )
 })
 
+test("answeringModelPolicy defaults to alert and rejects an unknown value on both exchange and convergence input", () => {
+  const exchangeInput = {
+    bindingKey: "ego-chat-main",
+    expectedTerminalMarker: "DONE",
+    prompt: "EGO_CHAT_ANSWERING_MODEL_POLICY\nreview",
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_ANSWERING_MODEL_POLICY",
+  }
+  assert.equal(parse(EgoExchangeSchema, exchangeInput).answeringModelPolicy, "alert")
+  assert.equal(
+    parse(EgoExchangeSchema, { ...exchangeInput, answeringModelPolicy: "pause" }).answeringModelPolicy,
+    "pause",
+  )
+  assert.throws(
+    () => parse(EgoExchangeSchema, { ...exchangeInput, answeringModelPolicy: "ignore" }),
+    (error) => error.code === "invalid_input",
+  )
+
+  assert.equal(parse(StartConvergenceSchema, convergenceInput(MAX_WAIT_MS)).answeringModelPolicy, "alert")
+  assert.equal(
+    parse(StartConvergenceSchema, { ...convergenceInput(MAX_WAIT_MS), answeringModelPolicy: "pause" })
+      .answeringModelPolicy,
+    "pause",
+  )
+  assert.throws(
+    () => parse(StartConvergenceSchema, { ...convergenceInput(MAX_WAIT_MS), answeringModelPolicy: "ignore" }),
+    (error) => error.code === "invalid_input",
+  )
+})
+
 test("receipt-enabled exchange input is closed and selected only before Send", () => {
   const input = {
     bindingKey: "a3k-canary",
