@@ -5629,6 +5629,61 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(replayedWorkflow.result.modelPolicy.sourceWorkflowId, started.id)
 })
 
+test("captured responses record the answering model slug on the exchange result and the verified policy", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adopted-model-slug"
+  const responseText = "The answer, at maximum thinking."
+  const responseDigest = digest(responseText)
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    adopt: async () => ({
+      adoptedWhileGenerating: false,
+      anchor: {
+        contentDigest: "a".repeat(64),
+        messageId: "adopt-user-1",
+      },
+      canonicalUrl,
+      durationMs: 1_000,
+      head: {
+        fingerprint: "adopted-head-slug",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: responseDigest,
+        lastMessageId: "adopt-assistant-1",
+        lastModelSlug: "gpt-6-pro",
+        lastRole: "assistant",
+        messageCount: 2,
+        renderedMessageCount: 2,
+      },
+      modelPolicy: modelPolicyObservation({ modelLabel: "Latest", effortLabel: "6 Pro", pillLabel: "6 Pro" }),
+      responseDigest,
+      responseText,
+      targetId: "adopted-tab",
+      taskSpaceIdentity: {
+        name: "adopted-model-slug-space",
+        taskId: "adopted-model-slug-space",
+      },
+      taskSpaceId: 10,
+    }),
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const started = await broker.startConversationAdoption({
+    bindingKey: "adopted-model-slug",
+    canonicalUrl,
+    taskSpace: 10,
+    timeoutMs: 30_000,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.modelPolicy.responseModelSlug, "gpt-6-pro")
+
+  const modelPolicy = broker.getModelPolicy()
+  assert.equal(modelPolicy.lastObserved.responseModelSlug, "gpt-6-pro")
+})
+
 test("conversation adoption rejects a complete capture without stable task-space identity", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

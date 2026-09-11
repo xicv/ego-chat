@@ -983,6 +983,7 @@ console.log('__EGO_CHAT_REANCHOR_CREATIONS__' + JSON.stringify(taskSpaceCreation
 async function runAdoptionDriverCase({
   additionalTaskSpaces = [],
   allowTaskSpaceReclaim = false,
+  assistantModelSlug = null,
   currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
   driftAtFinalResult = false,
@@ -1101,6 +1102,7 @@ const messages = () => {
     },
     {
       messageId: 'adopt-assistant-1',
+      modelSlug: ${JSON.stringify(assistantModelSlug)},
       role: 'assistant',
       text: generating ? 'Partial review' : 'The stable long review is complete.',
     },
@@ -3555,6 +3557,18 @@ test("a permanently disabled power control stops with policy_power_disabled", as
   assert.equal(stopped.error?.details?.reason, "model_policy_ui_unknown")
   assert.equal(stopped.error?.details?.evidence?.uiReason, "policy_power_disabled")
   assert.equal(stopped.counters.policyDomEvents.filter((event) => event.kind === "power_step").length, 0)
+})
+
+test("captured responses record the answering model slug", async () => {
+  const adopted = await runAdoptionDriverCase({ assistantModelSlug: "gpt-6-pro" })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.head.lastModelSlug, "gpt-6-pro")
+})
+
+test("a captured response without a model slug attribute yields null", async () => {
+  const adopted = await runAdoptionDriverCase({})
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.head.lastModelSlug, null)
 })
 
 test("composer-owned model policy rejects missing, wrong, broad, or ambiguous menu ownership", async (t) => {

@@ -483,6 +483,9 @@ async function egoDriverMain(
           messageId: imageOnly
             ? message.getAttribute('data-turn-id')
             : message.getAttribute('data-message-id'),
+          modelSlug: !imageOnly && role === 'assistant'
+            ? (message.getAttribute('data-message-model-slug') || null)
+            : null,
           role,
           text: String(content || ''),
         }
@@ -499,6 +502,7 @@ async function egoDriverMain(
           }
         : {}),
       messageId: message.messageId,
+      modelSlug: message.modelSlug ?? null,
       role: message.role,
       text: message.text,
     }))
@@ -602,6 +606,7 @@ async function egoDriverMain(
       fingerprintVersion: "tail-v1",
       lastContentDigest: last?.contentDigest ?? null,
       lastMessageId: last?.messageId ?? null,
+      lastModelSlug: last?.modelSlug ?? null,
       lastRole: last?.role ?? null,
       messageCount: Number.isInteger(logicalMessageCount) ? logicalMessageCount : entries.length,
       renderedMessageCount: entries.length,

@@ -2296,9 +2296,10 @@ export class Broker {
           { reason: "recovered_response_digest_mismatch" },
         )
       }
-      const recoveredModelPolicyObservation = this.#validateModelPolicyObservation(
-        workflow.result?.modelPolicy ?? persisted.modelPolicyObservation,
-      )
+      const recoveredModelPolicyObservation = this.#validateModelPolicyObservation({
+        ...(workflow.result?.modelPolicy ?? persisted.modelPolicyObservation),
+        responseModelSlug: verified.head?.lastModelSlug ?? null,
+      })
       if (!capturedRecovery) {
         await this.#assertBrokerAuthority("before_reconciled_response_capture_commit")
         const responseRef = await this.#store.putBlob(verified.responseText, {
@@ -4312,7 +4313,10 @@ export class Broker {
           result: {
             ...verified,
             ...(restartTaskSpaceRecovery ? { taskSpaceRecovery: restartTaskSpaceRecovery } : {}),
-            modelPolicy: this.#validateModelPolicyObservation(observedPolicy),
+            modelPolicy: this.#validateModelPolicyObservation({
+              ...observedPolicy,
+              responseModelSlug: verified.head?.lastModelSlug ?? null,
+            }),
           },
         }
       } catch (error) {
@@ -4801,7 +4805,10 @@ export class Broker {
           effectiveWorkflowBinding(binding, current),
         )
         result = { ...result, ...resultIdentity }
-        const observation = this.#validateModelPolicyObservation(result.modelPolicy)
+        const observation = this.#validateModelPolicyObservation({
+          ...result.modelPolicy,
+          responseModelSlug: result.head?.lastModelSlug ?? null,
+        })
         validateTaskSpaceControlRecovery(result.taskSpaceControlRecovery)
         if (
           typeof result.responseText !== "string"
@@ -6998,7 +7005,10 @@ export class Broker {
     }
     return {
       ...structuredClone(capture),
-      modelPolicy: this.#validateModelPolicyObservation(capture.modelPolicy),
+      modelPolicy: this.#validateModelPolicyObservation({
+        ...capture.modelPolicy,
+        responseModelSlug: capture.head?.lastModelSlug ?? null,
+      }),
     }
   }
 
