@@ -2528,7 +2528,13 @@ export class EventStore {
     }
 
     applyEvent(this.#state, event)
-    const persistedResponseDigest = event.workflow?.result?.responseRef?.digest
+    // Read the committed record back out of state rather than off the event
+    // payload: applyEvent() may transform event.workflow before storing it
+    // (see preserveConvergenceLivenessCheckpoint), so state is the only
+    // reliable source for what was actually persisted.
+    const persistedResponseDigest = typeof event.workflow?.id === "string"
+      ? this.#state.workflows[event.workflow.id]?.result?.responseRef?.digest
+      : undefined
     if (typeof persistedResponseDigest === "string") {
       this.#pendingBlobDigests.delete(persistedResponseDigest)
     }
