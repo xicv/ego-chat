@@ -1487,14 +1487,31 @@ async function egoDriverMain(
     return validTaskSpaceIdentity(identity) && identity.name === identity.taskId
   }
 
+  // A create-once binding that has not yet been promoted to "bound" still
+  // deserves the exact same Space-recovery treatment once its workflow
+  // carries confirmed-Send evidence with a real canonical /c/ URL: the
+  // provisional startUrl is deliberately excluded so a pre-Send create-once
+  // tab (whose canonicalUrl is not yet a conversation) stays out of scope.
   function canRecreateBoundTaskSpace(binding) {
-    return binding?.state === "bound"
+    if (
+      !Number.isSafeInteger(binding?.taskSpaceId)
+      || binding.taskSpaceId < 1
+      || typeof binding?.targetId !== "string"
+      || binding.targetId.length === 0
+      || !recreatableTaskSpaceIdentity(binding?.taskSpaceIdentity)
+    ) {
+      return false
+    }
+    if (binding.state === "bound") {
+      return typeof binding.canonicalUrl === "string"
+        && binding.canonicalUrl.length > 0
+        && ["capture_exchange", "exchange", "reanchor", "reconcile_bound", "verify"].includes(input.mode)
+    }
+    return binding.state === "unbound"
+      && input.mode === "capture_exchange"
       && typeof binding.canonicalUrl === "string"
       && binding.canonicalUrl.length > 0
-      && Number.isSafeInteger(binding.taskSpaceId)
-      && binding.taskSpaceId > 0
-      && recreatableTaskSpaceIdentity(binding.taskSpaceIdentity)
-      && ["capture_exchange", "exchange", "reanchor", "reconcile_bound", "verify"].includes(input.mode)
+      && isCanonicalConversationUrl(binding.canonicalUrl)
   }
 
   function taskSpaceRecreateGranted() {
@@ -3722,8 +3739,53 @@ async function egoDriverMain(
         })
         return
       }
-      selected = await selectExactTarget(input.binding.taskSpaceId, input.binding.targetId)
-      if (!selected) {
+      // A confirmed create-once send whose task space is still recreatable is
+      // treated exactly like a bound binding for Space recovery: the space
+      // selection (and, on an actual recreation, reopening the conversation)
+      // reuses the bound machinery instead of the plain exact-target lookup.
+      const task = canRecreateBoundTaskSpace(input.binding)
+        ? await useBoundTaskSpace(input.binding)
+        : await selectObservedTaskSpace(input.binding.taskSpaceId, {
+            ...(input.binding.taskSpaceIdentity ? { expectedIdentity: input.binding.taskSpaceIdentity } : {}),
+          })
+      if (!task) {
+        return
+      }
+      const tabs = await listTabs()
+      const existingTab = tabs.find((candidate) => candidate.targetId === input.binding.targetId)
+      if (existingTab) {
+        if (!await fencedSwitchTab(existingTab.targetId, "immediately_before_tab_switch")) {
+          return
+        }
+        selected = { tab: existingTab, targetId: existingTab.targetId, task }
+      } else if (taskSpaceRecovery) {
+        // The space was just recreated: its old tab cannot survive that. Reopen
+        // the observed canonical conversation, exactly like the bound path.
+        const navigation = await fencedOpenOrReuseTab(
+          normalizeUrl(expectedCanonicalUrl),
+          { timeout: 30, wait: true },
+          "immediately_before_navigation",
+        )
+        if (!navigation.performed) {
+          return
+        }
+        const reopened = navigation.value
+        const refreshedTabs = await listTabs()
+        const activeTab = refreshedTabs.find((candidate) => candidate.targetId === reopened?.targetId)
+          || refreshedTabs.find((candidate) => candidate.active)
+          || reopened
+        if (!activeTab?.targetId) {
+          humanRequired("bound_conversation_open_failed", "The canonical ChatGPT conversation could not be reopened after task-space recovery.", {
+            taskSpaceId: task.id,
+          })
+          return
+        }
+        selected = { tab: activeTab, targetId: activeTab.targetId, task }
+      } else {
+        humanRequired("bound_tab_missing", "The exact bound ChatGPT tab is no longer available.", {
+          targetId: input.binding.targetId,
+          taskSpaceId: task.id,
+        })
         return
       }
       const inspection = await waitForReadyInspection()
