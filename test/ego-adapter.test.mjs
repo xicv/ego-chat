@@ -3978,6 +3978,100 @@ test("a granted recreation restores a confirmed unbound create-once space, reope
   assert.equal(reconciled.result.responseText, "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST")
 })
 
+test("reconcile mode for a stopped confirmed unbound create-once send is reported as the retryable bound outage without recreation authority", async () => {
+  const identity = { name: "reconcile-vanished-space", taskId: "reconcile-vanished-space" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    bindingCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    bindingState: "unbound",
+    initialTabOpen: false,
+    mode: "reconcile",
+    taskSpaceIdentity: identity,
+    unboundTaskSpaceLive: false,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_missing")
+  assert.equal(reconciled.error?.details?.evidence?.recreatable, true)
+  assert.equal(reconciled.error?.details?.evidence?.matchCount, 0)
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("a granted recreation lets reconcile mode restore a stopped confirmed unbound create-once space, reopen the canonical conversation and read the attributable pair", async () => {
+  const identity = { name: "reconcile-recreate-space", taskId: "reconcile-recreate-space" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    bindingCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    bindingState: "unbound",
+    initialTabOpen: false,
+    mode: "reconcile",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    sentCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+    unboundTaskSpaceLive: false,
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.taskSpaceCreations, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [identity.name])
+  assert.notEqual(reconciled.result.taskSpaceId, 10)
+  assert.deepEqual(reconciled.result.taskSpaceIdentity, identity)
+  assert.deepEqual(reconciled.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: reconciled.result.taskSpaceId,
+  })
+  assert.equal(reconciled.result.canonicalUrl, "https://chatgpt.com/c/reconcile-driver-test")
+  assert.equal(reconciled.result.responseText, "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST")
+  assert.equal(reconciled.result.head.lastMessageId, "partial-assistant")
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("a name-only conflict blocks reconcile-mode recreation even with authority", async () => {
+  const identity = { name: "reconcile-conflict-space", taskId: "reconcile-conflict-space" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    bindingCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    bindingState: "unbound",
+    identityTaskSpaceLiveIdentity: { name: identity.name, taskId: "different-task-id" },
+    identityTaskSpaceOwnership: "agent",
+    initialTabOpen: false,
+    mode: "reconcile",
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+    unboundTaskSpaceLive: false,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_identity_conflict")
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
 test("an opaque identity that vanishes cannot be recreated even with authority", async () => {
   const identity = { name: "opaque-workspace", taskId: "opaque-task-id" }
   const reconciled = await runTaskSpaceReconciliationCase({
