@@ -508,6 +508,15 @@ async function egoDriverMain(
     }))
   }
 
+  // Shared node-set contract for provider status/alert/button evidence: reused
+  // by observeProviderTerminal (classification) and readProviderStatusLabels
+  // (pending-capture diagnostics) so the two never drift on what counts as
+  // visible provider-status markup. Requires `visible` and `latest` in scope.
+  const providerStatusNodesSnippet = String.raw`const statuses = [...latest.querySelectorAll('[role="status"], [role="alert"], button')]
+        .filter(visible)
+        .filter((node) => !node.closest('[data-message-author-role], .markdown, pre, code, blockquote'))
+        .filter((node) => !node.querySelector('[data-message-author-role], .markdown, pre, code, blockquote'))`
+
   async function observeProviderTerminal(promptMessageId, responseMessageId) {
     // Conservative semantic contract, not a claim that all current provider UI
     // uses these selectors. Unscoped/unknown markup must remain unclassified.
@@ -532,33 +541,60 @@ async function egoDriverMain(
       const assistants = [...latest.querySelectorAll('[data-message-author-role="assistant"]')]
       if (assistants.length > 1 || (expectedResponseId
         && assistants[0]?.getAttribute('data-message-id') !== expectedResponseId)) return null
-      const statuses = [...latest.querySelectorAll('[role="status"], [role="alert"], button')]
-        .filter(visible)
-        .filter((node) => !node.closest('[data-message-author-role], .markdown, pre, code, blockquote'))
-        .filter((node) => !node.querySelector('[data-message-author-role], .markdown, pre, code, blockquote'))
+      ${providerStatusNodesSnippet}
       if (statuses.length > 16) return null
+      const classify = (label) => {
+        if (/^This conversation is too long(?: to continue)?\. Please start a new chat\.?$/i.test(label)
+          || /^You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?$/i.test(label)) {
+          return 'conversation_exhausted'
+        }
+        if (/^You've reached your message limit\. Please try again later\.?$/i.test(label)
+          || /^You have reached your usage limit\. Please try again later\.?$/i.test(label)) {
+          return 'quota_limited'
+        }
+        if (/^Something went wrong\.(?: Please try again\.?)?$/i.test(label)
+          || /^An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?$/i.test(label)) {
+          return 'provider_error'
+        }
+        // A tier-1 sentence embedded inside extra surrounding text (e.g. an
+        // assistant quoting the banner) is a quotation, not live evidence: it
+        // must not fall through to the looser tier-2 token-pair rules below.
+        if (/This conversation is too long(?: to continue)?\. Please start a new chat\.?/i.test(label)
+          || /You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?/i.test(label)
+          || /You've reached your message limit\. Please try again later\.?/i.test(label)
+          || /You have reached your usage limit\. Please try again later\.?/i.test(label)
+          || /Something went wrong\.(?: Please try again\.?)?/i.test(label)
+          || /An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?/i.test(label)) {
+          return null
+        }
+        const lower = label.toLowerCase()
+        if ((lower.includes('too long') || lower.includes('maximum length'))
+          && (lower.includes('new chat') || lower.includes('start a new'))) {
+          return 'conversation_exhausted'
+        }
+        if ((lower.includes('message limit') || lower.includes('usage limit') || lower.includes('reached your limit'))
+          && lower.includes('try again')) {
+          return 'quota_limited'
+        }
+        if (lower.includes('something went wrong') || lower.includes('error occurred')) {
+          return 'provider_error'
+        }
+        return null
+      }
       const signals = statuses.flatMap((node) => {
         const label = String(node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
         if (label.length > 400) return [{ kind: 'unknown', label: '' }]
         if (/^Stopped thinking[.!]?$/i.test(label)) return [{ kind: 'stopped', label }]
         if (!['status', 'alert'].includes(node.getAttribute('role'))) return []
-        if (/^This conversation is too long(?: to continue)?\. Please start a new chat\.?$/i.test(label)
-          || /^You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?$/i.test(label)) {
-          return [{ kind: 'conversation_exhausted', label }]
-        }
-        if (/^You've reached your message limit\. Please try again later\.?$/i.test(label)
-          || /^You have reached your usage limit\. Please try again later\.?$/i.test(label)) {
-          return [{ kind: 'quota_limited', label }]
-        }
-        if (/^Something went wrong\.(?: Please try again\.?)?$/i.test(label)
-          || /^An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?$/i.test(label)) {
-          return [{ kind: 'provider_error', label }]
-        }
+        const kind = classify(label)
+        if (kind) return [{ kind, label }]
         return label ? [{ kind: 'unknown', label: '' }] : []
       })
-      const kinds = [...new Set(signals.map((signal) => signal.kind))]
-      if (kinds.length !== 1 || kinds[0] === 'unknown') return null
-      return { schema, kind: kinds[0], labels: [...new Set(signals.map((signal) => signal.label))].sort(), turnId }
+      const precedence = ['conversation_exhausted', 'quota_limited', 'provider_error', 'stopped']
+      const kinds = new Set(signals.map((signal) => signal.kind))
+      const kind = precedence.find((candidate) => kinds.has(candidate))
+      if (!kind) return null
+      return { schema, kind, labels: [...new Set(signals.map((signal) => signal.label))].sort(), turnId }
     })()`)
     if (!observation) return null
     return {

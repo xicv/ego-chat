@@ -4630,7 +4630,7 @@ test("provider terminal evidence requires the exact latest prompt followed by it
   assert.equal(captured.result.providerTerminal, undefined)
 })
 
-test("unrecognized latest-turn alerts cannot grant context-exhaustion classification", async () => {
+test("an unmatched status label beside a matched banner no longer vetoes classification", async () => {
   const captured = await runTaskSpaceReconciliationCase({
     captureContinuationAllowed: true,
     mode: "capture_exchange",
@@ -4640,8 +4640,66 @@ test("unrecognized latest-turn alerts cannot grant context-exhaustion classifica
     ] },
   })
   assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
+})
+
+test("status text that matches no known pattern yields no terminal classification", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{ label: "Regenerate response", role: "status" }] },
+  })
+  assert.equal(captured.error, undefined)
   assert.equal(captured.result.captureState, "pending")
   assert.equal(captured.result.providerTerminal, undefined)
+})
+
+test("confirmed capture matches a reworded exhaustion banner by token pair", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "You've reached the maximum length for this conversation. Please start a new chat to continue.",
+      role: "alert",
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
+})
+
+test("confirmed capture matches a reworded quota banner by token pair", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "You have reached your message limit for now. Please try again in 2 hours.",
+      role: "alert",
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "quota_limited")
+})
+
+test("confirmed capture applies exhaustion precedence over stopped and quota signals in the same observation", async (t) => {
+  const label = "This conversation is too long. Please start a new chat."
+  for (const [name, statuses] of [
+    ["stopped-and-length", [{ label, role: "alert" }, { label: "Stopped thinking" }]],
+    ["quota-and-length", [{ label, role: "alert" }, {
+      label: "You've reached your message limit. Please try again later.", role: "alert",
+    }]],
+  ]) {
+    await t.test(name, async () => {
+      const captured = await runTaskSpaceReconciliationCase({
+        captureContinuationAllowed: true, mode: "capture_exchange", providerDomOptions: { statuses },
+      })
+      assert.equal(captured.error, undefined)
+      assert.equal(captured.result.captureState, "provider_terminal")
+      assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
+    })
+  }
 })
 
 test("status wrappers containing assistant prose are not provider terminal evidence", async () => {
@@ -4667,10 +4725,6 @@ test("provider terminal classification ignores stale, hidden, quoted, and confli
     { name: "quoted", statuses: [{ label: `Example: ${label}`, role: "alert" }] },
     { name: "unqualified-button", statuses: [{ label, button: true }] },
     { name: "ambiguous-length", statuses: [{ label: "This conversation is too long.", role: "alert" }] },
-    { name: "stopped-and-length", statuses: [{ label, role: "alert" }, { label: "Stopped thinking" }] },
-    { name: "quota-and-length", statuses: [{ label, role: "alert" }, {
-      label: "You've reached your message limit. Please try again later.", role: "alert",
-    }] },
     { name: "later-user", statuses: [{ label, role: "alert" }], additionalUser: true },
     { name: "different-response", statuses: [{ label, role: "alert" }], responseId: "different-assistant" },
   ]
