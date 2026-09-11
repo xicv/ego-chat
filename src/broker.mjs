@@ -3573,7 +3573,15 @@ export class Broker {
     // Admission proved this exact stopped state. Never rebase abandonment
     // onto a concurrent resume or reconciliation that changed that proof.
     await this.#store.persist("workflow.cancelled", abandoned, workflow)
-    this.#synchronizeDurableClaimUrls()
+    // The runner already exited (the busy check above proved it), but its own
+    // finally block reads workflow state to decide whether to release this
+    // admission, and a cancel's own human_required transition is an async,
+    // disk-synced write the runner's finally can easily observe before it
+    // lands -- so the runner can exit believing the workflow is still running
+    // and leave the admission held. Abandonment is this workflow's last
+    // possible terminal transition, so it must release the admission itself
+    // or it leaks for the life of the process.
+    this.#releaseTaskSpaceAdmission(workflowId)
     return publicWorkflow(abandoned)
   }
 

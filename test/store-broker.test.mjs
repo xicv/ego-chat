@@ -10741,6 +10741,98 @@ test("cancelled confirmed create-once capture reconciles its exact first Send wi
   await restarted.ensureModelPolicy({ bindingKey: "cancelled-create-once" })
 })
 
+test("abandoning a cancelled pre-send exchange releases the runner's stale task-space admission", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const taskSpaceIdentity = browserTaskSpaceIdentity("admission-release")
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: null,
+        targetId: input.targetId,
+        taskSpaceIdentity,
+        taskSpaceId: 96,
+      }),
+      captureExchange: async () => {
+        throw new Error("capture must never run while Send keeps failing")
+      },
+      ensureModelPolicy: async () => modelPolicyObservation(),
+      sendExchange: async () => {
+        throw new EgoChatError(
+          "human_required",
+          "The live ChatGPT model does not match the requested policy.",
+          { reason: "model_policy_mismatch" },
+        )
+      },
+    },
+    recoveryDelaysMs: [60_000],
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "admission-release",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "admission-release-tab",
+    taskSpace: 96,
+  })
+  const turnMarker = "EGO_CHAT_ADMISSION_RELEASE"
+  const started = await broker.startEgoExchange({
+    bindingKey: "admission-release",
+    expectedTerminalMarker: `${turnMarker}_DONE`,
+    prompt: `${turnMarker}\nReview this.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+
+  // Let the runner fail Send, schedule pre-send recovery, and settle into its
+  // long #waitForRecovery sleep before cancelling out from under it -- exactly
+  // where the live incident's runner was sitting when it was cancelled.
+  // Persisting that transition fsyncs an event to disk, so polling needs a
+  // real timer tick (not just a microtask/setImmediate flush) between reads.
+  let scheduled
+  for (let attempt = 0; !scheduled && attempt < 500; attempt += 1) {
+    const workflow = store.getWorkflow(started.id)
+    if (workflow?.phase === "browser_owned" && workflow.lastRecovery?.code === "model_policy_mismatch") {
+      scheduled = workflow
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  assert.ok(scheduled, "the runner never scheduled pre-send recovery")
+
+  const cancelled = await broker.cancelWorkflow({ workflowId: started.id })
+  assert.equal(cancelled.status, "human_required")
+  assert.equal(cancelled.phase, "browser_owned")
+  assert.equal(cancelled.humanRequired.code, "cancelled_during_browser_operation")
+
+  const abandoned = await broker.abandonWorkflow({
+    acknowledgePotentialDelivery: true,
+    workflowId: started.id,
+  })
+  assert.equal(abandoned.status, "cancelled")
+  assert.equal(abandoned.phase, "recovery_abandoned")
+
+  // Nothing is running and nothing is bound any more. The cancelled-then-
+  // abandoned workflow must not go on holding the binding key's task-space
+  // admission forever.
+  await broker.ensureModelPolicy({ bindingKey: "admission-release" })
+
+  const retryTurnMarker = "EGO_CHAT_ADMISSION_RELEASE_RETRY"
+  const retried = await broker.startEgoExchange({
+    bindingKey: "admission-release",
+    expectedTerminalMarker: `${retryTurnMarker}_DONE`,
+    prompt: `${retryTurnMarker}\nReview this again.`,
+    timeoutMs: 30_000,
+    turnMarker: retryTurnMarker,
+  })
+  assert.equal(retried.status, "running")
+  assert.equal(retried.bindingKey, "admission-release")
+})
+
 test("reconciliation rejects canonical retargeting before blob or binding persistence", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
