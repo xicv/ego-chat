@@ -308,6 +308,15 @@ test("generation-zero markers remain compatible and successor markers are distin
   assert.equal(convergenceReviewIdentity(PARENT_ID, 1).turnMarker, `EGO_CHAT_CONVERGENCE_${token}_C1`)
   assert.notDeepEqual(convergenceReviewIdentity(PARENT_ID, 1, 1), convergenceReviewIdentity(PARENT_ID, 1))
   assert.deepEqual(convergenceReviewIdentity(PARENT_ID, 1, 1), convergenceReviewIdentity(PARENT_ID, 1, 1))
+  // Attempt 1 is the implicit default: its markers must stay byte-identical so
+  // digests of records written before the bounded retry existed keep validating.
+  assert.deepEqual(convergenceReviewIdentity(PARENT_ID, 1, 1, 1), convergenceReviewIdentity(PARENT_ID, 1, 1))
+  assert.deepEqual(convergenceReviewIdentity(PARENT_ID, 1, 0), convergenceReviewIdentity(PARENT_ID, 1, 0, 1))
+  const attempt2 = convergenceReviewIdentity(PARENT_ID, 1, 1, 2)
+  assert.notDeepEqual(attempt2, convergenceReviewIdentity(PARENT_ID, 1, 1))
+  assert.deepEqual(attempt2, convergenceReviewIdentity(PARENT_ID, 1, 1, 2))
+  assert.notEqual(attempt2.turnMarker, convergenceReviewIdentity(PARENT_ID, 1, 1).turnMarker)
+  assert.notEqual(attempt2.terminalMarker, convergenceReviewIdentity(PARENT_ID, 1, 1).terminalMarker)
 })
 
 test("maximum supported candidate packets survive checkpoint and resume despite JSON escaping", () => {

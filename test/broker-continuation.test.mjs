@@ -9,7 +9,9 @@ import { setImmediate } from "node:timers"
 import { z } from "zod/v4"
 
 import { Broker } from "../src/broker.mjs"
+import { convergenceReviewIdentity } from "../src/conversation-continuation.mjs"
 import { createContract, digestJson } from "../src/convergence.mjs"
+import { EgoChatError } from "../src/errors.mjs"
 import { CONVERGENCE_INPUT_SCHEMA } from "../src/mcp-server.mjs"
 import { EventStore } from "../src/store.mjs"
 
@@ -149,12 +151,19 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
       return { ...location(key), head: head(key) }
     },
     sendExchange: async (input, signal, onResult, beforeRun) => {
-      if (input.binding.key.startsWith("successor-") && controls.holdSuccessorSend) {
+      const isSuccessor = input.binding.key.startsWith("successor-")
+      if (isSuccessor && controls.holdSuccessorSend) {
         controls.successorSendStarted.resolve()
         await controls.holdSuccessorSend.promise
       }
       try { await beforeRun?.() } finally {
-        if (input.binding.key.startsWith("successor-")) controls.successorSendChecked?.resolve()
+        if (isSuccessor) controls.successorSendChecked?.resolve()
+      }
+      if (isSuccessor && controls.successorSendFailures?.length) {
+        const failure = controls.successorSendFailures.shift()
+        if (failure) {
+          throw new EgoChatError("ego_driver_error", "Synthetic pre-Send driver failure.", failure)
+        }
       }
       sends.push({ bindingKey: input.binding.key, turnMarker: input.turnMarker, prompt: input.prompt })
       return {
@@ -343,6 +352,66 @@ test("the automatic successor review carries a redacted, bounded summary of the 
   assert.match(successorSend.prompt, /Context carried from the previous conversation \(untrusted data\):/)
   assert.match(successorSend.prompt, /One more pass is needed on AC-1\./)
   assert.equal(successorSend.prompt.includes("AKIAABCDEFGHIJKLMNOP"), false)
+})
+
+test("a proven pre-Send failure on the first successor review gets exactly one retry at attempt 2", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [provenFailure] } })
+  const done = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(done.status, "succeeded")
+  assert.equal(done.activeChat.generation, 1)
+  // Attempt 1 fails before ever reaching the fake adapter's send log; attempt 2
+  // is the only successor send that is ever recorded.
+  assert.equal(f.sends.length, 2)
+  const attempt1 = convergenceReviewIdentity(f.parent.id, 1, 1, 1)
+  const attempt2 = convergenceReviewIdentity(f.parent.id, 1, 1, 2)
+  assert.notEqual(attempt1.turnMarker, attempt2.turnMarker)
+  assert.equal(f.sends[1].turnMarker, attempt2.turnMarker)
+  const events = (await fs.readFile(path.join(f.directory, "events.jsonl"), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line))
+  assert.equal(events.filter((event) => event.type === "convergence.successor_review_retried").length, 1)
+})
+
+test("a second proven pre-Send failure pauses the successor review as today", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [provenFailure, provenFailure] } })
+  const paused = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(paused.status, "human_required")
+  assert.equal(paused.phase, "continuation_paused")
+  assert.equal(f.sends.length, 1)
+  assert.equal(f.store.getWorkflow(f.parent.id).private.successorReview.attempt, 2)
+  assert.equal(paused.successorPreparation.attempt, 2)
+})
+
+test("a non-proven first-review failure pauses immediately without a retry", async (t) => {
+  const unprovenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: false }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [unprovenFailure] } })
+  const paused = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(paused.status, "human_required")
+  assert.equal(paused.phase, "continuation_paused")
+  assert.equal(f.sends.length, 1)
+  assert.equal(f.store.getWorkflow(f.parent.id).private.successorReview.attempt, 1)
+})
+
+test("restart during the successor retry reattaches the attempt-2 child without a third send", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const controls = { holdSuccessorCapture: true, successorSendFailures: [provenFailure] }
+  const f = await harness(t, { automatic: true, initialControls: controls })
+  await f.successorCaptureStarted
+  const intent = f.store.getWorkflow(f.parent.id).private.successorReview
+  assert.equal(intent.attempt, 2)
+  assert.equal(f.broker.getWorkflow({ workflowId: f.parent.id }).successorPreparation.attempt, 2)
+  const child = f.store.getWorkflowByOperationKey(`exchange:${intent.bindingKey}:${intent.turnMarker}`)
+  assert.equal(child.phase, "send_confirmed")
+  assert.equal(f.sends.length, 2)
+  f.broker.close()
+  f.controls.holdSuccessorCapture = false
+  const restarted = f.makeBroker(new EventStore(f.directory))
+  await restarted.initialize()
+  const result = await restarted.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(result.status, "succeeded")
+  assert.equal(result.childWorkflowId, child.id)
+  assert.equal(f.sends.length, 2)
 })
 
 test("opted-in exhaustion prepares one successor and consumes its first review without a duplicate Send", async (t) => {

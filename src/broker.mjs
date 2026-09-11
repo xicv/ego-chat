@@ -789,6 +789,7 @@ function publicWorkflow(workflow) {
       schema: "ego-chat-successor-preparation-receipt/v1",
       checkpointDigest: preparation.checkpointDigest,
       bindingKey: preparation.bindingKey, state: preparation.state,
+      ...(workflow.private.successorReview ? { attempt: workflow.private.successorReview.attempt ?? 1 } : {}),
     }
   }
   const sent = workflow.private?.send
@@ -6127,25 +6128,34 @@ export class Broker {
           request.chatGptTimeoutMs,
         )
         let child
+        // A promoted successor's first review may carry the bounded retry's
+        // distinct attempt-2 identity (see #completeAutomaticSuccessor); a
+        // freshly started review is always attempt 1, so this only ever
+        // widens what an already-linked child is allowed to match.
+        let capturedTerminalMarker = initialTerminalMarker
         if (
           current.phase === "chatgpt_running"
           && current.cycle === cycle
           && typeof current.childWorkflowId === "string"
         ) {
           child = this.#store.getWorkflow(current.childWorkflowId)
-          const expectedOperationKey = `exchange:${activeConvergenceBindingKey(current)}:${initialTurnMarker}`
-          if (
-            !child
-            || child.kind !== "ego_exchange"
-            || child.bindingKey !== activeConvergenceBindingKey(current)
-            || child.operationKey !== expectedOperationKey
-          ) {
+          const retriedIdentity = convergenceReviewIdentity(workflowId, cycle, current.activeChat?.generation ?? 0, 2)
+          const matched = [
+            { terminalMarker: initialTerminalMarker, turnMarker: initialTurnMarker },
+            retriedIdentity,
+          ].find((identity) => (
+            child?.kind === "ego_exchange"
+            && child.bindingKey === activeConvergenceBindingKey(current)
+            && child.operationKey === `exchange:${activeConvergenceBindingKey(current)}:${identity.turnMarker}`
+          ))
+          if (!matched) {
             throw new EgoChatError(
               "human_required",
               "The durable ChatGPT review child no longer matches its convergence cycle.",
               { reason: "convergence_recovery_state_invalid" },
             )
           }
+          capturedTerminalMarker = matched.terminalMarker
         } else {
           child = await this.#startEgoExchange({
             allowProtocolRepairCapture: true,
@@ -6228,7 +6238,7 @@ export class Broker {
           criteria: contract.criteria,
           cycle,
           targetDigest: contract.targetDigest,
-          terminalMarker: initialTerminalMarker,
+          terminalMarker: capturedTerminalMarker,
         })
         const protocolNormalization = consumed.protocolNormalization
         let review = consumed.review
@@ -6419,53 +6429,70 @@ export class Broker {
   async #completeAutomaticSuccessor(current, controller) {
     const workflowId = current.id
     const checkpoint = current.private.continuationCheckpoint
-    if (current.phase === "successor_preparing") {
-      await this.#prepareSuccessor({ workflowId, expectedCheckpointDigest: checkpoint.digest, acknowledgeNewChat: true }, controller)
-      current = this.#requireRunningConvergence(workflowId, controller.signal)
-      const plan = current.private.successorPreparation
-      const identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1)
-      const prompt = prepareChatGptReviewPrompt({
-        candidate: checkpoint.candidate, candidateDigest: checkpoint.candidateDigest,
-        carriedContext: checkpoint.priorReviewSummary ?? null,
-        contract: checkpoint.contract, cycle: current.cycle, ...identity,
-      }).prompt
-      const next = { ...current, phase: "successor_reviewing", updatedAt: new Date().toISOString(),
-        private: { ...current.private, successorReview: {
-          bindingKey: plan.bindingKey, ...identity, promptDigest: digest(prompt), candidateDigest: checkpoint.candidateDigest,
-        } } }
-      await this.#store.persist("convergence.successor_review_reserved", next, current)
-      current = next
-    }
-    const intent = current.private.successorReview
-    const plan = current.private.successorPreparation
-    const identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1)
-    const prompt = prepareChatGptReviewPrompt({
+    const buildReviewPrompt = (identity) => prepareChatGptReviewPrompt({
       candidate: checkpoint.candidate, candidateDigest: checkpoint.candidateDigest,
       carriedContext: checkpoint.priorReviewSummary ?? null,
       contract: checkpoint.contract, cycle: current.cycle, ...identity,
     }).prompt
-    if (plan?.state !== "prepared" || !isDeepStrictEqual(intent, {
-      bindingKey: plan.bindingKey, ...identity, promptDigest: digest(prompt), candidateDigest: checkpoint.candidateDigest,
-    })) throw new EgoChatError("continuation_not_authorized", "The exact successor review intent is invalid.")
-    this.#assertBindingAvailable(intent.bindingKey, workflowId)
-    this.#convergenceBindings.set(intent.bindingKey, workflowId)
-    const child = await this.#startEgoExchange({
-      bindingKey: intent.bindingKey, prompt, turnMarker: identity.turnMarker,
-      expectedTerminalMarker: identity.terminalMarker, allowTaskSpaceReclaim: true,
-      allowProtocolRepairCapture: true, timeoutMs: current.private.request.chatGptTimeoutMs,
-    }, workflowId, current)
-    this.#convergenceChildren.set(workflowId, child.id)
-    this.#requireRunningConvergence(workflowId, controller.signal)
-    let reviewed
-    while (!reviewed) {
-      try {
-        reviewed = await this.awaitWorkflow({ workflowId: child.id, timeoutMs: this.#convergenceChildWaitSliceMs }, controller.signal)
-      } catch (error) {
-        if (!(error instanceof EgoChatError) || error.code !== "wait_timeout") throw error
-        this.#requireRunningConvergence(workflowId, controller.signal)
-      }
+    if (current.phase === "successor_preparing") {
+      await this.#prepareSuccessor({ workflowId, expectedCheckpointDigest: checkpoint.digest, acknowledgeNewChat: true }, controller)
+      current = this.#requireRunningConvergence(workflowId, controller.signal)
+      const plan = current.private.successorPreparation
+      const identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1, 1)
+      const prompt = buildReviewPrompt(identity)
+      const next = { ...current, phase: "successor_reviewing", updatedAt: new Date().toISOString(),
+        private: { ...current.private, successorReview: {
+          bindingKey: plan.bindingKey, attempt: 1, ...identity, promptDigest: digest(prompt), candidateDigest: checkpoint.candidateDigest,
+        } } }
+      await this.#store.persist("convergence.successor_review_reserved", next, current)
+      current = next
     }
-    this.#convergenceChildren.delete(workflowId)
+    const plan = current.private.successorPreparation
+    // Runs (or, on restart, reattaches to) the successor's review child for one
+    // attempt's exact intent, waiting until it reaches a terminal state.
+    const runReviewChild = async (intent) => {
+      this.#assertBindingAvailable(intent.bindingKey, workflowId)
+      this.#convergenceBindings.set(intent.bindingKey, workflowId)
+      const child = await this.#startEgoExchange({
+        bindingKey: intent.bindingKey, prompt: buildReviewPrompt(intent), turnMarker: intent.turnMarker,
+        expectedTerminalMarker: intent.terminalMarker, allowTaskSpaceReclaim: true,
+        allowProtocolRepairCapture: true, timeoutMs: current.private.request.chatGptTimeoutMs,
+      }, workflowId, current)
+      this.#convergenceChildren.set(workflowId, child.id)
+      this.#requireRunningConvergence(workflowId, controller.signal)
+      let reviewed
+      while (!reviewed) {
+        try {
+          reviewed = await this.awaitWorkflow({ workflowId: child.id, timeoutMs: this.#convergenceChildWaitSliceMs }, controller.signal)
+        } catch (error) {
+          if (!(error instanceof EgoChatError) || error.code !== "wait_timeout") throw error
+          this.#requireRunningConvergence(workflowId, controller.signal)
+        }
+      }
+      this.#convergenceChildren.delete(workflowId)
+      return { child, reviewed }
+    }
+    let intent = current.private.successorReview
+    let identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1, intent?.attempt ?? 1)
+    let prompt = buildReviewPrompt(identity)
+    if (plan?.state !== "prepared" || !isDeepStrictEqual(intent, {
+      bindingKey: plan.bindingKey, attempt: intent?.attempt ?? 1, ...identity, promptDigest: digest(prompt), candidateDigest: checkpoint.candidateDigest,
+    })) throw new EgoChatError("continuation_not_authorized", "The exact successor review intent is invalid.")
+    let { child, reviewed } = await runReviewChild(intent)
+    if (
+      reviewed.status !== "succeeded"
+      && (intent.attempt ?? 1) === 1
+      && provenPreSendDriverFailure(reviewed.humanRequired?.diagnostic ?? reviewed.reconciliation?.browserInterruption)
+    ) {
+      current = this.#requireRunningConvergence(workflowId, controller.signal)
+      identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1, 2)
+      prompt = buildReviewPrompt(identity)
+      intent = { bindingKey: plan.bindingKey, attempt: 2, ...identity, promptDigest: digest(prompt), candidateDigest: checkpoint.candidateDigest }
+      const retryNext = { ...current, updatedAt: new Date().toISOString(), private: { ...current.private, successorReview: intent } }
+      await this.#store.persist("convergence.successor_review_retried", retryNext, current)
+      current = retryNext
+      ;({ child, reviewed } = await runReviewChild(intent))
+    }
     if (reviewed.status !== "succeeded") throw new EgoChatError("human_required", "The first successor review paused; its exact delivery evidence is retained.", {
       reason: reviewed.humanRequired?.code ?? reviewed.error?.code ?? "successor_review_incomplete",
     })

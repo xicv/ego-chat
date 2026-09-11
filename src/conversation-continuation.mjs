@@ -143,12 +143,19 @@ export function activeConvergenceBindingKey(workflow) {
   return checked(Key, workflow?.activeChat?.bindingKey ?? workflow?.bindingKey)
 }
 
-export function convergenceReviewIdentity(workflowId, cycle, generation = 0) {
+export function convergenceReviewIdentity(workflowId, cycle, generation = 0, attempt = 1) {
   checked(z.uuid(), workflowId)
   checked(z.number().int().positive(), cycle)
   checked(z.number().int().min(0).max(MAX_CHAT_GENERATIONS), generation)
+  checked(z.number().int().min(1).max(2), attempt)
   const markerToken = digestJson({ cycle, purpose: "review", workflowId, ...(generation > 0 ? { generation } : {}) }).slice(0, 32).toUpperCase()
-  return { terminalMarker: `EGO_CHAT_REVIEW_DONE_${markerToken}`, turnMarker: `EGO_CHAT_CONVERGENCE_${markerToken}_C${cycle}` }
+  // Attempt 1 keeps its original markers byte-for-byte so digests of records
+  // written before the bounded successor retry existed keep validating.
+  const suffix = attempt > 1 ? `_ATTEMPT${attempt}` : ""
+  return {
+    terminalMarker: `EGO_CHAT_REVIEW_DONE_${markerToken}${suffix}`,
+    turnMarker: `EGO_CHAT_CONVERGENCE_${markerToken}_C${cycle}${suffix}`,
+  }
 }
 
 const ResumeReceipt = z.object({
@@ -404,7 +411,7 @@ export function buildSuccessorPromotion({ workflow, child, binding, successorBin
   const checkpoint = validateContinuationCheckpoint(workflow.private.continuationCheckpoint, { workflow, child, binding })
   const plan = workflow.private.successorPreparation
   const intent = workflow.private.successorReview
-  const identity = convergenceReviewIdentity(workflow.id, workflow.cycle, checkpoint.generation + 1)
+  const identity = convergenceReviewIdentity(workflow.id, workflow.cycle, checkpoint.generation + 1, intent?.attempt ?? 1)
   if (plan?.state !== "prepared" || plan.checkpointDigest !== checkpoint.digest
     || plan.bindingKey !== successorBinding?.key
     || !isDeepStrictEqual(plan.preparedBinding.taskSpaceIdentity, successorBinding.taskSpaceIdentity)
