@@ -15,6 +15,7 @@ import {
   buildSuccessorPreparation,
   convergenceReviewIdentity,
   publicContinuationCheckpoint,
+  validateContinuationCheckpoint,
   validateConvergenceContinuationLineage,
 } from "./conversation-continuation.mjs"
 import {
@@ -782,6 +783,13 @@ function publicWorkflow(workflow) {
   if (workflow.private?.continuationCheckpoint) {
     copy.continuationCheckpoint = publicContinuationCheckpoint(workflow.private.continuationCheckpoint)
     if (workflow.private.successorReview) copy.continuationCheckpoint.allowedActions = []
+    const { candidate } = validateContinuationCheckpoint(workflow.private.continuationCheckpoint)
+    copy.candidateSummary = {
+      status: candidate.status,
+      summary: candidate.summary.slice(0, 2_000),
+      criteria: candidate.criteria.map(({ id, status }) => ({ id, status })),
+      blockerCount: candidate.blockers.length,
+    }
   }
   const preparation = workflow.private?.successorPreparation
   if (preparation) {

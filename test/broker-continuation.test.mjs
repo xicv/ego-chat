@@ -941,6 +941,20 @@ test("exhausted review preserves an exact private convergence checkpoint and pub
   assert.equal(f.counts().localCalls, 0)
 })
 
+test("a paused convergence exposes a bounded candidate summary while the review packet stays private", async (t) => {
+  const f = await harness(t)
+  assert.deepEqual(f.paused.candidateSummary, {
+    status: "candidate", summary: "Private retained candidate.",
+    criteria: [{ id: "AC-1", status: "pass" }], blockerCount: 0,
+  })
+  const serialized = JSON.stringify(f.paused.candidateSummary)
+  assert.equal(serialized.includes("review packet"), false)
+  assert.equal(serialized.includes("evidence"), false)
+  const child = f.broker.getWorkflow({ workflowId: f.paused.childWorkflowId })
+  assert.equal(child.kind, "ego_exchange")
+  assert.equal(child.candidateSummary, undefined)
+})
+
 test("approved successor keeps the parent and candidate while concurrent replay sends only once", async (t) => {
   const f = await harness(t)
   const oldBinding = f.store.getBinding(keys[0])
