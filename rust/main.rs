@@ -69,6 +69,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../bin/ego-chatd.mjs"),
     },
     EmbeddedFile {
+        path: "src/answering-model.mjs",
+        bytes: include_bytes!("../src/answering-model.mjs"),
+    },
+    EmbeddedFile {
         path: "src/app-server-client.mjs",
         bytes: include_bytes!("../src/app-server-client.mjs"),
     },

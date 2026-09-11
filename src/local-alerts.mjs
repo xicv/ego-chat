@@ -55,7 +55,8 @@ function loadConfig(dataDir) {
 export function formatAlertMessage(alert) {
   const shortId = String(alert.workflowId ?? "").slice(0, 8)
   const body = String(alert.message ?? "").slice(0, MESSAGE_MAX_LENGTH)
-  return `${alert.workflowKind} · ${alert.status} · ${alert.code} · ${shortId}: ${body}`
+  const label = alert.kind === "model_downgrade" ? "model downgrade" : alert.status
+  return `${alert.workflowKind} · ${label} · ${alert.code} · ${shortId}: ${body}`
 }
 
 export const ALERT_ATTENTION_STATUSES = new Set(["human_required", "failed"])

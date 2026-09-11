@@ -296,12 +296,14 @@ test("conversationContinuation defaults to a same-project successor on both the 
     bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
   })
   assert.equal(store.getWorkflow(started.id).private.request.conversationContinuation, "same_project_on_exhaustion")
+  assert.equal(store.getWorkflow(started.id).private.request.answeringModelPolicy, "alert")
 
   const mcpParsed = z.object(CONVERGENCE_INPUT_SCHEMA).parse({
     acceptanceCriteria: ["Default rollover applies without an explicit choice."],
     bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
   })
   assert.equal(mcpParsed.conversationContinuation, "same_project_on_exhaustion")
+  assert.equal(mcpParsed.answeringModelPolicy, "alert")
 })
 
 test("an explicit manual opt-out is stored and survives restart", async (t) => {
@@ -1184,3 +1186,236 @@ for (const cancelled of [false, true]) {
     assert.equal(f.counts().localCalls, 0)
   })
 }
+
+// --- answering-model downgrade + answeringModelPolicy: "pause" ---
+//
+// A full two-cycle convergence needs both a Codex App Server and a ChatGPT
+// reviewer each cycle, which the harness() above cannot provide (it seeds a
+// parent already at cycle 1 codex_captured and wires an appServerFactory
+// that deliberately throws). This bespoke fixture instead mirrors the
+// proven two-cycle convergence pattern in test/store-broker.test.mjs
+// (createConvergenceEgoAdapter + FakeConvergenceAppServer), extended with a
+// caller-chosen head.lastModelSlug per review so the answering model can be
+// scripted to drop between cycles.
+
+function fakeAlertSink() {
+  const alerts = []
+  return {
+    alerts,
+    describe: () => ({ enabled: true, reason: null, sound: "Glass", webhook: false }),
+    notify: async (alert) => {
+      alerts.push(alert)
+      return { channels: [{ channel: "macos", outcome: "accepted" }] }
+    },
+  }
+}
+
+function parseConvergencePrompt(prompt) {
+  return {
+    candidateDigest: prompt.match(/Candidate digest: ([a-f0-9]{64})/)?.[1],
+    cycle: Number(prompt.match(/Cycle: (\d+)/)?.[1]),
+    targetDigest: prompt.match(/Target digest: ([a-f0-9]{64})/)?.[1],
+  }
+}
+
+function slugCandidate(cycle) {
+  return {
+    blockers: [],
+    criteria: [{ evidence: `Cycle ${cycle} produced deterministic evidence.`, id: "AC-1", status: "pass" }],
+    reviewPacket: `Candidate packet for cycle ${cycle}.`,
+    status: "candidate",
+    summary: `Codex candidate ${cycle}.`,
+  }
+}
+
+class SlugConvergenceAppServer {
+  constructor() {
+    this.closed = false
+    this.turns = 0
+  }
+
+  async close() {
+    this.closed = true
+  }
+
+  async connect() {}
+
+  async recoverStructuredTurn() {
+    throw new Error("not expected")
+  }
+
+  async resumeThread(threadId) {
+    return { id: threadId, sessionId: threadId }
+  }
+
+  async runStructuredTurn(input) {
+    this.turns += 1
+    await input.onStarted?.({ turnId: `slug-codex-turn-${this.turns}` })
+    return {
+      durationMs: 5,
+      responseDigest: String(this.turns).repeat(64),
+      turnId: `slug-codex-turn-${this.turns}`,
+      value: slugCandidate(this.turns),
+      workspaceActivity: { count: 1, types: ["commandExecution"] },
+    }
+  }
+
+  async startThread() {
+    return { id: "slug-convergence-thread", sessionId: "slug-convergence-thread" }
+  }
+
+  async unsubscribeThread() {}
+}
+
+// reviewFactory(identity, exchangeCount) returns { slug, ...reviewFields };
+// reviewFields are sent back to the broker as the strict JSON review
+// envelope, and slug becomes that review's captured head.lastModelSlug.
+function slugConvergenceAdapter(reviewFactory) {
+  let exchanges = 0
+  return {
+    adapter: {
+      bind: async (input) => ({
+        canonicalUrl: input.canonicalUrl,
+        head: { fingerprint: "slug-convergence-initial-head", lastRole: "assistant", messageCount: 2 },
+        targetId: "slug-convergence-tab",
+        taskSpaceId: 20,
+        taskSpaceIdentity: { name: "slug-convergence-space", taskId: "slug-convergence-space-task" },
+      }),
+      exchange: async (input) => {
+        exchanges += 1
+        const identity = parseConvergencePrompt(input.prompt)
+        const { slug, ...review } = await reviewFactory(identity, exchanges)
+        const responseText = `${JSON.stringify(review)}\n${input.expectedTerminalMarker}`
+        const responseDigest = sha(responseText)
+        return {
+          canonicalUrl: input.binding.canonicalUrl,
+          durationMs: 5,
+          head: {
+            fingerprint: `slug-convergence-head-${exchanges}`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: responseDigest,
+            lastMessageId: `slug-convergence-assistant-${exchanges}`,
+            lastModelSlug: slug,
+            lastRole: "assistant",
+            messageCount: 2 + exchanges * 2,
+          },
+          modelPolicy,
+          responseDigest,
+          responseText,
+          targetId: "slug-convergence-tab",
+          taskSpaceIdentity: { name: "slug-convergence-space", taskId: "slug-convergence-space-task" },
+          taskSpaceId: 20,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    get exchanges() {
+      return exchanges
+    },
+  }
+}
+
+test("a convergence answering-model downgrade dispatches one alert and the cycle continues under the default alert policy", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-model-downgrade-alert-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const sink = fakeAlertSink()
+  const appServer = new SlugConvergenceAppServer()
+  const canonicalUrl = "https://chatgpt.com/c/model-downgrade-alert"
+  const ego = slugConvergenceAdapter((identity, exchanges) => {
+    const settled = identity.cycle === 2
+    return {
+      candidateDigest: identity.candidateDigest,
+      criteria: [{
+        evidence: settled ? "The revised candidate is exact." : "Another cycle is required.",
+        id: "AC-1",
+        status: settled ? "pass" : "fail",
+      }],
+      cycle: identity.cycle,
+      decision: settled ? "settled" : "continue",
+      findings: settled
+        ? []
+        : [{ action: "Revise the candidate once.", id: "B-REVISE", severity: "blocking", title: "One revision is required" }],
+      slug: exchanges === 1 ? "gpt-6-pro" : "gpt-5-6-thinking",
+      summary: settled ? "The contract is settled." : "Return one revised candidate.",
+      targetDigest: identity.targetDigest,
+    }
+  })
+  const store = new EventStore(directory)
+  const broker = new Broker({
+    alertSink: sink, appServerFactory: () => appServer, egoAdapter: ego.adapter, recoveryDelaysMs: [0], store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({ bindingKey: "model-downgrade-alert", canonicalUrl, mode: "existing", taskSpace: 20 })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Every cycle binds the immutable target identity."],
+    bindingKey: "model-downgrade-alert", cwd: directory, maxCycles: 4,
+    target: "Detect an answering-model downgrade mid-convergence without pausing.",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.cycleCount, 2)
+  assert.equal(appServer.turns, 2)
+  assert.equal(ego.exchanges, 2)
+
+  assert.equal(sink.alerts.length, 1)
+  const alert = sink.alerts[0]
+  assert.equal(alert.kind, "model_downgrade")
+  assert.equal(alert.code, "answering_model_downgraded")
+  assert.equal(alert.bindingKey, "model-downgrade-alert")
+  assert.equal(alert.message, "model-downgrade-alert answered by gpt-5-6-thinking after gpt-6-pro")
+
+  assert.deepEqual(completed.answeringModel, { first: "gpt-6-pro", last: "gpt-5-6-thinking" })
+})
+
+test("a convergence answering-model downgrade ends human_required and retains the review under the pause policy", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-model-downgrade-pause-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const sink = fakeAlertSink()
+  const appServer = new SlugConvergenceAppServer()
+  const canonicalUrl = "https://chatgpt.com/c/model-downgrade-pause"
+  const ego = slugConvergenceAdapter((identity, exchanges) => ({
+    candidateDigest: identity.candidateDigest,
+    criteria: [{ evidence: "Another cycle is required.", id: "AC-1", status: "fail" }],
+    cycle: identity.cycle,
+    decision: "continue",
+    findings: [{ action: "Revise the candidate once more.", id: "B-REVISE", severity: "blocking", title: "Another revision is required" }],
+    slug: exchanges === 1 ? "gpt-6-pro" : "gpt-5-6-thinking",
+    summary: "Return one more revised candidate.",
+    targetDigest: identity.targetDigest,
+  }))
+  const store = new EventStore(directory)
+  const broker = new Broker({
+    alertSink: sink, appServerFactory: () => appServer, egoAdapter: ego.adapter, recoveryDelaysMs: [0], store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({ bindingKey: "model-downgrade-pause", canonicalUrl, mode: "existing", taskSpace: 20 })
+
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Every cycle binds the immutable target identity."],
+    answeringModelPolicy: "pause",
+    bindingKey: "model-downgrade-pause", cwd: directory, maxCycles: 3,
+    target: "Pause a convergence on an answering-model downgrade.",
+  })
+  const stopped = await broker.awaitWorkflow({ timeoutMs: 5_000, workflowId: started.id })
+
+  assert.equal(stopped.status, "human_required")
+  assert.equal(stopped.phase, "stopped")
+  assert.equal(stopped.humanRequired.code, "answering_model_downgraded")
+  assert.match(stopped.humanRequired.message, /gpt-5-6-thinking/)
+  assert.match(stopped.humanRequired.message, /gpt-6-pro/)
+
+  // Ends the cycle immediately: no cycle-3 Codex turn and no resent review.
+  assert.equal(appServer.turns, 2)
+  assert.equal(ego.exchanges, 2)
+
+  const stored = store.getWorkflow(started.id)
+  assert.equal(stored.private.cycles.length, 2)
+  assert.ok(stored.private.cycles.at(-1).review, "the downgraded cycle's review is retained")
+  assert.equal(stored.private.cycles.at(-1).chatGpt.responseModelSlug, "gpt-5-6-thinking")
+
+  assert.deepEqual(stopped.answeringModel, { first: "gpt-6-pro", last: "gpt-5-6-thinking" })
+})

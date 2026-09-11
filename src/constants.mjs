@@ -29,6 +29,21 @@ export const DEFAULT_MODEL_POLICY = Object.freeze({
   thinkingEffort: "maximum_available",
 })
 
+// Highest-ranked (strongest) answering model first. Used to detect a silent
+// answering-model downgrade: the pre-send policy check verifies the
+// composer's strongest route and maximum effort, but not which model
+// actually answers.
+export const ANSWERING_MODEL_RANKS = Object.freeze([
+  "gpt-6-pro",
+  "gpt-6",
+  "gpt-5-6-pro",
+  "gpt-5-6-thinking",
+  "gpt-5-6",
+  "gpt-5-5-pro",
+  "gpt-5-5-thinking",
+  "gpt-5-5",
+])
+
 export const MAX_IPC_LINE_BYTES = 1024 * 1024
 export const MAX_DRIVER_INPUT_BYTES = 512 * 1024
 export const MAX_PROMPT_BYTES = 192 * 1024
