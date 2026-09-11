@@ -10833,6 +10833,158 @@ test("abandoning a cancelled pre-send exchange releases the runner's stale task-
   assert.equal(retried.bindingKey, "admission-release")
 })
 
+async function setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity }) {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  let sendCalls = 0
+  let reconcileCalls = 0
+  let captureEntered
+  const entered = new Promise((resolve) => { captureEntered = resolve })
+  const store = new EventStore(dataDir)
+  const reconcileResults = []
+  const broker = new Broker({
+    egoAdapter: {
+      ...unusedEgoAdapter,
+      bind: async (input) => ({
+        canonicalUrl: null,
+        targetId: input.targetId,
+        taskSpaceIdentity,
+        taskSpaceId: 84,
+      }),
+      ensureModelPolicy: async () => modelPolicyObservation(),
+      sendExchange: async (input) => {
+        sendCalls += 1
+        return {
+          // The live 2026-09-11 incident's send confirmation already carried
+          // the real canonical URL (not a provisional /WEB: id), so the
+          // vanished-space reconciliation must not need canonical promotion.
+          canonicalUrl: `https://chatgpt.com/c/${bindingKey}-recovered`,
+          modelPolicy: modelPolicyObservation(),
+          promptMessageId: `${bindingKey}-prompt`,
+          sentAt: new Date().toISOString(),
+          targetId: `${bindingKey}-tab`,
+          taskSpaceIdentity,
+          taskSpaceId: 84,
+          turnMarker: input.turnMarker,
+        }
+      },
+      captureExchange: async (_input, signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("cancelled capture")), { once: true })
+        captureEntered()
+      }),
+      reconcile: async (input) => {
+        reconcileCalls += 1
+        reconcileResults.push(input)
+        return {
+          canonicalUrl: `https://chatgpt.com/c/${bindingKey}-recovered`,
+          head: {
+            fingerprint: `${bindingKey}-after`,
+            fingerprintVersion: "tail-v1",
+            lastContentDigest: digest(`Recovered acknowledgement.\nDONE_${bindingKey.toUpperCase().replaceAll("-", "_")}`),
+            lastMessageId: `${bindingKey}-assistant`,
+            lastRole: "assistant",
+            messageCount: 2,
+          },
+          responseDigest: digest(`Recovered acknowledgement.\nDONE_${bindingKey.toUpperCase().replaceAll("-", "_")}`),
+          responseText: `Recovered acknowledgement.\nDONE_${bindingKey.toUpperCase().replaceAll("-", "_")}`,
+          targetId: `${bindingKey}-tab`,
+          taskSpaceIdentity,
+          taskSpaceId: 84,
+          turnMarker: input.turnMarker,
+        }
+      },
+    },
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey,
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: `${bindingKey}-tab`,
+    taskSpace: 84,
+  })
+  const turnMarker = "EGO_CHAT_VANISHED_SPACE_MARKER"
+  const started = await broker.startEgoExchange({
+    bindingKey,
+    expectedTerminalMarker: `DONE_${bindingKey.toUpperCase().replaceAll("-", "_")}`,
+    prompt: `${turnMarker}\nReview the checkpoint.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  await entered
+  await broker.cancelWorkflow({ workflowId: started.id })
+  await new Promise((resolve) => globalThis.setImmediate(resolve))
+  const cancelled = store.getWorkflow(started.id)
+  return {
+    broker, cancelled, reconcileCalls: () => reconcileCalls, reconcileResults, sendCalls: () => sendCalls, started, store,
+  }
+}
+
+for (const recoveryCode of ["task_space_identity_unavailable", "bound_task_space_identity_changed"]) {
+  test(`a confirmed create-once send stuck at ${recoveryCode} after its space vanished reconciles as an evidence-only capture without resending`, async (t) => {
+    const bindingKey = `vanished-space-${recoveryCode.replaceAll("_", "-")}`
+    const taskSpaceIdentity = browserTaskSpaceIdentity(bindingKey)
+    const { broker, cancelled, reconcileCalls, reconcileResults, sendCalls, started, store } =
+      await setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity })
+
+    // Simulate the 0.2.23 record shape: the capture loop observed the space
+    // vanish after the confirmed send instead of a host cancellation. The
+    // durable send evidence (private.send.promptMessageId) and the
+    // reconciliation evidence (the canonical URL) are unchanged.
+    const stuck = {
+      ...cancelled,
+      humanRequired: {
+        code: recoveryCode,
+        message: "The requested existing task space is not present before selection.",
+      },
+    }
+    await store.persist("workflow.human_required", stuck)
+    assert.equal(store.getWorkflow(started.id).private?.send?.promptMessageId, `${bindingKey}-prompt`)
+
+    const recovered = await broker.reconcileConversation({ bindingKey, workflowId: started.id })
+
+    assert.equal(recovered.canonicalUrl, `https://chatgpt.com/c/${bindingKey}-recovered`)
+    assert.equal(recovered.state, "bound")
+    assert.equal(broker.getWorkflow({ workflowId: started.id }).status, "succeeded")
+    assert.equal(sendCalls(), 1)
+    assert.equal(reconcileCalls(), 1)
+    assert.equal(reconcileResults[0].promptMessageId, `${bindingKey}-prompt`)
+    const binding = broker.getConversationBinding({ bindingKey })
+    assert.equal(binding.state, "bound")
+    assert.equal(binding.canonicalUrl, `https://chatgpt.com/c/${bindingKey}-recovered`)
+  })
+}
+
+test("a confirmed create-once send stuck before send confirmation is not reconciled by the vanished-space evidence path", async (t) => {
+  const bindingKey = "vanished-space-pre-send"
+  const taskSpaceIdentity = browserTaskSpaceIdentity(bindingKey)
+  const { broker, cancelled, reconcileCalls, started, store } =
+    await setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity })
+
+  // Nothing changes for an exchange that never confirmed a send: the same
+  // evidence shape, but the workflow never reached the send_confirmed phase
+  // and never recorded private.send, so the vanished-space evidence path
+  // must keep refusing exactly like it always has.
+  const stuck = {
+    ...cancelled,
+    humanRequired: {
+      code: "task_space_identity_unavailable",
+      message: "The requested existing task space is not present before selection.",
+    },
+    phase: "browser_owned",
+    private: { ...cancelled.private, send: undefined },
+  }
+  await store.persist("workflow.human_required", stuck)
+
+  await assert.rejects(
+    broker.reconcileConversation({ bindingKey, workflowId: started.id }),
+    (error) => error.code === "workflow_not_reconcilable",
+  )
+  assert.equal(reconcileCalls(), 0)
+})
+
 test("reconciliation rejects canonical retargeting before blob or binding persistence", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
@@ -15029,6 +15181,127 @@ test("a capture-loop bound task-space recreation is granted and recorded", async
     .split("\n")
     .map((line) => JSON.parse(line))
   assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+})
+
+test("a create-once capture-loop task-space recreation is granted and recorded after a confirmed send", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/create-once-task-space-recovery-capture"
+  const terminalMarker = "EGO_CHAT_CREATE_ONCE_TASK_SPACE_RECOVERY_CAPTURE_DONE"
+  const turnMarker = "EGO_CHAT_CREATE_ONCE_TASK_SPACE_RECOVERY_CAPTURE_TEST"
+  const taskSpaceIdentity = browserTaskSpaceIdentity("create-once-capture-recreate")
+  const boundTaskSpaceId = 205
+  const recreatedTaskSpaceId = 206
+  let captures = 0
+  let sends = 0
+  const captureParams = []
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async (input) => ({
+      canonicalUrl: null,
+      targetId: input.targetId,
+      taskSpaceIdentity,
+      taskSpaceId: boundTaskSpaceId,
+    }),
+    captureExchange: async (params) => {
+      captures += 1
+      captureParams.push(params.taskSpaceRecovery)
+      if (params.taskSpaceRecovery === undefined) {
+        throw new EgoChatError(
+          "human_required",
+          "The requested existing task space is not present before selection.",
+          { reason: "bound_task_space_missing", matchCount: 0, recreatable: true },
+        )
+      }
+      const responseText = terminalMarker
+      return {
+        canonicalUrl,
+        head: {
+          fingerprint: "create-once-capture-recreate-after",
+          fingerprintVersion: "tail-v1",
+          lastContentDigest: digest(responseText),
+          lastMessageId: "create-once-capture-recreate-assistant-after",
+          lastRole: "assistant",
+          messageCount: 2,
+        },
+        responseDigest: digest(responseText),
+        responseText,
+        targetId: "create-once-capture-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: recreatedTaskSpaceId,
+        taskSpaceRecovery: {
+          method: "recreate",
+          previousTaskSpaceId: boundTaskSpaceId,
+          taskSpaceId: recreatedTaskSpaceId,
+        },
+        turnMarker,
+      }
+    },
+    sendExchange: async () => {
+      sends += 1
+      return {
+        canonicalUrl,
+        modelPolicy: modelPolicyObservation(),
+        promptMessageId: "create-once-capture-recreate-user",
+        sentAt: new Date().toISOString(),
+        targetId: "create-once-capture-recreate-tab",
+        taskSpaceIdentity,
+        taskSpaceId: boundTaskSpaceId,
+        turnMarker,
+      }
+    },
+  }
+  const broker = new Broker({
+    boundTaskSpaceRecreateDelayMs: 0,
+    egoAdapter,
+    recoveryDelaysMs: [0],
+    store: new EventStore(dataDir),
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "create-once-task-space-recovery-capture",
+    mode: "create_once",
+    startUrl: "https://chatgpt.com/",
+    targetId: "create-once-capture-recreate-tab",
+    taskSpace: boundTaskSpaceId,
+  })
+
+  const started = await broker.startEgoExchange({
+    bindingKey: "create-once-task-space-recovery-capture",
+    expectedTerminalMarker: terminalMarker,
+    prompt: `${turnMarker}\nCapture after the confirmed create-once space vanishes.`,
+    timeoutMs: 30_000,
+    turnMarker,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.captureRecoveryCount, 1)
+  assert.equal(sends, 1)
+  assert.equal(captures, 2)
+  assert.equal(captureParams[0], undefined)
+  assert.deepEqual(captureParams[1], { allowRecreate: true })
+  assert.deepEqual(completed.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
+  const binding = broker.getConversationBinding({ bindingKey: "create-once-task-space-recovery-capture" })
+  assert.equal(binding.state, "bound")
+  assert.equal(binding.canonicalUrl, canonicalUrl)
+
+  const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  assert.equal(events.some((event) => event.type === "binding.promoted"), true)
+  const captureCommit = events.find((event) => event.type === "exchange.response_captured")
+  assert.deepEqual(captureCommit?.workflow?.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: boundTaskSpaceId,
+    taskSpaceId: recreatedTaskSpaceId,
+  })
 })
 
 test("a recreation observed during a pending capture is retained and closes the outage", async (t) => {

@@ -1476,6 +1476,7 @@ async function runTaskSpaceReconciliationCase({
   attachmentObservation = null,
   allowProtocolRepairCapture = false,
   allowTaskSpaceReclaim = false,
+  bindingCanonicalUrl = undefined,
   bindingState = "bound",
   bindingKey = "ego-chat-main",
   brokerFenceChangesDuringReclaimRelist = false,
@@ -1496,6 +1497,7 @@ async function runTaskSpaceReconciliationCase({
   imageOnlyResponse = false,
   identityTaskSpaceLiveIdentity = null,
   identityTaskSpaceOwnership = null,
+  initialTabOpen = undefined,
   mode = "reconcile_bound",
   ownershipAfterSelection = null,
   postSelectionConflictingIdentity = null,
@@ -1514,6 +1516,7 @@ async function runTaskSpaceReconciliationCase({
   taskSpaceGuard = null,
   taskSpaceIdentity = null,
   taskSpaceRecovery = undefined,
+  unboundTaskSpaceLive = true,
 } = {}) {
   driverCase += 1
   const driverUid = `ego-chat-reconcile-${process.pid}-${driverCase}`
@@ -1531,7 +1534,7 @@ async function runTaskSpaceReconciliationCase({
     ...(adoptedTaskSpaceOwnership
       ? [{ id: 10, name: "adoption-driver-space", ownership: adoptedTaskSpaceOwnership, taskId: "adoption-driver-space" }]
       : []),
-    ...(bindingState === "unbound"
+    ...(bindingState === "unbound" && unboundTaskSpaceLive
       ? [{ id: 10, ...effectiveTaskSpaceIdentity, ownership: "agent" }]
       : []),
     ...(requestedTaskSpaceOwnership
@@ -1589,7 +1592,9 @@ async function runTaskSpaceReconciliationCase({
     ...(allowTaskSpaceReclaim ? { allowTaskSpaceReclaim: true } : {}),
     ...(captureContinuationAllowed ? { captureContinuationAllowed: true } : {}),
     binding: {
-      canonicalUrl: bindingState === "bound" ? canonicalUrl : null,
+      canonicalUrl: bindingCanonicalUrl !== undefined
+        ? bindingCanonicalUrl
+        : (bindingState === "bound" ? canonicalUrl : null),
       headRole: bindingState === "bound" ? "assistant" : null,
       key: bindingKey,
       messageCount: bindingState === "bound" ? 2 : 0,
@@ -1642,7 +1647,7 @@ async function runTaskSpaceReconciliationCase({
   const harness = `
 process.getuid = () => ${JSON.stringify(driverUid)}
 const fs = await import('node:fs/promises')
-let opened = ${JSON.stringify(bindingState === "unbound")}
+let opened = ${JSON.stringify(initialTabOpen !== undefined ? initialTabOpen : bindingState === "unbound")}
 let composerDraft = ${JSON.stringify(composerDraft)}
 let driftTaskSpace = false
 let observedCanonicalUrl = ${JSON.stringify(canonicalUrl)}
@@ -3910,6 +3915,67 @@ test("capture_exchange mode recreates a vanished bound task space with authority
     previousTaskSpaceId: 10,
     taskSpaceId: reconciled.result.taskSpaceId,
   })
+})
+
+test("a vanished space for a confirmed unbound create-once send is reported as the retryable bound outage", async () => {
+  const identity = { name: "create-once-vanished-space", taskId: "create-once-vanished-space" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    bindingCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    bindingState: "unbound",
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    initialTabOpen: false,
+    mode: "capture_exchange",
+    sentCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    taskSpaceIdentity: identity,
+    unboundTaskSpaceLive: false,
+  })
+
+  assert.equal(reconciled.result, undefined)
+  assert.equal(reconciled.error?.code, "human_required")
+  assert.equal(reconciled.error?.details?.reason, "bound_task_space_missing")
+  assert.equal(reconciled.error?.details?.evidence?.recreatable, true)
+  assert.equal(reconciled.error?.details?.evidence?.matchCount, 0)
+  assert.equal(reconciled.taskSpaceCreations, 0)
+  assert.deepEqual(reconciled.taskSpaceRequests, [])
+  assert.deepEqual(reconciled.counters, {
+    claimTaskSpace: 0,
+    click: 0,
+    fillInput: 0,
+    pressKey: 0,
+    takeOverTaskSpace: 0,
+    typeText: 0,
+  })
+})
+
+test("a granted recreation restores a confirmed unbound create-once space, reopens the canonical conversation and captures", async () => {
+  const identity = { name: "create-once-recreate-space", taskId: "create-once-recreate-space" }
+  const reconciled = await runTaskSpaceReconciliationCase({
+    bindingCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    bindingState: "unbound",
+    captureContinuationAllowed: true,
+    generationRunning: false,
+    initialTabOpen: false,
+    mode: "capture_exchange",
+    responseText: "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST",
+    sentCanonicalUrl: "https://chatgpt.com/c/reconcile-driver-test",
+    taskSpaceIdentity: identity,
+    taskSpaceRecovery: { allowRecreate: true },
+    unboundTaskSpaceLive: false,
+  })
+
+  assert.equal(reconciled.error, undefined)
+  assert.equal(reconciled.taskSpaceCreations, 1)
+  assert.deepEqual(reconciled.taskSpaceRequests, [identity.name])
+  assert.notEqual(reconciled.result.taskSpaceId, 10)
+  assert.deepEqual(reconciled.result.taskSpaceIdentity, identity)
+  assert.deepEqual(reconciled.result.taskSpaceRecovery, {
+    method: "recreate",
+    previousTaskSpaceId: 10,
+    taskSpaceId: reconciled.result.taskSpaceId,
+  })
+  assert.equal(reconciled.result.canonicalUrl, "https://chatgpt.com/c/reconcile-driver-test")
+  assert.equal(reconciled.result.responseText, "Reviewed.\nEGO_CHAT_REVIEW_DONE_RECONCILE_TEST")
 })
 
 test("an opaque identity that vanishes cannot be recreated even with authority", async () => {
