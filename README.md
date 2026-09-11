@@ -623,10 +623,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.24 raises the ChatGPT thinking effort in the composer's effort view (the model view disables the Power control, which made every earlier attempt loop into `model_policy_mismatch`), fails closed instead of pressing a disabled control, and records the answering model slug (`responseModelSlug`) on every captured response and in the verified policy. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 20); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.25 makes the driver's keyboard steps real: the Ego driver runtime only acts on the mixed-case key names (`Enter`, `Escape`, `ArrowRight`), and the upper-case spellings used until 0.2.24 were silent no-ops, so raising the thinking effort from `Extra High` to `6 Pro` never happened and looped into `model_policy_mismatch`. The answering model slug (`responseModelSlug`) recording from 0.2.24 stays. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 21); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.24 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.25 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
