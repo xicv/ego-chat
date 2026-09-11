@@ -6,8 +6,11 @@ import path from "node:path"
 import test from "node:test"
 import { setImmediate } from "node:timers"
 
+import { z } from "zod/v4"
+
 import { Broker } from "../src/broker.mjs"
 import { createContract, digestJson } from "../src/convergence.mjs"
+import { CONVERGENCE_INPUT_SCHEMA } from "../src/mcp-server.mjs"
 import { EventStore } from "../src/store.mjs"
 
 const sha = (text) => createHash("sha256").update(text).digest("hex")
@@ -264,6 +267,68 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
     counts: () => ({ localCalls, reconciliations }),
   }
 }
+
+test("conversationContinuation defaults to a same-project successor on both the broker and MCP schemas", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-default-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const store = new EventStore(directory)
+  await store.initialize()
+  const broker = new Broker({
+    appServerFactory: () => { throw new Error("Not exercised by this default-value assertion") },
+    egoAdapter: { bind: async () => ({ ...location(keys[0]), head: head(keys[0]) }) },
+    recoveryDelaysMs: [0],
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({ bindingKey: keys[0], canonicalUrl: location(keys[0]).canonicalUrl, mode: "existing", taskSpace: location(keys[0]).taskSpaceId })
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Default rollover applies without an explicit choice."],
+    bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
+  })
+  assert.equal(store.getWorkflow(started.id).private.request.conversationContinuation, "same_project_on_exhaustion")
+
+  const mcpParsed = z.object(CONVERGENCE_INPUT_SCHEMA).parse({
+    acceptanceCriteria: ["Default rollover applies without an explicit choice."],
+    bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
+  })
+  assert.equal(mcpParsed.conversationContinuation, "same_project_on_exhaustion")
+})
+
+test("an explicit manual opt-out is stored and survives restart", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-manual-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const store = new EventStore(directory)
+  await store.initialize()
+  const contract = createContract("Private manual-opt-out target.", ["The exact candidate keeps its manual choice."])
+  const candidate = {
+    blockers: [], criteria: [{ id: "AC-1", status: "pass", evidence: "Private deterministic candidate evidence." }],
+    reviewPacket: "Private retained review packet.", status: "candidate", summary: "Private retained candidate.",
+  }
+  const now = new Date().toISOString()
+  const workflow = {
+    id: randomUUID(), kind: "convergence", bindingKey: keys[0], status: "running", phase: "codex_captured",
+    cycle: 1, candidateDigest: digestJson(candidate), targetDigest: contract.targetDigest,
+    cwd: directory, codexSandbox: "read-only", codexThreadId: "manual-opt-out-thread", maxCycles: null,
+    createdAt: now, updatedAt: now, deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+    inputDigest: digestJson({ contract, cwd: directory, sandbox: "read-only" }),
+    private: {
+      contract, priorReview: null,
+      cycles: [{ cycle: 1, candidate, candidateDigest: digestJson(candidate), codex: { turnId: "manual-opt-out-turn", responseDigest: sha("candidate"), workspaceActivity: { count: 1, types: ["commandExecution"] } } }],
+      request: {
+        acceptanceCriteria: contract.criteria.map(({ text }) => text), target: contract.target,
+        bindingKey: keys[0], cwd: directory, codexSandbox: "read-only", allowTaskSpaceReclaim: true,
+        conversationContinuation: "manual",
+        chatGptTimeoutMs: 30_000, codexTurnTimeoutMs: 30_000, wallClockTimeoutMs: 3_600_000,
+      },
+    },
+  }
+  await store.persist("workflow.started", workflow)
+  assert.equal(store.getWorkflow(workflow.id).private.request.conversationContinuation, "manual")
+  const restartedStore = new EventStore(directory)
+  await restartedStore.initialize()
+  assert.equal(restartedStore.getWorkflow(workflow.id).private.request.conversationContinuation, "manual")
+})
 
 test("opted-in exhaustion prepares one successor and consumes its first review without a duplicate Send", async (t) => {
   const f = await harness(t, { automatic: true })

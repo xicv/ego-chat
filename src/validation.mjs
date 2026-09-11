@@ -284,7 +284,7 @@ const ConvergenceTextSchema = (maximum) => z.string().trim().min(1).max(maximum)
   .refine((value) => !value.includes("\0"), "Text must not contain null bytes")
 
 export const StartConvergenceSchema = z.object({
-  conversationContinuation: z.enum(["manual", "same_project_on_exhaustion"]).default("manual"),
+  conversationContinuation: z.enum(["manual", "same_project_on_exhaustion"]).default("same_project_on_exhaustion"),
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true),
   bindingKey: BindingKeySchema,

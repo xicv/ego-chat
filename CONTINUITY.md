@@ -60,6 +60,8 @@ Human action remains appropriate only for:
 - a CAPTCHA or equivalent human verification challenge;
 - consequential authority outside review, such as credentials, merge, deployment, production access, or scope expansion.
 
+Choosing a same-project successor after attributed conversation exhaustion is durable broker authority by default; it does not require a human step unless the caller started the workflow with `conversationContinuation: "manual"`.
+
 Corrupt durable identity or a runtime capability mismatch may require maintenance, but must be reported as a tool/runtime fault rather than disguised as review feedback or a ceremonial approval request.
 
 ## Token and process continuity
