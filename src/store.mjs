@@ -1279,6 +1279,8 @@ export class EventStore {
   #maxResultBytes
   #maxStateBytes
   #maxTerminalWorkflows
+  #pendingBlobDigests = new Map()
+  #pendingBlobTtlMs
   #rawRetentionMs
   #state = clone(EMPTY_STATE)
   #statePath
@@ -1309,6 +1311,7 @@ export class EventStore {
     this.#maxResultBytes = options.maxResultBytes ?? MAX_RESULT_BYTES
     this.#maxStateBytes = options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES
     this.#maxTerminalWorkflows = options.maxTerminalWorkflows ?? 500
+    this.#pendingBlobTtlMs = options.pendingBlobTtlMs ?? 24 * 60 * 60 * 1_000
     this.#rawRetentionMs = options.rawRetentionMs ?? 30 * 24 * 60 * 60 * 1_000
     this.#statePath = path.join(dataDir, "state.json")
   }
@@ -1361,6 +1364,7 @@ export class EventStore {
     this.#blobBytes = 0
     this.#eventBytes = 0
     this.#eventsSinceCheckpoint = 0
+    this.#pendingBlobDigests = new Map()
 
     let durableRepairRequired = false
     let legacyReplay = false
@@ -1599,12 +1603,18 @@ export class EventStore {
       await writeAtomicText(filePath, text)
       this.#blobBytes += bytes.length
     }
-    return {
+    const reference = {
       digest,
       mediaType,
       sizeBytes: bytes.length,
       uri: `ego-chat-result:${digest}`,
     }
+    // Pin the digest until the event that references it (workflow.result.responseRef)
+    // is durably persisted. Without this, a compaction triggered between this write
+    // and that persist would see the blob as unreferenced and delete it out from
+    // under the in-flight result. See #mergePendingBlobReferences.
+    this.#pendingBlobDigests.set(digest, { at: Date.now(), reference })
+    return reference
   }
 
   async readBlob(reference, { maxBytes, offset }) {
@@ -2518,6 +2528,10 @@ export class EventStore {
     }
 
     applyEvent(this.#state, event)
+    const persistedResponseDigest = event.workflow?.result?.responseRef?.digest
+    if (typeof persistedResponseDigest === "string") {
+      this.#pendingBlobDigests.delete(persistedResponseDigest)
+    }
     this.#eventBytes += Buffer.byteLength(serializedEvent, "utf8")
     this.#eventsSinceCheckpoint += 1
     if (
@@ -3222,8 +3236,22 @@ export class EventStore {
     return { exact, retainedBytes }
   }
 
+  #mergePendingBlobReferences(references) {
+    const now = Date.now()
+    for (const [digest, pending] of this.#pendingBlobDigests) {
+      if (now - pending.at > this.#pendingBlobTtlMs) {
+        this.#pendingBlobDigests.delete(digest)
+        continue
+      }
+      if (!references.has(digest)) {
+        references.set(digest, pending.reference)
+      }
+    }
+  }
+
   async #reconcileBlobInventory() {
     const references = this.#referencedBlobMap()
+    this.#mergePendingBlobReferences(references)
     const quarantine = await this.#openPinnedBlobQuarantine()
     try {
       await this.#assertPinnedBlobQuarantine(quarantine, { requireEmpty: true })
