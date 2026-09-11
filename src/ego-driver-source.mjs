@@ -1508,7 +1508,7 @@ async function egoDriverMain(
         && ["capture_exchange", "exchange", "reanchor", "reconcile_bound", "verify"].includes(input.mode)
     }
     return binding.state === "unbound"
-      && input.mode === "capture_exchange"
+      && ["capture_exchange", "reconcile"].includes(input.mode)
       && typeof binding.canonicalUrl === "string"
       && binding.canonicalUrl.length > 0
       && isCanonicalConversationUrl(binding.canonicalUrl)
@@ -3620,15 +3620,66 @@ async function egoDriverMain(
       })
       return
     }
-    const selected = await selectExactTarget(
-      input.binding.taskSpaceId,
-      input.binding.targetId,
-      input.binding.taskSpaceIdentity,
-    )
-    if (!selected) {
-      return
+    let selected
+    let inspection
+    if (canRecreateBoundTaskSpace(input.binding)) {
+      // A confirmed create-once send whose task space vanished recovers
+      // exactly like a bound binding's vanished Space: reuse the bound
+      // selection machinery so a missing Space can be recreated by its
+      // deterministic name, and -- since a recreated Space cannot keep the
+      // original tab alive -- reopen the confirmed canonical conversation,
+      // exactly like reconcileBound's unbound branch does.
+      const task = await useBoundTaskSpace(input.binding)
+      if (!task) {
+        return
+      }
+      const tabs = await listTabs()
+      const existingTab = tabs.find((candidate) => candidate.targetId === input.binding.targetId)
+      if (existingTab) {
+        if (!await fencedSwitchTab(existingTab.targetId, "immediately_before_tab_switch")) {
+          return
+        }
+        selected = { tab: existingTab, targetId: existingTab.targetId, task }
+      } else if (taskSpaceRecovery) {
+        const navigation = await fencedOpenOrReuseTab(
+          normalizeUrl(input.binding.canonicalUrl),
+          { timeout: 30, wait: true },
+          "immediately_before_navigation",
+        )
+        if (!navigation.performed) {
+          return
+        }
+        const reopened = navigation.value
+        const refreshedTabs = await listTabs()
+        const activeTab = refreshedTabs.find((candidate) => candidate.targetId === reopened?.targetId)
+          || refreshedTabs.find((candidate) => candidate.active)
+          || reopened
+        if (!activeTab?.targetId) {
+          humanRequired("bound_conversation_open_failed", "The canonical ChatGPT conversation could not be reopened after task-space recovery.", {
+            taskSpaceId: task.id,
+          })
+          return
+        }
+        selected = { tab: activeTab, targetId: activeTab.targetId, task }
+      } else {
+        humanRequired("bound_tab_missing", "The exact bound ChatGPT tab is no longer available.", {
+          targetId: input.binding.targetId,
+          taskSpaceId: task.id,
+        })
+        return
+      }
+      inspection = await waitForReadyInspection()
+    } else {
+      selected = await selectExactTarget(
+        input.binding.taskSpaceId,
+        input.binding.targetId,
+        input.binding.taskSpaceIdentity,
+      )
+      if (!selected) {
+        return
+      }
+      inspection = await inspectPage()
     }
-    const inspection = await inspectPage()
     if (!assertReady(inspection, selected)) {
       return
     }

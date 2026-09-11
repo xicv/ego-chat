@@ -10833,7 +10833,12 @@ test("abandoning a cancelled pre-send exchange releases the runner's stale task-
   assert.equal(retried.bindingKey, "admission-release")
 })
 
-async function setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity }) {
+async function setUpConfirmedCreateOnceStuckAtSend(t, {
+  bindingKey,
+  reconcileTaskSpaceId = 84,
+  reconcileTaskSpaceRecovery = undefined,
+  taskSpaceIdentity,
+}) {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
   let sendCalls = 0
@@ -10889,8 +10894,9 @@ async function setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIde
           responseText: `Recovered acknowledgement.\nDONE_${bindingKey.toUpperCase().replaceAll("-", "_")}`,
           targetId: `${bindingKey}-tab`,
           taskSpaceIdentity,
-          taskSpaceId: 84,
+          taskSpaceId: reconcileTaskSpaceId,
           turnMarker: input.turnMarker,
+          ...(reconcileTaskSpaceRecovery ? { taskSpaceRecovery: reconcileTaskSpaceRecovery } : {}),
         }
       },
     },
@@ -10918,7 +10924,7 @@ async function setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIde
   await new Promise((resolve) => globalThis.setImmediate(resolve))
   const cancelled = store.getWorkflow(started.id)
   return {
-    broker, cancelled, reconcileCalls: () => reconcileCalls, reconcileResults, sendCalls: () => sendCalls, started, store,
+    broker, cancelled, dataDir, reconcileCalls: () => reconcileCalls, reconcileResults, sendCalls: () => sendCalls, started, store,
   }
 }
 
@@ -10975,6 +10981,123 @@ test("a confirmed create-once send stuck before send confirmation is not reconci
     },
     phase: "browser_owned",
     private: { ...cancelled.private, send: undefined },
+  }
+  await store.persist("workflow.human_required", stuck)
+
+  await assert.rejects(
+    broker.reconcileConversation({ bindingKey, workflowId: started.id }),
+    (error) => error.code === "workflow_not_reconcilable",
+  )
+  assert.equal(reconcileCalls(), 0)
+})
+
+for (const recoveryCode of ["task_space_identity_unavailable", "bound_task_space_identity_changed"]) {
+  test(`a confirmed create-once send whose Space vanished leaves only reconciliation evidence (real ${recoveryCode} shape) and still reconciles by recreating the Space`, async (t) => {
+    const bindingKey = `vanished-space-real-shape-${recoveryCode.replaceAll("_", "-")}`
+    const taskSpaceIdentity = browserTaskSpaceIdentity(bindingKey)
+    const { broker, cancelled, dataDir, reconcileCalls, reconcileResults, sendCalls, started, store } =
+      await setUpConfirmedCreateOnceStuckAtSend(t, {
+        bindingKey,
+        reconcileTaskSpaceId: 101,
+        reconcileTaskSpaceRecovery: { method: "recreate", previousTaskSpaceId: 84, taskSpaceId: 101 },
+        taskSpaceIdentity,
+      })
+
+    // The real 2026-09-11 stranded record: the capture loop's retries
+    // exhausted before human_required, so private.send never survived --
+    // only `reconciliation` (already carrying the confirmed canonical URL,
+    // taskSpaceIdentity, promptMessageId and sentAt from the send_confirmed
+    // patch) proves the send was confirmed.
+    const { modelPolicy, request } = cancelled.private
+    assert.equal(typeof cancelled.reconciliation?.promptMessageId, "string")
+    assert.equal(typeof cancelled.reconciliation?.sentAt, "string")
+    assert.equal(cancelled.reconciliation?.confirmedTaskSpace?.canonicalUrl, `https://chatgpt.com/c/${bindingKey}-recovered`)
+    const stuck = {
+      ...cancelled,
+      humanRequired: {
+        code: recoveryCode,
+        message: "The requested existing task space is not present before selection.",
+      },
+      private: { modelPolicy, request },
+    }
+    assert.equal(stuck.private.send, undefined)
+    await store.persist("workflow.human_required", stuck)
+
+    const recovered = await broker.reconcileConversation({ bindingKey, workflowId: started.id })
+
+    assert.equal(recovered.canonicalUrl, `https://chatgpt.com/c/${bindingKey}-recovered`)
+    assert.equal(recovered.state, "bound")
+    assert.equal(broker.getWorkflow({ workflowId: started.id }).status, "succeeded")
+    assert.equal(sendCalls(), 1)
+    assert.equal(reconcileCalls(), 1)
+    assert.equal(reconcileResults[0].promptMessageId, `${bindingKey}-prompt`)
+    assert.deepEqual(reconcileResults[0].taskSpaceRecovery, { allowRecreate: true })
+
+    const binding = broker.getConversationBinding({ bindingKey })
+    assert.equal(binding.state, "bound")
+    assert.equal(binding.canonicalUrl, `https://chatgpt.com/c/${bindingKey}-recovered`)
+    assert.equal(binding.taskSpaceId, 101)
+
+    const events = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    assert.equal(events.some((event) => event.type === "binding.task_space_recovered"), true)
+  })
+}
+
+test("a confirmed create-once send whose reconciliation-only evidence still has a provisional canonical URL is not reconciled by the vanished-space evidence path", async (t) => {
+  const bindingKey = "vanished-space-real-shape-provisional-url"
+  const taskSpaceIdentity = browserTaskSpaceIdentity(bindingKey)
+  const { broker, cancelled, reconcileCalls, started, store } =
+    await setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity })
+
+  const { modelPolicy, request } = cancelled.private
+  const stuck = {
+    ...cancelled,
+    humanRequired: {
+      code: "task_space_identity_unavailable",
+      message: "The requested existing task space is not present before selection.",
+    },
+    private: { modelPolicy, request },
+    reconciliation: {
+      ...cancelled.reconciliation,
+      confirmedTaskSpace: {
+        ...cancelled.reconciliation.confirmedTaskSpace,
+        canonicalUrl: `https://chatgpt.com/c/WEB:${bindingKey}-provisional`,
+      },
+    },
+  }
+  await store.persist("workflow.human_required", stuck)
+
+  await assert.rejects(
+    broker.reconcileConversation({ bindingKey, workflowId: started.id }),
+    (error) => error.code === "workflow_not_reconcilable",
+  )
+  assert.equal(reconcileCalls(), 0)
+})
+
+test("a confirmed create-once send whose reconciliation-only evidence names a different task-space identity is not reconciled by the vanished-space evidence path", async (t) => {
+  const bindingKey = "vanished-space-real-shape-identity-mismatch"
+  const taskSpaceIdentity = browserTaskSpaceIdentity(bindingKey)
+  const { broker, cancelled, reconcileCalls, started, store } =
+    await setUpConfirmedCreateOnceStuckAtSend(t, { bindingKey, taskSpaceIdentity })
+
+  const { modelPolicy, request } = cancelled.private
+  const stuck = {
+    ...cancelled,
+    humanRequired: {
+      code: "task_space_identity_unavailable",
+      message: "The requested existing task space is not present before selection.",
+    },
+    private: { modelPolicy, request },
+    reconciliation: {
+      ...cancelled.reconciliation,
+      confirmedTaskSpace: {
+        ...cancelled.reconciliation.confirmedTaskSpace,
+        taskSpaceIdentity: browserTaskSpaceIdentity(`${bindingKey}-different`),
+      },
+    },
   }
   await store.persist("workflow.human_required", stuck)
 

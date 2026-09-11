@@ -2080,7 +2080,28 @@ export class Broker {
     // A create-once send that confirmed before its space vanished (reported
     // as task_space_identity_unavailable or bound_task_space_identity_changed
     // when recreation was not granted or not eligible) is recovered the same
-    // way as a cancelled confirmed create-once send: read-only, no new Send.
+    // way as a cancelled confirmed create-once send: no new Send, but this
+    // recovery is now allowed to recreate the vanished Space by name before
+    // reopening the confirmed conversation read-only (see #egoAdapter.reconcile
+    // below). The durable confirmed-send evidence normally lives in
+    // private.send, but a record whose capture retries exhausted before it
+    // reached human_required can lose private.send entirely -- the confirmed
+    // Send is then provable only from workflow.reconciliation, which the
+    // exchange.send_confirmed patch always populates from the same evidence.
+    const confirmedSendEvidenceMatches = workflow.private?.send
+      ? (
+        workflow.private.send.promptMessageId === workflow.reconciliation?.promptMessageId
+        && workflow.private.send.targetId === binding.targetId
+      )
+      : (
+        typeof workflow.reconciliation?.sentAt === "string"
+        && workflow.reconciliation.sentAt.length > 0
+        && isCanonicalConversationUrl(workflow.reconciliation?.confirmedTaskSpace?.canonicalUrl)
+        && isDeepStrictEqual(
+          workflow.reconciliation?.confirmedTaskSpace?.taskSpaceIdentity,
+          binding.taskSpaceIdentity,
+        )
+      )
     const vanishedTaskSpaceConfirmedCreateOnce = binding.state === "unbound"
       && workflow.status === "human_required"
       && ["bound_task_space_identity_changed", "task_space_identity_unavailable"].includes(recoveryCode)
@@ -2089,8 +2110,7 @@ export class Broker {
       && workflow.reconciliation?.beforeHead?.messageId === null
       && typeof workflow.reconciliation?.promptMessageId === "string"
       && workflow.reconciliation.promptMessageId.length > 0
-      && workflow.private?.send?.promptMessageId === workflow.reconciliation.promptMessageId
-      && workflow.private.send.targetId === binding.targetId
+      && confirmedSendEvidenceMatches
     const unboundRecovery = binding.state === "unbound"
       && workflow.status === "human_required"
       && (
@@ -2179,6 +2199,7 @@ export class Broker {
                 inputDigest: workflow.inputDigest,
                 promptMessageId: workflow.reconciliation.promptMessageId,
                 turnMarker,
+                ...(vanishedTaskSpaceConfirmedCreateOnce ? { taskSpaceRecovery: { allowRecreate: true } } : {}),
               },
               undefined,
               (result) => this.#reserveBrowserTaskSpaceIdentity({
