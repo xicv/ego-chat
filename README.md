@@ -625,10 +625,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.28 adds the first overnight alerting layer: the broker raises a local macOS notification with sound (and an optional webhook configured in `<dataDir>/alerts.json`) once per workflow that needs a human, records receipts in a bounded `alerts.jsonl`, and reports the sink in `broker.status.alerts`; Eagle Monitor escalates a pre-Send stall to a human-required notification after 30 minutes, notifies once per semantic stagnation or loop incident in safe mode, repeats accepted notifications with a 1 h doubling backoff capped at 4 h, and convergence workflows carry the exact `eagle-monitor start` command in `supervision.monitorCommand`. It is not yet qualified as interruption-free overnight operation. The browser contract is unchanged (revision 23) but the Eagle Monitor policy digest changes, so a running monitor session reports version skew until it is stopped and started again; upgrade through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.29 ships the remaining overnight Tier 1 slices: ChatGPT terminal banners are matched by token pairs with precedence (a reworded length banner or one next to "Stopped thinking" now classifies as `chatgpt_conversation_exhausted`), pending captures retain the visible status labels, `conversationContinuation` defaults to `same_project_on_exhaustion` (set `manual` to opt out), the successor review carries the prior review summary, a provably pre-Send successor failure is retried exactly once, and paused convergence records expose a bounded `candidateSummary`. It is not yet qualified as interruption-free overnight operation: the exhaustion qualification procedure below has not been run. The browser contract changes (revision 24); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.28 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.29 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode

@@ -1,6 +1,6 @@
 {
   "name": "ego-chat",
-  "version": "0.2.28",
+  "version": "0.2.29",
   "private": true,
   "description": "Durable Codex, ZCode, Claude Code, and ChatGPT handoffs through Ego Browser",
   "type": "module",
