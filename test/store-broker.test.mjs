@@ -5629,6 +5629,117 @@ test("conversation adoption waits outside the caller, captures one stable tail, 
   assert.equal(replayedWorkflow.result.modelPolicy.sourceWorkflowId, started.id)
 })
 
+test("captured responses record the answering model slug on the exchange result and the verified policy", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/adopted-model-slug"
+  const responseText = "The answer, at maximum thinking."
+  const responseDigest = digest(responseText)
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    adopt: async () => ({
+      adoptedWhileGenerating: false,
+      anchor: {
+        contentDigest: "a".repeat(64),
+        messageId: "adopt-user-1",
+      },
+      canonicalUrl,
+      durationMs: 1_000,
+      head: {
+        fingerprint: "adopted-head-slug",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: responseDigest,
+        lastMessageId: "adopt-assistant-1",
+        lastModelSlug: "gpt-6-pro",
+        lastRole: "assistant",
+        messageCount: 2,
+        renderedMessageCount: 2,
+      },
+      modelPolicy: modelPolicyObservation({ modelLabel: "Latest", effortLabel: "6 Pro", pillLabel: "6 Pro" }),
+      responseDigest,
+      responseText,
+      targetId: "adopted-tab",
+      taskSpaceIdentity: {
+        name: "adopted-model-slug-space",
+        taskId: "adopted-model-slug-space",
+      },
+      taskSpaceId: 10,
+    }),
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+
+  const started = await broker.startConversationAdoption({
+    bindingKey: "adopted-model-slug",
+    canonicalUrl,
+    taskSpace: 10,
+    timeoutMs: 30_000,
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.modelPolicy.responseModelSlug, "gpt-6-pro")
+
+  const modelPolicy = broker.getModelPolicy()
+  assert.equal(modelPolicy.lastObserved.responseModelSlug, "gpt-6-pro")
+})
+
+test("a direct exchange records the answering model slug on its result and the verified policy", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: false, recursive: true }))
+  const canonicalUrl = "https://chatgpt.com/c/exchange-model-slug"
+  const responseText = "Reviewed at maximum thinking.\nDONE_EXCHANGE_SLUG"
+  const responseDigest = digest(responseText)
+  const egoAdapter = {
+    ...unusedEgoAdapter,
+    bind: async () => ({
+      canonicalUrl,
+      head: { fingerprint: "exchange-slug-head-0", lastRole: "assistant", messageCount: 2 },
+      targetId: "exchange-slug-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity("exchange-slug"),
+      taskSpaceId: 10,
+    }),
+    exchange: async (input) => ({
+      canonicalUrl,
+      durationMs: 20,
+      head: {
+        fingerprint: "exchange-slug-head-1",
+        fingerprintVersion: "tail-v1",
+        lastContentDigest: responseDigest,
+        lastMessageId: "exchange-slug-assistant-1",
+        lastModelSlug: "gpt-6-pro",
+        lastRole: "assistant",
+        messageCount: 4,
+      },
+      modelPolicy: modelPolicyObservation({ modelLabel: "Latest", effortLabel: "6 Pro", pillLabel: "6 Pro" }),
+      responseDigest,
+      responseText,
+      targetId: "exchange-slug-tab",
+      taskSpaceIdentity: browserTaskSpaceIdentity("exchange-slug"),
+      taskSpaceId: 10,
+      turnMarker: input.turnMarker,
+    }),
+  }
+  const broker = new Broker({ egoAdapter, store: new EventStore(dataDir) })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "exchange-slug", canonicalUrl, mode: "existing", taskSpace: 10,
+  })
+  const started = await broker.startEgoExchange({
+    bindingKey: "exchange-slug",
+    expectedTerminalMarker: "DONE_EXCHANGE_SLUG",
+    prompt: "EGO_CHAT_TURN_EXCHANGE_SLUG\nReview this.",
+    timeoutMs: 30_000,
+    turnMarker: "EGO_CHAT_TURN_EXCHANGE_SLUG",
+  })
+  const completed = await broker.awaitWorkflow({ timeoutMs: 2_000, workflowId: started.id })
+  assert.equal(completed.status, "succeeded")
+  assert.equal(completed.result.modelPolicy.responseModelSlug, "gpt-6-pro")
+  assert.equal(broker.getModelPolicy().lastObserved.responseModelSlug, "gpt-6-pro")
+  assert.equal(broker.getModelPolicy().lastObserved.sourceWorkflowId, started.id)
+})
+
 test("conversation adoption rejects a complete capture without stable task-space identity", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: false, recursive: true }))

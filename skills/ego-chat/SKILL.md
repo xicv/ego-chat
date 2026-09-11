@@ -26,6 +26,7 @@ When the user asks which setting is selected, use the read-only `ego_get_model_p
 - `pillLabel` is the provider's observed closed composer label. The September 2026 observation `Latest` → `6 Pro` is an example, not a permanent name or model-ranking rule.
 - `effortLabel` is a compatibility field: in the separate-model menu it repeats the closed composer label, so `6 Pro` alone does not identify an independent thinking-effort option.
 - `powerLevel` and `powerMax` establish the observed thinking setting. Report the numeric maximum explicitly, for example `Power 5/5`, alongside the route and composer label.
+- `responseModelSlug` is the answering model ChatGPT itself reported for the last captured response (for example `gpt-6-pro`); when the user asks which model answered, this is the authoritative evidence, not the pre-send route or pill label.
 
 Report these as the last verified observation, including `verifiedAt` when freshness matters. A stored observation is not a new UI check and does not authorize Send. Never infer an underlying API model identifier from a route or pill label. For an explicitly requested live policy-maintenance check, use the broker's `ego_ensure_model_policy`; ordinary exchanges should use their built-in checks. A temporary discovery failure stays with the same workflow and its bounded `uiReason` evidence rather than prompting a manual label search, model downgrade, or second browser controller.
 

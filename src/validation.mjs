@@ -153,6 +153,9 @@ export const HeadChangeEvidenceSchema = z.object({
 const ModelPolicyLabelSchema = z.string().trim().min(1).max(120)
   .refine((value) => !/[\u0000-\u001F\u007F]/.test(value), "Label must not contain control characters")
 
+const ResponseModelSlugSchema = z.string().trim().min(1).max(80)
+  .refine((value) => !/[\u0000-\u001F\u007F]/.test(value), "Model slug must not contain control characters")
+
 export const ModelPolicyObservationSchema = z.object({
   adjusted: z.boolean(),
   effortLabel: ModelPolicyLabelSchema,
@@ -161,6 +164,7 @@ export const ModelPolicyObservationSchema = z.object({
   pillLabel: ModelPolicyLabelSchema,
   powerLevel: z.number().int().positive().max(20),
   powerMax: z.number().int().positive().max(20),
+  responseModelSlug: ResponseModelSlugSchema.nullable().optional(),
 }).refine(
   (value) => value.powerLevel === value.powerMax,
   { message: "The observed ChatGPT power level must be the maximum", path: ["powerLevel"] },

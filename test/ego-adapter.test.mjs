@@ -606,11 +606,15 @@ globalThis.click = async (target) => {
       }
     } else {
       policyMenuOpen = !policyMenuOpen
+      if (!policyMenuOpen) modelChoicesOpen = false
       deferredPolicyActivation = false
       deferredPolicyActivationWaits = 0
     }
   }
-  if (target === '#prompt-textarea') policyMenuOpen = false
+  if (target === '#prompt-textarea') {
+    policyMenuOpen = false
+    modelChoicesOpen = false
+  }
 }
 
 globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
@@ -712,6 +716,7 @@ globalThis.js = async (source) => {
         ok: true,
         pillLabel: 'Thinking effort',
         policyVariant: 'separate_model',
+        powerDisabled: modelChoicesOpen,
         selectedModelIndex: modelChoicesOpen ? selectedModelIndex : null,
       }
     }
@@ -978,6 +983,7 @@ console.log('__EGO_CHAT_REANCHOR_CREATIONS__' + JSON.stringify(taskSpaceCreation
 async function runAdoptionDriverCase({
   additionalTaskSpaces = [],
   allowTaskSpaceReclaim = false,
+  assistantModelSlug = null,
   currentModelLabels = ["GPT-5.6 Sol", "GPT-5.5"],
   currentSelectedModelIndex = 0,
   driftAtFinalResult = false,
@@ -1096,6 +1102,7 @@ const messages = () => {
     },
     {
       messageId: 'adopt-assistant-1',
+      modelSlug: ${JSON.stringify(assistantModelSlug)},
       role: 'assistant',
       text: generating ? 'Partial review' : 'The stable long review is complete.',
     },
@@ -1178,8 +1185,14 @@ globalThis.click = async (target) => {
   counters.click += 1
   if (String(target).includes('send-button')) counters.sendClick += 1
   if (policyDom) return policyDom.click(target)
-  if (String(target).includes('__composer-pill')) policyMenuOpen = !policyMenuOpen
-  if (target === '#prompt-textarea') policyMenuOpen = false
+  if (String(target).includes('__composer-pill')) {
+    policyMenuOpen = !policyMenuOpen
+    if (!policyMenuOpen) modelChoicesOpen = false
+  }
+  if (target === '#prompt-textarea') {
+    policyMenuOpen = false
+    modelChoicesOpen = false
+  }
 }
 globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
@@ -1187,7 +1200,7 @@ globalThis.pressKey = async (key) => {
   if (policyDom) return policyDom.pressKey(key)
   if (key === 'ARROWRIGHT') {
     counters.pressKey += 1
-    policyCurrent = 4
+    if (!modelChoicesOpen) policyCurrent = 4
   }
   if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') {
     modelChoicesOpen = true
@@ -1291,6 +1304,7 @@ globalThis.js = async (source) => {
         ok: true,
         pillLabel: 'Thinking effort',
         policyVariant: 'separate_model',
+        powerDisabled: modelChoicesOpen,
         selectedModelIndex: modelChoicesOpen ? selectedModelIndex : null,
         strongestModelIndex: modelChoicesOpen
           ? (currentModelLabels[0]?.startsWith('Default ') ? 1 : 0)
@@ -3507,9 +3521,54 @@ test("conversation adoption selects the GPT-6 Pro route and maximum effort when 
   assert.deepEqual(events[activation], { index: 0, kind: "model_activation", method: "dom" })
   assert.ok(events.slice(activation + 1).some((event) => event.kind === "open"))
   assert.ok(events.slice(activation + 1).some((event) => event.kind === "read" && event.selected === 0))
-  assert.equal(events.filter((event) => event.kind === "power_step").length, 2)
+  const powerSteps = events.filter((event) => event.kind === "power_step")
+  assert.equal(powerSteps.length, 2)
+  assert.ok(powerSteps.every((event) => event.modelOpen === false))
   assert.equal(events.some((event) => event.kind.startsWith("unrelated_") || event.kind === "escape"), false)
   assert.equal(adopted.counters.sendClick, 0)
+})
+
+// The brief describes this as the live pre-send scenario, but the pre-send
+// harness's read-only verifyExistingMaximumModelPolicy hardcodes
+// `adjusted: false` and overwrites observedModelPolicy on success (see
+// src/ego-driver-source.mjs around verifyExistingMaximumModelPolicy), so a
+// genuinely successful pre-send run can never surface `adjusted: true`.
+// Both flows call the same ensureMaximumModelPolicy under test, and the
+// adoption harness returns that function's result verbatim.
+test("current policy repair raises power in the effort view when the model view disables the slider", async () => {
+  const adopted = await runAdoptionDriverCase({
+    policyDomOptions: { current: 3, maximum: 4, selected: 0 },
+  })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.modelPolicy.adjusted, true)
+  assert.equal(adopted.result.modelPolicy.powerLevel, 5)
+  assert.equal(adopted.result.modelPolicy.powerMax, 5)
+  const events = adopted.counters.policyDomEvents
+  const powerSteps = events.filter((event) => event.kind === "power_step")
+  assert.equal(powerSteps.length, 1)
+  assert.ok(powerSteps.every((event) => event.modelOpen === false))
+})
+
+test("a permanently disabled power control stops with policy_power_disabled", async () => {
+  const stopped = await runPreSendDriverCase({
+    policyDomOptions: { current: 3, maximum: 4, selected: 0, powerDisabledInEffortView: true },
+  })
+  assert.equal(stopped.error?.code, "human_required")
+  assert.equal(stopped.error?.details?.reason, "model_policy_ui_unknown")
+  assert.equal(stopped.error?.details?.evidence?.uiReason, "policy_power_disabled")
+  assert.equal(stopped.counters.policyDomEvents.filter((event) => event.kind === "power_step").length, 0)
+})
+
+test("captured responses record the answering model slug", async () => {
+  const adopted = await runAdoptionDriverCase({ assistantModelSlug: "gpt-6-pro" })
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.head.lastModelSlug, "gpt-6-pro")
+})
+
+test("a captured response without a model slug attribute yields null", async () => {
+  const adopted = await runAdoptionDriverCase({})
+  assert.equal(adopted.error, undefined)
+  assert.equal(adopted.result.head.lastModelSlug, null)
 })
 
 test("composer-owned model policy rejects missing, wrong, broad, or ambiguous menu ownership", async (t) => {

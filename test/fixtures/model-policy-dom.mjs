@@ -6,6 +6,8 @@ export function createModelPolicyDom(options = {}) {
     maximum: 4,
     menuOpen: false,
     modelOpen: false,
+    powerDisabledInEffortView: false,
+    powerDisabledInModelView: true,
     selected: 1,
     ...options,
   }
@@ -60,10 +62,15 @@ export function createModelPolicyDom(options = {}) {
     "aria-valuemax": () => String(state.maximum),
     "aria-valuenow": () => String(state.current),
   }, "", [], () => state.menuOpen)
-  const power = new Element({ role: "menuitem", "aria-label": "Power", tabindex: "-1" },
-    "", [slider], () => state.menuOpen)
+  const power = new Element({
+    role: "menuitem", "aria-label": "Power", tabindex: "-1",
+    "aria-disabled": () => String(
+      (state.modelOpen && state.powerDisabledInModelView) || state.powerDisabledInEffortView,
+    ),
+  }, "", [slider], () => state.menuOpen)
   const modelTrigger = new Element({
     role: "menuitem", "aria-label": "Select model", tabindex: "-1",
+    "aria-expanded": () => String(state.modelOpen),
   }, "6 Pro", [], () => state.menuOpen)
   const labels = options.labels ?? ["Latest", "GPT-5.6 Sol"]
   const choices = labels.map((label, index) => {
@@ -136,7 +143,7 @@ export function createModelPolicyDom(options = {}) {
     },
     pressKey(key) {
       if (key === "ENTER") {
-        if (document.activeElement === modelTrigger) state.modelOpen = true
+        if (document.activeElement === modelTrigger) state.modelOpen = !state.modelOpen
         else if (document.activeElement === pill) pill.click()
         else {
           state.activationMethod = "keyboard"
@@ -145,8 +152,11 @@ export function createModelPolicyDom(options = {}) {
         }
       }
       if (key === "ARROWRIGHT" && document.activeElement === power) {
-        state.current = Math.min(state.current + 1, state.maximum)
-        events.push({ kind: "power_step" })
+        const disabled = (state.modelOpen && state.powerDisabledInModelView) || state.powerDisabledInEffortView
+        if (!disabled) {
+          state.current = Math.min(state.current + 1, state.maximum)
+        }
+        events.push({ kind: "power_step", modelOpen: state.modelOpen })
       }
       if (key === "ESCAPE") {
         events.push({ kind: "escape" })

@@ -483,6 +483,9 @@ async function egoDriverMain(
           messageId: imageOnly
             ? message.getAttribute('data-turn-id')
             : message.getAttribute('data-message-id'),
+          modelSlug: !imageOnly && role === 'assistant'
+            ? (message.getAttribute('data-message-model-slug') || null)
+            : null,
           role,
           text: String(content || ''),
         }
@@ -499,6 +502,7 @@ async function egoDriverMain(
           }
         : {}),
       messageId: message.messageId,
+      modelSlug: message.modelSlug ?? null,
       role: message.role,
       text: message.text,
     }))
@@ -602,6 +606,7 @@ async function egoDriverMain(
       fingerprintVersion: "tail-v1",
       lastContentDigest: last?.contentDigest ?? null,
       lastMessageId: last?.messageId ?? null,
+      lastModelSlug: last?.modelSlug ?? null,
       lastRole: last?.role ?? null,
       messageCount: Number.isInteger(logicalMessageCount) ? logicalMessageCount : entries.length,
       renderedMessageCount: entries.length,
@@ -1952,6 +1957,7 @@ async function egoDriverMain(
         ? [...powerItems[0].querySelectorAll('[role="slider"]')].filter(visible)
         : []
       const slider = sliders[0]
+      const powerDisabled = powerItems[0]?.getAttribute('aria-disabled') === 'true'
       const strictInteger = (raw) => {
         if (typeof raw !== 'string') {
           return null
@@ -2019,6 +2025,7 @@ async function egoDriverMain(
           minimum,
           modelRowCount: modelRows.length,
           ok: false,
+          powerDisabled,
           powerItemCount: powerItems.length,
           sliderCount: sliders.length,
           reason: 'policy_menu_structure',
@@ -2035,6 +2042,7 @@ async function egoDriverMain(
           ok: true,
           pillLabel: clean(pill.innerText || pill.textContent),
           policyVariant: 'coupled_power',
+          powerDisabled,
         }
       }
 
@@ -2067,9 +2075,11 @@ async function egoDriverMain(
           modelChoiceCount: modelChoices.length,
           modelChoicesOpen,
           modelLabel: modelChoicesOpen ? modelLabels[selectedModelIndexes[0]] : null,
+          modelViewOpen: modelTriggers[0]?.getAttribute('aria-expanded') === 'true',
           ok: true,
           pillLabel: clean(pill.innerText || pill.textContent),
           policyVariant: 'separate_model',
+          powerDisabled,
           selectedModelIndex: modelChoicesOpen ? selectedModelIndexes[0] : null,
           strongestModelIndex: modelChoicesOpen ? strongestModelIndex : null,
         }
@@ -2217,6 +2227,9 @@ async function egoDriverMain(
         .filter(visible)
         .filter((element) => element.getAttribute('aria-label') === ${labelLiteral})
       if (items.length !== 1) {
+        return false
+      }
+      if (items[0].getAttribute('aria-disabled') === 'true') {
         return false
       }
       items[0].focus()
@@ -2492,6 +2505,37 @@ async function egoDriverMain(
 
     const currentState = opened.state
     if (currentState.current < currentState.maximum) {
+      let stepState = currentState
+      if (stepState.powerDisabled || stepState.modelViewOpen) {
+        if (!await closeModelPolicyMenu()) {
+          humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close before the thinking-effort adjustment.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+            uiReason: "policy_menu_close_before_power_adjustment",
+          })
+          return null
+        }
+        opened = await openStableModelPolicyState(false)
+        if (!opened.ok) {
+          await closeModelPolicyMenu()
+          humanRequired("model_policy_ui_unknown", "The ChatGPT thinking-effort control could not be reopened for adjustment.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+            uiReason: opened.reason,
+          })
+          return null
+        }
+        stepState = opened.state
+        if (stepState.powerDisabled || stepState.modelViewOpen) {
+          await closeModelPolicyMenu()
+          humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control is disabled in the current view.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+            uiReason: stepState.powerDisabled ? "policy_power_disabled" : "policy_model_view_open",
+          })
+          return null
+        }
+      }
       const focused = await focusPolicyMenuItem("Power")
       if (!focused) {
         await closeModelPolicyMenu()
@@ -2502,12 +2546,12 @@ async function egoDriverMain(
         })
         return null
       }
-      for (let step = currentState.current; step < currentState.maximum; step += 1) {
+      for (let step = stepState.current; step < stepState.maximum; step += 1) {
         if (!await fencedPressKey("ARROWRIGHT", "before_policy_power_step")) {
           return null
         }
+        adjusted = true
       }
-      adjusted = true
       await wait(1)
     }
 
