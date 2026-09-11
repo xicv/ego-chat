@@ -33,6 +33,8 @@ function waitModeSchema(defaultMode = "progress") {
 
 const EGO_EXCHANGE_INPUT_SCHEMA = {
   allowTaskSpaceReclaim: z.literal(true).default(true).describe("Ego Chat automatically reclaims only the exact deterministic task space owned by this binding, including read-only recovery after Send."),
+  answeringModelPolicy: z.enum(["alert", "pause"]).default("alert")
+    .describe("A single exchange always alerts on a detected answering-model downgrade (the model that actually answered ranks below the last known-good answering model on this binding); pause has no additional effect here."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   expectedTerminalMarker: z.string().min(1).max(200),
   prompt: z.string().min(1).max(MAX_PROMPT_BYTES),
@@ -57,6 +59,8 @@ export const CONVERGENCE_INPUT_SCHEMA = {
     .describe("Defaults to broker-owned same-project successor reviews after attributed conversation exhaustion; other failures never authorize rollover. Set manual to opt out."),
   acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true).describe("Every ChatGPT review cycle and its read-only recovery may reclaim only this binding's exact deterministic Ego task space."),
+  answeringModelPolicy: z.enum(["alert", "pause"]).default("alert")
+    .describe("Detects a downgrade of the model that actually answers a review relative to the first review's answering model. alert (default) only notifies and the cycle continues; pause additionally ends the convergence as human_required with code answering_model_downgraded, retaining the downgraded review without resending it."),
   bindingKey: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
     .describe("Per-review browser recovery deadline. This does not bound the durable workflow or its host attachment."),
@@ -123,6 +127,7 @@ const MCP_INSTRUCTIONS = [
   "Task-space ownership is automatic for the exact deterministic binding space. Pass allowTaskSpaceReclaim as true (the default) so Send, capture, and reconciliation can reclaim that one space; this never authorizes another task space or clearing an unrelated human draft. A vanished Ego-Chat-named Space is recreated by name after a short delay without host involvement.",
   "Never call ego_verify_conversation as a preflight for a fresh send. A fresh exchange or review performs its own canonical URL, stable-head, browser-readiness, automatic exact-space reclaim, and live model-policy checks. If binding identity is uncertain before a send, use ego_get_conversation instead because it reads durable state without browser control. Reserve ego_verify_conversation for an explicitly requested maintenance checkpoint or a documented migration or reconciliation case.",
   "For model-setting questions, read ego_get_model_policy.lastObserved: modelLabel is the menu route, pillLabel is the closed composer label, and powerLevel/powerMax is the verified thinking setting. In the separate-model menu effortLabel repeats pillLabel and is not an independent effort option. Report these observed labels and verifiedAt without guessing versioned names or an API model identifier. Ordinary sends already discover and verify maximum policy; do not add a browser preflight or manual label search.",
+  "The pre-send policy check verifies the composer's strongest route and maximum effort, not which model actually answers; a lower-ranked responding model raises a model_downgrade alert (see ego_get_model_policy.lastDowngrade and getStatus().alerts.lastAlert), and a convergence started with answeringModelPolicy: \"pause\" instead ends as human_required with code answering_model_downgraded.",
   "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in or open ego-chat-main for ordinary transport recovery. Same-project successor rollover after a verified conversation-exhaustion checkpoint is automatic by default; only an explicit manual opt-out or an unattributed pause needs a caller-selected successor. Authentication and verification_challenge require their own genuine user action.",
   "Use ego_converge_until_settled for durable multi-cycle work; supply an immutable target, observable acceptance criteria, and the absolute working directory. Use workspace-write when the user authorized local fixes and read-only for review-only targets.",
   "When a host with a shell starts an until-settled convergence, run the returned supervision.monitorCommand once to attach Eagle Monitor and run eagle-monitor stop --json after settlement or cancellation; a single exchange has no monitorCommand and must not start the monitor.",

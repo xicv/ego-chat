@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util"
 import { EgoChatError } from "./errors.mjs"
 import { browserCaptureWaitPolicy } from "./browser-capture-policy.mjs"
 import { isAttentionState } from "./local-alerts.mjs"
+import { isAnsweringModelDowngrade } from "./answering-model.mjs"
 import {
   activeConvergenceBindingKey,
   automaticSuccessorEnabled,
@@ -1193,6 +1194,7 @@ export class Broker {
   #convergenceClients = new Map()
   #controllers = new Map()
   #egoAdapter
+  #lastAnsweringModelByBinding = new Map()
   #boundTaskSpaceRecreateDelayMs
   #recoveryDelaysMs
   #captureObservationIntervalMs
@@ -1257,6 +1259,7 @@ export class Broker {
   async initialize() {
     await this.#store.initialize()
     this.#synchronizeDurableClaimUrls()
+    this.#seedLastAnsweringModelByBinding()
     if (this.#taskSpine) {
       try {
         await this.#taskSpine.initialize()
@@ -6293,6 +6296,9 @@ export class Broker {
           evaluation = { settled: false }
         }
         const signature = reviewSignature(review)
+        const answeringModelSlug = typeof reviewed.result?.modelPolicy?.responseModelSlug === "string"
+          ? reviewed.result.modelPolicy.responseModelSlug
+          : null
 
         current = this.#requireRunningConvergence(workflowId, controller.signal)
         const completedCycle = current.private.cycles.at(-1)
@@ -6305,7 +6311,18 @@ export class Broker {
               summary: `${review.summary}\n\nBroker liveness note: this candidate/review state repeated. Re-inspect the evidence, change strategy, and make substantive progress instead of repeating the same response.`,
             }
           : review
+        // The first review's answering model is the durable baseline; every
+        // later review in this convergence is compared against it, not
+        // against the immediately preceding one.
+        const priorFirstAnsweringModelSlug = current.private.firstAnsweringModelSlug ?? null
+        const nextFirstAnsweringModelSlug = priorFirstAnsweringModelSlug ?? answeringModelSlug
         await this.#transition(current, "convergence.chatgpt_review_captured", {
+          // Public convenience mirror of private.firstAnsweringModelSlug and
+          // this cycle's answering model, exposed even after settlement
+          // clears `private`.
+          ...(nextFirstAnsweringModelSlug
+            ? { answeringModel: { first: nextFirstAnsweringModelSlug, last: answeringModelSlug ?? nextFirstAnsweringModelSlug } }
+            : {}),
           candidateDigest,
           childWorkflowId: child.id,
           cycle,
@@ -6324,16 +6341,35 @@ export class Broker {
                   protocolRepairWorkflowIds: [],
                   redactedSecretSignatures: preparedReviewPrompt.redactedSecretSignatures,
                   responseDigest: reviewed.result.responseDigest,
+                  responseModelSlug: answeringModelSlug,
                   transportCompaction: preparedReviewPrompt.transportCompaction,
                 },
                 review,
                 reviewSignature: signature,
               },
             ],
+            firstAnsweringModelSlug: nextFirstAnsweringModelSlug,
             priorReview: continuationReview,
           },
         })
         current = this.#requireRunningConvergence(workflowId, controller.signal)
+
+        if (
+          (current.private.request.answeringModelPolicy ?? "alert") === "pause"
+          && priorFirstAnsweringModelSlug
+          && isAnsweringModelDowngrade(priorFirstAnsweringModelSlug, answeringModelSlug)
+        ) {
+          await this.#transition(current, "convergence.answering_model_downgraded", {
+            humanRequired: {
+              code: "answering_model_downgraded",
+              message: `The ChatGPT review was answered by ${answeringModelSlug} after ${priorFirstAnsweringModelSlug}; the downgraded review is retained without a resend.`,
+            },
+            phase: "stopped",
+            private: current.private,
+            status: "human_required",
+          })
+          return
+        }
 
         if (evaluation.settled) {
           await this.#completeConvergenceSettlement({
@@ -8089,8 +8125,87 @@ export class Broker {
       state: "verified",
       updatedAt: now,
     }
+    const { downgrade, record } = this.#detectAnsweringModelDowngrade({
+      at: now,
+      bindingKey,
+      current,
+      next,
+      slug: verified.responseModelSlug,
+      workflowId: sourceWorkflowId,
+    })
     await this.#assertBrokerAuthority("before_model_policy_commit")
-    await this.#store.persistModelPolicy("model_policy.verified", next)
-    return publicModelPolicy(next)
+    await this.#store.persistModelPolicy(
+      downgrade ? "model_policy.answering_model_downgraded" : "model_policy.verified",
+      record,
+    )
+    if (downgrade) {
+      void this.#dispatchAlert({
+        at: now,
+        bindingKey,
+        code: "answering_model_downgraded",
+        kind: "model_downgrade",
+        message: truncateForAlert(
+          `${bindingKey} answered by ${downgrade.slug} after ${downgrade.previousSlug}`,
+          200,
+        ),
+        phase: null,
+        status: null,
+        workflowId: sourceWorkflowId ?? null,
+        workflowKind: sourceWorkflowId ? (this.#store.getWorkflow(sourceWorkflowId)?.kind ?? null) : null,
+      })
+    }
+    return publicModelPolicy(record)
+  }
+
+  // Detection never throws into the caller: any internal failure here is
+  // swallowed the same way a failed alert dispatch is, so a durable
+  // model-policy commit is never blocked by this best-effort check.
+  #detectAnsweringModelDowngrade({ at, bindingKey, current, next, slug, workflowId }) {
+    try {
+      if (typeof slug !== "string") {
+        return { downgrade: null, record: next }
+      }
+      const previousSlug = (
+        current.lastObserved?.bindingKey === bindingKey
+        && typeof current.lastObserved?.responseModelSlug === "string"
+      )
+        ? current.lastObserved.responseModelSlug
+        : (this.#lastAnsweringModelByBinding.get(bindingKey) ?? null)
+      this.#lastAnsweringModelByBinding.set(bindingKey, slug)
+      if (!isAnsweringModelDowngrade(previousSlug, slug)) {
+        return { downgrade: null, record: next }
+      }
+      const downgrade = { at, bindingKey, previousSlug, slug, workflowId: workflowId ?? null }
+      return { downgrade, record: { ...next, lastDowngrade: downgrade } }
+    } catch {
+      return { downgrade: null, record: next }
+    }
+  }
+
+  // Seeds the per-binding "last answering model" map from durable history.
+  // The single global model-policy record only remembers the most recent
+  // binding's answering model, so after a restart (or whenever another
+  // binding's exchange completed in between) this map is the only way to
+  // recover an older binding's last known answering model.
+  #seedLastAnsweringModelByBinding() {
+    const latestByBinding = new Map()
+    for (const workflow of this.#store.listWorkflows()) {
+      const slug = workflow.result?.modelPolicy?.responseModelSlug
+      if (
+        workflow.kind !== "ego_exchange"
+        || workflow.status !== "succeeded"
+        || typeof workflow.bindingKey !== "string"
+        || typeof slug !== "string"
+      ) {
+        continue
+      }
+      const existing = latestByBinding.get(workflow.bindingKey)
+      if (!existing || Date.parse(workflow.updatedAt) > Date.parse(existing.updatedAt)) {
+        latestByBinding.set(workflow.bindingKey, { slug, updatedAt: workflow.updatedAt })
+      }
+    }
+    for (const [bindingKey, { slug }] of latestByBinding) {
+      this.#lastAnsweringModelByBinding.set(bindingKey, slug)
+    }
   }
 }

@@ -243,9 +243,12 @@ export const AttachmentEvidenceReleaseRequestSchema = z.object({
   source_workflow_id: WorkflowIdSchema,
 }).strict()
 
+export const AnsweringModelPolicySchema = z.enum(["alert", "pause"]).default("alert")
+
 export const EgoExchangeSchema = z.object({
   allowProtocolRepairCapture: z.literal(true).optional(),
   allowTaskSpaceReclaim: z.literal(true).default(true),
+  answeringModelPolicy: AnsweringModelPolicySchema,
   bindingKey: BindingKeySchema,
   expectedPreviousHead: ConversationHeadAnchorSchema.optional(),
   expectedTerminalMarker: z.string().min(1).max(200),
@@ -287,6 +290,7 @@ export const StartConvergenceSchema = z.object({
   conversationContinuation: z.enum(["manual", "same_project_on_exhaustion"]).default("same_project_on_exhaustion"),
   acceptanceCriteria: z.array(ConvergenceTextSchema(2_000)).min(1).max(8),
   allowTaskSpaceReclaim: z.literal(true).default(true),
+  answeringModelPolicy: AnsweringModelPolicySchema,
   bindingKey: BindingKeySchema,
   chatGptTimeoutMs: z.number().int().min(30_000).max(MAX_WAIT_MS).default(15 * 60 * 1_000)
     .describe("Per-review browser recovery deadline. This does not bound the durable workflow or its host attachment."),
