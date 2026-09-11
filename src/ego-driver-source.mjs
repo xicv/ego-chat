@@ -2507,7 +2507,14 @@ async function egoDriverMain(
     if (currentState.current < currentState.maximum) {
       let stepState = currentState
       if (stepState.powerDisabled || stepState.modelViewOpen) {
-        await closeModelPolicyMenu()
+        if (!await closeModelPolicyMenu()) {
+          humanRequired("model_policy_ui_unknown", "The ChatGPT model policy menu did not close before the thinking-effort adjustment.", {
+            targetId: selected.targetId,
+            taskSpaceId: selected.task.id,
+            uiReason: "policy_menu_close_before_power_adjustment",
+          })
+          return null
+        }
         opened = await openStableModelPolicyState(false)
         if (!opened.ok) {
           await closeModelPolicyMenu()
@@ -2519,12 +2526,12 @@ async function egoDriverMain(
           return null
         }
         stepState = opened.state
-        if (stepState.powerDisabled) {
+        if (stepState.powerDisabled || stepState.modelViewOpen) {
           await closeModelPolicyMenu()
           humanRequired("model_policy_ui_unknown", "The ChatGPT maximum-power control is disabled in the current view.", {
             targetId: selected.targetId,
             taskSpaceId: selected.task.id,
-            uiReason: "policy_power_disabled",
+            uiReason: stepState.powerDisabled ? "policy_power_disabled" : "policy_model_view_open",
           })
           return null
         }
@@ -2543,8 +2550,8 @@ async function egoDriverMain(
         if (!await fencedPressKey("ARROWRIGHT", "before_policy_power_step")) {
           return null
         }
+        adjusted = true
       }
-      adjusted = true
       await wait(1)
     }
 
