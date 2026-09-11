@@ -2077,9 +2077,28 @@ export class Broker {
     const pausedConfirmedCreateOnce = ["provider_paused", "capture_paused"].includes(workflow.phase)
       && Boolean(workflow.private?.send?.promptMessageId)
       && BOUND_RECOVERY_CODES.has(recoveryCode)
+    // A create-once send that confirmed before its space vanished (reported
+    // as task_space_identity_unavailable or bound_task_space_identity_changed
+    // when recreation was not granted or not eligible) is recovered the same
+    // way as a cancelled confirmed create-once send: read-only, no new Send.
+    const vanishedTaskSpaceConfirmedCreateOnce = binding.state === "unbound"
+      && workflow.status === "human_required"
+      && ["bound_task_space_identity_changed", "task_space_identity_unavailable"].includes(recoveryCode)
+      && workflow.phase === "send_confirmed"
+      && !workflow.private?.request?.receiptCapture
+      && workflow.reconciliation?.beforeHead?.messageId === null
+      && typeof workflow.reconciliation?.promptMessageId === "string"
+      && workflow.reconciliation.promptMessageId.length > 0
+      && workflow.private?.send?.promptMessageId === workflow.reconciliation.promptMessageId
+      && workflow.private.send.targetId === binding.targetId
     const unboundRecovery = binding.state === "unbound"
       && workflow.status === "human_required"
-      && (recoveryCode === "canonical_conversation_missing" || cancelledConfirmedCreateOnce || pausedConfirmedCreateOnce)
+      && (
+        recoveryCode === "canonical_conversation_missing"
+        || cancelledConfirmedCreateOnce
+        || pausedConfirmedCreateOnce
+        || vanishedTaskSpaceConfirmedCreateOnce
+      )
     const browserInterruption = workflow.reconciliation?.browserInterruption
     const boundRecovery = binding.state === "bound"
       && (
@@ -2163,7 +2182,7 @@ export class Broker {
               },
               undefined,
               (result) => this.#reserveBrowserTaskSpaceIdentity({
-                allowCanonicalPromotion: cancelledConfirmedCreateOnce,
+                allowCanonicalPromotion: cancelledConfirmedCreateOnce || vanishedTaskSpaceConfirmedCreateOnce,
                 expectedCanonicalUrl: identityBinding.canonicalUrl,
                 key: identityBinding.key,
                 owner: admissionOwner,
@@ -2195,7 +2214,7 @@ export class Broker {
               () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
             )
         this.#reserveBrowserTaskSpaceIdentity({
-          allowCanonicalPromotion: cancelledConfirmedCreateOnce,
+          allowCanonicalPromotion: cancelledConfirmedCreateOnce || vanishedTaskSpaceConfirmedCreateOnce,
           expectedCanonicalUrl: identityBinding.canonicalUrl,
           key: identityBinding.key,
           owner: admissionOwner,
