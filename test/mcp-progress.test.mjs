@@ -34,6 +34,26 @@ test("supervised workflow status degrades a missing child record without losing 
   assert.match(workflow.supervision.message, /record is unavailable/)
 })
 
+test("supervised workflow status keeps the monitor command the broker placed on supervision", async () => {
+  const monitorCommand = "eagle-monitor start --workflow parent --binding-key main --mode safe --power-policy keep-awake-on-ac --json"
+  const workflow = await readSupervisedWorkflow(
+    {},
+    "parent",
+    undefined,
+    async () => ({
+      createdAt: "2026-09-03T00:00:00.000Z",
+      cycle: 1,
+      kind: "convergence",
+      phase: "codex_running",
+      status: "running",
+      supervision: { monitorCommand },
+    }),
+  )
+
+  assert.equal(workflow.supervision.monitorCommand, monitorCommand)
+  assert.equal(typeof workflow.supervision.message, "string")
+})
+
 test("an in-flight supervision read is aborted and drained before the wait returns", async () => {
   let activeReads = 0
   let readCount = 0

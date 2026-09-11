@@ -292,7 +292,9 @@ export async function readSupervisedWorkflow(
   }
   return {
     ...workflow,
-    supervision: superviseWorkflow(workflow, child),
+    // Keep the fields publicWorkflow already placed on supervision (the
+    // Eagle Monitor start command); superviseWorkflow only adds live state.
+    supervision: { ...(workflow.supervision ?? {}), ...superviseWorkflow(workflow, child) },
   }
 }
 
