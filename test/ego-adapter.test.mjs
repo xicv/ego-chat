@@ -4775,6 +4775,7 @@ test("provider terminal classification ignores stale, hidden, quoted, and confli
     })),
     { name: "hidden", statuses: [{ label, role: "alert", hidden: true }] },
     { name: "quoted", statuses: [{ label: `Example: ${label}`, role: "alert", containsProse: true }] },
+    { name: "quoted-prefixed-alert", statuses: [{ label: `Example: ${label}`, role: "alert" }] },
     { name: "unqualified-button", statuses: [{ label, button: true }] },
     { name: "ambiguous-length", statuses: [{ label: "This conversation is too long.", role: "alert" }] },
     { name: "later-user", statuses: [{ label, role: "alert" }], additionalUser: true },

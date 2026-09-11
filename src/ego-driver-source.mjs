@@ -556,6 +556,21 @@ async function egoDriverMain(
           || /^An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?$/i.test(label)) {
           return 'provider_error'
         }
+        // A live banner is the whole status text (at most a trailing suffix such
+        // as "Learn more"); an exact banner sentence preceded by other text is a
+        // quotation of the banner, not live evidence, and must not reach the
+        // looser token-pair rules below.
+        const embedded = [
+          /This conversation is too long(?: to continue)?\. Please start a new chat\.?/i,
+          /You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?/i,
+          /You've reached your message limit\. Please try again later\.?/i,
+          /You have reached your usage limit\. Please try again later\.?/i,
+          /Something went wrong\.(?: Please try again\.?)?/i,
+          /An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?/i,
+        ].map((pattern) => pattern.exec(label)).find(Boolean)
+        if (embedded && embedded.index > 0) {
+          return null
+        }
         const lower = label.toLowerCase()
         if ((lower.includes('too long') || lower.includes('maximum length'))
           && (lower.includes('new chat') || lower.includes('start a new'))) {
