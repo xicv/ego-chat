@@ -3975,6 +3975,7 @@ test("confirmed exchanges resume after a bounded pending capture without another
           captureState: "pending",
           generationRunning: false,
           promptMessageId,
+          statusLabels: ["Still composing a reply…"],
           targetId: "capture-slice-tab",
           taskSpaceIdentity: browserTaskSpaceIdentity(String(18)),
           taskSpaceId: 18,
@@ -4051,7 +4052,9 @@ test("confirmed exchanges resume after a bounded pending capture without another
   assert.deepEqual(pendingState, {
     generationRunning: false,
     reason: "response_not_terminal",
+    statusLabels: ["Still composing a reply…"],
   })
+  assert.deepEqual(pendingEvents[0].workflow.captureObservation.statusLabels, ["Still composing a reply…"])
   // Capture observation and durable event append sample the clock separately.
   assert.equal(new Date(observedAt).toISOString(), observedAt)
   assert.ok(Date.parse(captureObservationTimes[0]) <= Date.parse(observedAt))

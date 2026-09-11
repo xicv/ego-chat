@@ -153,7 +153,15 @@ test("an inactive capture checkpoint survives restart and stops the tight retry 
     ...f.adapter,
     captureExchange: async () => {
       reads += 1
-      return { ...location, captureState: "pending", captureReason: "response_not_terminal", generationRunning: false, promptMessageId: "confirmed-user", turnMarker }
+      return {
+        ...location,
+        captureReason: "response_not_terminal",
+        captureState: "pending",
+        generationRunning: false,
+        promptMessageId: "confirmed-user",
+        statusLabels: ["Still composing a reply…"],
+        turnMarker,
+      }
     },
   }, store: new EventStore(f.dataDir) })
   await restarted.initialize()
@@ -161,6 +169,8 @@ test("an inactive capture checkpoint survives restart and stops the tight retry 
   const result = await restarted.awaitWorkflow({ workflowId: started.id, timeoutMs: 1_000 })
   assert.equal(result.phase, "capture_paused")
   assert.equal(result.humanRequired.code, "inactive_capture_stalled")
+  assert.deepEqual(result.humanRequired.diagnostic, { statusLabels: ["Still composing a reply…"] })
+  assert.deepEqual(result.captureObservation.statusLabels, ["Still composing a reply…"])
   assert.equal(result.providerTerminal, undefined)
   assert.equal(result.delivery.state, "confirmed")
   assert.equal(reads, 1)

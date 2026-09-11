@@ -658,9 +658,15 @@ function validatePendingCapture(value, workflow, binding) {
     && isProvisionalConversationUrl(sent?.canonicalUrl)
     && isCanonicalConversationUrl(value.canonicalUrl)
   )
+  const validStatusLabels = value.statusLabels === undefined || (
+    Array.isArray(value.statusLabels)
+    && value.statusLabels.length <= 4
+    && value.statusLabels.every((label) => typeof label === "string" && label.length > 0 && label.length <= 160)
+  )
   const exactIdentity = sent
     && canonicalIdentity
     && validPendingReason
+    && validStatusLabels
     && value.promptMessageId === sent.promptMessageId
     && typeof value.targetId === "string"
     && value.targetId.length > 0
@@ -4764,6 +4770,9 @@ export class Broker {
                   generationRunning: captured.generationRunning,
                   observedAt: new Date().toISOString(),
                   reason: captured.captureReason,
+                  ...(Array.isArray(captured.statusLabels) && captured.statusLabels.length > 0
+                    ? { statusLabels: captured.statusLabels }
+                    : {}),
                 }
                 const locatorPromoted = captured.canonicalUrl !== current.private.send.canonicalUrl
                 if (locatorPromoted ||
@@ -4811,6 +4820,13 @@ export class Broker {
                     humanRequired: {
                       code: "inactive_capture_stalled",
                       message: "The confirmed turn remained inactive without an attributable terminal response for thirty minutes. Its checkpoint is preserved for read-only recovery; do not resend or infer conversation exhaustion.",
+                      // Read from the freshly observed capturePending in scope, not
+                      // current.capturePending: the durable field is only rewritten
+                      // when the reason or generationRunning actually changes, so it
+                      // can be stale by the time this stall check runs.
+                      ...(capturePending.statusLabels
+                        ? { diagnostic: { statusLabels: capturePending.statusLabels } }
+                        : {}),
                     },
                     private: current.private,
                   })
