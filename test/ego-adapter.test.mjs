@@ -1785,6 +1785,9 @@ globalThis.js = async (source) => {
     }
     return Function('document', 'return ' + source)(createProviderTerminalDom(providerDomOptions, providerStatusReads))
   }
+  if (source.includes('.slice(0, 4)')) {
+    return Function('document', 'return ' + source)(createProviderTerminalDom(providerDomOptions, 1))
+  }
   if (source.includes("composer.replaceChildren()") && source.includes("deleteContentBackward")) {
     composerDraft = ''
     return true
@@ -4456,6 +4459,7 @@ test("bounded capture yields only with the exact confirmed prompt identity", asy
     captureState: "pending",
     generationRunning: true,
     promptMessageId: "reconcile-user",
+    statusLabels: [],
     targetId: "recovered-bound-tab",
     taskSpaceId: 11,
     taskSpaceIdentity: {
@@ -4556,6 +4560,40 @@ test("bounded capture tolerates a transient missing generation control", async (
   assert.equal(captured.result.captureState, "pending")
   assert.equal(captured.result.generationRunning, false)
   assert.equal(captured.result.promptMessageId, "reconcile-user")
+  assert.deepEqual(captured.result.statusLabels, [])
+})
+
+test("pending capture excludes status text embedded in assistant message content", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true, mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "This conversation is too long. Please start a new chat.", role: "alert", containsProse: true,
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "pending")
+  assert.deepEqual(captured.result.statusLabels, [])
+})
+
+test("pending capture records up to four whitespace-collapsed status labels truncated to 160 characters", async () => {
+  const rawLongLabel = "Working   \t  on   it" + "x".repeat(200)
+  const collapsedLongLabel = rawLongLabel.trim().replace(/\s+/g, " ")
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true, mode: "capture_exchange",
+    providerDomOptions: { statuses: [
+      { label: "One", role: "status" },
+      { label: "Two", role: "status" },
+      { label: "Three", role: "status" },
+      { label: rawLongLabel, role: "status" },
+      { label: "Five", role: "status" },
+    ] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureReason, "response_not_terminal")
+  assert.equal(captured.result.statusLabels.length, 4)
+  assert.deepEqual(captured.result.statusLabels.slice(0, 3), ["One", "Two", "Three"])
+  assert.equal(captured.result.statusLabels[3], collapsedLongLabel.slice(0, 160))
+  assert.equal(captured.result.statusLabels[3].length, 160)
 })
 
 test("confirmed capture classifies a stable latest-turn stopped status without resending", async () => {
@@ -4756,6 +4794,7 @@ test("provider terminal capture requires repeated stable status and no active ge
   assert.equal(generating.error, undefined)
   assert.equal(generating.result.captureReason, "generation_running")
   assert.equal(generating.result.providerTerminal, undefined)
+  assert.deepEqual(generating.result.statusLabels, ["Stopped thinking"])
 })
 
 test("provider terminal results retain final canonical, task-space and broker fences", async (t) => {

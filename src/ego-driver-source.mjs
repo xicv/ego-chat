@@ -629,6 +629,31 @@ async function egoDriverMain(
     return true
   }
 
+  // Read-only diagnostic companion to observeProviderTerminal: best-effort labels
+  // for a pending (non-terminal) capture, so a stalled checkpoint can say what
+  // ChatGPT was visibly showing. Never authoritative for any state transition.
+  async function readProviderStatusLabels(promptMessageId) {
+    const labels = await js(String.raw`(() => {
+      const expectedPromptId = ${JSON.stringify(promptMessageId)}
+      const visible = (node) => Boolean(node && node.getClientRects().length > 0
+        && !node.closest('[aria-hidden="true"], [hidden]'))
+      const turns = [...document.querySelectorAll('section[data-turn][data-turn-id]')].filter(visible)
+      const latest = turns.at(-1)
+      if (!latest || latest.getAttribute('data-turn') !== 'assistant') return []
+      const messages = [...document.querySelectorAll('[data-message-author-role]')].filter(visible)
+      const prompts = messages.filter((node) => node.getAttribute('data-message-id') === expectedPromptId)
+      const lastUser = messages.filter((node) => node.getAttribute('data-message-author-role') === 'user').at(-1)
+      if (prompts.length !== 1 || prompts[0] !== lastUser || latest.contains(prompts[0])) return []
+      ${providerStatusNodesSnippet}
+      return statuses
+        .map((node) => String(node.innerText || node.textContent || '').trim().replace(/\s+/g, ' '))
+        .filter((label) => label.length > 0)
+        .slice(0, 4)
+        .map((label) => label.slice(0, 160))
+    })()`)
+    return Array.isArray(labels) ? labels : []
+  }
+
   function summarizeConversationHead(entries, logicalMessageCount = undefined) {
     const last = entries.at(-1) ?? null
     return {
@@ -4007,6 +4032,7 @@ async function egoDriverMain(
               captureState: "pending",
               generationRunning: true,
               promptMessageId: pendingPrompt.messageId,
+              statusLabels: await readProviderStatusLabels(pendingPrompt.messageId),
               targetId: selected.targetId,
               turnMarker: input.turnMarker,
           }, "before_pending_generation_result")
@@ -4140,6 +4166,7 @@ async function egoDriverMain(
           captureState: "pending",
           generationRunning: false,
           promptMessageId: prompt.messageId,
+          statusLabels: await readProviderStatusLabels(prompt.messageId),
           targetId: selected.targetId,
           turnMarker: input.turnMarker,
       }, "before_pending_terminal_result")
