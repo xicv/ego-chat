@@ -259,7 +259,7 @@ globalThis.click = async () => { counters.click += 1 }
 globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
 globalThis.pressKey = async (key) => {
-  if (key === 'ARROWRIGHT' || key === 'ENTER') counters.pressKey += 1
+  if (key === 'ArrowRight' || key === 'Enter') counters.pressKey += 1
 }
 globalThis.cdp = async () => { counters.cdp += 1 }
 globalThis.js = async (source) => {
@@ -621,14 +621,14 @@ globalThis.fillInput = async () => { throw new Error('unexpected fillInput') }
 globalThis.typeText = async () => { throw new Error('unexpected typeText') }
 globalThis.pressKey = async (key) => {
   if (policyDom) return policyDom.pressKey(key)
-  if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') modelChoicesOpen = true
-  if (key === 'ENTER' && focusedPolicyControl === 'model_choice') {
+  if (key === 'Enter' && focusedPolicyControl === 'model_trigger') modelChoicesOpen = true
+  if (key === 'Enter' && focusedPolicyControl === 'model_choice') {
     selectedModelIndex = focusedModelIndex
     counters.modelSelections += 1
     policyMenuOpen = false
     modelChoicesOpen = false
   }
-  if (key === 'ESCAPE') {
+  if (key === 'Escape') {
     policyMenuOpen = false
     modelChoicesOpen = false
   }
@@ -1198,20 +1198,20 @@ globalThis.fillInput = async () => { counters.fillInput += 1 }
 globalThis.typeText = async () => { counters.typeText += 1 }
 globalThis.pressKey = async (key) => {
   if (policyDom) return policyDom.pressKey(key)
-  if (key === 'ARROWRIGHT') {
+  if (key === 'ArrowRight') {
     counters.pressKey += 1
     if (!modelChoicesOpen) policyCurrent = 4
   }
-  if (key === 'ENTER' && focusedPolicyControl === 'model_trigger') {
+  if (key === 'Enter' && focusedPolicyControl === 'model_trigger') {
     modelChoicesOpen = true
-  } else if (key === 'ENTER' && focusedPolicyControl === 'model_choice') {
+  } else if (key === 'Enter' && focusedPolicyControl === 'model_choice') {
     selectedModelIndex = focusedModelIndex
     focusedModelIndex = null
     focusedPolicyControl = null
     modelChoicesOpen = false
     policyMenuOpen = false
   }
-  if (key === 'ESCAPE') {
+  if (key === 'Escape') {
     policyMenuOpen = false
     modelChoicesOpen = false
   }
@@ -1875,7 +1875,10 @@ test("fixed Ego driver source is valid ESM", () => {
   assert.match(EGO_DRIVER_SOURCE, /composer\.matches\('input, textarea'\)/)
   assert.match(EGO_DRIVER_SOURCE, /collapsible-user-message-content/)
   assert.match(EGO_DRIVER_SOURCE, /aria-valuemax/)
-  assert.match(EGO_DRIVER_SOURCE, /ARROWRIGHT/)
+  assert.match(EGO_DRIVER_SOURCE, /fencedPressKey\("ArrowRight"/)
+  // The Ego driver runtime ignores upper-case key names (verified live on
+  // 2026-09-11: pressKey("ARROWRIGHT"), ("ENTER") and ("ESCAPE") were no-ops).
+  assert.doesNotMatch(EGO_DRIVER_SOURCE, /PressKey\("(?:ARROWRIGHT|ENTER|ESCAPE)"/)
   assert.match(EGO_DRIVER_SOURCE, /dismiss ChatGPT policy menu/)
   assert.match(EGO_DRIVER_SOURCE, /draftMarkerCount/)
   assert.match(EGO_DRIVER_SOURCE, /digestMatchCount/)
