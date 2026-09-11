@@ -23,9 +23,10 @@ export function answeringModelRank(slug) {
   return bestIndex === -1 ? 0 : ANSWERING_MODEL_RANKS.length - bestIndex
 }
 
-// True only when both slugs are known, ranked strings and the rank strictly
-// dropped. An unknown previous slug, an unknown next slug, an upgrade, or an
-// unchanged model is never a downgrade.
+// True only when the previous slug is a known, ranked model and the next
+// slug ranks strictly below it. An unknown next slug counts as a downgrade
+// because it cannot be proven at least as strong; an unknown previous slug,
+// an upgrade, or an unchanged model is never a downgrade.
 export function isAnsweringModelDowngrade(previousSlug, slug) {
   if (typeof previousSlug !== "string" || typeof slug !== "string") {
     return false
