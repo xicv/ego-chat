@@ -2165,13 +2165,13 @@ async function egoDriverMain(
             await wait(1)
             continue
           }
-          if (!await fencedPressKey("ENTER", "before_policy_menu_close_key")) return false
+          if (!await fencedPressKey("Enter", "before_policy_menu_close_key")) return false
         }
         await wait(1)
         continue
       }
       if (state.policyMenuCount > 0 || state.visibleModelChoiceCount > 0) {
-        if (!await fencedPressKey("ESCAPE", "before_policy_menu_escape")) return false
+        if (!await fencedPressKey("Escape", "before_policy_menu_escape")) return false
         await wait(1)
         continue
       }
@@ -2382,7 +2382,7 @@ async function egoDriverMain(
         if (!focused) {
           return { ok: false, reason: "policy_trigger_focus", trigger }
         }
-        if (!await fencedPressKey("ENTER", "before_policy_menu_open_key")) {
+        if (!await fencedPressKey("Enter", "before_policy_menu_open_key")) {
           return { ok: false, reason: "task_space_fence" }
         }
       }
@@ -2411,7 +2411,7 @@ async function egoDriverMain(
       if (!focused) {
         return { ok: false, reason: "policy_model_trigger_focus", state, trigger }
       }
-      if (!await fencedPressKey("ENTER", "before_policy_model_choices_key")) {
+      if (!await fencedPressKey("Enter", "before_policy_model_choices_key")) {
         return { ok: false, reason: "task_space_fence" }
       }
       await wait(1)
@@ -2469,7 +2469,7 @@ async function egoDriverMain(
     ) {
       const focused = await focusModelChoice(before.strongestModelIndex)
       if (focused) {
-        if (!await fencedPressKey("ENTER", "before_policy_model_selection_key")) {
+        if (!await fencedPressKey("Enter", "before_policy_model_selection_key")) {
           return null
         }
       } else if (!await clickModelChoice(before.strongestModelIndex)) {
@@ -2547,7 +2547,7 @@ async function egoDriverMain(
         return null
       }
       for (let step = stepState.current; step < stepState.maximum; step += 1) {
-        if (!await fencedPressKey("ARROWRIGHT", "before_policy_power_step")) {
+        if (!await fencedPressKey("ArrowRight", "before_policy_power_step")) {
           return null
         }
         adjusted = true

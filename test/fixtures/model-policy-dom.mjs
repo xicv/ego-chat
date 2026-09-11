@@ -141,8 +141,11 @@ export function createModelPolicyDom(options = {}) {
     click(target) {
       if (String(target).includes("__composer-pill")) pill.click()
     },
+    // The live Ego driver runtime only recognizes the mixed-case key names
+    // ("Enter", "Escape", "ArrowRight"); an upper-case spelling is a silent
+    // no-op there, so this fake ignores it the same way.
     pressKey(key) {
-      if (key === "ENTER") {
+      if (key === "Enter") {
         if (document.activeElement === modelTrigger) state.modelOpen = !state.modelOpen
         else if (document.activeElement === pill) pill.click()
         else {
@@ -151,14 +154,14 @@ export function createModelPolicyDom(options = {}) {
           state.activationMethod = null
         }
       }
-      if (key === "ARROWRIGHT" && document.activeElement === power) {
+      if (key === "ArrowRight" && document.activeElement === power) {
         const disabled = (state.modelOpen && state.powerDisabledInModelView) || state.powerDisabledInEffortView
         if (!disabled) {
           state.current = Math.min(state.current + 1, state.maximum)
         }
         events.push({ kind: "power_step", modelOpen: state.modelOpen })
       }
-      if (key === "ESCAPE") {
+      if (key === "Escape") {
         events.push({ kind: "escape" })
         state.menuOpen = false
         state.modelOpen = false
