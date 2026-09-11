@@ -147,6 +147,28 @@ test("pre-Send and post-Send recovery never select a Send or replacement workflo
   )
 })
 
+test("a pre-Send stall does not require a human until it escalates past 30 minutes", () => {
+  const tenMinutesStale = observation({
+    workflow: { phase: "browser_owned", status: "running", updatedAt: "2026-09-04T00:00:00.000Z" },
+  })
+  const classification = classifyMonitorState(tenMinutesStale)
+  assert.equal(classification.state, MonitorState.STALLED_BEFORE_SEND)
+  assert.equal(classification.humanRequired, false)
+  assert.equal(classification.reasonCode, "pre_send_progress_stalled")
+  assert.equal(chooseMonitorAction(classification, tenMinutesStale), MonitorAction.ATTACH_EXACT_WORKFLOW)
+})
+
+test("a pre-Send stall escalates to a human-required notification after 30 minutes", () => {
+  const thirtyOneMinutesStale = observation({
+    workflow: { phase: "browser_owned", status: "running", updatedAt: "2026-09-03T23:39:00.000Z" },
+  })
+  const classification = classifyMonitorState(thirtyOneMinutesStale)
+  assert.equal(classification.state, MonitorState.STALLED_BEFORE_SEND)
+  assert.equal(classification.humanRequired, true)
+  assert.equal(classification.reasonCode, "pre_send_stall_escalated")
+  assert.equal(chooseMonitorAction(classification, thirtyOneMinutesStale), MonitorAction.NOTIFY_USER)
+})
+
 test("every convergence delivery projection preserves the Send boundary", () => {
   const cases = [
     {

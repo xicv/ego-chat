@@ -148,21 +148,33 @@ export function createPowerController(config, {
   }
 }
 
+// Keyed by either a reasonCode or a MonitorState value; resolveMonitorNotificationMessage
+// checks the reason code first since it is the more specific signal.
+const NOTIFICATION_MESSAGES = {
+  ambiguous_unconfirmed_delivery: "Ego Chat delivery is ambiguous; exact-workflow reconciliation is required.",
+  crash_loop: "The Ego Chat broker is in a crash loop; recovery is paused.",
+  disk_full: "Eagle Monitor storage is unavailable; recovery is paused.",
+  human_required_auth_challenge: "Ego Chat needs human authentication or challenge completion.",
+  human_required_other: "Eagle Monitor needs human review before recovery can continue.",
+  pre_send_stall_escalated: "Ego Chat has been stuck before Send for 30 minutes; check Ego Lite and the bound Space.",
+  semantic_looping: "Ego Chat convergence is repeating the same state; review the workflow.",
+  semantic_stagnant: "Ego Chat convergence shows no useful progress; review the workflow.",
+  send_confirmed_capture: "Ego Chat response capture exceeded its service budget; review the exact workflow.",
+  version_skew: "The running Ego Chat broker is incompatible with this monitor runtime.",
+}
+
+export function resolveMonitorNotificationMessage(classification) {
+  return NOTIFICATION_MESSAGES[classification.reasonCode]
+    ?? NOTIFICATION_MESSAGES[classification.state]
+    ?? "Eagle Monitor requires attention."
+}
+
 export function createLocalNotifier(config) {
-  const messages = {
-    ambiguous_unconfirmed_delivery: "Ego Chat delivery is ambiguous; exact-workflow reconciliation is required.",
-    crash_loop: "The Ego Chat broker is in a crash loop; recovery is paused.",
-    disk_full: "Eagle Monitor storage is unavailable; recovery is paused.",
-    human_required_auth_challenge: "Ego Chat needs human authentication or challenge completion.",
-    human_required_other: "Eagle Monitor needs human review before recovery can continue.",
-    send_confirmed_capture: "Ego Chat response capture exceeded its service budget; review the exact workflow.",
-    version_skew: "The running Ego Chat broker is incompatible with this monitor runtime.",
-  }
   return {
     notify: async (classification, dispatchFence) => {
       await dispatchFence?.assertCurrent()
-      const message = messages[classification.state] ?? "Eagle Monitor requires attention."
-      const script = `display notification ${JSON.stringify(message)} with title "Eagle Monitor"`
+      const message = resolveMonitorNotificationMessage(classification)
+      const script = `display notification ${JSON.stringify(message)} with title "Eagle Monitor" sound name "Glass"`
       const result = await execBounded(config.commands.osascript, ["-e", script])
       if (result.code !== 0) throw new Error("notification_failed")
     },

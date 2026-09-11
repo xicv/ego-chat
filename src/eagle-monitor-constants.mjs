@@ -26,8 +26,11 @@ const POLICY_CONTRACT = {
   deadConfirmationMs: 1_000,
   brokerUnavailableAlertMs: 5 * 60_000,
   notificationBacklogLimit: 16,
+  notificationRepeatMs: 60 * 60 * 1000,
+  notificationRepeatMaxMs: 4 * 60 * 60 * 1000,
   notificationRetryMs: 5 * 60_000,
   postSendStallMs: 2 * 60 * 60 * 1000,
+  preSendStallEscalationMs: 30 * 60 * 1000,
   preSendStallMs: 5 * 60 * 1000,
   schemaVersion: EAGLE_MONITOR_SCHEMA_VERSION,
 }

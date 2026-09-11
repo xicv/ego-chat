@@ -383,6 +383,36 @@ test("start rejects a corrupt monitor epoch before lifecycle mutation", async (t
   assert.equal(await store.readSession(), null)
 })
 
+test("shadow mode reports notifications suppressed, safe mode reports local", async (t) => {
+  const { config, lifecycle } = await fixture(t)
+  const store = new EagleMonitorStore(config)
+  const outputs = []
+  const run = (argv) => runEagleMonitorCli({
+    argv,
+    config,
+    lifecycle,
+    now: () => "2026-09-04T00:00:00.000Z",
+    observeMonitor: async () => ({ active: true, epoch: 1 }),
+    store,
+    write: (value) => outputs.push(value),
+  })
+
+  assert.equal(await run(["start", "--workflow", WORKFLOW_ID, "--json"]), 0)
+  assert.equal(outputs.at(-1).result.mode, "shadow")
+  assert.equal(outputs.at(-1).result.notifications, "suppressed_in_shadow_mode")
+  assert.equal(await run(["status", "--json"]), 0)
+  assert.equal(outputs.at(-1).result.notifications, "suppressed_in_shadow_mode")
+
+  assert.equal(await run(["stop", "--json"]), 0)
+  assert.equal(await run([
+    "start", "--workflow", WORKFLOW_ID, "--binding-key", "ego-chat-main", "--mode", "safe", "--json",
+  ]), 0)
+  assert.equal(outputs.at(-1).result.mode, "safe")
+  assert.equal(outputs.at(-1).result.notifications, "local")
+  assert.equal(await run(["status", "--json"]), 0)
+  assert.equal(outputs.at(-1).result.notifications, "local")
+})
+
 test("the public CLI emits stable JSON and never registers a real LaunchAgent in tests", async (t) => {
   const { config, lifecycle } = await fixture(t)
   const store = new EagleMonitorStore(config)
@@ -414,12 +444,14 @@ test("the public CLI emits stable JSON and never registers a real LaunchAgent in
   ]), 0)
   assert.equal(outputs.at(-1).ok, true)
   assert.equal(outputs.at(-1).result.powerPolicy, "keep-awake-on-ac")
+  assert.equal(outputs.at(-1).result.notifications, "local")
   assert.equal(JSON.stringify(outputs.at(-1)).includes(WORKFLOW_ID), false)
 
   assert.equal(await run(["status", "--json"]), 0)
   assert.equal(outputs.at(-1).result.session.workflowDigest.length, 64)
   assert.equal(outputs.at(-1).result.session.bindingDigest.length, 64)
   assert.deepEqual(outputs.at(-1).result.monitor, { active: true, epoch: 1 })
+  assert.equal(outputs.at(-1).result.notifications, "local")
   assert.equal(outputs.at(-1).result.policyMatches, true)
   assert.equal(outputs.at(-1).result.readiness.state, "starting")
   assert.equal(outputs.at(-1).result.readiness.ready, false)

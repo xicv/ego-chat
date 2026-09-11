@@ -12,7 +12,7 @@ import { loadEagleMonitorConfig, safeDigest } from "../src/eagle-monitor-config.
 import { EagleMonitorEngine } from "../src/eagle-monitor-engine.mjs"
 import { acquireMonitorLease } from "../src/eagle-monitor-lease.mjs"
 import { MonitorAction, MonitorState } from "../src/eagle-monitor-policy.mjs"
-import { createPowerController } from "../src/eagle-monitor-runtime.mjs"
+import { createPowerController, resolveMonitorNotificationMessage } from "../src/eagle-monitor-runtime.mjs"
 import {
   EAGLE_SEMANTIC_POLICY,
   projectEagleSemanticCheckpoint,
@@ -766,7 +766,9 @@ test("pre-Send, ambiguous, and confirmed-Send recovery stay exact and never rese
     workflow: {
       phase: "browser_owned",
       status: "running",
-      updatedAt: "2026-09-03T23:00:00.000Z",
+      // Stale enough to trigger the pre-Send stall (preSendStallMs) but not
+      // yet the human-required escalation (preSendStallEscalationMs).
+      updatedAt: "2026-09-03T23:50:00.000Z",
     },
   })
   const preSend = await context.engine.tick()
@@ -1630,7 +1632,11 @@ test("unknown lease evidence cannot renew the unavailable IPC grace period", asy
     c.time.monotonic += 300_000
   }
   assert.equal(c.actions.some(([action]) => ["start", "attach", "reconcile"].includes(action)), false)
-  assert.equal(c.actions.filter(([action]) => action === "notify").length, 1)
+  // The identical incident persists for the whole 97 * 5-minute run (about
+  // 8 hours), so the repeat schedule (60/120/240/240-minute doubling, capped
+  // at notificationRepeatMaxMs) legitimately re-notifies a few more times;
+  // the alternating lease evidence must not add any notification beyond that.
+  assert.equal(c.actions.filter(([action]) => action === "notify").length, 4)
 })
 
 test("failed notification backlog is bounded and retains an explicit overflow alert", async (t) => {
@@ -1827,4 +1833,202 @@ test("failed notification outcome persistence preserves the dispatch receipt", a
   c.time.monotonic += 300_000
   assert.equal((await c.createEngine().tick()).state.notification.outcome, "accepted")
   assert.deepEqual(reports, ["authentication_required", "monitor_storage_unavailable", "authentication_required"])
+})
+
+test("safe-mode semantic stagnation and looping submit one deduplicated notification each; suspect submits nothing", async (t) => {
+  const context = await fixture(t, { mode: "safe" })
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      phase: "working",
+      status: "running",
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    },
+  })
+
+  const first = await context.engine.tick()
+  assert.equal(first.state.semantic.classification, "suspect")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 0)
+
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  const second = await context.createEngine().tick()
+  assert.equal(second.state.semantic.classification, "stagnant")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+  assert.equal(second.state.notification.reasonCode, "semantic_stagnant")
+  assert.equal(second.state.notification.state, MonitorState.HEALTHY)
+  assert.equal(second.state.notification.outcome, "accepted")
+
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  const third = await context.createEngine().tick()
+  assert.equal(third.state.semantic.classification, "looping")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 2)
+  assert.equal(third.state.notification.reasonCode, "semantic_looping")
+
+  // A fourth tick with the same loop incident key submits nothing more.
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  const fourth = await context.createEngine().tick()
+  assert.equal(fourth.state.semantic.classification, "looping")
+  assert.equal(fourth.state.semantic.incidentKey, third.state.semantic.incidentKey)
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 2)
+})
+
+test("shadow mode never submits a semantic stagnation or looping notification", async (t) => {
+  const context = await fixture(t, { mode: "shadow" })
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      phase: "working",
+      status: "running",
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    },
+  })
+  await context.engine.tick()
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  const second = await context.createEngine().tick()
+  assert.equal(second.state.semantic.classification, "stagnant")
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  const third = await context.createEngine().tick()
+  assert.equal(third.state.semantic.classification, "looping")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 0)
+  assert.equal(third.state.lastAction.outcome, "predicted_shadow_only")
+})
+
+test("an accepted human-required notification repeats with a doubling delay capped at 4 hours", async (t) => {
+  const context = await fixture(t, { mode: "safe" })
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      humanRequired: { code: "authentication_required" },
+      phase: "stopped",
+      status: "human_required",
+    },
+  })
+
+  const first = await context.engine.tick()
+  assert.equal(first.classification.state, MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE)
+  assert.equal(first.state.notification.outcome, "accepted")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+
+  // 59 minutes later: the repeat delay (60 minutes) has not elapsed yet.
+  context.time.wall += 59 * 60_000
+  context.time.monotonic += 59 * 60_000
+  const before = await context.createEngine().tick()
+  assert.equal(before.state.lastAction.outcome, "already_reported")
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+
+  // 2 more minutes (61 total): the first repeat fires.
+  context.time.wall += 2 * 60_000
+  context.time.monotonic += 2 * 60_000
+  const firstRepeat = await context.createEngine().tick()
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 2)
+  assert.equal(firstRepeat.state.notification.outcome, "accepted")
+  assert.equal(firstRepeat.state.notification.repeatCount, 1)
+
+  // 119 minutes later: the doubled delay (120 minutes) has not elapsed yet.
+  context.time.wall += 119 * 60_000
+  context.time.monotonic += 119 * 60_000
+  await context.createEngine().tick()
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 2)
+
+  // 2 more minutes (121 total since the first repeat): the second repeat fires.
+  context.time.wall += 2 * 60_000
+  context.time.monotonic += 2 * 60_000
+  const secondRepeat = await context.createEngine().tick()
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 3)
+  assert.equal(secondRepeat.state.notification.repeatCount, 2)
+
+  // The delay caps at 4 hours: repeatCount 2 would otherwise double to 8
+  // hours, but the next repeat is still due after only 4 hours and 1 minute.
+  context.time.wall += 4 * 60 * 60_000 + 60_000
+  context.time.monotonic += 4 * 60 * 60_000 + 60_000
+  const cappedRepeat = await context.createEngine().tick()
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 4)
+  assert.equal(cappedRepeat.state.notification.repeatCount, 3)
+})
+
+test("a repeat resets when the workflow returns to healthy", async (t) => {
+  const context = await fixture(t, { mode: "safe" })
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      humanRequired: { code: "authentication_required" },
+      phase: "stopped",
+      status: "human_required",
+    },
+  })
+  await context.engine.tick()
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 1)
+
+  context.time.wall += 1_000
+  context.time.monotonic += 1_000
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: { phase: "codex_running", status: "running", updatedAt: new Date(context.time.wall).toISOString() },
+  })
+  const healthy = await context.createEngine().tick()
+  assert.equal(healthy.classification.state, MonitorState.HEALTHY)
+  assert.equal(healthy.state.notification, null)
+
+  context.time.wall += 59 * 60_000
+  context.time.monotonic += 59 * 60_000
+  context.setObservation({
+    available: true,
+    conclusivelyDead: false,
+    epoch: 7,
+    runtimeIdentity: RUNTIME_IDENTITY,
+    workflow: {
+      humanRequired: { code: "authentication_required" },
+      phase: "stopped",
+      status: "human_required",
+    },
+  })
+  const again = await context.createEngine().tick()
+  assert.equal(again.state.notification.outcome, "accepted")
+  assert.equal(again.state.notification.repeatCount ?? 0, 0)
+  assert.equal(context.actions.filter(([action]) => action === "notify").length, 2)
+})
+
+test("resolveMonitorNotificationMessage prefers the reason code over the operational state", () => {
+  assert.match(
+    resolveMonitorNotificationMessage({ reasonCode: "pre_send_stall_escalated", state: MonitorState.STALLED_BEFORE_SEND }),
+    /stuck before Send for 30 minutes/,
+  )
+  assert.match(
+    resolveMonitorNotificationMessage({ reasonCode: "semantic_stagnant", state: MonitorState.HEALTHY }),
+    /no useful progress/,
+  )
+  assert.match(
+    resolveMonitorNotificationMessage({ reasonCode: "semantic_looping", state: MonitorState.HEALTHY }),
+    /repeating the same state/,
+  )
+  // No message is registered under the reason code itself, so this falls
+  // back to the state-keyed message.
+  assert.match(
+    resolveMonitorNotificationMessage({ reasonCode: "authentication_required", state: MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE }),
+    /authentication or challenge completion/,
+  )
+  assert.equal(
+    resolveMonitorNotificationMessage({ reasonCode: "unknown_reason", state: "unknown_state" }),
+    "Eagle Monitor requires attention.",
+  )
 })

@@ -243,7 +243,12 @@ function semanticIncidentId(hex) {
 }
 
 function assertNotification(n) {
-  assertKeys(n, new Set(["key", "reasonCode", "state", "outcome", "attemptedAt", "retryAt"]), "Notification submission")
+  // acceptedAt, nextRepeatAt, and repeatCount are optional so a notification
+  // persisted before the repeat feature existed still loads.
+  assertKeys(n, new Set([
+    "key", "reasonCode", "state", "outcome", "attemptedAt", "retryAt",
+    "acceptedAt", "nextRepeatAt", "repeatCount",
+  ]), "Notification submission")
   if (!DIGEST_PATTERN.test(n.key ?? "") || !validNullableEvidenceCode(n.reasonCode)
     || !MONITOR_ACTION_POLICY[n.state]?.includes(MonitorAction.NOTIFY_USER)
     || !["pending", "dispatching", "failed", "accepted"].includes(n.outcome)
@@ -251,7 +256,10 @@ function assertNotification(n) {
     || (n.outcome === "pending" && (n.attemptedAt !== null || n.retryAt !== null))
     || (n.outcome === "accepted" && (n.attemptedAt === null || n.retryAt !== null))
     || (["dispatching", "failed"].includes(n.outcome)
-      && (n.attemptedAt === null || n.retryAt === null || n.retryAt < n.attemptedAt))) {
+      && (n.attemptedAt === null || n.retryAt === null || n.retryAt < n.attemptedAt))
+    || (n.acceptedAt !== undefined && !validNullableInteger(n.acceptedAt))
+    || (n.nextRepeatAt !== undefined && !validNullableInteger(n.nextRepeatAt))
+    || (n.repeatCount !== undefined && !validNullableInteger(n.repeatCount))) {
     failCorrupt("Notification submission has an invalid value.")
   }
 }
@@ -688,6 +696,7 @@ export class EagleMonitorStore {
       pendingNotificationCount: (currentState?.notificationBacklog ?? []).filter(entry => entry.outcome !== "accepted").length
         + (currentState?.notification && currentState.notification.outcome !== "accepted" ? 1 : 0),
       monitor,
+      notifications: session ? (session.mode === "shadow" ? "suppressed_in_shadow_mode" : "local") : null,
       observationFreshness,
       nextObservationAt: active ? (currentState?.nextObservationAt ?? null) : null,
       phase: currentState?.phase ?? null,
