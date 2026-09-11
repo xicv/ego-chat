@@ -119,7 +119,7 @@ export function createLocalAlertSink({
     lines.push(JSON.stringify(receipt))
     const bounded = lines.slice(-MAX_ALERT_RECEIPTS)
     const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`
-    await fs.writeFile(tmpPath, `${bounded.join("\n")}\n`)
+    await fs.writeFile(tmpPath, `${bounded.join("\n")}\n`, { mode: 0o600 })
     await fs.rename(tmpPath, filePath)
   }
 
