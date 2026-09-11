@@ -6426,6 +6426,7 @@ export class Broker {
       const identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1)
       const prompt = prepareChatGptReviewPrompt({
         candidate: checkpoint.candidate, candidateDigest: checkpoint.candidateDigest,
+        carriedContext: checkpoint.priorReviewSummary ?? null,
         contract: checkpoint.contract, cycle: current.cycle, ...identity,
       }).prompt
       const next = { ...current, phase: "successor_reviewing", updatedAt: new Date().toISOString(),
@@ -6440,6 +6441,7 @@ export class Broker {
     const identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1)
     const prompt = prepareChatGptReviewPrompt({
       candidate: checkpoint.candidate, candidateDigest: checkpoint.candidateDigest,
+      carriedContext: checkpoint.priorReviewSummary ?? null,
       contract: checkpoint.contract, cycle: current.cycle, ...identity,
     }).prompt
     if (plan?.state !== "prepared" || !isDeepStrictEqual(intent, {

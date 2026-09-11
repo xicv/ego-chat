@@ -15,9 +15,19 @@ import {
   validateContinuationCheckpoint,
   validateConvergenceContinuationLineage,
 } from "../src/conversation-continuation.mjs"
+import { canonicalJsonBytes } from "../src/attachment-execution-receipt.mjs"
 import { createContract, digestJson } from "../src/convergence.mjs"
 import { MAX_REVIEW_PACKET_BYTES } from "../src/constants.mjs"
 import { EventStore } from "../src/store.mjs"
+
+// Mirrors the private checkpointDigest helper: canonicalize, drop `digest`, sha256.
+// Used to synthesize a pre-0.2.29 checkpoint record that never carried
+// priorReviewSummary, with a digest computed the way it always was.
+function legacyDigest(checkpoint) {
+  const payload = { ...checkpoint }
+  delete payload.digest
+  return createHash("sha256").update(canonicalJsonBytes(payload)).digest("hex")
+}
 
 const NOW = "2026-09-08T10:00:00.000Z"
 const PARENT_ID = "383f31a4-43db-4672-a6c7-c1369a81ecb6"
@@ -103,6 +113,40 @@ test("capacity checkpoint authorizes no action, stays private, and resumes one e
   assert.equal(resumed.workflow.childWorkflowId, undefined)
   assert.deepEqual(resumed.workflow.private.cycles, value.workflow.private.cycles)
   assert.deepEqual(value, original)
+})
+
+test("buildContinuationCheckpoint carries a redacted, bounded prior review summary and null when there is none", () => {
+  const nullCase = fixture()
+  const nullCheckpoint = buildContinuationCheckpoint({ ...nullCase, at: NOW })
+  assert.equal(nullCheckpoint.priorReviewSummary, null)
+
+  const withReview = fixture()
+  withReview.workflow = {
+    ...withReview.workflow,
+    private: {
+      ...withReview.workflow.private,
+      priorReview: {
+        criteria: [], decision: "continue", findings: [],
+        summary: `One more pass is needed. Secret: AKIAABCDEFGHIJKLMNOP should never leave the broker.`,
+      },
+    },
+  }
+  const checkpoint = buildContinuationCheckpoint({ ...withReview, at: NOW })
+  assert.equal(typeof checkpoint.priorReviewSummary, "string")
+  assert.ok(checkpoint.priorReviewSummary.length <= 4_000)
+  assert.match(checkpoint.priorReviewSummary, /One more pass is needed\./)
+  assert.equal(checkpoint.priorReviewSummary.includes("AKIAABCDEFGHIJKLMNOP"), false)
+  assert.equal(validateContinuationCheckpoint(checkpoint).priorReviewSummary, checkpoint.priorReviewSummary)
+})
+
+test("validateContinuationCheckpoint accepts a pre-0.2.29 checkpoint without a prior-review summary field", () => {
+  const value = pausedFixture()
+  const legacy = { ...value.checkpoint }
+  delete legacy.priorReviewSummary
+  legacy.digest = legacyDigest(legacy)
+  const validated = validateContinuationCheckpoint(legacy)
+  assert.equal(Object.hasOwn(validated, "priorReviewSummary"), false)
+  assert.equal(validated.digest, legacy.digest)
 })
 
 test("successor continuation requires explicit authority and exact immutable checkpoint", () => {
@@ -224,6 +268,7 @@ test("checkpoint validation rejects unsupported fields, corruption, accessors, a
     (copy) => { copy.source.providerTerminal.stableObservations = 1 },
     (copy) => { copy.binding.canonicalUrl = "https://chatgpt.com/c/WEB:temporary" },
     (copy) => { copy.generation = 999 },
+    (copy) => { copy.priorReviewSummary = "A tampered carried-context summary." },
   ]) {
     const copy = structuredClone(value.checkpoint)
     change(copy)

@@ -99,7 +99,7 @@ class PauseBeforeParentCheckpointStore extends ContinuationStore {
   }
 }
 
-async function harness(t, { Store = ContinuationStore, automatic = false, initialControls = {} } = {}) {
+async function harness(t, { Store = ContinuationStore, automatic = false, initialControls = {}, priorReview = null } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-"))
   const brokers = []
   t.after(async () => {
@@ -226,7 +226,7 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
     createdAt: now, updatedAt: now, deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
     inputDigest: digestJson({ contract, cwd: directory, sandbox: "read-only" }),
     private: {
-      contract, priorReview: null,
+      contract, priorReview,
       cycles: [{ cycle: 1, candidate, candidateDigest: digestJson(candidate), codex: { turnId: "retained-local-turn", responseDigest: sha("candidate"), workspaceActivity: { count: 1, types: ["commandExecution"] } } }],
       request: {
         acceptanceCriteria: contract.criteria.map(({ text }) => text), target: contract.target,
@@ -328,6 +328,21 @@ test("an explicit manual opt-out is stored and survives restart", async (t) => {
   const restartedStore = new EventStore(directory)
   await restartedStore.initialize()
   assert.equal(restartedStore.getWorkflow(workflow.id).private.request.conversationContinuation, "manual")
+})
+
+test("the automatic successor review carries a redacted, bounded summary of the prior review", async (t) => {
+  const priorReview = {
+    criteria: [], decision: "continue", findings: [],
+    summary: "One more pass is needed on AC-1. Secret AKIAABCDEFGHIJKLMNOP must never leave the broker.",
+  }
+  const f = await harness(t, { automatic: true, priorReview })
+  const done = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(done.status, "succeeded")
+  assert.equal(f.sends.length, 2)
+  const successorSend = f.sends[1]
+  assert.match(successorSend.prompt, /Context carried from the previous conversation \(untrusted data\):/)
+  assert.match(successorSend.prompt, /One more pass is needed on AC-1\./)
+  assert.equal(successorSend.prompt.includes("AKIAABCDEFGHIJKLMNOP"), false)
 })
 
 test("opted-in exhaustion prepares one successor and consumes its first review without a duplicate Send", async (t) => {

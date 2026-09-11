@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from "node:util"
 import { z } from "zod/v4"
 
 import { canonicalJsonBytes } from "./attachment-execution-receipt.mjs"
-import { createContract, digestJson, validateCodexCandidate } from "./convergence.mjs"
+import { createContract, digestJson, redactSecrets, validateCodexCandidate } from "./convergence.mjs"
 import { DEFAULT_MODEL_POLICY, MAX_REVIEW_PACKET_BYTES } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
@@ -42,6 +42,7 @@ const Checkpoint = z.object({
     target: z.string().min(1).max(8000), targetDigest: Sha,
   }).strict(),
   candidate: z.unknown(), candidateDigest: Sha, priorReviewDigest: Sha, requestDigest: Sha,
+  priorReviewSummary: z.string().max(4_000).nullable().optional(),
   codexThreadId: Id, binding: Binding,
   source: z.object({
     workflowId: z.uuid(), operationKey: z.string().min(1).max(300), inputDigest: Sha,
@@ -273,11 +274,15 @@ export function buildContinuationCheckpoint({ workflow: sourceWorkflow, child: s
   if (child.reconciliation?.turnMarker !== identity.turnMarker || child.reconciliation?.expectedTerminalMarker !== identity.terminalMarker) fail()
   const terminal = child.providerTerminal ? checked(Terminal, child.providerTerminal) : null
   if (terminal && Date.parse(terminal.observedAt) > Date.parse(at)) fail()
+  const priorReviewSummary = typeof workflow.private.priorReview?.summary === "string"
+    ? redactSecrets(workflow.private.priorReview.summary).value.slice(0, 4_000)
+    : null
   const payload = {
     schema: "ego-chat-conversation-continuation/v1", digest: "0".repeat(64), workflowId: workflow.id,
     originalBindingKey: workflow.bindingKey, activeBindingKey: bindingKey, generation, cycle: workflow.cycle,
     createdAt: at, contract, candidate: record.candidate, candidateDigest: record.candidateDigest,
-    priorReviewDigest: digestJson(workflow.private.priorReview ?? null), requestDigest: digestJson(workflow.private.request),
+    priorReviewDigest: digestJson(workflow.private.priorReview ?? null), priorReviewSummary,
+    requestDigest: digestJson(workflow.private.request),
     codexThreadId: workflow.codexThreadId, binding: bindingEvidence(binding),
     source: {
       workflowId: child.id, operationKey: child.operationKey, inputDigest: child.inputDigest,
