@@ -623,10 +623,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.23 recreates a vanished Ego-Chat-named task space by name after a short delay and reopens the bound conversation in it, retries driver crashes that provably happened before prompt composition, and commits a response found by restart reconciliation. It does not authorize blind resends or new MR actions, and is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 19); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.24 raises the ChatGPT thinking effort in the composer's effort view (the model view disables the Power control, which made every earlier attempt loop into `model_policy_mismatch`), fails closed instead of pressing a disabled control, and records the answering model slug (`responseModelSlug`) on every captured response and in the verified policy. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 20); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.23 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.24 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
