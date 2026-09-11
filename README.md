@@ -609,6 +609,8 @@ npm run gate0:app-server
 
 `npm run gate0:ego` can send live ChatGPT turns. It requires `EGO_CHAT_GATE0_CONFIRM_SEND=1`. Once the binding already contains messages, it also requires `EGO_CHAT_GATE0_ALLOW_REPEAT=1`, preventing accidental repeat runs.
 
+**Exhaustion qualification (not yet run).** Confirming live ChatGPT terminal-banner detection needs a throwaway conversation on a test binding: opt in to convergence with `conversationContinuation: "same_project_on_exhaustion"` and let it run until the provider's own length-limit banner appears, then confirm the ledger recorded `chatgpt_conversation_exhausted` and that a successor was prepared. This procedure has not been run against live ChatGPT markup.
+
 See [GATE0.md](https://github.com/xicv/ego-chat/blob/main/GATE0.md) for the original component qualification, [CONTINUITY.md](https://github.com/xicv/ego-chat/blob/main/CONTINUITY.md) for the convergence contract and evidence, and [RESEARCH.md](https://github.com/xicv/ego-chat/blob/main/RESEARCH.md) for the research and architectural decision record.
 
 ## Wait expiry and early delivery tracking
