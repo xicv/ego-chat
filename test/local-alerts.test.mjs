@@ -241,6 +241,45 @@ test("record() appends receipts and keeps at most 200 lines", async (t) => {
   assert.equal(parsedFirst.workflowId, "workflow-5")
 })
 
+test("record() writes alerts.jsonl with private permissions", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(() => fs.rm(dataDir, { force: true, recursive: true }))
+  const sink = createLocalAlertSink({ dataDir })
+  await sink.record({ workflowId: "private", code: "c", channels: [], at: new Date().toISOString() })
+  const stat = await fs.stat(path.join(dataDir, "alerts.jsonl"))
+  assert.equal(stat.mode & 0o777, 0o600)
+})
+
+test("record() keeps accepting receipts after one failed write", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(async () => {
+    await fs.chmod(dataDir, 0o700)
+    await fs.rm(dataDir, { force: true, recursive: true })
+  })
+  const sink = createLocalAlertSink({ dataDir })
+  await fs.chmod(dataDir, 0o500)
+  await assert.rejects(
+    sink.record({ workflowId: "blocked", code: "c", channels: [], at: new Date().toISOString() }),
+  )
+  await fs.chmod(dataDir, 0o700)
+  await sink.record({ workflowId: "after-failure", code: "c", channels: [], at: new Date().toISOString() })
+  const lines = (await fs.readFile(path.join(dataDir, "alerts.jsonl"), "utf8")).trim().split("\n")
+  assert.deepEqual(lines.map((line) => JSON.parse(line).workflowId), ["after-failure"])
+})
+
+test("notify() still returns its channels when the receipt write fails", async (t) => {
+  const dataDir = await createDataDir()
+  t.after(async () => {
+    await fs.chmod(dataDir, 0o700)
+    await fs.rm(dataDir, { force: true, recursive: true })
+  })
+  const runner = recordingRunner({ code: 0 })
+  const sink = createLocalAlertSink({ dataDir, runner })
+  await fs.chmod(dataDir, 0o500)
+  const result = await sink.notify(sampleAlert({ workflowId: "unrecorded" }))
+  assert.deepEqual(result, { channels: [{ channel: "macos", outcome: "accepted" }] })
+})
+
 test("notify() calls record() itself with a bounded receipt", async (t) => {
   const dataDir = await createDataDir()
   t.after(() => fs.rm(dataDir, { force: true, recursive: true }))

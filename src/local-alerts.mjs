@@ -141,18 +141,25 @@ export function createLocalAlertSink({
       if (config.webhookUrl !== undefined) {
         channels.push(await webhookChannel(alert, config))
       }
-      await this.record({
-        at: alert.at,
-        channels,
-        code: alert.code,
-        workflowId: alert.workflowId,
-      })
+      try {
+        await this.record({
+          at: alert.at,
+          channels,
+          code: alert.code,
+          workflowId: alert.workflowId,
+        })
+      } catch {
+        // The receipt file is best-effort evidence; the channels above already ran.
+      }
       return { channels }
     },
 
     async record(receipt) {
-      recordChain = recordChain.then(() => recordReceipt(receipt))
-      await recordChain
+      // Writes are serialized through one chain; a failed write must not poison
+      // the chain for every later receipt, so the shared tail always resolves.
+      const attempt = recordChain.then(() => recordReceipt(receipt))
+      recordChain = attempt.catch(() => {})
+      await attempt
     },
   }
 }
