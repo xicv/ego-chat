@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util"
 
 import { EgoChatError } from "./errors.mjs"
 import { browserCaptureWaitPolicy } from "./browser-capture-policy.mjs"
+import { isAttentionState } from "./local-alerts.mjs"
 import {
   activeConvergenceBindingKey,
   automaticSuccessorEnabled,
@@ -728,6 +729,34 @@ function responseExcerpt(value, maximumBytes = 4 * 1024) {
   return `${bytes.subarray(0, maximumBytes).toString("utf8")}\n[response continues in result reference]`
 }
 
+const NO_ALERT_SINK = Object.freeze({
+  describe: () => ({ enabled: false, reason: "no_sink", sound: null, webhook: false }),
+  notify: async () => ({ channels: [] }),
+  record: async () => {},
+})
+
+function truncateForAlert(value, maximumLength) {
+  const text = typeof value === "string" ? value : ""
+  return text.length > maximumLength ? text.slice(0, maximumLength) : text
+}
+
+// Pure decision behind the broker's alert dedup: fire only when the next
+// workflow state is an attention state and either the workflow was not
+// previously in one, or the attention code changed while it stayed one.
+export function classifyAlertTransition(expected, next) {
+  const was = isAttentionState(expected)
+  const now = isAttentionState(next)
+  if (!now) {
+    return null
+  }
+  const code = next.humanRequired?.code ?? next.error?.code ?? null
+  const prior = expected.humanRequired?.code ?? expected.error?.code ?? null
+  if (was && code === prior) {
+    return null
+  }
+  return { code }
+}
+
 function publicWorkflow(workflow) {
   const copy = structuredClone(workflow)
   if (workflow.private?.continuationCheckpoint) {
@@ -1113,6 +1142,8 @@ export class Broker {
   #activeBindings = new Set()
   #activeConversationUrls = new Map()
   #adoptionTaskSpaces = new Map()
+  #alertSink
+  #alerts = { dispatched: 0, failed: 0, lastAlert: null }
   #appServerFactory
   #attachmentReceiptAuthority
   #attachmentCaptureBindings = new Map()
@@ -1138,6 +1169,7 @@ export class Broker {
   #waiters = new Map()
 
   constructor({
+    alertSink = undefined,
     appServerFactory,
     attachmentReceiptAuthority = undefined,
     boundTaskSpaceRecreateDelayMs = BOUND_TASK_SPACE_RECREATE_DELAY_MS,
@@ -1168,6 +1200,7 @@ export class Broker {
     }
     this.#boundTaskSpaceRecreateDelayMs = boundTaskSpaceRecreateDelayMs
     this.#captureObservationIntervalMs = captureObservationIntervalMs
+    this.#alertSink = alertSink ?? NO_ALERT_SINK
     this.#appServerFactory = appServerFactory
     this.#attachmentReceiptAuthority = attachmentReceiptAuthority
     this.#brokerIdentity = brokerIdentity ?? {
@@ -1443,6 +1476,10 @@ export class Broker {
     const workflows = this.#store.listWorkflows()
     return {
       activeBindings: [...this.#activeBindings].sort(),
+      alerts: {
+        config: this.#alertSink.describe(),
+        ...this.#alerts,
+      },
       broker: {
         brokerId: this.#brokerIdentity.brokerId,
         epoch: this.#brokerIdentity.epoch,
@@ -7813,6 +7850,8 @@ export class Broker {
         continue
       }
 
+      this.#maybeAlert(expected, next)
+
       if (isTerminal(next)) {
         const waiters = [...(this.#waiters.get(next.id) ?? [])]
         for (const waiter of waiters) {
@@ -7826,6 +7865,45 @@ export class Broker {
       "workflow_transition_conflict",
       "The terminal workflow transition could not be serialized.",
     )
+  }
+
+  // Fire-and-forget: alert dispatch never delays or fails the transition it
+  // observed. classifyAlertTransition decides whether this patch newly
+  // entered (or changed the reason for) an attention state.
+  #maybeAlert(expected, next) {
+    const classification = classifyAlertTransition(expected, next)
+    if (!classification) {
+      return
+    }
+    const alert = {
+      at: new Date().toISOString(),
+      bindingKey: next.bindingKey ?? null,
+      code: classification.code,
+      kind: "workflow_attention",
+      message: truncateForAlert(next.humanRequired?.message ?? next.error?.message ?? "", 200),
+      phase: next.phase ?? null,
+      status: next.status,
+      workflowId: next.id,
+      workflowKind: next.kind,
+    }
+    void this.#dispatchAlert(alert)
+  }
+
+  async #dispatchAlert(alert) {
+    let channels = []
+    let failed = false
+    try {
+      const result = await this.#alertSink.notify(alert)
+      channels = Array.isArray(result?.channels) ? result.channels : []
+      failed = channels.some((channel) => channel.outcome === "failed")
+    } catch {
+      failed = true
+    }
+    this.#alerts = {
+      dispatched: this.#alerts.dispatched + 1,
+      failed: this.#alerts.failed + (failed ? 1 : 0),
+      lastAlert: { ...alert, channels },
+    }
   }
 
   async #assertBrokerAuthority(phase) {

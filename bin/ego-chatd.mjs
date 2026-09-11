@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { createInstalledAttachmentReceiptAuthority } from "../src/attachment-receipt-authority.mjs"
 import { Broker } from "../src/broker.mjs"
 import { AppServerClient } from "../src/app-server-client.mjs"
+import { createLocalAlertSink } from "../src/local-alerts.mjs"
 import { EventStore } from "../src/store.mjs"
 import { DurableTaskSpine } from "../src/task-spine.mjs"
 import { DurableTaskStore } from "../src/task-store.mjs"
@@ -52,6 +53,7 @@ const egoAdapter = new EgoAdapter({
   dataDir: config.dataDir,
 })
 const broker = new Broker({
+  alertSink: createLocalAlertSink({ dataDir: config.dataDir }),
   appServerFactory: () => new AppServerClient(),
   attachmentReceiptAuthority: createInstalledAttachmentReceiptAuthority({
     dataDir: config.dataDir,
