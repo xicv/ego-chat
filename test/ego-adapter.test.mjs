@@ -4707,6 +4707,20 @@ test("confirmed capture matches a reworded exhaustion banner by token pair", asy
   assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
 })
 
+test("confirmed capture matches an exact exhaustion banner followed by extra text", async () => {
+  const captured = await runTaskSpaceReconciliationCase({
+    captureContinuationAllowed: true,
+    mode: "capture_exchange",
+    providerDomOptions: { statuses: [{
+      label: "This conversation is too long. Please start a new chat. Learn more",
+      role: "alert",
+    }] },
+  })
+  assert.equal(captured.error, undefined)
+  assert.equal(captured.result.captureState, "provider_terminal")
+  assert.equal(captured.result.providerTerminal.kind, "conversation_exhausted")
+})
+
 test("confirmed capture matches a reworded quota banner by token pair", async () => {
   const captured = await runTaskSpaceReconciliationCase({
     captureContinuationAllowed: true,
@@ -4760,7 +4774,7 @@ test("provider terminal classification ignores stale, hidden, quoted, and confli
       name: location, statuses: [{ label, role: "alert", location }],
     })),
     { name: "hidden", statuses: [{ label, role: "alert", hidden: true }] },
-    { name: "quoted", statuses: [{ label: `Example: ${label}`, role: "alert" }] },
+    { name: "quoted", statuses: [{ label: `Example: ${label}`, role: "alert", containsProse: true }] },
     { name: "unqualified-button", statuses: [{ label, button: true }] },
     { name: "ambiguous-length", statuses: [{ label: "This conversation is too long.", role: "alert" }] },
     { name: "later-user", statuses: [{ label, role: "alert" }], additionalUser: true },

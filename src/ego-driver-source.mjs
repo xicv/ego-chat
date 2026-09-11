@@ -556,17 +556,6 @@ async function egoDriverMain(
           || /^An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?$/i.test(label)) {
           return 'provider_error'
         }
-        // A tier-1 sentence embedded inside extra surrounding text (e.g. an
-        // assistant quoting the banner) is a quotation, not live evidence: it
-        // must not fall through to the looser tier-2 token-pair rules below.
-        if (/This conversation is too long(?: to continue)?\. Please start a new chat\.?/i.test(label)
-          || /You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\.?/i.test(label)
-          || /You've reached your message limit\. Please try again later\.?/i.test(label)
-          || /You have reached your usage limit\. Please try again later\.?/i.test(label)
-          || /Something went wrong\.(?: Please try again\.?)?/i.test(label)
-          || /An error occurred while generating (?:a|the) response\.(?: Please try again\.?)?/i.test(label)) {
-          return null
-        }
         const lower = label.toLowerCase()
         if ((lower.includes('too long') || lower.includes('maximum length'))
           && (lower.includes('new chat') || lower.includes('start a new'))) {
