@@ -1,6 +1,7 @@
 const nodeGlobals = Object.fromEntries(
   [
     "AbortController",
+    "AbortSignal",
     "Buffer",
     "cliLog",
     "URL",
