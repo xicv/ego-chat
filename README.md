@@ -636,10 +636,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.30 pins a freshly written result blob until the event that references it is persisted, so a compaction between the two (frequent with 150 to 196 KB prompts, because prompts live in the event log) can no longer quarantine the blob and stop every later exchange start with `corrupt_result_blob_inventory`; the strict inventory verification is unchanged and a truly orphaned blob is still reaped after its pin ages out. The 2026-09-11 exhaustion qualification run is recorded below: no length banner after 8.25 MB, a silent answering-model downgrade caught by `responseModelSlug`, and the alert sink and safe-mode Eagle Monitor qualified live. It is not yet qualified as interruption-free overnight operation. The browser contract is unchanged (revision 24); upgrade through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.31 alerts when ChatGPT answers with a weaker model than it did before on the same binding (`ANSWERING_MODEL_RANKS`, `model_policy.answering_model_downgraded`, `lastDowngrade` on `ego_get_model_policy`, a `model_downgrade` alert through the local sink) and adds `answeringModelPolicy: "alert" | "pause"`; with `pause` a convergence review answered by a lower-ranked model than the parent's first review ends the cycle as `human_required` / `answering_model_downgraded` with the review retained and no resend. The pre-send policy proof covers the composer's route and effort, not the answering model, which is why this evidence matters. It is not yet qualified as interruption-free overnight operation. The browser contract is unchanged (revision 24); upgrade through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.30 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.31 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
