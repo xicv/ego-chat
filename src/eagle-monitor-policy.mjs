@@ -34,13 +34,16 @@ export const MonitorAction = Object.freeze({
 const observe = [MonitorAction.OBSERVE, MonitorAction.RELEASE_IDLE_SLEEP_ASSERTION]
 const activePower = [MonitorAction.HOLD_IDLE_SLEEP_ASSERTION, MonitorAction.RELEASE_IDLE_SLEEP_ASSERTION]
 const attach = [MonitorAction.OBSERVE, MonitorAction.ATTACH_EXACT_WORKFLOW, ...activePower]
+const attachAndNotify = [...attach, MonitorAction.NOTIFY_USER]
 const reconcile = [...attach, MonitorAction.RECONCILE_EXACT_WORKFLOW, MonitorAction.NOTIFY_USER]
 
 export const MONITOR_ACTION_POLICY = Object.freeze({
   [MonitorState.AMBIGUOUS_UNCONFIRMED_DELIVERY]: Object.freeze(reconcile),
   [MonitorState.CRASH_LOOP]: Object.freeze([...observe, MonitorAction.NOTIFY_USER]),
   [MonitorState.DISK_FULL]: Object.freeze([...observe, MonitorAction.NOTIFY_USER]),
-  [MonitorState.HEALTHY]: Object.freeze(attach),
+  // Attach may keep observing a healthy workflow, and NOTIFY_USER is needed
+  // for semantic stagnation/looping notifications raised while healthy.
+  [MonitorState.HEALTHY]: Object.freeze(attachAndNotify),
   [MonitorState.HUMAN_REQUIRED_AUTH_CHALLENGE]: Object.freeze([
     ...observe,
     MonitorAction.NOTIFY_USER,
@@ -49,7 +52,9 @@ export const MONITOR_ACTION_POLICY = Object.freeze({
   [MonitorState.POWER_SLEEP]: Object.freeze(observe),
   [MonitorState.SEND_CONFIRMED_CAPTURE]: Object.freeze(reconcile),
   [MonitorState.SETTLED]: Object.freeze(observe),
-  [MonitorState.STALLED_BEFORE_SEND]: Object.freeze(attach),
+  // NOTIFY_USER is needed once a pre-Send stall escalates past
+  // preSendStallEscalationMs (see classifyMonitorState).
+  [MonitorState.STALLED_BEFORE_SEND]: Object.freeze(attachAndNotify),
   [MonitorState.STARTUP]: Object.freeze([
     ...observe,
     MonitorAction.START_BROKER,
@@ -228,7 +233,13 @@ export function classifyMonitorState(observation) {
     )
     && updatedAgeMs(workflow, observation.nowMs) >= EAGLE_MONITOR_POLICY.preSendStallMs
   ) {
-    return { humanRequired: false, reasonCode: "pre_send_progress_stalled", state: MonitorState.STALLED_BEFORE_SEND }
+    const escalated = updatedAgeMs(workflow, observation.nowMs)
+      >= EAGLE_MONITOR_POLICY.preSendStallEscalationMs
+    return {
+      humanRequired: escalated,
+      reasonCode: escalated ? "pre_send_stall_escalated" : "pre_send_progress_stalled",
+      state: MonitorState.STALLED_BEFORE_SEND,
+    }
   }
   return { humanRequired: false, reasonCode: "workflow_progressing", state: MonitorState.HEALTHY }
 }

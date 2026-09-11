@@ -185,6 +185,10 @@ const RUNTIME_FILES: &[EmbeddedFile] = &[
         bytes: include_bytes!("../src/ipc-server.mjs"),
     },
     EmbeddedFile {
+        path: "src/local-alerts.mjs",
+        bytes: include_bytes!("../src/local-alerts.mjs"),
+    },
+    EmbeddedFile {
         path: "src/mcp-server.mjs",
         bytes: include_bytes!("../src/mcp-server.mjs"),
     },

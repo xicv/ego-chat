@@ -178,7 +178,18 @@ export class EagleMonitorEngine {
   }
 
   async #submitNotification(state, notification, nowMs) {
-    if (notification.outcome === "accepted") return "already_reported"
+    if (notification.outcome === "accepted") {
+      // The same incident is still open: re-notify once its repeat delay has
+      // elapsed (doubling from notificationRepeatMs, capped at
+      // notificationRepeatMaxMs), otherwise it stays already reported.
+      if (!Number.isSafeInteger(notification.nextRepeatAt) || nowMs < notification.nextRepeatAt) {
+        return "already_reported"
+      }
+      notification.outcome = "pending"
+      notification.repeatCount = (notification.repeatCount ?? 0) + 1
+      notification.acceptedAt = null
+      notification.nextRepeatAt = null
+    }
     if (notification.retryAt !== null && nowMs < notification.retryAt) return "failed"
     assertMonitorActionAllowed(notification.state, MonitorAction.NOTIFY_USER)
     notification.outcome = "dispatching"
@@ -193,6 +204,11 @@ export class EagleMonitorEngine {
         reasonCode: notification.reasonCode, state: notification.state }, this.#lease)
       notification.outcome = "accepted"
       notification.retryAt = null
+      notification.acceptedAt = nowMs
+      notification.nextRepeatAt = nowMs + Math.min(
+        this.#config.policy.notificationRepeatMs * (2 ** (notification.repeatCount ?? 0)),
+        this.#config.policy.notificationRepeatMaxMs,
+      )
     } catch (_error) {
       notification.outcome = "failed"
     }
@@ -415,6 +431,21 @@ export class EagleMonitorEngine {
         await this.#submitNotification(state, state.notification, nowMs)
       } else if ([MonitorState.HEALTHY, MonitorState.SETTLED].includes(classification.state)) {
         state.notification = null
+      }
+      // Semantic stagnation/looping while otherwise healthy or reading a
+      // confirmed-Send capture is reported once per incident key, deduplicated
+      // against the retained incidents rather than the repeat-timer state
+      // above (which the HEALTHY branch just cleared).
+      if (
+        [MonitorState.HEALTHY, MonitorState.SEND_CONFIRMED_CAPTURE].includes(classification.state)
+        && ["looping", "stagnant"].includes(semantic.classification)
+        && !semanticIncidentKeys.includes(semantic.incidentKey)
+      ) {
+        await this.#notify(state, {
+          humanRequired: true,
+          reasonCode: `semantic_${semantic.classification}`,
+          state: classification.state,
+        }, { ...notificationIdentity, semanticIncidentKey: semantic.incidentKey }, nowMs)
       }
       // At most one retained report per tick, in addition to the current incident.
       const pending = state.notificationBacklog?.find(entry => entry.outcome !== "accepted"

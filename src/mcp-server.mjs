@@ -125,6 +125,7 @@ const MCP_INSTRUCTIONS = [
   "For model-setting questions, read ego_get_model_policy.lastObserved: modelLabel is the menu route, pillLabel is the closed composer label, and powerLevel/powerMax is the verified thinking setting. In the separate-model menu effortLabel repeats pillLabel and is not an independent effort option. Report these observed labels and verifiedAt without guessing versioned names or an API model identifier. Ordinary sends already discover and verify maximum policy; do not add a browser preflight or manual label search.",
   "A proven pre-Send delivery absence is retried automatically in the same binding with a new unique marker and unchanged candidate identity. There is no fixed retry ceiling and no packet-compaction ceremony. Do not ask the user to log in or open ego-chat-main for ordinary transport recovery. A verified conversation-exhaustion checkpoint may separately require an explicitly selected successor; authentication and verification_challenge require their own genuine user action.",
   "Use ego_converge_until_settled for durable multi-cycle work; supply an immutable target, observable acceptance criteria, and the absolute working directory. Use workspace-write when the user authorized local fixes and read-only for review-only targets.",
+  "When a host with a shell starts an until-settled convergence, run the returned supervision.monitorCommand once to attach Eagle Monitor and run eagle-monitor stop --json after settlement or cancellation; a single exchange has no monitorCommand and must not start the monitor.",
   "Keep post-settlement commit, push, merge, deploy, or release work outside the review target so the current host can run its normal authority and verification gates after settlement.",
   "Keep the default progress wait for unattended convergence so deterministic broker supervision reports phase changes, recovery counters, and whether ChatGPT delivery is not started, unconfirmed, confirmed, or captured. These local status reads do not invoke another model. Use token_saver only when the user explicitly prefers a silent wait; keep that one tool call open and do not poll workflow_status or await_workflow.",
   "Default convergence to read-only; use workspace-write only when local implementation is authorized.",
@@ -291,7 +292,9 @@ export async function readSupervisedWorkflow(
   }
   return {
     ...workflow,
-    supervision: superviseWorkflow(workflow, child),
+    // Keep the fields publicWorkflow already placed on supervision (the
+    // Eagle Monitor start command); superviseWorkflow only adds live state.
+    supervision: { ...(workflow.supervision ?? {}), ...superviseWorkflow(workflow, child) },
   }
 }
 

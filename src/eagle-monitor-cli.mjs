@@ -193,6 +193,7 @@ export async function runEagleMonitorCli({
         result = {
           changed: configured.changed || service.changed,
           mode,
+          notifications: mode === "shadow" ? "suppressed_in_shadow_mode" : "local",
           policyDigest: resolvedConfig.policy.digest,
           powerPolicy,
           service,
