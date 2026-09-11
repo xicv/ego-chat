@@ -6,8 +6,13 @@ import path from "node:path"
 import test from "node:test"
 import { setImmediate } from "node:timers"
 
+import { z } from "zod/v4"
+
 import { Broker } from "../src/broker.mjs"
+import { convergenceReviewIdentity } from "../src/conversation-continuation.mjs"
 import { createContract, digestJson } from "../src/convergence.mjs"
+import { EgoChatError } from "../src/errors.mjs"
+import { CONVERGENCE_INPUT_SCHEMA } from "../src/mcp-server.mjs"
 import { EventStore } from "../src/store.mjs"
 
 const sha = (text) => createHash("sha256").update(text).digest("hex")
@@ -96,7 +101,7 @@ class PauseBeforeParentCheckpointStore extends ContinuationStore {
   }
 }
 
-async function harness(t, { Store = ContinuationStore, automatic = false, initialControls = {} } = {}) {
+async function harness(t, { Store = ContinuationStore, automatic = false, initialControls = {}, priorReview = null } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-"))
   const brokers = []
   t.after(async () => {
@@ -146,12 +151,19 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
       return { ...location(key), head: head(key) }
     },
     sendExchange: async (input, signal, onResult, beforeRun) => {
-      if (input.binding.key.startsWith("successor-") && controls.holdSuccessorSend) {
+      const isSuccessor = input.binding.key.startsWith("successor-")
+      if (isSuccessor && controls.holdSuccessorSend) {
         controls.successorSendStarted.resolve()
         await controls.holdSuccessorSend.promise
       }
       try { await beforeRun?.() } finally {
-        if (input.binding.key.startsWith("successor-")) controls.successorSendChecked?.resolve()
+        if (isSuccessor) controls.successorSendChecked?.resolve()
+      }
+      if (isSuccessor && controls.successorSendFailures?.length) {
+        const failure = controls.successorSendFailures.shift()
+        if (failure) {
+          throw new EgoChatError("ego_driver_error", "Synthetic pre-Send driver failure.", failure)
+        }
       }
       sends.push({ bindingKey: input.binding.key, turnMarker: input.turnMarker, prompt: input.prompt })
       return {
@@ -223,7 +235,7 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
     createdAt: now, updatedAt: now, deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
     inputDigest: digestJson({ contract, cwd: directory, sandbox: "read-only" }),
     private: {
-      contract, priorReview: null,
+      contract, priorReview,
       cycles: [{ cycle: 1, candidate, candidateDigest: digestJson(candidate), codex: { turnId: "retained-local-turn", responseDigest: sha("candidate"), workspaceActivity: { count: 1, types: ["commandExecution"] } } }],
       request: {
         acceptanceCriteria: contract.criteria.map(({ text }) => text), target: contract.target,
@@ -264,6 +276,324 @@ async function harness(t, { Store = ContinuationStore, automatic = false, initia
     counts: () => ({ localCalls, reconciliations }),
   }
 }
+
+test("conversationContinuation defaults to a same-project successor on both the broker and MCP schemas", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-default-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const store = new EventStore(directory)
+  await store.initialize()
+  const broker = new Broker({
+    appServerFactory: () => { throw new Error("Not exercised by this default-value assertion") },
+    egoAdapter: { bind: async () => ({ ...location(keys[0]), head: head(keys[0]) }) },
+    recoveryDelaysMs: [0],
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({ bindingKey: keys[0], canonicalUrl: location(keys[0]).canonicalUrl, mode: "existing", taskSpace: location(keys[0]).taskSpaceId })
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Default rollover applies without an explicit choice."],
+    bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
+  })
+  assert.equal(store.getWorkflow(started.id).private.request.conversationContinuation, "same_project_on_exhaustion")
+
+  const mcpParsed = z.object(CONVERGENCE_INPUT_SCHEMA).parse({
+    acceptanceCriteria: ["Default rollover applies without an explicit choice."],
+    bindingKey: keys[0], cwd: directory, target: "Confirm the default continuation policy.",
+  })
+  assert.equal(mcpParsed.conversationContinuation, "same_project_on_exhaustion")
+})
+
+test("an explicit manual opt-out is stored and survives restart", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-manual-"))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const store = new EventStore(directory)
+  await store.initialize()
+  const contract = createContract("Private manual-opt-out target.", ["The exact candidate keeps its manual choice."])
+  const candidate = {
+    blockers: [], criteria: [{ id: "AC-1", status: "pass", evidence: "Private deterministic candidate evidence." }],
+    reviewPacket: "Private retained review packet.", status: "candidate", summary: "Private retained candidate.",
+  }
+  const now = new Date().toISOString()
+  const workflow = {
+    id: randomUUID(), kind: "convergence", bindingKey: keys[0], status: "running", phase: "codex_captured",
+    cycle: 1, candidateDigest: digestJson(candidate), targetDigest: contract.targetDigest,
+    cwd: directory, codexSandbox: "read-only", codexThreadId: "manual-opt-out-thread", maxCycles: null,
+    createdAt: now, updatedAt: now, deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+    inputDigest: digestJson({ contract, cwd: directory, sandbox: "read-only" }),
+    private: {
+      contract, priorReview: null,
+      cycles: [{ cycle: 1, candidate, candidateDigest: digestJson(candidate), codex: { turnId: "manual-opt-out-turn", responseDigest: sha("candidate"), workspaceActivity: { count: 1, types: ["commandExecution"] } } }],
+      request: {
+        acceptanceCriteria: contract.criteria.map(({ text }) => text), target: contract.target,
+        bindingKey: keys[0], cwd: directory, codexSandbox: "read-only", allowTaskSpaceReclaim: true,
+        conversationContinuation: "manual",
+        chatGptTimeoutMs: 30_000, codexTurnTimeoutMs: 30_000, wallClockTimeoutMs: 3_600_000,
+      },
+    },
+  }
+  await store.persist("workflow.started", workflow)
+  assert.equal(store.getWorkflow(workflow.id).private.request.conversationContinuation, "manual")
+  const restartedStore = new EventStore(directory)
+  await restartedStore.initialize()
+  assert.equal(restartedStore.getWorkflow(workflow.id).private.request.conversationContinuation, "manual")
+})
+
+test("the automatic successor review carries a redacted, bounded summary of the prior review", async (t) => {
+  const priorReview = {
+    criteria: [], decision: "continue", findings: [],
+    summary: "One more pass is needed on AC-1. Secret AKIAABCDEFGHIJKLMNOP must never leave the broker.",
+  }
+  const f = await harness(t, { automatic: true, priorReview })
+  const done = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(done.status, "succeeded")
+  assert.equal(f.sends.length, 2)
+  const successorSend = f.sends[1]
+  assert.match(successorSend.prompt, /Context carried from the previous conversation \(untrusted data\):/)
+  assert.match(successorSend.prompt, /One more pass is needed on AC-1\./)
+  assert.equal(successorSend.prompt.includes("AKIAABCDEFGHIJKLMNOP"), false)
+})
+
+test("a proven pre-Send failure on the first successor review gets exactly one retry at attempt 2", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [provenFailure] } })
+  const done = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(done.status, "succeeded")
+  assert.equal(done.activeChat.generation, 1)
+  // Attempt 1 fails before ever reaching the fake adapter's send log; attempt 2
+  // is the only successor send that is ever recorded.
+  assert.equal(f.sends.length, 2)
+  const attempt1 = convergenceReviewIdentity(f.parent.id, 1, 1, 1)
+  const attempt2 = convergenceReviewIdentity(f.parent.id, 1, 1, 2)
+  assert.notEqual(attempt1.turnMarker, attempt2.turnMarker)
+  assert.equal(f.sends[1].turnMarker, attempt2.turnMarker)
+  const events = (await fs.readFile(path.join(f.directory, "events.jsonl"), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line))
+  assert.equal(events.filter((event) => event.type === "convergence.successor_review_retried").length, 1)
+})
+
+test("a second proven pre-Send failure pauses the successor review as today", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [provenFailure, provenFailure] } })
+  const paused = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(paused.status, "human_required")
+  assert.equal(paused.phase, "continuation_paused")
+  assert.equal(f.sends.length, 1)
+  assert.equal(f.store.getWorkflow(f.parent.id).private.successorReview.attempt, 2)
+  assert.equal(paused.successorPreparation.attempt, 2)
+})
+
+test("a non-proven first-review failure pauses immediately without a retry", async (t) => {
+  const unprovenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: false }
+  const f = await harness(t, { automatic: true, initialControls: { successorSendFailures: [unprovenFailure] } })
+  const paused = await f.broker.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(paused.status, "human_required")
+  assert.equal(paused.phase, "continuation_paused")
+  assert.equal(f.sends.length, 1)
+  assert.equal(f.store.getWorkflow(f.parent.id).private.successorReview.attempt, 1)
+})
+
+test("restart during the successor retry reattaches the attempt-2 child without a third send", async (t) => {
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const controls = { holdSuccessorCapture: true, successorSendFailures: [provenFailure] }
+  const f = await harness(t, { automatic: true, initialControls: controls })
+  await f.successorCaptureStarted
+  const intent = f.store.getWorkflow(f.parent.id).private.successorReview
+  assert.equal(intent.attempt, 2)
+  assert.equal(f.broker.getWorkflow({ workflowId: f.parent.id }).successorPreparation.attempt, 2)
+  const child = f.store.getWorkflowByOperationKey(`exchange:${intent.bindingKey}:${intent.turnMarker}`)
+  assert.equal(child.phase, "send_confirmed")
+  assert.equal(f.sends.length, 2)
+  f.broker.close()
+  f.controls.holdSuccessorCapture = false
+  const restarted = f.makeBroker(new EventStore(f.directory))
+  await restarted.initialize()
+  const result = await restarted.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(result.status, "succeeded")
+  assert.equal(result.childWorkflowId, child.id)
+  assert.equal(f.sends.length, 2)
+})
+
+test("a successor review intent persisted before the attempt field existed still resumes after restart", async (t) => {
+  const controls = { holdSuccessorCapture: true }
+  const f = await harness(t, { automatic: true, initialControls: controls })
+  await f.successorCaptureStarted
+  const reserved = f.store.getWorkflow(f.parent.id)
+  assert.equal(reserved.phase, "successor_reviewing")
+  assert.equal(reserved.private.successorReview.attempt, 1)
+  const sendsBeforeRestart = f.sends.length
+  f.broker.close()
+  // A 0.2.28 broker persisted the intent without an attempt key; strip it the
+  // way such a record looks on disk before the upgraded broker restarts.
+  const legacyStore = new EventStore(f.directory)
+  await legacyStore.initialize?.()
+  const current = legacyStore.getWorkflow(f.parent.id)
+  const { attempt, ...legacyIntent } = current.private.successorReview
+  assert.equal(attempt, 1)
+  await legacyStore.persist("convergence.successor_review_reserved", {
+    ...current, updatedAt: new Date().toISOString(),
+    private: { ...current.private, successorReview: legacyIntent },
+  }, current)
+  legacyStore.close?.()
+  f.controls.holdSuccessorCapture = false
+  const restarted = f.makeBroker(new EventStore(f.directory))
+  await restarted.initialize()
+  const result = await restarted.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(result.status, "succeeded")
+  assert.equal(f.sends.length, sendsBeforeRestart)
+})
+
+class RetryPromotionAppServer {
+  constructor(candidate) {
+    this.candidate = candidate
+    this.turns = 0
+  }
+
+  async close() {}
+  async connect() {}
+  async recoverStructuredTurn() { throw new Error("not expected") }
+  async resumeThread(threadId) { return { id: threadId, sessionId: threadId } }
+
+  async runStructuredTurn(input) {
+    this.turns += 1
+    await input.onStarted?.({ turnId: `codex-turn-${this.turns}` })
+    return {
+      durationMs: 1, responseDigest: sha(`retry-promotion-turn-${this.turns}`), turnId: `codex-turn-${this.turns}`,
+      value: this.candidate, workspaceActivity: { count: 1, types: ["commandExecution"] },
+    }
+  }
+
+  async startThread() { return { id: "retained-local-thread", sessionId: "retained-local-thread" } }
+  async unsubscribeThread() {}
+}
+
+test("a second cycle after the retried successor review starts fresh at attempt 1", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ego-broker-continuation-retry-cycle2-"))
+  const brokers = []
+  t.after(async () => {
+    for (const broker of brokers) broker.close()
+    await fs.rm(directory, { recursive: true, force: true })
+  })
+  const provenFailure = { reason: "task_space_identity_missing", driverStage: "composing_prompt", draftCleared: true }
+  const sendFailures = [provenFailure]
+  const sends = []
+  let successorCaptures = 0
+  const browserLocation = (binding) => keys.includes(binding.key) ? location(binding.key) : {
+    canonicalUrl: `https://chatgpt.com/g/g-p-continuation-tests/c/${binding.key}`,
+    targetId: binding.targetId, taskSpaceId: binding.taskSpaceId, taskSpaceIdentity: binding.taskSpaceIdentity,
+  }
+  const captureWith = (decision) => (input) => {
+    const responseText = `Review notes for AC-1.\nEGO_CHAT_DECISION: ${decision}\n${input.expectedTerminalMarker}`
+    return {
+      ...browserLocation(input.binding), durationMs: 1, modelPolicy,
+      head: head(input.binding.key, responseText), responseText, responseDigest: sha(responseText),
+      turnMarker: input.turnMarker,
+    }
+  }
+  // Field order matches AgentCandidateSchema/CriterionResultSchema so this
+  // literal's digest equals the digest of its zod-validated captured form.
+  const candidate2 = {
+    blockers: [], criteria: [{ evidence: "Cycle 2 deterministic evidence.", id: "AC-1", status: "pass" }],
+    reviewPacket: "Cycle 2 review packet.", status: "candidate", summary: "Cycle 2 candidate.",
+  }
+  const adapter = {
+    prepareSuccessor: async (input, signal, onResult) => {
+      const result = {
+        canonicalUrl: null, startUrl: input.startUrl, targetId: "prepared-successor-tab",
+        taskSpaceId: 901, taskSpaceIdentity: { name: input.taskSpaceName, taskId: "prepared-successor-task" },
+        head: { fingerprint: sha("null"), fingerprintVersion: "tail-v1", lastContentDigest: null, lastMessageId: null, lastRole: null, messageCount: 0, renderedMessageCount: 0 },
+      }
+      await onResult?.(result)
+      return result
+    },
+    bind: async (input) => {
+      const key = keys.find((candidate) => location(candidate).canonicalUrl === input.canonicalUrl)
+      return { ...location(key), head: head(key) }
+    },
+    sendExchange: async (input) => {
+      const isSuccessor = input.binding.key.startsWith("successor-")
+      if (isSuccessor && sendFailures.length) {
+        const failure = sendFailures.shift()
+        if (failure) throw new EgoChatError("ego_driver_error", "Synthetic pre-Send driver failure.", failure)
+      }
+      sends.push({ bindingKey: input.binding.key, turnMarker: input.turnMarker })
+      return {
+        ...browserLocation(input.binding), modelPolicy, turnMarker: input.turnMarker,
+        promptMessageId: `${input.binding.key}-confirmed-user`, sentAt: new Date().toISOString(),
+      }
+    },
+    captureExchange: async (input) => {
+      if (input.binding.key === keys[0]) {
+        return {
+          ...location(keys[0]), captureState: "provider_terminal", generationRunning: false,
+          promptMessageId: input.promptMessageId, turnMarker: input.turnMarker,
+          providerTerminal: {
+            schema: "ego-chat-provider-terminal/v1", kind: "conversation_exhausted",
+            source: "latest_turn_status", signalDigest: sha("bounded exact provider exhaustion"), stableObservations: 2,
+          },
+        }
+      }
+      successorCaptures += 1
+      // The retried (attempt-2) first review reports CONTINUE; the fresh
+      // second cycle's review settles.
+      return successorCaptures === 1 ? captureWith("CONTINUE")(input) : captureWith("SETTLED")(input)
+    },
+  }
+  const appServer = new RetryPromotionAppServer(candidate2)
+  const makeBroker = (store) => {
+    const broker = new Broker({ store, egoAdapter: adapter, recoveryDelaysMs: [0], appServerFactory: () => appServer })
+    brokers.push(broker)
+    return broker
+  }
+  const bootstrap = makeBroker(new EventStore(directory))
+  await bootstrap.initialize()
+  for (const key of keys) {
+    await bootstrap.bindConversation({ bindingKey: key, mode: "existing", canonicalUrl: location(key).canonicalUrl, taskSpace: location(key).taskSpaceId })
+  }
+  bootstrap.close()
+  const store = new EventStore(directory)
+  await store.initialize()
+  const contract = createContract("Private retained implementation target.", ["The exact candidate survives a conversation boundary."])
+  const candidate1 = {
+    blockers: [], criteria: [{ id: "AC-1", status: "pass", evidence: "Private deterministic candidate evidence." }],
+    reviewPacket: "Private retained review packet.", status: "candidate", summary: "Private retained candidate.",
+  }
+  const now = new Date().toISOString()
+  const parent = {
+    id: randomUUID(), kind: "convergence", bindingKey: keys[0], status: "running", phase: "codex_captured",
+    cycle: 1, candidateDigest: digestJson(candidate1), targetDigest: contract.targetDigest,
+    cwd: directory, codexSandbox: "read-only", codexThreadId: "retained-local-thread", maxCycles: null,
+    createdAt: now, updatedAt: now, deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+    inputDigest: digestJson({ contract, cwd: directory, sandbox: "read-only" }),
+    private: {
+      contract, priorReview: null,
+      cycles: [{ cycle: 1, candidate: candidate1, candidateDigest: digestJson(candidate1), codex: { turnId: "retained-local-turn", responseDigest: sha("candidate"), workspaceActivity: { count: 1, types: ["commandExecution"] } } }],
+      request: {
+        acceptanceCriteria: contract.criteria.map(({ text }) => text), target: contract.target,
+        bindingKey: keys[0], cwd: directory, codexSandbox: "read-only", allowTaskSpaceReclaim: true,
+        conversationContinuation: "same_project_on_exhaustion",
+        chatGptTimeoutMs: 30_000, codexTurnTimeoutMs: 30_000, wallClockTimeoutMs: 3_600_000,
+      },
+    },
+  }
+  await store.persist("workflow.started", parent)
+  const broker = makeBroker(store)
+  await broker.initialize()
+  const done = await broker.awaitWorkflow({ workflowId: parent.id, timeoutMs: 3_000 })
+  assert.equal(done.status, "succeeded")
+  assert.equal(done.cycle, 2)
+  assert.equal(done.activeChat.generation, 1)
+  assert.equal(done.candidateDigest, digestJson(candidate2))
+  assert.equal(appServer.turns, 1)
+  const attempt1 = convergenceReviewIdentity(parent.id, 1, 1, 1)
+  const attempt2 = convergenceReviewIdentity(parent.id, 1, 1, 2)
+  const cycle2 = convergenceReviewIdentity(parent.id, 2, 1)
+  const successorSends = sends.filter(({ bindingKey }) => bindingKey !== keys[0])
+  assert.equal(successorSends.length, 2)
+  assert.equal(successorSends[0].turnMarker, attempt2.turnMarker)
+  assert.notEqual(successorSends[0].turnMarker, attempt1.turnMarker)
+  assert.equal(successorSends[1].turnMarker, cycle2.turnMarker)
+})
 
 test("opted-in exhaustion prepares one successor and consumes its first review without a duplicate Send", async (t) => {
   const f = await harness(t, { automatic: true })
@@ -638,6 +968,20 @@ test("exhausted review preserves an exact private convergence checkpoint and pub
   assert.equal(f.store.getBinding(keys[0]).headMessageId, head(keys[0]).lastMessageId)
   assert.equal(f.sends.length, 1)
   assert.equal(f.counts().localCalls, 0)
+})
+
+test("a paused convergence exposes a bounded candidate summary while the review packet stays private", async (t) => {
+  const f = await harness(t)
+  assert.deepEqual(f.paused.candidateSummary, {
+    status: "candidate", summary: "Private retained candidate.",
+    criteria: [{ id: "AC-1", status: "pass" }], blockerCount: 0,
+  })
+  const serialized = JSON.stringify(f.paused.candidateSummary)
+  assert.equal(serialized.includes("review packet"), false)
+  assert.equal(serialized.includes("evidence"), false)
+  const child = f.broker.getWorkflow({ workflowId: f.paused.childWorkflowId })
+  assert.equal(child.kind, "ego_exchange")
+  assert.equal(child.candidateSummary, undefined)
 })
 
 test("approved successor keeps the parent and candidate while concurrent replay sends only once", async (t) => {

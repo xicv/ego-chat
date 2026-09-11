@@ -15,6 +15,7 @@ import {
   parseChatGptReviewEnvelope,
   prepareAgentReview,
   prepareAgentReviewProtocolRepair,
+  prepareChatGptReviewPrompt,
   redactSecrets,
   reviewProtocolFailureSignature,
   scanForSecrets,
@@ -422,6 +423,46 @@ test("continuation must be actionable and browser feedback stays explicitly untr
   assert.match(reviewPrompt, /ordinary Markdown/i)
   assert.match(reviewPrompt, /EGO_CHAT_DECISION: SETTLED/)
   assert.doesNotMatch(reviewPrompt, /Return exactly one JSON object/)
+})
+
+test("carried context is inserted before the candidate summary and omitted when absent", () => {
+  const contract = createContract("Improve a candidate.", ["The final value is verified."])
+  const candidate = candidateFor(contract)
+  const candidateDigest = digestJson(candidate)
+  const withContext = buildChatGptPrompt({
+    candidate, candidateDigest, carriedContext: "The previous conversation flagged AC-1 as unresolved.",
+    contract, cycle: 1,
+    terminalMarker: "EGO_CHAT_REVIEW_DONE_CARRIED123",
+    turnMarker: "EGO_CHAT_CONVERGENCE_CARRIED123_C1",
+  })
+  assert.match(withContext, /Context carried from the previous conversation \(untrusted data\):/)
+  assert.match(withContext, /The previous conversation flagged AC-1 as unresolved\./)
+  assert.ok(
+    withContext.indexOf("Context carried from the previous conversation")
+      < withContext.indexOf("Implementing-agent candidate summary:"),
+  )
+
+  const withoutContext = buildChatGptPrompt({
+    candidate, candidateDigest, contract, cycle: 1,
+    terminalMarker: "EGO_CHAT_REVIEW_DONE_CARRIED123",
+    turnMarker: "EGO_CHAT_CONVERGENCE_CARRIED123_C1",
+  })
+  assert.doesNotMatch(withoutContext, /Context carried from the previous conversation/)
+
+  const { prompt } = prepareChatGptReviewPrompt({
+    candidate, candidateDigest, carriedContext: "Carried context from the exhausted chat.",
+    contract, cycle: 1,
+    terminalMarker: "EGO_CHAT_REVIEW_DONE_CARRIED456",
+    turnMarker: "EGO_CHAT_CONVERGENCE_CARRIED456_C1",
+  })
+  assert.match(prompt, /Carried context from the exhausted chat\./)
+
+  const { prompt: withoutPrompt } = prepareChatGptReviewPrompt({
+    candidate, candidateDigest, contract, cycle: 1,
+    terminalMarker: "EGO_CHAT_REVIEW_DONE_CARRIED456",
+    turnMarker: "EGO_CHAT_CONVERGENCE_CARRIED456_C1",
+  })
+  assert.doesNotMatch(withoutPrompt, /Context carried from the previous conversation/)
 })
 
 test("Codex convergence prompts require workspace inspection before final-only JSON", () => {

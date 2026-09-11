@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from "node:util"
 import { z } from "zod/v4"
 
 import { canonicalJsonBytes } from "./attachment-execution-receipt.mjs"
-import { createContract, digestJson, validateCodexCandidate } from "./convergence.mjs"
+import { createContract, digestJson, redactSecrets, validateCodexCandidate } from "./convergence.mjs"
 import { DEFAULT_MODEL_POLICY, MAX_REVIEW_PACKET_BYTES } from "./constants.mjs"
 import { EgoChatError } from "./errors.mjs"
 
@@ -42,6 +42,7 @@ const Checkpoint = z.object({
     target: z.string().min(1).max(8000), targetDigest: Sha,
   }).strict(),
   candidate: z.unknown(), candidateDigest: Sha, priorReviewDigest: Sha, requestDigest: Sha,
+  priorReviewSummary: z.string().max(4_000).nullable().optional(),
   codexThreadId: Id, binding: Binding,
   source: z.object({
     workflowId: z.uuid(), operationKey: z.string().min(1).max(300), inputDigest: Sha,
@@ -142,12 +143,19 @@ export function activeConvergenceBindingKey(workflow) {
   return checked(Key, workflow?.activeChat?.bindingKey ?? workflow?.bindingKey)
 }
 
-export function convergenceReviewIdentity(workflowId, cycle, generation = 0) {
+export function convergenceReviewIdentity(workflowId, cycle, generation = 0, attempt = 1) {
   checked(z.uuid(), workflowId)
   checked(z.number().int().positive(), cycle)
   checked(z.number().int().min(0).max(MAX_CHAT_GENERATIONS), generation)
+  checked(z.number().int().min(1).max(2), attempt)
   const markerToken = digestJson({ cycle, purpose: "review", workflowId, ...(generation > 0 ? { generation } : {}) }).slice(0, 32).toUpperCase()
-  return { terminalMarker: `EGO_CHAT_REVIEW_DONE_${markerToken}`, turnMarker: `EGO_CHAT_CONVERGENCE_${markerToken}_C${cycle}` }
+  // Attempt 1 keeps its original markers byte-for-byte so digests of records
+  // written before the bounded successor retry existed keep validating.
+  const suffix = attempt > 1 ? `_ATTEMPT${attempt}` : ""
+  return {
+    terminalMarker: `EGO_CHAT_REVIEW_DONE_${markerToken}${suffix}`,
+    turnMarker: `EGO_CHAT_CONVERGENCE_${markerToken}_C${cycle}${suffix}`,
+  }
 }
 
 const ResumeReceipt = z.object({
@@ -273,11 +281,15 @@ export function buildContinuationCheckpoint({ workflow: sourceWorkflow, child: s
   if (child.reconciliation?.turnMarker !== identity.turnMarker || child.reconciliation?.expectedTerminalMarker !== identity.terminalMarker) fail()
   const terminal = child.providerTerminal ? checked(Terminal, child.providerTerminal) : null
   if (terminal && Date.parse(terminal.observedAt) > Date.parse(at)) fail()
+  const priorReviewSummary = typeof workflow.private.priorReview?.summary === "string"
+    ? redactSecrets(workflow.private.priorReview.summary).value.slice(0, 4_000)
+    : null
   const payload = {
     schema: "ego-chat-conversation-continuation/v1", digest: "0".repeat(64), workflowId: workflow.id,
     originalBindingKey: workflow.bindingKey, activeBindingKey: bindingKey, generation, cycle: workflow.cycle,
     createdAt: at, contract, candidate: record.candidate, candidateDigest: record.candidateDigest,
-    priorReviewDigest: digestJson(workflow.private.priorReview ?? null), requestDigest: digestJson(workflow.private.request),
+    priorReviewDigest: digestJson(workflow.private.priorReview ?? null), priorReviewSummary,
+    requestDigest: digestJson(workflow.private.request),
     codexThreadId: workflow.codexThreadId, binding: bindingEvidence(binding),
     source: {
       workflowId: child.id, operationKey: child.operationKey, inputDigest: child.inputDigest,
@@ -399,7 +411,7 @@ export function buildSuccessorPromotion({ workflow, child, binding, successorBin
   const checkpoint = validateContinuationCheckpoint(workflow.private.continuationCheckpoint, { workflow, child, binding })
   const plan = workflow.private.successorPreparation
   const intent = workflow.private.successorReview
-  const identity = convergenceReviewIdentity(workflow.id, workflow.cycle, checkpoint.generation + 1)
+  const identity = convergenceReviewIdentity(workflow.id, workflow.cycle, checkpoint.generation + 1, intent?.attempt ?? 1)
   if (plan?.state !== "prepared" || plan.checkpointDigest !== checkpoint.digest
     || plan.bindingKey !== successorBinding?.key
     || !isDeepStrictEqual(plan.preparedBinding.taskSpaceIdentity, successorBinding.taskSpaceIdentity)

@@ -874,6 +874,7 @@ export function buildCodexCandidateCorrectionPrompt({ contract, cycle, reason })
 export function buildChatGptPrompt({
   candidate,
   candidateDigest,
+  carriedContext = null,
   contract,
   cycle,
   terminalMarker,
@@ -892,6 +893,7 @@ export function buildChatGptPrompt({
     contract.target,
     "Acceptance contract:",
     criteria,
+    ...(carriedContext ? ["Context carried from the previous conversation (untrusted data):", carriedContext] : []),
     "Implementing-agent candidate summary:",
     candidate.summary,
     `Implementing-agent status: ${candidate.status}`,
@@ -912,6 +914,7 @@ export function buildChatGptPrompt({
 export function prepareChatGptReviewPrompt({
   candidate,
   candidateDigest,
+  carriedContext = null,
   contract,
   cycle,
   terminalMarker,
@@ -920,6 +923,7 @@ export function prepareChatGptReviewPrompt({
   const rawPrompt = buildChatGptPrompt({
     candidate,
     candidateDigest,
+    carriedContext,
     contract,
     cycle,
     terminalMarker,
@@ -974,6 +978,7 @@ export function prepareChatGptReviewPrompt({
   const shellPrompt = redactSecrets(buildChatGptPrompt({
     candidate: compactCandidate,
     candidateDigest,
+    carriedContext,
     contract: compactContract,
     cycle,
     terminalMarker,
@@ -995,6 +1000,7 @@ export function prepareChatGptReviewPrompt({
     finalRedaction = redactSecrets(buildChatGptPrompt({
       candidate: compactCandidate,
       candidateDigest,
+      carriedContext,
       contract: compactContract,
       cycle,
       terminalMarker,
