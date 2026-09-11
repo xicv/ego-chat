@@ -623,10 +623,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.25 makes the driver's keyboard steps real: the Ego driver runtime only acts on the mixed-case key names (`Enter`, `Escape`, `ArrowRight`), and the upper-case spellings used until 0.2.24 were silent no-ops, so raising the thinking effort from `Extra High` to `6 Pro` never happened and looped into `model_policy_mismatch`. The answering model slug (`responseModelSlug`) recording from 0.2.24 stays. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 21); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.26 recovers a `create_once` conversation whose Ego Space vanishes after its Send was confirmed (the Space is recreated by name, the observed conversation is reopened, and a record that already ended as `task_space_identity_unavailable` is reconcilable as an evidence-only capture), and releases a cancelled exchange's task-space admission when it is abandoned. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 22); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.25 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.26 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
