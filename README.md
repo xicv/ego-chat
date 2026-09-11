@@ -623,10 +623,10 @@ After Send, `workflow.delivery` exposes confirmation time and a permanent `canon
 
 ## Release verification
 
-v0.2.26 recovers a `create_once` conversation whose Ego Space vanishes after its Send was confirmed (the Space is recreated by name, the observed conversation is reopened, and a record that already ended as `task_space_identity_unavailable` is reconcilable as an evidence-only capture), and releases a cancelled exchange's task-space admission when it is abandoned. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 22); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
+v0.2.27 makes the `create_once` recovery from v0.2.26 work on real stranded records: `reconcile` accepts the confirmed-send evidence that survives a failed capture (`reconciliation.confirmedTaskSpace`, `promptMessageId`, `sentAt`), recreates the vanished Space by name, reopens the confirmed conversation and captures the answer read-only; nothing is ever resent. It is not yet qualified as interruption-free overnight operation. The browser contract changes (revision 23); upgrade only through an idle, child-drained broker handoff, then restart connected hosts together. Never stop an active confirmed-Send workflow just to upgrade:
 
 ```sh
-cargo install --registry crates-io --version 0.2.26 --locked --force ego-chat
+cargo install --registry crates-io --version 0.2.27 --locked --force ego-chat
 ego-chat setup
 # For ZCode users:
 ego-chat setup-zcode
