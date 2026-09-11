@@ -757,6 +757,20 @@ export function classifyAlertTransition(expected, next) {
   return { code }
 }
 
+// Ids and binding keys are UUIDs or match ^[a-z0-9][a-z0-9._-]{0,63}$, so this
+// never needs shell quoting. Returns null (never throws) when the workflow's
+// current binding key cannot be determined.
+export function monitorCommandFor(workflow) {
+  if (workflow?.kind !== "convergence") {
+    return null
+  }
+  const bindingKey = workflow.activeChat?.bindingKey ?? workflow.bindingKey ?? null
+  if (typeof bindingKey !== "string" || bindingKey.length === 0 || typeof workflow.id !== "string") {
+    return null
+  }
+  return `eagle-monitor start --workflow ${workflow.id} --binding-key ${bindingKey} --mode safe --power-policy keep-awake-on-ac --json`
+}
+
 function publicWorkflow(workflow) {
   const copy = structuredClone(workflow)
   if (workflow.private?.continuationCheckpoint) {
@@ -781,6 +795,12 @@ function publicWorkflow(workflow) {
       state: "confirmed",
     }
   }
+  if (workflow.kind === "convergence") {
+    const monitorCommand = monitorCommandFor(workflow)
+    if (monitorCommand) {
+      copy.supervision = { ...(copy.supervision ?? {}), monitorCommand }
+    }
+  }
   delete copy.private
   return copy
 }
@@ -798,6 +818,7 @@ function publicWorkflowWithSupervision(workflow, store) {
   return {
     ...copy,
     supervision: {
+      ...copy.supervision,
       ...supervision,
       semanticCheckpoint: projectEagleSemanticCheckpoint(workflow, child, supervision),
     },

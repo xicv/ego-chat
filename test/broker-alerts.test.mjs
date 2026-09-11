@@ -246,3 +246,77 @@ test("classifyAlertTransition does not fire when leaving or staying outside an a
     { id: "w1", kind: "ego_exchange", status: "succeeded", phase: "bound" },
   ), null)
 })
+
+test("startConvergence returns the Eagle Monitor start command", async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-broker-alerts-monitor-cmd-"))
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }))
+  const store = new EventStore(dataDir)
+  const broker = new Broker({
+    appServerFactory: () => { throw new Error("not used before the assertion below") },
+    egoAdapter: {
+      bind: async () => ({
+        canonicalUrl: "https://chatgpt.com/c/monitor-cmd-fixture",
+        head: {
+          fingerprint: sha("before"), fingerprintVersion: "tail-v1",
+          lastContentDigest: sha("before"), lastMessageId: "before-assistant",
+          lastRole: "assistant", messageCount: 2,
+        },
+        targetId: "monitor-cmd-tab", taskSpaceId: 905,
+        taskSpaceIdentity: { name: "monitor-cmd-space", taskId: "monitor-cmd-space-task" },
+      }),
+    },
+    recoveryDelaysMs: [0],
+    store,
+  })
+  await broker.initialize()
+  t.after(() => broker.close())
+  await broker.bindConversation({
+    bindingKey: "monitor-cmd-test", canonicalUrl: "https://chatgpt.com/c/monitor-cmd-fixture",
+    mode: "existing", taskSpace: 905,
+  })
+  const started = await broker.startConvergence({
+    acceptanceCriteria: ["Done."], bindingKey: "monitor-cmd-test", cwd: dataDir,
+    target: "Verify the monitor command is returned.",
+  })
+  assert.equal(
+    started.supervision.monitorCommand,
+    `eagle-monitor start --workflow ${started.id} --binding-key monitor-cmd-test --mode safe --power-policy keep-awake-on-ac --json`,
+  )
+})
+
+test("getStatus().runningWorkflows carries the monitor command for a convergence workflow but not for an exchange", async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "ego-chat-broker-alerts-monitor-cmd-status-"))
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }))
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const convergence = {
+    bindingKey: "monitor-cmd-status-binding",
+    createdAt: "2026-09-03T00:00:00.000Z",
+    id: "ab36e59f-5667-493a-be9d-849f7198f857",
+    kind: "convergence",
+    phase: "chatgpt_running",
+    status: "running",
+    updatedAt: "2026-09-03T00:01:00.000Z",
+  }
+  const exchange = {
+    bindingKey: "monitor-cmd-status-binding",
+    createdAt: "2026-09-03T00:00:00.000Z",
+    id: "4a993f1d-64dd-4741-a78d-55b4378521bc",
+    kind: "ego_exchange",
+    phase: "send_confirmed",
+    status: "running",
+    updatedAt: "2026-09-03T00:02:00.000Z",
+  }
+  await store.persist("workflow.started", convergence)
+  await store.persist("workflow.started", exchange)
+  const broker = new Broker({ egoAdapter: {}, store })
+
+  const { runningWorkflows } = broker.getStatus()
+  const visibleConvergence = runningWorkflows.find((workflow) => workflow.id === convergence.id)
+  const visibleExchange = runningWorkflows.find((workflow) => workflow.id === exchange.id)
+  assert.equal(
+    visibleConvergence.supervision.monitorCommand,
+    "eagle-monitor start --workflow ab36e59f-5667-493a-be9d-849f7198f857 --binding-key monitor-cmd-status-binding --mode safe --power-policy keep-awake-on-ac --json",
+  )
+  assert.equal(visibleExchange.supervision.monitorCommand, undefined)
+})
