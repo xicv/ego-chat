@@ -2182,7 +2182,7 @@ export class Broker {
               },
               undefined,
               (result) => this.#reserveBrowserTaskSpaceIdentity({
-                allowCanonicalPromotion: cancelledConfirmedCreateOnce,
+                allowCanonicalPromotion: cancelledConfirmedCreateOnce || vanishedTaskSpaceConfirmedCreateOnce,
                 expectedCanonicalUrl: identityBinding.canonicalUrl,
                 key: identityBinding.key,
                 owner: admissionOwner,
@@ -2214,7 +2214,7 @@ export class Broker {
               () => ({ taskSpaceGuard: this.#taskSpaceGuard(admissionOwner) }),
             )
         this.#reserveBrowserTaskSpaceIdentity({
-          allowCanonicalPromotion: cancelledConfirmedCreateOnce,
+          allowCanonicalPromotion: cancelledConfirmedCreateOnce || vanishedTaskSpaceConfirmedCreateOnce,
           expectedCanonicalUrl: identityBinding.canonicalUrl,
           key: identityBinding.key,
           owner: admissionOwner,
