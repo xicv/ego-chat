@@ -414,6 +414,35 @@ test("restart during the successor retry reattaches the attempt-2 child without 
   assert.equal(f.sends.length, 2)
 })
 
+test("a successor review intent persisted before the attempt field existed still resumes after restart", async (t) => {
+  const controls = { holdSuccessorCapture: true }
+  const f = await harness(t, { automatic: true, initialControls: controls })
+  await f.successorCaptureStarted
+  const reserved = f.store.getWorkflow(f.parent.id)
+  assert.equal(reserved.phase, "successor_reviewing")
+  assert.equal(reserved.private.successorReview.attempt, 1)
+  const sendsBeforeRestart = f.sends.length
+  f.broker.close()
+  // A 0.2.28 broker persisted the intent without an attempt key; strip it the
+  // way such a record looks on disk before the upgraded broker restarts.
+  const legacyStore = new EventStore(f.directory)
+  await legacyStore.initialize?.()
+  const current = legacyStore.getWorkflow(f.parent.id)
+  const { attempt, ...legacyIntent } = current.private.successorReview
+  assert.equal(attempt, 1)
+  await legacyStore.persist("convergence.successor_review_reserved", {
+    ...current, updatedAt: new Date().toISOString(),
+    private: { ...current.private, successorReview: legacyIntent },
+  }, current)
+  legacyStore.close?.()
+  f.controls.holdSuccessorCapture = false
+  const restarted = f.makeBroker(new EventStore(f.directory))
+  await restarted.initialize()
+  const result = await restarted.awaitWorkflow({ workflowId: f.parent.id, timeoutMs: 2_000 })
+  assert.equal(result.status, "succeeded")
+  assert.equal(f.sends.length, sendsBeforeRestart)
+})
+
 class RetryPromotionAppServer {
   constructor(candidate) {
     this.candidate = candidate

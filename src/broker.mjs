@@ -6480,7 +6480,11 @@ export class Broker {
       this.#convergenceChildren.delete(workflowId)
       return { child, reviewed }
     }
+    // An intent persisted before the bounded retry existed carries no attempt
+    // key; it is attempt 1 and must keep resuming after an upgrade.
     let intent = current.private.successorReview
+      ? { ...current.private.successorReview, attempt: current.private.successorReview.attempt ?? 1 }
+      : current.private.successorReview
     let identity = convergenceReviewIdentity(workflowId, current.cycle, checkpoint.generation + 1, intent?.attempt ?? 1)
     let prompt = buildReviewPrompt(identity)
     if (plan?.state !== "prepared" || !isDeepStrictEqual(intent, {
